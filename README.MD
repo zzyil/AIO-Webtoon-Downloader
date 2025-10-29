@@ -1,4 +1,4 @@
-# Mangataro Downloader 📚
+# AIO Webtoon & Light Novel Downloader 📚
 
 > [!IMPORTANT]
 > comick.io has shut down. This project now targets [mangataro.org](https://mangataro.org) with the same feature set—thanks for sticking around!
