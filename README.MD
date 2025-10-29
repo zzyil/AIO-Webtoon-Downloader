@@ -110,6 +110,8 @@ cd comick.io-Downloader
 python3 -m pip install -r requirements.txt
 ```
 
+- Optional (macOS + Homebrew + pyenv): `./test_scripts/python_version_tester.sh` auto-installs the tested interpreters and runs smoke tests across every supported Python version.
+
 ---
 
 ## 🚀 Usage

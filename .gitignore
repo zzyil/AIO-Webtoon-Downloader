@@ -10,4 +10,6 @@ comics/
 tmp_*/
 temp_epub_*/
 *.epub
+test_scripts/*/venv/
 mangataro.org.har
+sites/__pycache__
