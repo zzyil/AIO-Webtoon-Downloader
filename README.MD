@@ -110,8 +110,6 @@ cd comick.io-Downloader
 python3 -m pip install -r requirements.txt
 ```
 
-- Optional (macOS + Homebrew + pyenv): `./test_scripts/python_version_tester.sh` auto-installs the tested interpreters and runs smoke tests across every supported Python version.
-
 ---
 
 ## 🚀 Usage
@@ -329,12 +327,16 @@ This tool is provided strictly for educational purposes and to help you create p
 
 1. Fork the repo  
 2. Create a feature branch (`git checkout -b feature/foo`)  
-3. Test your update with `/test_scripts/python_version_tester.sh`
+3. Test your update (where possible)  
+   - macOS (Apple Silicon): [`test_scripts/python_version_tester.sh`](test_scripts/python_version_tester.sh) automatically spins up per-version virtualenvs after installing missing `python@X.Y` formulae via Homebrew (pyenv is optional but supported).  
+   - Otherwise: run targeted unit/download tests that exercise your change.
 4. Commit (`git commit -m "Add foo"`)  
 5. Push (`git push origin feature/foo`)  
 7. Open a Pull Request  
 
 Please follow the existing style and include tests where applicable.
+
+> Tip: The multi-version test script expects Homebrew to provide `python@X.Y`. If you're on another platform, mimic that matrix with your package manager or pyenv so we keep coverage consistent.
 
 ---
 
