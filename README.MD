@@ -1,12 +1,12 @@
-# comick.io Downloader 📚
+# Mangataro Downloader 📚
 
 > [!IMPORTANT]
-> comick.io seems to have been shutdown. Once a new platform establishes itself I will rewrite this project for said platform, thank you for your support everybody!
+> comick.io has shut down. This project now targets [mangataro.org](https://mangataro.org) with the same feature set—thanks for sticking around!
 
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/) [![GNU GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and manga from [comick.io](https://comick.io) and package them into **PDF**, **EPUB**, or **CBZ**—with intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
+The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and light novels from [mangataro.org](https://mangataro.org) and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
 
 ![Comick.io Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/main/comick_downloader.png?raw=true)
 
@@ -35,12 +35,16 @@ The most versatile, feature-rich & customizable command-line tool to download we
   Download specific chapters, ranges (`1-5`), or lists (`1,3,5-7`).
 - 🏷️ **Scanlation Group Control**  
   Prioritize your favorite scanlation group(s), or choose by highest upvotes.
-- 🖼️ **Image Processing**  
-  Resize, scale, recombine, and compress images for optimal reading.
+- 🖼️ **Smart Page Processing**  
+  Resize, scale, recombine, and compress image chapters. Webtoon strips stay continuous; page-style scans keep their page layout.
 - 🚫 **No-Processing Mode**  
   Package raw pages as-is into PDF/EPUB/CBZ (skip all resizing/recombining/scaling) via `--no-processing`.
 - 📁 **Multiple Formats**  
   Export as PDF, fixed-layout EPUB, vertical-scroll EPUB, or CBZ.
+- 📚 **Light-Novel Friendly**  
+  Detects prose chapters automatically—EPUB embeds true XHTML pages, PDF outputs selectable text, CBZ renders text blocks as images, and `--format none` saves plain `.txt` chapters.
+- 🧼 **Clean Chapter Content**  
+  Automatically strips Mangataro boilerplate (group avatars, site banners, copyright notices) so only true page content lands in your book.
 - 🔄 **Resumable Downloads**  
   Automatically picks up where it left off if interrupted.
 - ✂️ **Book Splitting**  
@@ -122,7 +126,7 @@ Run `python3 comick_downloader.py --help` for the full option list.
 
 | Option                        | Description                                                                                                                                                                                                                  | Default     |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| `COMIC_URL`                   | URL of the comic’s main page (e.g. `https://comick.io/comic/demo-comic`)                                                                                                                                                     | _required_  |
+| `COMIC_URL`                   | URL of the manga’s main page (e.g. `https://mangataro.org/manga/shadow-slave`)                                                                                                                                               | _required_  |
 | `--cookies STRING`            | HTTP cookie string for restricted content (e.g. `key1=val1; key2=val2`)                                                                                                                                                     | `""`        |
 | `--group STRING...`           | Preferred scanlation groups (comma-separated or multiple args).                                                                                                                                                              | `[]`        |
 | `--mix-by-upvote`             | When multiple `--group` entries exist, pick the version with the highest upvotes among them.                                                                                                                                 | `False`     |
@@ -148,17 +152,17 @@ Run `python3 comick_downloader.py --help` for the full option list.
 
 ## 🔐 Cookie Setup
 
-If authentication is required, export your cookies:
+If authentication is required, export your cookies as a single quoted string:
 
 ```bash
-export COOKIES='ads_provider2="…"; membership_alert=true; …'
+export COOKIES='session_token=…; another_cookie=…'
 ```
 
-Then run:
+Then run (adding `--site` if auto-detection ever fails):
 
 ```bash
-python3 comick_downloader.py --cookies "$COOKIES" \
-  "https://comick.io/comic/your-comic-url"
+python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
+  "https://mangataro.org/manga/shadow-slave"
 ```
 
 ---
@@ -169,67 +173,70 @@ python3 comick_downloader.py --cookies "$COOKIES" \
 
    ```bash
    python3 comick_downloader.py \
-     --cookies "$COOKIES" \
+     --site mangataro \
      --group Asura \
      --chapters "1-2" \
      --format epub \
      --epub-layout page \
      --verbose \
-     "https://comick.io/comic/demo-comic"
+     "https://mangataro.org/manga/re-zero-kara-hajimeru-isekai-seikatsu"
    ```
 
 2. **Vertical EPUB**, chapters 1–20, split every 5 chapters, verbose & debug:
 
    ```bash
    python3 comick_downloader.py \
-     --group Asura \
+     --site mangataro \
      --chapters "1-20" \
      --format epub \
      --epub-layout vertical \
      --split 5ch \
      --verbose --debug \
-     "https://comick.io/comic/demo-comic"
+     "https://mangataro.org/manga/shadow-slave"
    ```
 
 3. **CBZ**, chapters 1–2, one chapter per file:
 
    ```bash
    python3 comick_downloader.py \
-     --group Asura \
+     --site mangataro \
      --chapters "1-2" \
      --format cbz \
-     --split 1ch \
-     "https://comick.io/comic/demo-comic"
+     --keep-chapters \
+     "https://mangataro.org/manga/shadow-slave"
    ```
 
 4. **PDF**, chapters 1–2, save each chapter separately:
 
    ```bash
    python3 comick_downloader.py \
-     --group Asura \
+     --site mangataro \
      --chapters "1-2" \
      --format pdf \
      --keep-chapters \
-     "https://comick.io/comic/demo-comic"
+     "https://mangataro.org/manga/re-zero-kara-hajimeru-isekai-seikatsu"
    ```
 
-5. **Raw CBZ**, chapters 1–50 (no resizing/recombining/scaling):
+5. **Light-novel EPUB** (prose converted to XHTML, no image slicing):
 
    ```bash
    python3 comick_downloader.py \
+     --site mangataro \
+     --chapters "1-5" \
+     --format epub \
+     --epub-layout page \
+     "https://mangataro.org/manga/re-zero-kara-hajimeru-isekai-seikatsu"
+   ```
+
+6. **Raw CBZ** (pages copied as-is):
+
+   ```bash
+   python3 comick_downloader.py \
+     --site mangataro \
      --chapters "1-50" \
      --format cbz \
      --no-processing \
-     "https://comick.io/comic/demo-comic"
-   ```
-
-6. **Raw EPUB** (pages copied as-is):
-
-   ```bash
-   python3 comick_downloader.py \
-    --format epub \
-    --no-processing \
-    "https://comick.io/comic/demo-comic"
+     "https://mangataro.org/manga/shadow-slave"
    ```
 
 ---

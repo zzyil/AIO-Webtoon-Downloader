@@ -7,3 +7,7 @@ test_scripts/3.8.*/
 test_scripts/3.7.*/
 .DS_Store
 comics/
+tmp_*/
+temp_epub_*/
+*.epub
+mangataro.org.har
