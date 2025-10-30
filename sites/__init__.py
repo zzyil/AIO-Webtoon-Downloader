@@ -6,9 +6,11 @@ from typing import Iterable, Optional
 
 from .base import BaseSiteHandler
 from .mangataro import MangataroSiteHandler
+from .asura import AsuraSiteHandler
 
 _REGISTERED_HANDLERS: Iterable[BaseSiteHandler] = (
     MangataroSiteHandler(),
+    AsuraSiteHandler(),
 )
 
 
