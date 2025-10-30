@@ -1,7 +1,7 @@
 # AIO Webtoon & Light Novel Downloader 📚
 
 > [!IMPORTANT]
-> comick.io has shut down. This project now targets [mangataro.org](https://mangataro.org) with the same feature set—thanks for sticking around!
+> comick.io has ceased providing any media themselves. This project now targets multiple other platforms with the same feature set—thanks for sticking around!
 
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/) [![GNU GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
