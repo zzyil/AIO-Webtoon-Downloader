@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/) [![GNU GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and light novels from [mangataro.org](https://mangataro.org) and [asuracomic.net](https://asuracomic.net) and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
+The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and light novels from [mangataro.org](https://mangataro.org), [bato.to](https://bato.to), [asuracomic.net](https://asuracomic.net) & many others, and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
 
 ![Comick.io Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/main/comick_downloader.png?raw=true)
 
