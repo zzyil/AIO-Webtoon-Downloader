@@ -108,7 +108,7 @@ Notes:
 | Site | Notes |
 | ----- | ----- |
 | [mangataro.org](https://mangataro.org) | Light novels handled as text (EPUB XHTML / PDF text), image chapters auto-processed |
-| [asuracomic.net](https://asuracomic.net) | Fast chapter parsing via Next.js flight data; handles float chapters & direct gg.asuracomic CDN images |
+| [asuracomic.net](https://asuracomic.net) | Full support for all webtoons. |
 
 ## 🧰 Installation
 
