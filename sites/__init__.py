@@ -8,11 +8,13 @@ from .base import BaseSiteHandler
 from .mangataro import MangataroSiteHandler
 from .asura import AsuraSiteHandler
 from .batoto import BatoToSiteHandler
+from .mangapark import MangaParkSiteHandler
 
 _REGISTERED_HANDLERS: Iterable[BaseSiteHandler] = (
     MangataroSiteHandler(),
     AsuraSiteHandler(),
     BatoToSiteHandler(),
+    MangaParkSiteHandler(),
 )
 
 
