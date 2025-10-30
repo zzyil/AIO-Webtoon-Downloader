@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/) [![GNU GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and light novels from [mangataro.org](https://mangataro.org) and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
+The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and light novels from [mangataro.org](https://mangataro.org) and [asuracomic.net](https://asuracomic.net) and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
 
 ![Comick.io Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/main/comick_downloader.png?raw=true)
 
@@ -15,6 +15,7 @@ The most versatile, feature-rich & customizable command-line tool to download we
 
 - [🚀 Features](#-features)  
 - [🛠️ Requirements](#%EF%B8%8F-requirements)  
+- [🌐 Supported Sites](#-supported-sites)
 - [🧰 Installation](#-installation)  
 - [🚀 Usage](#-usage)  
 - [⚙️ Options](#%EF%B8%8F-options)  
@@ -101,6 +102,13 @@ Notes:
 - On macOS (Apple Silicon), Python 3.7 may need system libraries to build Pillow.
 
 ---
+
+## 🌐 Supported Sites
+
+| Site | Notes |
+| ----- | ----- |
+| [mangataro.org](https://mangataro.org) | Light novels handled as text (EPUB XHTML / PDF text), image chapters auto-processed |
+| [asuracomic.net](https://asuracomic.net) | Fast chapter parsing via Next.js flight data; handles float chapters & direct gg.asuracomic CDN images |
 
 ## 🧰 Installation
 
@@ -195,7 +203,17 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
      "https://mangataro.org/manga/shadow-slave"
    ```
 
-3. **CBZ**, chapters 1–2, one chapter per file:
+3. **Asura PDF**, chapters 1–2 from a series page:
+
+   ```bash
+   python3 comick_downloader.py \
+     --site asura \
+     --chapters "1-2" \
+     --format pdf \
+     "https://asuracomic.net/series/regression-of-the-yong-clan-heir-9c9e0572"
+   ```
+
+4. **CBZ**, chapters 1–2, one chapter per file:
 
    ```bash
    python3 comick_downloader.py \
@@ -206,7 +224,7 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
      "https://mangataro.org/manga/shadow-slave"
    ```
 
-4. **PDF**, chapters 1–2, save each chapter separately:
+5. **PDF**, chapters 1–2, save each chapter separately:
 
    ```bash
    python3 comick_downloader.py \
@@ -217,18 +235,18 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
      "https://mangataro.org/manga/re-zero-kara-hajimeru-isekai-seikatsu"
    ```
 
-5. **Light-novel EPUB** (prose converted to XHTML, no image slicing):
+6. **Light-novel EPUB** (prose converted to XHTML, no image slicing):
 
    ```bash
    python3 comick_downloader.py \
-     --site mangataro \
-     --chapters "1-5" \
+    --site mangataro \
+    --chapters "1-5" \
      --format epub \
      --epub-layout page \
      "https://mangataro.org/manga/re-zero-kara-hajimeru-isekai-seikatsu"
    ```
 
-6. **Raw CBZ** (pages copied as-is):
+7. **Raw CBZ** (pages copied as-is):
 
    ```bash
    python3 comick_downloader.py \
