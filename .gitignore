@@ -13,3 +13,4 @@ temp_epub_*/
 test_scripts/*/venv/
 mangataro.org.har
 sites/__pycache__
+asuracomic.net.har
