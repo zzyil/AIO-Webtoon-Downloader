@@ -5,6 +5,8 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
+from bs4 import BeautifulSoup
+
 from .base import BaseSiteHandler, SiteComicContext
 
 
@@ -17,15 +19,14 @@ class AsuraSiteHandler(BaseSiteHandler):
         "www.asurascans.net",
     )
 
-    BASE_URL = "https://asuracomic.net"
-
     def configure_session(self, scraper, args) -> None:
-        scraper.headers.update(
-            {
-                "Referer": self.BASE_URL + "/",
-                "Origin": self.BASE_URL,
-            }
-        )
+        if "Referer" not in scraper.headers:
+            scraper.headers.update(
+                {
+                    "Referer": "https://asuracomic.net/",
+                    "Origin": "https://asuracomic.net",
+                }
+            )
 
     # -- Helpers -----------------------------------------------------
     def _fetch_html(self, url: str, scraper, make_request) -> str:
@@ -162,6 +163,37 @@ class AsuraSiteHandler(BaseSiteHandler):
                 return resolved
         return None
 
+    def _split_people(self, text: str) -> List[str]:
+        parts = re.split(r"[,/]", text)
+        return [p.strip() for p in parts if p.strip()]
+
+    def _extract_people_from_html(self, html: str) -> Dict[str, List[str]]:
+        soup = BeautifulSoup(html, "html.parser")
+        authors: List[str] = []
+        artists: List[str] = []
+        info_section = soup.select_one(
+            "div.grid.grid-cols-1.md\\:grid-cols-2.gap-5.mt-8"
+        )
+        if info_section:
+            for row in info_section.find_all("div", recursive=False):
+                labels = row.find_all("h3")
+                if len(labels) < 2:
+                    continue
+                label_text = labels[0].get_text(strip=True).lower()
+                value_text = labels[1].get_text(strip=True)
+                if "author" in label_text or "writer" in label_text:
+                    authors = self._split_people(value_text)
+                elif "artist" in label_text or "illustrator" in label_text:
+                    artists = self._split_people(value_text)
+        result: Dict[str, List[str]] = {}
+        if authors:
+            result["authors"] = authors
+        if artists:
+            result["artists"] = artists
+            if not authors:
+                result.setdefault("authors", artists)
+        return result
+
     def _parse_chapter_page(self, html: str) -> Dict:
         content = self._extract_flight_content(html)
         pointer_map = self._build_pointer_map(content)
@@ -185,8 +217,8 @@ class AsuraSiteHandler(BaseSiteHandler):
             "pointers": pointer_map,
         }
 
-    def _chapter_url(self, slug: str, chapter_value: str) -> str:
-        return f"{self.BASE_URL}/series/{slug}/chapter/{chapter_value}"
+    def _chapter_url(self, base: str, slug: str, chapter_value: str) -> str:
+        return f"{base}/series/{slug}/chapter/{chapter_value}"
 
     # -- Base overrides ----------------------------------------------
     def fetch_comic_context(
@@ -198,18 +230,26 @@ class AsuraSiteHandler(BaseSiteHandler):
         if not comic:
             raise RuntimeError("Unable to parse comic metadata from Asura page.")
 
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
         slug = comic.get("slug") or self._slug_from_url(url)
         title = comic.get("name") or slug
         comic.setdefault("slug", slug)
         comic.setdefault("name", title)
         comic.setdefault("hid", str(comic.get("id") or slug))
+        if comic.get("thumb") and not comic.get("cover"):
+            comic["cover"] = comic["thumb"]
+        comic["_base_url"] = base_url
+        extra_people = self._extract_people_from_html(html)
+        for key, value in extra_people.items():
+            if value:
+                comic[key] = value
 
         # inject helpers
         comic["_chapter_map"] = data.get("chapter_map", [])
-        comic["_base_url"] = self._series_base(slug)
 
         if not comic["_chapter_map"]:
-            series_url = self._series_base(slug)
+            series_url = self._series_base(base_url, slug)
             series_html = self._fetch_html(series_url, scraper, make_request)
             series_data = self._parse_chapter_page(series_html)
             if series_data.get("chapter_map"):
@@ -218,14 +258,26 @@ class AsuraSiteHandler(BaseSiteHandler):
                 for key, value in series_data["comic"].items():
                     if key not in comic or comic[key] in (None, "", []):
                         comic[key] = value
+            extra_people = self._extract_people_from_html(series_html)
+            for key, value in extra_people.items():
+                if not comic.get(key):
+                    comic[key] = value
         if not comic["_chapter_map"]:
             try:
                 first_html = self._fetch_html(
-                    self._chapter_url(slug, "1"), scraper, make_request
+                    self._chapter_url(base_url, slug, "1"), scraper, make_request
                 )
                 first_data = self._parse_chapter_page(first_html)
                 if first_data.get("chapter_map"):
                     comic["_chapter_map"] = first_data["chapter_map"]
+                if first_data.get("comic"):
+                    for key, value in first_data["comic"].items():
+                        if key not in comic or comic[key] in (None, "", []):
+                            comic[key] = value
+                extra_people = self._extract_people_from_html(first_html)
+                for key, value in extra_people.items():
+                    if not comic.get(key):
+                        comic[key] = value
             except Exception:
                 pass
 
@@ -255,18 +307,23 @@ class AsuraSiteHandler(BaseSiteHandler):
         # authors / artists might be included under different keys; handle gracefully
         for key, target in (("authors", "authors"), ("artists", "artists")):
             if key in comic and isinstance(comic[key], list):
-                metadata[target] = [
-                    item["name"]
-                    for item in comic[key]
-                    if isinstance(item, dict) and item.get("name")
-                ]
+                if comic[key] and isinstance(comic[key][0], dict):
+                    metadata[target] = [
+                        item["name"]
+                        for item in comic[key]
+                        if isinstance(item, dict) and item.get("name")
+                    ]
+                else:
+                    metadata[target] = [str(item).strip() for item in comic[key] if str(item).strip()]
 
         return metadata
 
     def get_chapters(
         self, context: SiteComicContext, scraper, language: str, make_request
     ) -> List[Dict]:
+        comic = context.comic or {}
         slug = context.identifier
+        base_url = comic.get("_base_url") or "https://asuracomic.net"
         chapter_map: List[Dict] = context.comic.get("_chapter_map", [])
         chapters: List[Dict] = []
 
@@ -294,7 +351,7 @@ class AsuraSiteHandler(BaseSiteHandler):
                     "hid": f"{slug}-{chapter_no}",
                     "chap": chapter_no,
                     "title": label or f"Chapter {chapter_no}",
-                    "url": self._chapter_url(slug, chapter_no),
+                    "url": self._chapter_url(base_url, slug, chapter_no),
                     "group_name": None,
                 }
             )
@@ -323,8 +380,8 @@ class AsuraSiteHandler(BaseSiteHandler):
         return image_urls
 
     # -- Internal helpers --------------------------------------------
-    def _series_base(self, slug: str) -> str:
-        return f"{self.BASE_URL}/series/{slug}"
+    def _series_base(self, base: str, slug: str) -> str:
+        return f"{base}/series/{slug}"
 
     def _slug_from_url(self, url: str) -> str:
         path = urlparse(url).path
