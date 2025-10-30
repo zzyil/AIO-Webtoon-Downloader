@@ -1400,6 +1400,8 @@ def main():
     args = p.parse_args()
 
     handler = resolve_site_handler(args.comic_url, args.site)
+    if not handler:
+        sys.exit("Unable to resolve site handler. Use --site to specify explicitly.")
 
     # Process the group argument to handle comma-separated strings
     if args.group:

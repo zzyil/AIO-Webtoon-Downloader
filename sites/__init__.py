@@ -7,10 +7,12 @@ from typing import Iterable, Optional
 from .base import BaseSiteHandler
 from .mangataro import MangataroSiteHandler
 from .asura import AsuraSiteHandler
+from .batoto import BatoToSiteHandler
 
 _REGISTERED_HANDLERS: Iterable[BaseSiteHandler] = (
     MangataroSiteHandler(),
     AsuraSiteHandler(),
+    BatoToSiteHandler(),
 )
 
 
