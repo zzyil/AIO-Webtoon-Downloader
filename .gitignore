@@ -11,7 +11,9 @@ tmp_*/
 temp_epub_*/
 *.epub
 test_scripts/*/venv/
+/venv
 mangataro.org.har
 sites/__pycache__
 asuracomic.net.har
 bato.to.har
+unused/
