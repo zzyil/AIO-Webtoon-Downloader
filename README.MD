@@ -110,6 +110,7 @@ Notes:
 | [mangataro.org](https://mangataro.org) | Light novels handled as text (EPUB XHTML / PDF text), image chapters auto-processed |
 | [asuracomic.net](https://asuracomic.net) | Full support for all webtoons. |
 | [bato.to](https://bato.to) | GraphQL-backed chapter list with reader image filtering; auto-detects novels vs. image chapters. |
+| [mangapark.net](https://mangapark.net) | GraphQL metadata + chapter lists with CDN image filtering; supports hybrid text/image chapters. |
 
 ## 🧰 Installation
 
