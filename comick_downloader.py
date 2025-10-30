@@ -1572,10 +1572,11 @@ def main():
         return re.sub(r'[\\/*?:"<>|]', "", name).replace(" ", "_")
 
     safe_title = sanitize_filename(title)
-    base_filename = safe_title
+    safe_site = sanitize_filename(handler.name)
+    base_filename = f"{safe_title}_{safe_site}" if safe_site else safe_title
     if args.group:
         safe_group = sanitize_filename("_".join(args.group))
-        base_filename = f"{safe_title}_{safe_group}"
+        base_filename = f"{base_filename}_{safe_group}"
 
     pool = handler.get_chapters(context, scraper, args.language, make_request)
 
@@ -1679,10 +1680,15 @@ def main():
     current_epub_markers = []
 
     original_cover_path = None
-    if args.format in ["epub", "cbz"] and context.soup:
-        cover_tag = context.soup.find("meta", property="og:image")
-        if cover_tag and cover_tag.get("content"):
-            cover_url = cover_tag["content"]
+    if args.format in ["epub", "cbz"]:
+        cover_url = None
+        if context.soup:
+            cover_tag = context.soup.find("meta", property="og:image")
+            if cover_tag and cover_tag.get("content"):
+                cover_url = cover_tag["content"]
+        if not cover_url:
+            cover_url = comic_data.get("cover") or comic_data.get("thumb")
+        if cover_url:
             original_cover_path = dl_image(
                 cover_url, main_tmp_dir, "cover_orig.jpg", scraper
             )
