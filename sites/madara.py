@@ -217,9 +217,91 @@ class MadaraSiteHandler(BaseSiteHandler):
                                         ))
                                 if chapters:
                                     return chapters
-                    break  # Found a working chapter page, no need to try others
+
+                    # No select found, try probing for chapters (last resort)
+                    # This works for sites like adultwebtoon that are fully JS-driven
+                    if not chapters:
+                        chapters = self._probe_for_chapters(page_url, test_url)
+                        if chapters:
+                            return chapters
+
+                    # Only break if we found chapters, otherwise try next URL format
+                    if chapters:
+                        break
             except Exception:
                 continue
+
+        return chapters
+
+    def _probe_for_chapters(self, page_url: str, first_chapter_url: str) -> List[_MadaraChapter]:
+        """
+        Last-resort fallback: probe for chapters by testing sequential URLs.
+        Only used when no other method works (e.g., adultwebtoon.com).
+
+        NOTE: This method is not recommended as it makes many requests.
+        It should only be used when all other methods fail.
+        """
+        import requests
+        from urllib.parse import urljoin
+        import re
+
+        chapters: List[_MadaraChapter] = []
+
+        # Detect the chapter number format from first_chapter_url
+        # Examples: chapter-1, chapter-01, chapter-001
+        padding = 0
+        match = re.search(r'chapter-(\d+)', first_chapter_url)
+        if match:
+            chapter_num_str = match.group(1)
+            padding = len(chapter_num_str)  # 1 = no padding, 2 = "01", 3 = "001"
+
+        # Verify the first chapter actually has images before proceeding
+        # Some sites return 200 for any chapter URL but only certain formats have content
+        try:
+            response = requests.get(first_chapter_url, timeout=10)
+            if response.status_code == 200:
+                # Check if page has images by looking for common image indicators
+                has_images = (
+                    'reading-content' in response.text or
+                    '<img' in response.text and ('wp-manga-chapter-img' in response.text or 'chapter' in response.text.lower())
+                )
+                if not has_images:
+                    return []
+        except Exception:
+            return []
+
+        # Limit probing to avoid making too many requests
+        max_probe = 100
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+
+        for i in range(1, max_probe + 1):
+            try:
+                # Format chapter number with detected padding
+                if padding > 1:
+                    chapter_slug = f"chapter-{i:0{padding}d}"
+                else:
+                    chapter_slug = f"chapter-{i}"
+
+                chapter_url = urljoin(page_url, f"{chapter_slug}/")
+                response = requests.head(chapter_url, timeout=5, allow_redirects=True)
+
+                if response.status_code == 200:
+                    chapters.append(_MadaraChapter(
+                        url=chapter_url,
+                        title=f"Chapter {i}",
+                        date_text=None
+                    ))
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        # Stop if we hit 3 consecutive 404s
+                        break
+            except Exception:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    break
 
         return chapters
 

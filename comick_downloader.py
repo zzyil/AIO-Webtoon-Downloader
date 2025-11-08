@@ -1140,7 +1140,18 @@ a:hover, a:active { text-decoration: underline; }
                 arcname = os.path.relpath(file_path, temp_dir)
                 zf.write(file_path, arcname)
 
-    shutil.rmtree(temp_dir)
+    # Clean up temp directory with retry logic for file handle issues
+    try:
+        shutil.rmtree(temp_dir)
+    except OSError:
+        # If rmtree fails, try again with ignore_errors after brief delay
+        import time
+        time.sleep(0.1)  # Brief delay to allow file handles to close
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass  # Ignore cleanup errors - EPUB file was successfully created
+
     print(f"EPUB saved \u2192 {os.path.basename(out_path)}")
 
 def merge_pdf_files(input_paths, out_path, metadata):
