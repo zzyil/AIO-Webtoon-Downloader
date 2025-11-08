@@ -1,5 +1,3 @@
-"""Auto-generated Madara site mappings from Tachiyomi migrate data."""
-
 from __future__ import annotations
 
 # NOTE: Keep entries sorted alphabetically for readability.
@@ -96,10 +94,8 @@ MADARA_EXTRA_SITES = [
     ('manytoonme', 'https://manytoon.me'),
     ('milftoon', 'https://milftoon.xxx'),
     ('murimscan', 'https://inkreads.com'),
-    ('nitroscans', 'https://nitroscans.net'),
     ('novelcrow', 'https://novelcrow.com'),
     ('novelmic', 'https://novelmic.com'),
-    ('paragonscans', 'https://paragonscans.com'),
     ('paritehaber', 'https://www.paritehaber.com'),
     ('pawmanga', 'https://pawmanga.com'),
     ('petrotechsociety', 'https://www.petrotechsociety.org'),

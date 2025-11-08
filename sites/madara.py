@@ -173,6 +173,56 @@ class MadaraSiteHandler(BaseSiteHandler):
                 chapters.append(_MadaraChapter(url=href, title=title, date_text=date_text))
         return chapters
 
+    def _extract_from_chapter_selector(self, soup: BeautifulSoup, page_url: str) -> List[_MadaraChapter]:
+        """
+        Fallback for sites like manytoon where chapter list isn't in HTML,
+        but we can try to load a chapter page and extract from the dropdown selector.
+        """
+        chapters: List[_MadaraChapter] = []
+
+        # Try common first chapter URLs
+        from urllib.parse import urljoin
+        potential_chapter_urls = [
+            urljoin(page_url, "chapter-1/"),
+            urljoin(page_url, "chapter-01/"),
+            urljoin(page_url, "chapter-001/"),
+        ]
+
+        for test_url in potential_chapter_urls:
+            try:
+                import requests
+                # Use basic requests here to avoid circular dependency
+                response = requests.get(test_url, timeout=10)
+                if response.status_code == 200:
+                    # Try to parse chapter list from select dropdown
+                    chapter_soup = self._make_soup(response.text)
+                    selects = chapter_soup.find_all("select")
+
+                    for select in selects:
+                        options = select.find_all("option")
+                        # Check if this looks like a chapter selector
+                        if len(options) > 1:
+                            sample_value = options[0].get("value", "")
+                            if "chapter" in sample_value.lower():
+                                # This is likely the chapter selector
+                                for option in options:
+                                    chapter_slug = option.get("value", "")
+                                    chapter_title = option.get_text(strip=True)
+                                    if chapter_slug and chapter_title:
+                                        chapter_url = urljoin(page_url, f"{chapter_slug}/")
+                                        chapters.append(_MadaraChapter(
+                                            url=chapter_url,
+                                            title=chapter_title,
+                                            date_text=None
+                                        ))
+                                if chapters:
+                                    return chapters
+                    break  # Found a working chapter page, no need to try others
+            except Exception:
+                continue
+
+        return chapters
+
     def _load_ajax_chapters(self, soup: BeautifulSoup, scraper, referer: Optional[str] = None) -> Optional[BeautifulSoup]:
         holder = soup.select_one("#manga-chapters-holder, #chapterlist")
         if not holder:
@@ -245,6 +295,11 @@ class MadaraSiteHandler(BaseSiteHandler):
             ajax_soup = self._load_ajax_chapters(soup, scraper, referer=page_url)
             if ajax_soup:
                 chapters = self._collect_chapter_elements(ajax_soup)
+
+        # Fallback: Try to extract from chapter selector dropdown (used by manytoon, etc.)
+        if not chapters and page_url:
+            chapters = self._extract_from_chapter_selector(soup, page_url)
+
         chapter_dicts: List[Dict] = []
         for chapter in chapters:
             chap_num = self._extract_chapter_number(chapter.title) or chapter.title
