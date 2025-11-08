@@ -17,3 +17,7 @@ sites/__pycache__
 asuracomic.net.har
 bato.to.har
 unused/
+.vscode/settings.json
+migrate/
+tmp/
+har/

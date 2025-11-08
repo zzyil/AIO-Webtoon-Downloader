@@ -111,6 +111,10 @@ Notes:
 | [asuracomic.net](https://asuracomic.net) | Full support for all webtoons. |
 | [bato.to](https://bato.to) | GraphQL-backed chapter list with reader image filtering; auto-detects novels vs. image chapters. |
 | [mangapark.net](https://mangapark.net) | GraphQL metadata + chapter lists with CDN image filtering; supports hybrid text/image chapters. |
+| [kagane.org](https://kagane.org) | DRM-protected CDN that requires a personal Widevine `.wvd` file. Place it in the repo root or set `KAGANE_WVD`. See [docs/Widevine.md](docs/Widevine.md) for setup instructions. |
+| [mangareader.to](https://mangareader.to) | Supports English chapters; scrambled pages are automatically descrambled client-side. |
+| [mangadex.org](https://mangadex.org) | Uses the official MangaDex API with At-Home server support, plus translated-language filtering and scanlation group selection. |
+| [dynasty-scans.com](https://dynasty-scans.com) | Series and doujin entries parsed via the official JSON endpoints; reader pages are fetched directly from Dynasty’s CDN. |
 
 ## 🧰 Installation
 

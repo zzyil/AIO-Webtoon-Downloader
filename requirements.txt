@@ -4,3 +4,5 @@ lxml
 Pillow
 pypdf
 requests
+pywidevine
+cryptography

@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence
+from urllib.parse import urljoin, urlparse
+
+from bs4 import BeautifulSoup, FeatureNotFound
+
+from .base import BaseSiteHandler, SiteComicContext
+
+
+@dataclass
+class _MadaraChapter:
+    url: str
+    title: str
+    date_text: Optional[str]
+
+
+class MadaraSiteHandler(BaseSiteHandler):
+    """
+    Shared scraper for Madara/MadTheme based sites.
+
+    Many of the requested sources (MangaBuddy, MangaBin, SumManga, etc.)
+    follow the same HTML structure. This base handler keeps the per-site
+    implementation lightweight while still allowing overrides if a site
+    deviates from the defaults.
+    """
+
+    chapter_selectors: Sequence[str] = (
+        "li.wp-manga-chapter",
+        "div#chapterlist li",
+        "div#chapter-chap li",
+        "ul.main.version-chap li",
+    )
+
+    reader_selectors: Sequence[str] = (
+        "div.reading-content img",
+        "div#chapter-images img",
+        "div.page-break img",
+    )
+
+    def __init__(self, site_name: str, base_url: str, extra_domains: Optional[Iterable[str]] = None) -> None:
+        super().__init__()
+        self.site_name = site_name
+        self.base_url = base_url.rstrip("/")
+        parsed = urlparse(self.base_url)
+        domains = {parsed.netloc}
+        if parsed.netloc.startswith("www."):
+            domains.add(parsed.netloc[4:])
+        else:
+            domains.add(f"www.{parsed.netloc}")
+        if extra_domains:
+            domains.update(extra_domains)
+        self.domains = tuple(sorted(domains))
+        self.name = site_name
+
+        try:
+            import lxml  # type: ignore  # noqa: F401
+
+            self._parser = "lxml"
+        except Exception:
+            self._parser = "html.parser"
+
+    # ------------------------------------------------------------------ helpers
+    def _make_soup(self, html: str) -> BeautifulSoup:
+        try:
+            return BeautifulSoup(html, self._parser)
+        except FeatureNotFound:
+            return BeautifulSoup(html, "html.parser")
+
+    def _slug_from_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        parts = [p for p in parsed.path.split("/") if p]
+        if not parts:
+            return parsed.netloc
+        if parts[-1] == "manga":
+            return parts[-2] if len(parts) >= 2 else "series"
+        return parts[-1]
+
+    def _extract_text(self, soup: BeautifulSoup, selectors: Sequence[str]) -> Optional[str]:
+        for selector in selectors:
+            node = soup.select_one(selector)
+            if node:
+                text = node.get_text(strip=True)
+                if text:
+                    return text
+        return None
+
+    def _extract_people(self, soup: BeautifulSoup, labels: Iterable[str]) -> List[str]:
+        values: List[str] = []
+        rows = soup.select(".post-content_item")
+        lowered = [lbl.lower() for lbl in labels]
+        for row in rows:
+            heading = row.select_one(".summary-heading")
+            content = row.select_one(".summary-content")
+            if not heading or not content:
+                continue
+            label = heading.get_text(strip=True).lower()
+            if any(lbl in label for lbl in lowered):
+                people = re.split(r"[,/]", content.get_text(" ", strip=True))
+                values.extend([p.strip() for p in people if p.strip()])
+        return values
+
+    def _extract_alt_titles(self, soup: BeautifulSoup) -> List[str]:
+        alternatives: List[str] = []
+        for selector in (".summary-heading:contains('Alternative') + .summary-content", ".alternative > span"):
+            for node in soup.select(selector):
+                text = node.get_text(" ", strip=True)
+                if text:
+                    for part in re.split(r"[,;/]", text):
+                        cleaned = part.strip()
+                        if cleaned and cleaned not in alternatives:
+                            alternatives.append(cleaned)
+        return alternatives
+
+    def _extract_description(self, soup: BeautifulSoup) -> Optional[str]:
+        for selector in (".summary__content", ".description-summary p", ".description p", ".summary p"):
+            node = soup.select_one(selector)
+            if node:
+                text = node.get_text("\n", strip=True)
+                if text:
+                    return text
+        return None
+
+    def _extract_cover(self, soup: BeautifulSoup, page_url: str) -> Optional[str]:
+        cover = soup.select_one(".summary_image img, .img-responsive, div.thumb img")
+        if not cover:
+            return None
+        src = cover.get("data-src") or cover.get("data-lazy-src") or cover.get("src")
+        if not src:
+            return None
+        src = src.strip()
+        if src.startswith("//"):
+            return "https:" + src
+        if src.startswith("/"):
+            return urljoin(page_url, src)
+        if src.startswith("http"):
+            return src
+        return urljoin(page_url, src)
+
+    def _extract_genres(self, soup: BeautifulSoup) -> List[str]:
+        entries = [a.get_text(strip=True) for a in soup.select(".genres-content a, .genres a")]
+        return [e for e in entries if e]
+
+    def _extract_chapter_number(self, title: str) -> Optional[str]:
+        match = re.search(r"(\d+(?:\.\d+)?)", title)
+        return match.group(1) if match else None
+
+    def _parse_date(self, text: Optional[str]) -> Optional[str]:
+        if not text:
+            return None
+        return text.strip()
+
+    def _collect_chapter_elements(self, soup: BeautifulSoup) -> List[_MadaraChapter]:
+        chapters: List[_MadaraChapter] = []
+        for selector in self.chapter_selectors:
+            for node in soup.select(selector):
+                link = node.select_one("a")
+                if not link:
+                    continue
+                href = link.get("href")
+                if not href:
+                    continue
+                title = link.get_text(" ", strip=True)
+                date_node = node.select_one(".chapter-release-date, .chapter-release-time, .chapter-release > span")
+                date_text = date_node.get_text(strip=True) if date_node else None
+                chapters.append(_MadaraChapter(url=href, title=title, date_text=date_text))
+        return chapters
+
+    def _load_ajax_chapters(self, soup: BeautifulSoup, scraper) -> Optional[BeautifulSoup]:
+        holder = soup.select_one("#manga-chapters-holder, #chapterlist")
+        if not holder:
+            return None
+        post_id = holder.get("data-id") or holder.get("data-post-id")
+        if not post_id:
+            return None
+        ajax_url = urljoin(self.base_url + "/", "/wp-admin/admin-ajax.php")
+        response = scraper.post(
+            ajax_url,
+            data={"action": "manga_get_chapters", "manga": post_id},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        response.raise_for_status()
+        return self._make_soup(response.text)
+
+    def _parse_chapters(self, soup: BeautifulSoup, scraper) -> List[Dict]:
+        chapters = self._collect_chapter_elements(soup)
+        if not chapters:
+            ajax_soup = self._load_ajax_chapters(soup, scraper)
+            if ajax_soup:
+                chapters = self._collect_chapter_elements(ajax_soup)
+        chapter_dicts: List[Dict] = []
+        for chapter in chapters:
+            chap_num = self._extract_chapter_number(chapter.title) or chapter.title
+            chapter_dicts.append(
+                {
+                    "hid": chapter.url.rstrip("/"),
+                    "chap": chap_num,
+                    "title": chapter.title,
+                    "url": chapter.url,
+                    "uploaded": self._parse_date(chapter.date_text),
+                }
+            )
+        return chapter_dicts
+
+    def configure_session(self, scraper, args) -> None:
+        scraper.headers.setdefault("Referer", self.base_url + "/")
+        scraper.headers.setdefault("Origin", self.base_url)
+
+    def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
+        response = make_request(url, scraper)
+        html = response.text
+        soup = self._make_soup(html)
+
+        title = (
+            self._extract_text(soup, ("h1.entry-title", ".post-title h1", "h1.manga-name"))
+            or self._slug_from_url(url)
+        )
+        slug = self._slug_from_url(url)
+
+        comic: Dict[str, object] = {
+            "hid": slug,
+            "title": title,
+            "alt_names": self._extract_alt_titles(soup),
+            "desc": self._extract_description(soup),
+            "cover": self._extract_cover(soup, url),
+            "url": url,
+        }
+
+        authors = self._extract_people(soup, ("author", "writer"))
+        if authors:
+            comic["authors"] = authors
+        artists = self._extract_people(soup, ("artist", "illustrator"))
+        if artists:
+            comic["artists"] = artists
+        genres = self._extract_genres(soup)
+        if genres:
+            comic["genres"] = genres
+
+        comic["language"] = "en"
+
+        return SiteComicContext(comic=comic, title=title, identifier=slug, soup=soup)
+
+    def get_chapters(
+        self,
+        context: SiteComicContext,
+        scraper,
+        language: str,
+        make_request,
+    ) -> List[Dict]:
+        soup = context.soup
+        if soup is None:
+            source_url = context.comic.get("url")
+            url = source_url if isinstance(source_url, str) else urljoin(self.base_url + "/", context.identifier)
+            response = make_request(url, scraper)
+            soup = self._make_soup(response.text)
+        return self._parse_chapters(soup, scraper)
+
+    def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
+        chapter_url = chapter.get("url")
+        if not chapter_url:
+            raise RuntimeError("Chapter URL missing.")
+        response = make_request(chapter_url, scraper)
+        soup = self._make_soup(response.text)
+
+        image_urls: List[str] = []
+        for selector in self.reader_selectors:
+            for img in soup.select(selector):
+                src = (
+                    img.get("data-src")
+                    or img.get("data-srcset")
+                    or img.get("data-cfsrc")
+                    or img.get("src")
+                )
+                if not src:
+                    continue
+                src = src.strip()
+                if not src:
+                    continue
+                if src.startswith("//"):
+                    src = "https:" + src
+                elif src.startswith("/"):
+                    src = urljoin(chapter_url, src)
+                elif not src.startswith("http"):
+                    src = urljoin(chapter_url, src)
+                if src not in image_urls:
+                    image_urls.append(src)
+            if image_urls:
+                break
+
+        if not image_urls:
+            raise RuntimeError("Unable to locate images for chapter.")
+        return image_urls
+
+
+__all__ = ["MadaraSiteHandler"]

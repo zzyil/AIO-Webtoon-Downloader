@@ -1773,17 +1773,38 @@ def main():
                 f"  Fetching {len(media_entries)} media item(s)..."
             )
             for entry in media_entries:
-                if isinstance(entry, dict) and entry.get("type") == "text":
-                    paragraphs = entry.get("paragraphs", [])
-                    title_text = entry.get("title") or ch.get("title")
-                    if paragraphs or title_text:
-                        text_blocks.append(
-                            {
-                                "paragraphs": paragraphs,
-                                "title": title_text,
-                            }
+                if isinstance(entry, dict):
+                    entry_type = entry.get("type")
+                    if entry_type == "text":
+                        paragraphs = entry.get("paragraphs", [])
+                        title_text = entry.get("title") or ch.get("title")
+                        if paragraphs or title_text:
+                            text_blocks.append(
+                                {
+                                    "paragraphs": paragraphs,
+                                    "title": title_text,
+                                }
+                            )
+                        continue
+                    if entry_type == "binary_image":
+                        blob = entry.get("data")
+                        if not blob:
+                            continue
+                        ext = entry.get("extension") or ".jpg"
+                        if not ext.startswith("."):
+                            ext = "." + ext
+                        custom_name = entry.get("name")
+                        filename = (
+                            custom_name
+                            if custom_name
+                            else f"{n}_{page_counter:04d}{ext}"
                         )
-                    continue
+                        pth = os.path.join(tdir, filename)
+                        with open(pth, "wb") as fh:
+                            fh.write(blob)
+                        raw_image_paths.append(pth)
+                        page_counter += 1
+                        continue
 
                 full_url = entry if isinstance(entry, str) else entry.get("url")
                 if not full_url:
