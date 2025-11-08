@@ -11,6 +11,7 @@ MADARA_EXTRA_SITES = [
     ('aryascans', 'https://aryascans.com'),
     ('battleinfivesecondsaftermeeting', 'https://www.deatte5.com'),
     ('boratscans', 'https://boratscans.com'),
+    ('brainrotcomics', 'https://brainrotcomics.com/'),
     ('cocomic', 'https://cocomic.co'),
     ('coffeemanga', 'https://coffeemanga.io'),
     ('darkscans', 'https://darkscans.net'),
