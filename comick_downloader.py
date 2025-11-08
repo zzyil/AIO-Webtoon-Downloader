@@ -52,7 +52,13 @@ def log_debug(*args, **kwargs):
 def make_request(url: str, scraper):
     try:
         r = scraper.get(url)
-        r.raise_for_status()
+        # Some sites (like madarascans.com) return 403 but still serve content
+        # Only fail if we got a real error (4xx/5xx) AND no content
+        if r.status_code >= 400:
+            if not r.text or len(r.text) < 100:
+                r.raise_for_status()
+            # Otherwise, log but continue (it's likely Cloudflare sending content with 403)
+            log_verbose(f"  Warning: Got status {r.status_code} but response has content, continuing...")
         return r
     except requests.exceptions.RequestException as e:
         sys.exit(f"Request failed: {e}")

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
+import requests
 
 from .base import BaseSiteHandler, SiteComicContext
 
@@ -104,7 +106,10 @@ class MadaraSiteHandler(BaseSiteHandler):
 
     def _extract_alt_titles(self, soup: BeautifulSoup) -> List[str]:
         alternatives: List[str] = []
-        for selector in (".summary-heading:contains('Alternative') + .summary-content", ".alternative > span"):
+        for selector in (
+            ".summary-heading:-soup-contains('Alternative') + .summary-content",
+            ".alternative > span",
+        ):
             for node in soup.select(selector):
                 text = node.get_text(" ", strip=True)
                 if text:
@@ -168,26 +173,76 @@ class MadaraSiteHandler(BaseSiteHandler):
                 chapters.append(_MadaraChapter(url=href, title=title, date_text=date_text))
         return chapters
 
-    def _load_ajax_chapters(self, soup: BeautifulSoup, scraper) -> Optional[BeautifulSoup]:
+    def _load_ajax_chapters(self, soup: BeautifulSoup, scraper, referer: Optional[str] = None) -> Optional[BeautifulSoup]:
         holder = soup.select_one("#manga-chapters-holder, #chapterlist")
         if not holder:
             return None
         post_id = holder.get("data-id") or holder.get("data-post-id")
         if not post_id:
             return None
-        ajax_url = urljoin(self.base_url + "/", "/wp-admin/admin-ajax.php")
-        response = scraper.post(
-            ajax_url,
-            data={"action": "manga_get_chapters", "manga": post_id},
-            headers={"X-Requested-With": "XMLHttpRequest"},
-        )
-        response.raise_for_status()
-        return self._make_soup(response.text)
 
-    def _parse_chapters(self, soup: BeautifulSoup, scraper) -> List[Dict]:
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": self.base_url,
+        }
+        if referer:
+            headers["Referer"] = referer
+
+        # Method 1: Try direct ajax/chapters/ endpoint (used by some sites like cocomic.co)
+        if referer:
+            ajax_chapters_url = urljoin(referer, "ajax/chapters/")
+            try:
+                response = scraper.post(ajax_chapters_url, headers=headers)
+                if response.status_code == 200 and len(response.text) > 100:
+                    # Check if it looks like chapter HTML (not an error message)
+                    if "wp-manga-chapter" in response.text or "chapter" in response.text.lower():
+                        return self._make_soup(response.text)
+            except Exception:
+                pass
+
+        # Method 2: Try standard wp-admin/admin-ajax.php endpoint
+        ajax_url = urljoin(self.base_url + "/", "/wp-admin/admin-ajax.php")
+        nonce = holder.get("data-nonce") or holder.get("data-security")
+        payload = {"action": "manga_get_chapters", "manga": post_id}
+        if nonce:
+            payload["security"] = nonce
+            payload["nonce"] = nonce
+
+        try:
+            response = scraper.post(ajax_url, data=payload, headers=headers)
+            response.raise_for_status()
+            if response.text and response.text != "0":
+                return self._make_soup(response.text)
+        except requests.HTTPError:
+            pass
+        except Exception:
+            pass
+
+        # Method 3: Try fallback action
+        fallback_payload = {
+            "action": "wp_manga_load_more_chapter",
+            "manga": post_id,
+            "page": 1,
+            "order": "desc",
+        }
+        if nonce:
+            fallback_payload["security"] = nonce
+            fallback_payload["nonce"] = nonce
+        try:
+            response = scraper.post(ajax_url, data=fallback_payload, headers=headers)
+            response.raise_for_status()
+            if response.text and response.text != "0":
+                return self._make_soup(response.text)
+        except Exception:
+            pass
+
+        # All methods failed
+        return None
+
+    def _parse_chapters(self, soup: BeautifulSoup, scraper, page_url: Optional[str] = None) -> List[Dict]:
         chapters = self._collect_chapter_elements(soup)
         if not chapters:
-            ajax_soup = self._load_ajax_chapters(soup, scraper)
+            ajax_soup = self._load_ajax_chapters(soup, scraper, referer=page_url)
             if ajax_soup:
                 chapters = self._collect_chapter_elements(ajax_soup)
         chapter_dicts: List[Dict] = []
@@ -207,6 +262,10 @@ class MadaraSiteHandler(BaseSiteHandler):
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault("Referer", self.base_url + "/")
         scraper.headers.setdefault("Origin", self.base_url)
+        scraper.headers.setdefault(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         response = make_request(url, scraper)
@@ -255,7 +314,11 @@ class MadaraSiteHandler(BaseSiteHandler):
             url = source_url if isinstance(source_url, str) else urljoin(self.base_url + "/", context.identifier)
             response = make_request(url, scraper)
             soup = self._make_soup(response.text)
-        return self._parse_chapters(soup, scraper)
+        page_url = None
+        source_url = context.comic.get("url")
+        if isinstance(source_url, str):
+            page_url = source_url
+        return self._parse_chapters(soup, scraper, page_url=page_url)
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")

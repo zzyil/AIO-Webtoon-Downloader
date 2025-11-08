@@ -10,6 +10,8 @@ from .asura import AsuraSiteHandler
 from .artlapsa import ArtlapsaSiteHandler
 from .asmotoon import AsmotoonSiteHandler
 from .assortedscans import AssortedScansSiteHandler
+from .arc_relight import ArcRelightSiteHandler
+from .arcanescans import ArcaneScansSiteHandler
 from .batoto import BatoToSiteHandler
 from .dynasty import DynastySiteHandler
 from .likemanga import LikeMangaSiteHandler
@@ -35,6 +37,8 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     ArtlapsaSiteHandler(),
     AsmotoonSiteHandler(),
     AssortedScansSiteHandler(),
+    ArcRelightSiteHandler(),
+    ArcaneScansSiteHandler(),
     BatoToSiteHandler(),
     MangaParkSiteHandler(),
     MangaBuddySiteHandler(),
