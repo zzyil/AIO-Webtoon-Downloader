@@ -1,4 +1,4 @@
-# AIO Webtoon & Light Novel Downloader 📚
+# AIO Webtoon, Manga, Comic & Light Novel Downloader 📚
 
 > [!IMPORTANT]
 > comick.io has ceased providing any media themselves. This project now targets multiple other platforms with the same feature set—thanks for sticking around!
