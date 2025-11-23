@@ -31,6 +31,7 @@ from .mangataro import MangataroSiteHandler
 from .summanga import SumMangaSiteHandler
 from .weebcentral import WeebCentralSiteHandler
 from .mangafire import MangaFireSiteHandler
+from .comix import ComixSiteHandler
 
 _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     MangataroSiteHandler(),
@@ -57,6 +58,7 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     DynastySiteHandler(),
     MangaDexSiteHandler(),
     MangaHubSiteHandler(),
+    ComixSiteHandler(),
 )
 
 _REGISTERED_HANDLERS: Iterable[BaseSiteHandler] = tuple(

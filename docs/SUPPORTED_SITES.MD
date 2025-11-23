@@ -16,6 +16,7 @@
 | [boratscans.com](https://boratscans.com) |  |
 | [cocomic.co](https://cocomic.co) |  |
 | [coffeemanga.io](https://coffeemanga.io) |  |
+| [comix.to](https://comix.to) | Supports scanlation group selection, tested ✅ |
 | [darkscans.net](https://darkscans.net) |  |
 | [decadencescans.com](https://reader.decadencescans.com) |  |
 | [dragontea.ink](https://dragontea.ink) |  |

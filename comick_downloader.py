@@ -1938,14 +1938,32 @@ def main():
         )
 
     if args.chapters.lower() != "all":
-        chapters = [
-            c
-            for c in chapters
-            if is_chapter_wanted(float(c["chap"]), args.chapters)
-        ]
-        log_verbose(
-            f"  --chapters '{args.chapters}': Filtered list down to {len(chapters)} chapters."
-        )
+        # Check for negative indexing (e.g. "-1" for last chapter, "-3" for last 3)
+        is_negative_index = False
+        try:
+            if args.chapters.strip().startswith("-") and "," not in args.chapters:
+                # Check if it's a valid integer (e.g. -1, -5)
+                # Note: This might conflict with actual negative chapter numbers (e.g. -12),
+                # but those are rare. We prioritize the "last N" semantics here.
+                val = int(args.chapters)
+                if val < 0:
+                    chapters = chapters[val:]
+                    is_negative_index = True
+                    log_verbose(
+                        f"  --chapters '{args.chapters}': Interpreted as last {-val} chapters. Selected {len(chapters)} chapters."
+                    )
+        except ValueError:
+            pass
+
+        if not is_negative_index:
+            chapters = [
+                c
+                for c in chapters
+                if is_chapter_wanted(float(c["chap"]), args.chapters)
+            ]
+            log_verbose(
+                f"  --chapters '{args.chapters}': Filtered list down to {len(chapters)} chapters."
+            )
 
     if not chapters:
         sys.exit("No chapters selected.")

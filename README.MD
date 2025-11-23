@@ -125,7 +125,8 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [asuracomic.net](https://asuracomic.net) |  |
 | [asurascans.net](https://asurascans.net) |  |
 | [atsu.moe](https://atsu.moe) |  |
-| [bato.to](https://bato.to) |  ||
+| [bato.to](https://bato.to) |  |
+| [comix.to](https://comix.to) | Supports multiple scanlation groups |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |
 | [mangadex.org](https://mangadex.org) | Supports scanlation group selection |
 | [mangafire.to](https://mangafire.to) |  |
