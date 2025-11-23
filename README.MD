@@ -121,24 +121,23 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 
 | Site | Notes |
 | ----- | ----- |
-| [asuracomic.net](https://asuracomic.net) |  |
-| [asurascans.net](https://asurascans.net) |  |
+| [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) · tested ✅  |
 | [atsu.moe](https://atsu.moe) |  |
-| [bato.to](https://bato.to) |  |
+| [bato.to](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) · tested ✅ |
 | [comix.to](https://comix.to) | Supports multiple scanlation groups |
-| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) (bare + `www.`) |
+| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) · tested ✅ |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |
-| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/MANGABUDDY_MIRRORS.MD) |
+| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) · tested ✅ |
 | [mangadex.org](https://mangadex.org) | Supports scanlation group selection |
-| [mangafire.to](https://mangafire.to) |  |
+| [mangafire.to](https://mangafire.to) | Supports multiple languages · tested ✅ |
 | [mangahub.io](https://mangahub.io) |  |
 | [mangakiss.org](https://mangakiss.org) |  |
-| [MangaKakalot / Manganato](https://www.manganato.gg) | tested ✅ · See [mirror list](docs/SUPPORTED_SITES.MD) |
+| [MangaKakalot / Manganato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) · tested ✅ |
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection |
 | [manhuafast.net](https://manhuafast.net) |  |
 | [manhuaga.org](https://manhua-ga.org) |  |
 | [manhwaclan.com](https://manhwaclan.com) |  |
-| [weebcentral.com](https://weebcentral.com) | Supports scanlation group selection |
+| [weebcentral.com](https://weebcentral.com) | Supports scanlation group selection · tested ✅ |
 
 ---
 
