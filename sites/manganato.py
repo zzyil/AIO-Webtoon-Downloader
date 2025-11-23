@@ -8,11 +8,20 @@ from bs4 import BeautifulSoup, FeatureNotFound
 from .base import BaseSiteHandler, SiteComicContext
 
 
-class MangaKakalotSiteHandler(BaseSiteHandler):
-    name = "mangakakalot"
-    domains = ("mangakakalot.gg", "www.mangakakalot.gg")
+class ManganatoSiteHandler(BaseSiteHandler):
+    name = "manganato"
+    domains = (
+        "manganato.gg",
+        "www.manganato.gg",
+        "nelomanga.net",
+        "www.nelomanga.net",
+        "natomanga.com",
+        "www.natomanga.com",
+        "mangakakalot.gg",
+        "www.mangakakalot.gg",
+    )
 
-    _BASE_URL = "https://www.mangakakalot.gg"
+    _BASE_URL = "https://www.manganato.gg"
 
     def __init__(self) -> None:
         try:
@@ -33,9 +42,9 @@ class MangaKakalotSiteHandler(BaseSiteHandler):
         parsed = urlparse(url)
         parts = [p for p in parsed.path.split("/") if p]
         if not parts:
-            raise RuntimeError("Invalid MangaKakalot URL.")
+            raise RuntimeError("Invalid Manganato URL.")
         if parts[0] != "manga":
-            raise RuntimeError("Only /manga/... URLs are supported for MangaKakalot.")
+            raise RuntimeError("Only /manga/... URLs are supported for Manganato.")
         return parts[1]
 
     def _absolute(self, base: str, href: Optional[str]) -> Optional[str]:
@@ -177,18 +186,18 @@ class MangaKakalotSiteHandler(BaseSiteHandler):
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
         if not isinstance(url, str):
-            raise RuntimeError("Chapter URL missing for MangaKakalot.")
+            raise RuntimeError("Chapter URL missing for Manganato.")
         response = make_request(url, scraper)
         soup = self._make_soup(response.text)
         images: List[str] = []
-        for img in soup.select("#chapter-content img, .reading-detail img, .page_chapter img"):
+        for img in soup.select("#chapter-content img, .reading-detail img, .page_chapter img, .container-chapter-reader img"):
             src = img.get("data-src") or img.get("data-original") or img.get("src")
             absolute = self._absolute(url, src)
             if absolute and absolute not in images:
                 images.append(absolute)
         if not images:
-            raise RuntimeError("Unable to locate MangaKakalot chapter images.")
+            raise RuntimeError("Unable to locate Manganato chapter images.")
         return images
 
 
-__all__ = ["MangaKakalotSiteHandler"]
+__all__ = ["ManganatoSiteHandler"]

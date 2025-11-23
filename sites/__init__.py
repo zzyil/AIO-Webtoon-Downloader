@@ -23,7 +23,7 @@ from .mangabuddy import MangaBuddySiteHandler
 from .mangabin import MangaBinSiteHandler
 from .mangahub import MangaHubSiteHandler
 from .mangafox import MangaFoxSiteHandler
-from .mangakakalot import MangaKakalotSiteHandler
+from .manganato import ManganatoSiteHandler
 from .mangareader import MangaReaderSiteHandler
 from .mangakatana import MangaKatanaSiteHandler
 from .mangapark import MangaParkSiteHandler
@@ -50,7 +50,7 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     WeebCentralSiteHandler(),
     AtsumaruSiteHandler(),
     MangaKatanaSiteHandler(),
-    MangaKakalotSiteHandler(),
+    ManganatoSiteHandler(),
     LikeMangaSiteHandler(),
     MangaFoxSiteHandler(),
     KaganeSiteHandler(),

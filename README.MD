@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/) [![GNU GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and light novels from [mangataro.org](https://mangataro.org), [mangafire.to](https://mangafire.to), [bato.to](https://bato.to), [asuracomic.net](https://asuracomic.net) & many others, and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
+The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and light novels from [mangataro.org](https://mangataro.org), [mangafire.to](https://mangafire.to), [bato.to](https://bato.to), [asuracomic.net](https://asuracomic.net), [weebcentral.com](https://weebcentral.com), [manganato.gg](https://www.manganato.gg) & many others, and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
 
 ![Comick.io Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/main/comick_downloader.png?raw=true)
 
@@ -131,6 +131,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [mangafire.to](https://mangafire.to) |  |
 | [mangahub.io](https://mangahub.io) |  |
 | [mangakiss.org](https://mangakiss.org) |  |
+| [manganato.gg/nelomanga.net/natomanga.com/mangakakalot.gg](https://www.manganato.gg) | tested ✅ |
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection |
 | [manhuafast.net](https://manhuafast.net) |  |
 | [manhuaga.org](https://manhua-ga.org) |  |

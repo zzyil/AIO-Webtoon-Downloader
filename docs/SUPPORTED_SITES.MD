@@ -67,9 +67,7 @@
 | [mangafreakonline.com](https://mangafreak.online) |  |
 | [mangagg.com](https://mangagg.com) |  |
 | [mangahentai.me](https://mangahentai.me) |  |
-| [mangahub.io](https://mangahub.io) |  |
-| [mangakakalot.gg](https://mangakakalot.gg) |  |
-| [mangakiss.org](https://mangakiss.org) |  |
+| [manganato.gg/nelomanga.net/natomanga.com/mangakakalot.gg](https://www.manganato.gg) | tested ✅ |
 | [mangaleveling.com](https://mangaleveling.com) |  |
 | [mangamaniacs.org](https://mangamaniacs.org) |  |
 | [mangaonlineteam.com](https://mangaonlineteam.com) |  |
