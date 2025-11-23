@@ -119,7 +119,7 @@ python3 -m pip install -r requirements.txt
 
 For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD)
 
-| Site | Notes | Status |
+| Site | Notes | Integration Status |
 | ----- | ----- | ----- |
 | [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | tested ✅  |
 | [atsu.moe](https://atsu.moe) |  |  |
