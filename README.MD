@@ -124,7 +124,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) · tested ✅  |
 | [atsu.moe](https://atsu.moe) |  |
 | [bato.to](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) · tested ✅ |
-| [comix.to](https://comix.to) | Supports multiple scanlation groups |
+| [comix.to](https://comix.to) | Supports multiple scanlation groups · tested ✅ |
 | [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) · tested ✅ |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |
 | [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) · tested ✅ |
