@@ -21,3 +21,4 @@ unused/
 migrate/
 tmp/
 har/
+node_modules/

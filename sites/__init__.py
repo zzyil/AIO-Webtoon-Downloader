@@ -30,9 +30,11 @@ from .mangapark import MangaParkSiteHandler
 from .mangataro import MangataroSiteHandler
 from .summanga import SumMangaSiteHandler
 from .weebcentral import WeebCentralSiteHandler
+from .mangafire import MangaFireSiteHandler
 
 _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     MangataroSiteHandler(),
+    MangaFireSiteHandler(),
     AsuraSiteHandler(),
     ArtlapsaSiteHandler(),
     AsmotoonSiteHandler(),

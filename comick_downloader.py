@@ -30,6 +30,10 @@ import requests
 
 from PIL import Image, ImageDraw, ImageFont
 
+# Increase PIL decompression bomb limit for large manga pages
+# MangaFire often has high-resolution pages that exceed the default limit
+Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels (default is ~89 megapixels)
+
 _VERBOSE = False  # Global flag for standard verbose output
 _DEBUG = False  # Global flag for debug-level output
 
