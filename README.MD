@@ -8,7 +8,7 @@
 
 The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), manga, comics and light novels from [mangataro.org](https://mangataro.org), [mangafire.to](https://mangafire.to), [bato.to](https://bato.to), [asuracomic.net](https://asuracomic.net), [weebcentral.com](https://weebcentral.com), [manganato.gg](https://www.manganato.gg), [comix.to](https://comix.to) & many others, and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
 
-![AIO Webtoon & Light Novel Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/main/AIO.png?raw=true)
+![AIO Webtoon & Light Novel Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/multi-site-support/AIO.png?raw=true)
 
 
 ## 📑 Table of Contents
