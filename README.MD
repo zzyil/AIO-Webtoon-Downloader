@@ -126,12 +126,14 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [atsu.moe](https://atsu.moe) |  |
 | [bato.to](https://bato.to) |  |
 | [comix.to](https://comix.to) | Supports multiple scanlation groups |
+| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) (bare + `www.`) |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |
+| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/MANGABUDDY_MIRRORS.MD) |
 | [mangadex.org](https://mangadex.org) | Supports scanlation group selection |
 | [mangafire.to](https://mangafire.to) |  |
 | [mangahub.io](https://mangahub.io) |  |
 | [mangakiss.org](https://mangakiss.org) |  |
-| [manganato.gg/nelomanga.net/natomanga.com/mangakakalot.gg](https://www.manganato.gg) | tested ✅ |
+| [MangaKakalot / Manganato](https://www.manganato.gg) | tested ✅ · See [mirror list](docs/SUPPORTED_SITES.MD) |
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection |
 | [manhuafast.net](https://manhuafast.net) |  |
 | [manhuaga.org](https://manhua-ga.org) |  |

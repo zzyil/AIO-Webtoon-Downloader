@@ -9,9 +9,23 @@ from bs4 import BeautifulSoup, FeatureNotFound
 from .base import BaseSiteHandler, SiteComicContext
 
 
+_MANGAFOX_MAIN_DOMAINS = (
+    "fanfox.net",
+    "www.fanfox.net",
+    "m.fanfox.net",
+)
+
+_MANGAFOX_MIRRORS = (
+    "mangafox.la",
+    "www.mangafox.la",
+    "mangahere.cc",
+    "www.mangahere.cc",
+)
+
+
 class MangaFoxSiteHandler(BaseSiteHandler):
     name = "mangafox"
-    domains = ("fanfox.net", "www.fanfox.net", "m.fanfox.net")
+    domains = _MANGAFOX_MAIN_DOMAINS + _MANGAFOX_MIRRORS
 
     _BASE_URL = "https://fanfox.net"
     _MOBILE_URL = "https://m.fanfox.net"
@@ -35,9 +49,11 @@ class MangaFoxSiteHandler(BaseSiteHandler):
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault("Referer", self._BASE_URL + "/")
         scraper.headers.setdefault("User-Agent", "Mozilla/5.0")
-        scraper.cookies.set("isAdult", "1", domain="fanfox.net", path="/")
-        scraper.cookies.set("isAdult", "1", domain=".fanfox.net", path="/")
-        scraper.cookies.set("isAdult", "1", domain="www.fanfox.net", path="/")
+        adult_domains = ("fanfox.net", "mangafox.la", "mangahere.cc")
+        for domain in adult_domains:
+            scraper.cookies.set("isAdult", "1", domain=domain, path="/")
+            scraper.cookies.set("isAdult", "1", domain=f".{domain}", path="/")
+            scraper.cookies.set("isAdult", "1", domain=f"www.{domain}", path="/")
         scraper.cookies.set("readway", "2", domain="m.fanfox.net", path="/")
 
     def _slug_from_url(self, url: str) -> str:
@@ -138,6 +154,7 @@ class MangaFoxSiteHandler(BaseSiteHandler):
             soup = self._make_soup(response.text)
 
         chapters: List[Dict] = []
+        source_url = context.comic.get("url") or self._BASE_URL
         for anchor in soup.select("ul.detail-main-list li a"):
             href = anchor.get("href")
             if not href:
@@ -153,7 +170,7 @@ class MangaFoxSiteHandler(BaseSiteHandler):
                     "hid": href.rstrip("/"),
                     "chap": name,
                     "title": name,
-                    "url": urljoin(self._BASE_URL, href),
+                    "url": urljoin(source_url, href),
                     "uploaded": uploaded,
                 }
             )

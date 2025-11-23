@@ -8,18 +8,33 @@ from bs4 import BeautifulSoup, FeatureNotFound
 from .base import BaseSiteHandler, SiteComicContext
 
 
+_MANGANATO_DOMAINS = (
+    "mangabats.com",
+    "www.mangabats.com",
+    "mangakakalot.fan",
+    "www.mangakakalot.fan",
+    "mangakakalot.gg",
+    "www.mangakakalot.gg",
+    "mangakakalove.com",
+    "www.mangakakalove.com",
+    "manganato.gg",
+    "www.manganato.gg",
+    "natomanga.com",
+    "www.natomanga.com",
+    "nelomanga.com",
+    "www.nelomanga.com",
+    "nelomanga.net",
+    "www.nelomanga.net",
+    "zazamanga.com",
+    "www.zazamanga.com",
+    "zinmanga.net",
+    "www.zinmanga.net",
+)
+
+
 class ManganatoSiteHandler(BaseSiteHandler):
     name = "manganato"
-    domains = (
-        "manganato.gg",
-        "www.manganato.gg",
-        "nelomanga.net",
-        "www.nelomanga.net",
-        "natomanga.com",
-        "www.natomanga.com",
-        "mangakakalot.gg",
-        "www.mangakakalot.gg",
-    )
+    domains = _MANGANATO_DOMAINS
 
     _BASE_URL = "https://www.manganato.gg"
 
@@ -68,7 +83,7 @@ class ManganatoSiteHandler(BaseSiteHandler):
                     return text
         return None
 
-    def _collect_chapter_rows(self, soup: BeautifulSoup) -> List[Dict]:
+    def _collect_chapter_rows(self, soup: BeautifulSoup, page_url: str) -> List[Dict]:
         results: List[Dict] = []
         selectors = [
             ".list-chapter li a",
@@ -82,7 +97,7 @@ class ManganatoSiteHandler(BaseSiteHandler):
                 href = anchor.get("href")
                 if not href:
                     continue
-                absolute = self._absolute(self._BASE_URL, href)
+                absolute = self._absolute(page_url, href) or self._absolute(self._BASE_URL, href)
                 if not absolute or absolute in seen:
                     continue
                 seen.add(absolute)
@@ -167,7 +182,8 @@ class ManganatoSiteHandler(BaseSiteHandler):
         if soup is None:
             response = make_request(context.comic.get("url"), scraper)
             soup = self._make_soup(response.text)
-        chapter_rows = self._collect_chapter_rows(soup)
+        source_url = context.comic.get("url") or self._BASE_URL
+        chapter_rows = self._collect_chapter_rows(soup, source_url)
         chapters: List[Dict] = []
         for row in chapter_rows:
             number = self._chapter_number(row["title"])

@@ -22,7 +22,7 @@
 | [dragontea.ink](https://dragontea.ink) |  |
 | [dynasty-scans.com](https://dynasty-scans.com) | Supports scanlation group selection |
 | [evilflowers.com](https://evilflowers.com) |  |
-| [fanfox.net](https://fanfox.net) |  |
+| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) — both bare and `www.` variants |
 | [firescans.xyz](https://firescans.xyz) |  |
 | [freecomiconline.me](https://freecomiconline.me) |  |
 | [freemanga.me](https://freemanga.me) |  |
@@ -57,7 +57,7 @@
 | [manga18fx.com](https://manga18fx.com) |  |
 | [manga18x.net](https://manga18x.net) |  |
 | [manga3s.com](https://manga3s.com) |  |
-| [mangabuddy.com](https://mangabuddy.com) |  |
+| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](MANGABUDDY_MIRRORS.MD) |
 | [mangaclash.com](https://toonclash.com) |  |
 | [mangadass.com](https://mangadass.com) |  |
 | [mangadistrict.com](https://mangadistrict.com) |  |
@@ -67,7 +67,7 @@
 | [mangafreakonline.com](https://mangafreak.online) |  |
 | [mangagg.com](https://mangagg.com) |  |
 | [mangahentai.me](https://mangahentai.me) |  |
-| [manganato.gg/nelomanga.net/natomanga.com/mangakakalot.gg](https://www.manganato.gg) | tested ✅ |
+| [MangaKakalot / Manganato family](https://www.manganato.gg) | tested ✅ · See [mirror list](MANGAKAKALOT_MIRRORS.MD) |
 | [mangaleveling.com](https://mangaleveling.com) |  |
 | [mangamaniacs.org](https://mangamaniacs.org) |  |
 | [mangaonlineteam.com](https://mangaonlineteam.com) |  |
@@ -232,4 +232,30 @@
 | [zbato.net](https://zbato.net) |  |
 | [zbato.org](https://zbato.org) |  |
 
-For supported NSFW sites, check [docs/NSFW.MD](docs/NSFW.MD)
+## MangaBuddy mirrors
+
+| Site | Notes |
+| ----- | ----- |
+| [mangacute.com](https://mangacute.com/) | also supports `www.mangacute.com` |
+| [mangaforest.com](https://mangaforest.com/) | also supports `www.mangaforest.com` |
+| [mangamirror.com](https://mangamirror.com/) | also supports `www.mangamirror.com` |
+| [mangapuma.com](https://mangapuma.com/) | also supports `www.mangapuma.com` |
+| [mangaxyz.com](https://mangaxyz.com/) | also supports `www.mangaxyz.com` |
+| [truemanga.com](https://truemanga.com/) | also supports `www.truemanga.com` |
+
+## MangaKakalot / Manganato mirrors
+
+| Site | Notes |
+| ----- | ----- |
+| [mangabats.com](https://mangabats.com/) | also supports `www.mangabats.com` |
+| [mangakakalot.fan](https://mangakakalot.fan/) | also supports `www.mangakakalot.fan` |
+| [mangakakalot.gg](https://mangakakalot.gg/) | also supports `www.mangakakalot.gg` |
+| [mangakakalove.com](https://mangakakalove.com/) | also supports `www.mangakakalove.com` |
+| [manganato.gg](https://manganato.gg/) | also supports `www.manganato.gg` |
+| [natomanga.com](https://natomanga.com/) | also supports `www.natomanga.com` |
+| [nelomanga.com](https://nelomanga.com/) | also supports `www.nelomanga.com` |
+| [nelomanga.net](https://nelomanga.net/) | also supports `www.nelomanga.net` |
+| [zazamanga.com](https://zazamanga.com/) | also supports `www.zazamanga.com` |
+| [zinmanga.net](https://zinmanga.net/) | also supports `www.zinmanga.net` |
+
+For supported NSFW sites, check [NSFW.MD](NSFW.MD)
