@@ -13,7 +13,6 @@
 | [asuracomic.net](https://asuracomic.net) |  |
 | [asurascans.net](https://asurascans.net) |  |
 | [atsu.moe](https://atsu.moe) |  |
-| [bato.to](https://bato.to) |  |
 | [boratscans.com](https://boratscans.com) |  |
 | [cocomic.co](https://cocomic.co) |  |
 | [coffeemanga.io](https://coffeemanga.io) |  |
@@ -167,5 +166,69 @@
 | [zinmanga.org](https://mangazin.org) |  |
 | [zinmangacom.com](https://zin-manga.com) |  |
 | [zinmanganet.com](https://zinmanga.net) |  |
+
+## Bato mirrors
+
+| Site | Notes |
+| ----- | ----- |
+| [ato.to](https://ato.to) |  |
+| [bato.ac](https://bato.ac) |  |
+| [bato.bz](https://bato.bz) |  |
+| [bato.cc](https://bato.cc) |  |
+| [bato.cx](https://bato.cx) |  |
+| [bato.day](https://bato.day) |  |
+| [bato.id](https://bato.id) |  |
+| [bato.ing](https://bato.ing) |  |
+| [bato.pw](https://bato.pw) |  |
+| [bato.red](https://bato.red) |  |
+| [bato.run](https://bato.run) |  |
+| [bato.sh](https://bato.sh) |  |
+| [bato.si](https://bato.si) |  |
+| [bato.to](https://bato.to) |  |
+| [bato.vc](https://bato.vc) |  |
+| [batocomic.com](https://batocomic.com) |  |
+| [batocomic.net](https://batocomic.net) |  |
+| [batocomic.org](https://batocomic.org) |  |
+| [batoto.in](https://batoto.in) |  |
+| [batoto.tv](https://batoto.tv) |  |
+| [batotoo.com](https://batotoo.com) |  |
+| [batotwo.com](https://batotwo.com) |  |
+| [batpub.com](https://batpub.com) |  |
+| [batread.com](https://batread.com) |  |
+| [battwo.com](https://battwo.com) |  |
+| [comiko.net](https://comiko.net) |  |
+| [comiko.org](https://comiko.org) |  |
+| [dto.to](https://dto.to) |  |
+| [fto.to](https://fto.to) |  |
+| [hto.to](https://hto.to) |  |
+| [jto.to](https://jto.to) |  |
+| [kuku.to](https://kuku.to) |  |
+| [lto.to](https://lto.to) |  |
+| [mangatoto.com](https://mangatoto.com) |  |
+| [mangatoto.net](https://mangatoto.net) |  |
+| [mangatoto.org](https://mangatoto.org) |  |
+| [mto.to](https://mto.to) |  |
+| [nto.to](https://nto.to) |  |
+| [okok.to](https://okok.to) |  |
+| [readtoto.com](https://readtoto.com) |  |
+| [readtoto.net](https://readtoto.net) |  |
+| [readtoto.org](https://readtoto.org) |  |
+| [ruru.to](https://ruru.to) |  |
+| [vba.to](https://vba.to) |  |
+| [vto.to](https://vto.to) |  |
+| [wba.to](https://wba.to) |  |
+| [wto.to](https://wto.to) |  |
+| [xba.to](https://xba.to) |  |
+| [xbato.com](https://xbato.com) |  |
+| [xbato.net](https://xbato.net) |  |
+| [xbato.org](https://xbato.org) |  |
+| [xdxd.to](https://xdxd.to) |  |
+| [xto.to](https://xto.to) |  |
+| [yba.to](https://yba.to) |  |
+| [yto.to](https://yto.to) |  |
+| [zba.to](https://zba.to) |  |
+| [zbato.com](https://zbato.com) |  |
+| [zbato.net](https://zbato.net) |  |
+| [zbato.org](https://zbato.org) |  |
 
 For supported NSFW sites, check [docs/NSFW.MD](docs/NSFW.MD)

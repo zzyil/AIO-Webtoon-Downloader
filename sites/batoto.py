@@ -8,16 +8,12 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup, NavigableString
 
 from .base import BaseSiteHandler, SiteComicContext
+from .bato_mirrors import BATO_MIRRORS
 
 
 class BatoToSiteHandler(BaseSiteHandler):
     name = "batoto"
-    domains: Tuple[str, ...] = (
-        "bato.to",
-        "www.bato.to",
-        "mangatoto.com",
-        "www.mangatoto.com",
-    )
+    domains: Tuple[str, ...] = BATO_MIRRORS
 
     _BASE_URL = "https://bato.to"
     _GRAPHQL_ENDPOINT = f"{_BASE_URL}/apo/"
