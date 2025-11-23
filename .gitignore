@@ -22,3 +22,4 @@ migrate/
 tmp/
 har/
 node_modules/
+__pycache__/

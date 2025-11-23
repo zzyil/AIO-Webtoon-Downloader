@@ -4,18 +4,22 @@
 # Multi-site comic downloader  →  PDF, EPUB, or CBZ
 # -----------------------------------------------------------
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import glob
 import json
 import math
 import os
+import random
 import re
 import shutil
 import sys
+import threading
 import time
 import textwrap
 import xml.sax.saxutils
 import zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from sites import get_handler_by_name, get_handler_for_url
 from sites.base import SiteComicContext
@@ -143,32 +147,173 @@ def is_chapter_wanted(chapter_num_float: float, range_spec: str) -> bool:
 # -----------------------------------------------------------
 # file helpers
 # -----------------------------------------------------------
-def _try_download_url(url, pth, name, scraper, max_retries, retry_delay):
-    """Attempts to download a single URL with retries. Returns path or None."""
-    for attempt in range(max_retries):
+_RATE_LIMIT_SCHEDULE: Dict[str, float] = {}
+_RATE_LIMIT_LOCK = threading.Lock()
+_HOST_POLITE_DELAY: Dict[str, float] = {}
+
+
+def _record_rate_limit(host: str, delay: float) -> None:
+    if not host or delay <= 0:
+        return
+    wake_time = time.monotonic() + delay
+    with _RATE_LIMIT_LOCK:
+        current = _RATE_LIMIT_SCHEDULE.get(host, 0.0)
+        if wake_time > current:
+            _RATE_LIMIT_SCHEDULE[host] = wake_time
+
+
+def _bump_polite_delay(host: str, minimum: float = 0.75) -> None:
+    if not host:
+        return
+    with _RATE_LIMIT_LOCK:
+        current = _HOST_POLITE_DELAY.get(host, 0.0)
+        baseline = max(minimum, current if current else 0.0)
+        new_delay = min(8.0, max(minimum, baseline * 1.5 if baseline else minimum))
+        _HOST_POLITE_DELAY[host] = new_delay
+
+
+def _cool_polite_delay(host: str) -> None:
+    if not host:
+        return
+    with _RATE_LIMIT_LOCK:
+        current = _HOST_POLITE_DELAY.get(host, 0.0)
+        if not current:
+            return
+        new_delay = current * 0.7
+        if new_delay < 0.2:
+            _HOST_POLITE_DELAY.pop(host, None)
+        else:
+            _HOST_POLITE_DELAY[host] = new_delay
+
+
+def _respect_rate_limit(host: str) -> None:
+    if not host:
+        return
+    with _RATE_LIMIT_LOCK:
+        wake_time = _RATE_LIMIT_SCHEDULE.get(host, 0.0)
+        polite_delay = _HOST_POLITE_DELAY.get(host, 0.0)
+    remaining = wake_time - time.monotonic()
+    if remaining > 0:
+        wait = min(remaining, 30)
+        log_verbose(f"  Waiting {wait:.1f}s for {host} to honor rate limit...")
+        time.sleep(wait)
+    if polite_delay and polite_delay > 0:
+        jitter = min(0.5, polite_delay * 0.25)
+        extra = polite_delay + random.uniform(0, jitter)
+        log_verbose(f"  Throttling {host} for {extra:.2f}s to avoid CDN slowdowns...")
+        time.sleep(extra)
+
+
+def _extract_error_info(exc: requests.exceptions.RequestException) -> Tuple[Optional[int], str]:
+    response = getattr(exc, "response", None)
+    status = None
+    snippet = ""
+    if response is not None:
+        status = response.status_code
         try:
-            r = scraper.get(url, stream=True, timeout=30)
+            snippet = response.text[:200].lower()
+        except Exception:
+            snippet = ""
+    return status, snippet
+
+
+def _is_retryable_error(exc: requests.exceptions.RequestException) -> bool:
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    ):
+        return True
+    status, _ = _extract_error_info(exc)
+    if status is None:
+        return True
+    if status >= 500 or status in {429, 408}:
+        return True
+    return False
+
+
+def _looks_like_rate_limit(status: Optional[int], body_snippet: str) -> bool:
+    if status in {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}:
+        return True
+    keywords = (
+        "reduce your request rate",
+        "slowdownread",
+        "please slow down",
+        "rate limit",
+    )
+    body_lower = body_snippet or ""
+    return any(token in body_lower for token in keywords)
+
+
+def _try_download_url(
+    url, pth, name, scraper, max_retries, retry_delay, timeout=30
+) -> Tuple[bool, Optional[requests.exceptions.RequestException]]:
+    """Attempts to download a single URL with retries. Returns (success, last_error)."""
+
+    host = urlparse(url).netloc
+    last_error: Optional[requests.exceptions.RequestException] = None
+
+    for attempt in range(max_retries):
+        _respect_rate_limit(host)
+        try:
+            r = scraper.get(url, stream=True, timeout=timeout)
             r.raise_for_status()
             with open(pth, "wb") as fh:
                 for chunk in r.iter_content(8192):
                     fh.write(chunk)
-            return pth  # Success
+            _cool_polite_delay(host)
+            return True, None  # Success
         except requests.exceptions.RequestException as e:
+            last_error = e
             log_verbose(
                 f"  Warning: Attempt {attempt + 1}/{max_retries} failed for {os.path.basename(name)} ({os.path.basename(url)}): {e}"
             )
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-    return None
+            status, body_snippet = _extract_error_info(e)
+            retryable = _is_retryable_error(e)
+            looks_rate_limited = _looks_like_rate_limit(status, body_snippet)
+
+            if looks_rate_limited:
+                cooldown = max(3.0, min(20.0, retry_delay * (attempt + 1) * 2))
+                log_verbose(
+                    f"    Detected rate limiting from {host or 'remote host'}. Cooling down for {cooldown:.1f}s before retrying..."
+                )
+                _record_rate_limit(host, cooldown)
+                _bump_polite_delay(host)
+
+            if attempt < max_retries - 1 and retryable:
+                if not looks_rate_limited:
+                    delay = retry_delay * (2 ** attempt)
+                    time.sleep(delay)
+                continue
+            break
+
+    return False, last_error
 
 
-def dl_image(url: str, folder: str, name: str, scraper) -> str:
+def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) -> str:
     """
-    Downloads an image using a sophisticated fallback chain.
+    Downloads an image using a sophisticated fallback chain with parallel attempts.
     Returns the file path on success, or None on failure.
+    
+    Args:
+        url: URL to download
+        folder: Directory to save the image
+        name: Filename for the image
+        scraper: HTTP scraper object
+        cleanup: If True, clean up failed parallel temp files. If False, preserve them.
+    
+    Strategy:
+    1. Try the first variant (original URL) sequentially with full retries
+    2. If it fails, launch all remaining variants in parallel with reduced retries
+    3. Return first successful download
     """
-    max_retries = 2
-    retry_delay = 0.5  # seconds
+    max_retries = 5
+    retry_delay = 1.0  # seconds
+    parallel_retries = 1  # Reduced retries for parallel attempts
+    timeout = 30  # seconds
     extensions_to_try = [".webp", ".png", ".jpg", ".jpeg", ".avif"]
 
     os.makedirs(folder, exist_ok=True)
@@ -192,29 +337,176 @@ def dl_image(url: str, folder: str, name: str, scraper) -> str:
     # De-duplicate the list while preserving order
     unique_urls_to_try = list(dict.fromkeys(urls_to_try))
 
-    # 2. Loop through the generated URLs and attempt to download
-    has_failed_a_variant = False
-    for attempt_url in unique_urls_to_try:
-        if has_failed_a_variant:
-            log_verbose(f"  Trying next variant: {os.path.basename(attempt_url)}")
-        else:
-            log_debug(f"  Trying URL variant: {os.path.basename(attempt_url)}")
+    # 2. Try the first variant sequentially (fast path for working images)
+    first_url = unique_urls_to_try[0]
+    log_debug(f"  Trying URL variant: {os.path.basename(first_url)}")
+    
+    success, first_error = _try_download_url(
+        first_url, pth, name, scraper, max_retries, retry_delay, timeout
+    )
+    if success:
+        log_debug(f"  Successfully downloaded {os.path.basename(name)} using first variant.")
+        return pth  # Success on first try!
 
-        if _try_download_url(
-            attempt_url, pth, name, scraper, max_retries, retry_delay
+    def _should_force_sequential(err: Optional[requests.exceptions.RequestException]) -> bool:
+        if not err:
+            return False
+        if isinstance(
+            err,
+            (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+            ),
         ):
-            success_message = f"  Successfully downloaded {os.path.basename(name)} using this variant."
-            if has_failed_a_variant:
-                # If in a retry scenario, show success in verbose mode.
-                log_verbose(success_message)
-            else:
-                # Otherwise, only show success in debug mode.
-                log_debug(success_message)
-            return pth  # Success!
-        else:
-            has_failed_a_variant = True
+            return True
+        status, snippet = _extract_error_info(err)
+        return _looks_like_rate_limit(status, snippet)
 
-    # 3. If all attempts failed
+    force_sequential_fallback = _should_force_sequential(first_error)
+
+    # 3. First variant failed - try remaining variants (optionally sequentially)
+    remaining_urls = unique_urls_to_try[1:]
+    if not remaining_urls:
+        print(f"  Error: Skipping image {os.path.basename(name)} after trying the only available variant.")
+        return None
+
+    if force_sequential_fallback:
+        log_verbose(
+            f"  First variant failed due to throttling/timeouts. Retrying {len(remaining_urls)} variants sequentially..."
+        )
+        for alt_url in remaining_urls:
+            log_debug(f"    [Sequential Fallback] Attempting {os.path.basename(alt_url)}")
+            success, _ = _try_download_url(
+                alt_url,
+                pth,
+                name,
+                scraper,
+                max_retries,
+                retry_delay,
+                timeout,
+            )
+            if success:
+                log_verbose(
+                    f"  Successfully downloaded {os.path.basename(name)} via sequential fallback variant: {os.path.basename(alt_url)}"
+                )
+                return pth
+
+        print(
+            f"  Error: Skipping image {os.path.basename(name)} after throttled sequential retries across {len(unique_urls_to_try)} variants."
+        )
+        return None
+
+    log_verbose(f"  First variant failed. Trying {len(remaining_urls)} remaining variants in parallel...")
+
+    # Import here to avoid dependency at module level
+    import tempfile
+    import threading
+    
+    # Track all temp files created for cleanup
+    temp_files_created = []
+    temp_files_lock = threading.Lock()
+    
+    # Track which thread succeeded (if any)
+    success_lock = threading.Lock()
+    successful_temp_file = [None]  # Use list to allow modification in nested function
+
+    def try_variant(attempt_url, thread_id):
+        """Helper function for parallel execution - each thread uses its own temp file"""
+        temp_path = None
+        try:
+            # Create a unique temporary file for this thread
+            temp_fd, temp_path = tempfile.mkstemp(dir=folder, prefix=f".tmp_{name}_")
+            os.close(temp_fd)  # Close the file descriptor, we'll use the path
+            
+            # Track this temp file for cleanup
+            with temp_files_lock:
+                temp_files_created.append(temp_path)
+            
+            log_debug(f"    [Parallel] Attempting {os.path.basename(attempt_url)}")
+            success, _ = _try_download_url(
+                attempt_url,
+                temp_path,
+                name,
+                scraper,
+                parallel_retries,
+                retry_delay,
+                timeout,
+            )
+            if success:
+                # Successfully downloaded to temp file
+                log_debug(f"    [Parallel] Success: {os.path.basename(attempt_url)}")
+                
+                with success_lock:
+                    if successful_temp_file[0] is None:
+                        # We're the first successful download
+                        successful_temp_file[0] = (temp_path, attempt_url)
+                        return attempt_url
+                
+                # Another thread already succeeded, this will be cleaned up later
+                return None
+            else:
+                # Download failed, will be cleaned up later
+                return None
+        except Exception as e:
+            log_debug(f"    [Parallel] Exception for {os.path.basename(attempt_url)}: {e}")
+            return None
+
+    # Use ThreadPoolExecutor to try all remaining variants in parallel
+    # Limit workers to avoid overwhelming the server
+    max_workers = min(len(remaining_urls), 5)
+    
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all variant attempts with thread IDs
+            future_to_url = {
+                executor.submit(try_variant, url, i): url 
+                for i, url in enumerate(remaining_urls)
+            }
+            
+            # Wait for first successful result
+            for future in as_completed(future_to_url):
+                result = future.result()
+                if result:
+                    # Cancel remaining futures since we found a successful download
+                    for f in future_to_url:
+                        f.cancel()
+                    break
+    finally:
+        # Clean up ALL temp files except the successful one (unless cleanup is disabled)
+        if cleanup:
+            successful_path = successful_temp_file[0][0] if successful_temp_file[0] else None
+            
+            for temp_path in temp_files_created:
+                if temp_path != successful_path:
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                            log_debug(f"    [Cleanup] Removed temp file: {os.path.basename(temp_path)}")
+                    except Exception as e:
+                        log_debug(f"    [Cleanup] Failed to remove temp file {os.path.basename(temp_path)}: {e}")
+        else:
+            log_debug(f"    [Cleanup] Skipped - preserving {len(temp_files_created)} temp files for debugging")
+    
+    # Move successful temp file to final destination
+    if successful_temp_file[0]:
+        temp_path, successful_url = successful_temp_file[0]
+        try:
+            # Rename temp file to final path
+            shutil.move(temp_path, pth)
+            log_verbose(f"  Successfully downloaded {os.path.basename(name)} using variant: {os.path.basename(successful_url)}")
+            return pth
+        except Exception as e:
+            print(f"  Error: Failed to move temp file to {pth}: {e}")
+            # Clean up the temp file if move failed
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except:
+                pass
+            return None
+
+    # 4. All attempts failed
     print(
         f"  Error: Skipping image {os.path.basename(name)} after trying all {len(unique_urls_to_try)} URL variants."
     )
@@ -1713,7 +2005,7 @@ def main():
             cover_url = comic_data.get("cover") or comic_data.get("thumb")
         if cover_url:
             original_cover_path = dl_image(
-                cover_url, main_tmp_dir, "cover_orig.jpg", scraper
+                cover_url, main_tmp_dir, "cover_orig.jpg", scraper, cleanup=not args.no_cleanup
             )
             if args.format == "cbz" and original_cover_path:
                 current_book_content.append(
@@ -1831,11 +2123,13 @@ def main():
                 if not full_url:
                     continue
                 filename = f"{n}_{page_counter:04d}.jpg"
+                
                 pth = dl_image(
                     full_url,
                     tdir,
                     filename,
                     scraper,
+                    cleanup=not args.no_cleanup,
                 )
                 if pth:
                     raw_image_paths.append(pth)
