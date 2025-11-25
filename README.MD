@@ -132,7 +132,6 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [mangadex.org](https://mangadex.org) | Supports scanlation group selection | tested ✅ |
 | [mangafire.to](https://mangafire.to) | Supports multiple languages | tested ✅  |
 | [mangahub.io](https://mangahub.io) |  | tested ✅ |
-| [mangakiss.org](https://mangakiss.org) |  |  |
 | [MangaKakalot / Manganato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) | tested ✅  |
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection | tested ✅ |
 | [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | tested ✅ |
