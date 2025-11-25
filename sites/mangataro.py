@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import time
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound, NavigableString
 
@@ -90,37 +93,16 @@ class MangataroSiteHandler(BaseSiteHandler):
             raise RuntimeError("Comic page HTML not available for parsing.")
 
         chapter_links = soup.select("a[data-chapter-id]")
-        chapters: List[Dict] = []
-        seen_ids = set()
+        chapters = self._parse_chapter_links(chapter_links)
+        if chapters:
+            return chapters
 
-        for link in chapter_links:
-            chapter_id = (link.get("data-chapter-id") or "").strip()
-            if not chapter_id or chapter_id in seen_ids:
-                continue
-            seen_ids.add(chapter_id)
+        manga_id = self._extract_manga_id(soup)
+        if not manga_id:
+            return []
 
-            href = link.get("href")
-            if not href:
-                continue
-            chapter_url = urljoin("https://mangataro.org/", href)
-
-            chap_number = self._extract_chapter_number(link)
-            if chap_number is None:
-                continue
-
-            group_name = (link.get("data-group-name") or "").strip() or None
-
-            chapters.append(
-                {
-                    "hid": chapter_id,
-                    "chap": chap_number,
-                    "url": chapter_url,
-                    "group_name": group_name,
-                    "title": (link.get("title") or "").strip() or None,
-                }
-            )
-
-        return chapters
+        api_chapters = self._fetch_chapters_via_api(manga_id, scraper, make_request)
+        return api_chapters
 
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
         group_name = chapter_version.get("group_name")
@@ -330,6 +312,124 @@ class MangataroSiteHandler(BaseSiteHandler):
                 paragraphs = [line.strip() for line in text.splitlines()]
 
         return paragraphs
+
+    def _parse_chapter_links(self, chapter_links) -> List[Dict]:
+        chapters: List[Dict] = []
+        seen_ids = set()
+
+        for link in chapter_links:
+            chapter_id = (link.get("data-chapter-id") or "").strip()
+            if not chapter_id or chapter_id in seen_ids:
+                continue
+            seen_ids.add(chapter_id)
+
+            href = link.get("href")
+            if not href:
+                continue
+            chapter_url = urljoin("https://mangataro.org/", href)
+
+            chap_number = self._extract_chapter_number(link)
+            if chap_number is None:
+                continue
+
+            group_name = (link.get("data-group-name") or "").strip() or None
+
+            chapters.append(
+                {
+                    "hid": chapter_id,
+                    "chap": chap_number,
+                    "url": chapter_url,
+                    "group_name": group_name,
+                    "title": (link.get("title") or "").strip() or None,
+                }
+            )
+
+        return chapters
+
+    def _extract_manga_id(self, soup: BeautifulSoup) -> Optional[str]:
+        container = soup.select_one(".chapter-list[data-manga-id]")
+        if container:
+            manga_id = (container.get("data-manga-id") or "").strip()
+            if manga_id:
+                return manga_id
+        body = soup.find("body", attrs={"data-manga-id": True})
+        if body:
+            manga_id = (body.get("data-manga-id") or "").strip()
+            if manga_id:
+                return manga_id
+        generic = soup.find(attrs={"data-manga-id": True})
+        if generic:
+            manga_id = (generic.get("data-manga-id") or "").strip()
+            if manga_id:
+                return manga_id
+        return None
+
+    def _fetch_chapters_via_api(self, manga_id: str, scraper, make_request) -> List[Dict]:
+        token, timestamp = self._generate_api_signature()
+        params = {
+            "manga_id": manga_id,
+            "offset": 0,
+            "limit": 500,
+            "order": "DESC",
+            "_t": token,
+            "_ts": timestamp,
+        }
+        api_url = (
+            "https://mangataro.org/auth/manga-chapters?"
+            + urlencode(params, doseq=True)
+        )
+
+        try:
+            response = make_request(api_url, scraper)
+            data = response.json()
+        except Exception:
+            return []
+
+        if not isinstance(data, dict) or not data.get("success"):
+            return []
+
+        entries = data.get("chapters") or []
+        chapters: List[Dict] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            chapter_id = (entry.get("id") or "").strip()
+            if not chapter_id:
+                continue
+            chapter_url = entry.get("url") or ""
+            if not chapter_url:
+                continue
+            chapter_url = urljoin("https://mangataro.org/", chapter_url)
+            chap_number = (entry.get("chapter") or "").strip()
+            if not chap_number:
+                continue
+
+            likes_raw = entry.get("likes")
+            try:
+                likes = int(likes_raw)
+            except Exception:
+                likes = 0
+
+            chapters.append(
+                {
+                    "hid": chapter_id,
+                    "chap": chap_number,
+                    "url": chapter_url,
+                    "group_name": (entry.get("group_name") or "").strip() or None,
+                    "title": (entry.get("title") or "").strip() or None,
+                    "lang": (entry.get("language") or "").strip() or None,
+                    "up_count": likes,
+                }
+            )
+
+        return chapters
+
+    def _generate_api_signature(self) -> tuple[str, int]:
+        timestamp = int(time.time())
+        hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+        secret = f"mng_ch_{hour}"
+        digest = hashlib.md5(f"{timestamp}{secret}".encode("utf-8")).hexdigest()
+        return digest[:16], timestamp
 
 
 def _split_people(text: str) -> List[str]:

@@ -120,7 +120,7 @@
 | [mangaclash.com](https://toonclash.com) |  |
 | [MangaCrazy](https://mangacrazy.net) | tested ✅ |
 | [mangadass.com](https://mangadass.com) |  |
-| [mangadex.org](https://mangadex.org) | Supports scanlation group selection |
+| [mangadex.org](https://mangadex.org) | tested ✅ · Supports scanlation group selection |
 | [mangadistrict.com](https://mangadistrict.com) |  |
 | [mangafire.to](https://mangafire.to) |  |
 | [mangaforfree.com](https://mangaforfree.com) |  |
@@ -129,7 +129,7 @@
 | [mangafreakonline.com](https://mangafreak.online) |  |
 | [mangagg.com](https://mangagg.com) |  |
 | [mangagojo.com](https://mangagojo.com) | tested ✅ |
-| [mangahentai.me](https://mangahentai.me) |  |
+| [mangahub.io](https://mangahub.io) | tested ✅ |
 | [MangaKakalot / Manganato family](https://www.manganato.gg) | tested ✅ · See [mirror list](MANGAKAKALOT_MIRRORS.MD) |
 | [MangaLc](https://manga-lc.net) | tested ✅ |
 | [mangaleveling.com](https://mangaleveling.com) |  |

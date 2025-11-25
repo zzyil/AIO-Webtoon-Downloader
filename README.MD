@@ -129,9 +129,9 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [flamecomics.xyz](https://flamecomics.xyz) |  | tested ✅  |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |  |
 | [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | tested ✅  |
-| [mangadex.org](https://mangadex.org) | Supports scanlation group selection |  |
+| [mangadex.org](https://mangadex.org) | Supports scanlation group selection | tested ✅ |
 | [mangafire.to](https://mangafire.to) | Supports multiple languages | tested ✅  |
-| [mangahub.io](https://mangahub.io) |  |  |
+| [mangahub.io](https://mangahub.io) |  | tested ✅ |
 | [mangakiss.org](https://mangakiss.org) |  |  |
 | [MangaKakalot / Manganato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) | tested ✅  |
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection |  |
