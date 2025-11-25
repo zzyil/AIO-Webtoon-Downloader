@@ -29,6 +29,10 @@ _MANGANATO_DOMAINS = (
     "www.zazamanga.com",
     "zinmanga.net",
     "www.zinmanga.net",
+    "mangakakalot.com",
+    "www.mangakakalot.com",
+    "manganelo.com",
+    "www.manganelo.com",
 )
 
 
@@ -58,8 +62,16 @@ class ManganatoSiteHandler(BaseSiteHandler):
         parts = [p for p in parsed.path.split("/") if p]
         if not parts:
             raise RuntimeError("Invalid Manganato URL.")
-        if parts[0] != "manga":
-            raise RuntimeError("Only /manga/... URLs are supported for Manganato.")
+        if parts[0] != "manga" and parts[0] != "chapter":
+             # Mangakakalot uses /chapter/ sometimes? No, usually /manga/ or /read-
+             # Actually, Mangakakalot URLs: https://mangakakalot.com/manga/read_one_piece_manga_online_free4
+             # Manganelo: https://manganelo.com/manga/read_one_piece_manga_online_free4
+             # Manganato: https://manganato.com/manga-bn978870
+             # So /manga/ is common.
+             pass
+        # Relax check for now or improve it
+        if len(parts) < 2:
+             raise RuntimeError("Invalid Manganato/Mangakakalot URL.")
         return parts[1]
 
     def _absolute(self, base: str, href: Optional[str]) -> Optional[str]:

@@ -5,6 +5,7 @@
 # -----------------------------------------------------------
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
 import glob
 import json
 import math
@@ -19,7 +20,7 @@ import textwrap
 import xml.sax.saxutils
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote_to_bytes
 
 from sites import get_handler_by_name, get_handler_for_url
 from sites.base import SiteComicContext
@@ -318,6 +319,24 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
 
     os.makedirs(folder, exist_ok=True)
     pth = os.path.join(folder, name)
+
+    if url.startswith("data:"):
+        try:
+            header, encoded = url.split(",", 1)
+        except ValueError:
+            log_verbose(f"  Warning: Invalid data URI for {name}")
+            return None
+        try:
+            if ";base64" in header:
+                data = base64.b64decode(encoded)
+            else:
+                data = unquote_to_bytes(encoded)
+        except Exception as exc:
+            log_verbose(f"  Warning: Failed to decode data URI for {name} ({exc})")
+            return None
+        with open(pth, "wb") as fh:
+            fh.write(data)
+        return pth
 
     # 1. Generate the list of potential URLs to try
     urls_to_try = []

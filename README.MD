@@ -126,6 +126,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [bato.to](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) | tested ✅  |
 | [comix.to](https://comix.to) | Supports multiple scanlation groups | tested ✅  |
 | [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | tested ✅  |
+| [flamecomics.xyz](https://flamecomics.xyz) |  | tested ✅  |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |  |
 | [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | tested ✅  |
 | [mangadex.org](https://mangadex.org) | Supports scanlation group selection |  |
@@ -137,6 +138,11 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [manhuafast.net](https://manhuafast.net) |  |  |
 | [manhuaga.org](https://manhua-ga.org) |  |  |
 | [manhwaclan.com](https://manhwaclan.com) |  |  |
+| [manhuaplus.com](https://manhuaplus.com) |  | tested ✅  |
+| [manhuaus.com](https://manhuaus.com) |  | tested ✅  |
+| [razure.org](https://razure.org) | light-novel support | tested ✅  |
+| [tcbonepiecechapters.com](https://tcbonepiecechapters.com) |  | tested ✅  |
+| [violetscans.org](https://violetscans.org) |  | tested ✅  |
 | [weebcentral.com](https://weebcentral.com) | Supports scanlation group selection | tested ✅  |
 
 ---
@@ -376,6 +382,16 @@ This tool is provided strictly for educational purposes and to help you create p
 Please follow the existing style and include tests where applicable.
 
 > Tip: The multi-version test script expects Homebrew to provide `python@X.Y`. If you're on another platform, mimic that matrix with your package manager or pyenv so we keep coverage consistent.
+
+### Madara handler regression sweep
+
+Use [`test_scripts/run_madara_site_tests.py`](test_scripts/run_madara_site_tests.py) to load every domain in [`madara_sites_urls.txt`](madara_sites_urls.txt), grab a random series from the homepage, and execute the [`test_scripts/test_new_sites.py`](test_scripts/test_new_sites.py) flow for that URL. Example:
+
+```bash
+python3 test_scripts/run_madara_site_tests.py --shuffle --max-sites 25
+```
+
+The script prints two rollups: (1) domains that successfully returned comic data and images, and (2) domains that need manual inspection (missing handlers, failing requests, no chapters/images, etc.).
 
 ---
 

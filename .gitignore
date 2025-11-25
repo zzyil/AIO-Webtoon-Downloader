@@ -23,3 +23,5 @@ tmp/
 har/
 node_modules/
 __pycache__/
+rip/
+test_scripts/internal/
