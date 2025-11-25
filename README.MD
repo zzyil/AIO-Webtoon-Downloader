@@ -148,10 +148,10 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 ## 🚀 Usage
 
 ```bash
-python3 comick_downloader.py [OPTIONS] COMIC_URL
+python3 aio-dl.py [OPTIONS] COMIC_URL
 ```
 
-Run `python3 comick_downloader.py --help` for the full option list.
+Run `python3 aio-dl.py --help` for the full option list.
 
 ---
 
@@ -194,7 +194,7 @@ export COOKIES='session_token=…; another_cookie=…'
 Then run (adding `--site` if auto-detection ever fails):
 
 ```bash
-python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
+python3 aio-dl.py --site mangataro --cookies "$COOKIES" \
   "https://mangataro.org/manga/shadow-slave"
 ```
 
@@ -205,7 +205,7 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
 1. **Page-layout EPUB**, chapters 1–2, preferred group **Asura**, verbose:
 
    ```bash
-   python3 comick_downloader.py \
+   python3 aio-dl.py \
      --site mangataro \
      --group Asura \
      --chapters "1-2" \
@@ -218,7 +218,7 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
 2. **Vertical EPUB**, chapters 1–20, split every 5 chapters, verbose & debug:
 
    ```bash
-   python3 comick_downloader.py \
+   python3 aio-dl.py \
      --site mangataro \
      --chapters "1-20" \
      --format epub \
@@ -231,7 +231,7 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
 3. **Asura PDF**, chapters 1–2 from a series page:
 
    ```bash
-   python3 comick_downloader.py \
+   python3 aio-dl.py \
      --site asura \
      --chapters "1-2" \
      --format pdf \
@@ -241,7 +241,7 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
 4. **CBZ**, chapters 1–2, one chapter per file:
 
    ```bash
-   python3 comick_downloader.py \
+   python3 aio-dl.py \
      --site mangataro \
      --chapters "1-2" \
      --format cbz \
@@ -252,7 +252,7 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
 5. **PDF**, chapters 1–2, save each chapter separately:
 
    ```bash
-   python3 comick_downloader.py \
+   python3 aio-dl.py \
      --site mangataro \
      --chapters "1-2" \
      --format pdf \
@@ -263,7 +263,7 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
 6. **Light-novel EPUB** (prose converted to XHTML, no image slicing):
 
    ```bash
-   python3 comick_downloader.py \
+   python3 aio-dl.py \
     --site mangataro \
     --chapters "1-5" \
      --format epub \
@@ -274,7 +274,7 @@ python3 comick_downloader.py --site mangataro --cookies "$COOKIES" \
 7. **Raw CBZ** (pages copied as-is):
 
    ```bash
-   python3 comick_downloader.py \
+   python3 aio-dl.py \
      --site mangataro \
      --chapters "1-50" \
      --format cbz \

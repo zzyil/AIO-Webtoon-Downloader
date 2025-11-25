@@ -42,11 +42,11 @@ Example:
 
 ```bash
 export KAGANE_WVD=/path/to/my_device.wvd
-python3 comick_downloader.py --site kagane --comic-url https://kagane.org/series/...
+python3 aio-dl.py --site kagane --comic-url https://kagane.org/series/...
 ```
 
 If you prefer not to set the environment variable, simply copy the
-`.wvd` file into the project root (next to `comick_downloader.py`).
+`.wvd` file into the project root (next to `aio-dl.py`).
 
 ## 4. Keep your device file safe
 

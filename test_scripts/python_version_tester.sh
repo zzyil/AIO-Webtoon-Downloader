@@ -22,11 +22,11 @@ export PIP_NO_INPUT=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-PYTHON_SCRIPT_PATH="$ROOT_DIR/comick_downloader.py"
+PYTHON_SCRIPT_PATH="$ROOT_DIR/aio-dl.py"
 PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
 
 if [ ! -f "$PYTHON_SCRIPT_PATH" ]; then
-  echo "Error: 'comick_downloader.py' not found at: $PYTHON_SCRIPT_PATH"
+  echo "Error: 'aio-dl.py' not found at: $PYTHON_SCRIPT_PATH"
   exit 1
 fi
 
@@ -288,17 +288,17 @@ for version in "${VERSIONS[@]}"; do
 
   "$PY_BIN" -m pip install "cloudscraper" >/dev/null 2>&1 || true
 
-  ln -sf "$PYTHON_SCRIPT_PATH" "$RUN_DIR/comick_downloader.py"
+  ln -sf "$PYTHON_SCRIPT_PATH" "$RUN_DIR/aio-dl.py"
 
   echo "Running in: $RUN_DIR"
   (
     cd "$RUN_DIR"
-    if "$PY_BIN" comick_downloader.py \
+    if "$PY_BIN" aio-dl.py \
       --site mangataro \
       --chapters "1-2" \
       --format pdf \
       --keep-chapters \
-      "https://mangataro.org/manga/genius-blacksmiths-game"; then
+      "https://webtoon.url"; then
       echo "✓ Download task completed successfully for Python $version"
       successful_versions+=("$version")
     else
