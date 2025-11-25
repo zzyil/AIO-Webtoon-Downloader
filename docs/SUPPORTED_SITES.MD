@@ -214,7 +214,7 @@
 | [SummerToon](https://summertoons.com) | recent check 11.25.25 ✅ |
 | [TankouHentai](https://tankouhentai.com) | recent check 11.25.25 ✅ |
 | [TatakaeScan](https://tatakaescan.com) | recent check 11.25.25 ✅ |
-| [tcbonepiecechapters.com](https://tcbonepiecechapters.com) | recent check 11.25.25 ✅ |
+| [tcbonepiecechapters.com](https://tcbonepiecechapters.com) | covers not loading & meta missing ⚠️ |
 | [TercoScans (tecnoxmoon.xyz)](https://tecnoxmoon.xyz) | recent check 11.25.25 ✅ |
 | [TerritorioLealtad](https://territorioleal.com) | recent check 11.25.25 ✅ |
 | [theblank.net](https://theblank.net) |  |
