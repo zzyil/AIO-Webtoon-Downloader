@@ -122,7 +122,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | Site | Notes | Integration Status |
 | ----- | ----- | ----- |
 | [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | tested ✅  |
-| [atsu.moe](https://atsu.moe) |  |  |
+| [atsu.moe](https://atsu.moe) |  | currently unavailable |
 | [bato.to](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) | tested ✅  |
 | [comix.to](https://comix.to) | Supports multiple scanlation groups | tested ✅  |
 | [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | tested ✅  |
@@ -134,9 +134,9 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [mangahub.io](https://mangahub.io) |  | tested ✅ |
 | [mangakiss.org](https://mangakiss.org) |  |  |
 | [MangaKakalot / Manganato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) | tested ✅  |
-| [mangataro.org](https://mangataro.org) | Supports scanlation group selection |  |
-| [manhuafast.net](https://manhuafast.net) |  |  |
-| [manhuaga.org](https://manhua-ga.org) |  |  |
+| [mangataro.org](https://mangataro.org) | Supports scanlation group selection | tested ✅ |
+| [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | tested ✅ |
+| [manhuaga.org](https://manhua-ga.org) |  | currently unavailable |
 | [manhuaplus.com](https://manhuaplus.com) |  | tested ✅  |
 | [manhuaus.com](https://manhuaus.com) |  | tested ✅  |
 | [razure.org](https://razure.org) | light-novel support | tested ✅  |

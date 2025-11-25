@@ -144,7 +144,7 @@
 | [MangaRomance](https://mangaromance19.com) | tested ✅ |
 | [MangaSehri](https://manga-sehri.com) | tested ✅ |
 | [mangasushi.org](https://mangasushi.org) |  |
-| [mangataro.org](https://mangataro.org) | Supports scanlation group selection |
+| [mangataro.org](https://mangataro.org) | tested ✅ · Supports scanlation group selection |
 | [mangatone.com](https://mangatone.com) |  |
 | [MangaTRNet](https://mangatr.app) | tested ✅ |
 | [MangaTuk](https://mangatuk.com) | tested ✅ |
@@ -155,8 +155,8 @@
 | [Manhatic](https://manhatic.com) | tested ✅ |
 | [manhuaaz.com](https://manhuaaz.com) |  |
 | [manhuaes.com](https://manhuaes.com) |  |
-| [manhuafast.com](https://manhuafast.com) |  |
-| [manhuafast.net](https://manhuafast.net) |  |
+| [manhuafast.com](https://manhuafast.com) | tested ✅ |
+| [manhuafast.net](https://manhuafast.net) | tested ✅ |
 | [manhuaga.org](https://manhua-ga.org) |  |
 | [manhuahot.com](https://manhuahot.com) |  |
 | [manhuanext.com](https://manhuanext.com) |  |
