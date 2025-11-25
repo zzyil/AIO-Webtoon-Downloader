@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ------------------------------------------------------------------
-# comick.io downloader  →  PDF, EPUB, or CBZ
+# Multi-site comic downloader  →  PDF, EPUB, or CBZ
 # -----------------------------------------------------------
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
 import glob
 import json
 import math
 import os
+import random
 import re
 import shutil
 import sys
+import threading
 import time
+import textwrap
 import xml.sax.saxutils
 import zipfile
-from typing import Dict, List
-from bs4 import BeautifulSoup, FeatureNotFound
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, unquote_to_bytes
+
+from sites import get_handler_by_name, get_handler_for_url
+from sites.base import SiteComicContext
 
 # cloudscraper is optional; fall back to requests.Session if unavailable
 try:
@@ -25,16 +33,12 @@ except Exception:  # pragma: no cover
 
 import requests
 
-# Detect lxml availability (ensure C extension is importable)
-try:
-    from lxml import etree as _lxml_etree  # noqa: F401
-    _HAS_LXML = True
-except Exception:
-    _HAS_LXML = False
+from PIL import Image, ImageDraw, ImageFont
 
-from PIL import Image
+# Increase PIL decompression bomb limit for large manga pages
+# MangaFire often has high-resolution pages that exceed the default limit
+Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels (default is ~89 megapixels)
 
-API_BASE_URL = "https://api.comick.io"
 _VERBOSE = False  # Global flag for standard verbose output
 _DEBUG = False  # Global flag for debug-level output
 
@@ -57,7 +61,13 @@ def log_debug(*args, **kwargs):
 def make_request(url: str, scraper):
     try:
         r = scraper.get(url)
-        r.raise_for_status()
+        # Some sites (like madarascans.com) return 403 but still serve content
+        # Only fail if we got a real error (4xx/5xx) AND no content
+        if r.status_code >= 400:
+            if not r.text or len(r.text) < 100:
+                r.raise_for_status()
+            # Otherwise, log but continue (it's likely Cloudflare sending content with 403)
+            log_verbose(f"  Warning: Got status {r.status_code} but response has content, continuing...")
         return r
     except requests.exceptions.RequestException as e:
         sys.exit(f"Request failed: {e}")
@@ -93,113 +103,20 @@ def parse_aspect_ratio(spec: str) -> float:
     return float(spec)
 
 
-# -----------------------------------------------------------
-# chapter helpers
-# -----------------------------------------------------------
-def get_chapters(hid: str, scraper, lang: str):
-    chapters, page = [], 1
-    while True:
-        log_debug(f"  Fetching chapter list page {page}...")
-        url = f"{API_BASE_URL}/comic/{hid}/chapters?lang={lang}&page={page}"
-        chunk = make_request(url, scraper).json().get("chapters", [])
-        if not chunk:
-            break
-        chapters.extend(chunk)
-        page += 1
-    return chapters
+def resolve_site_handler(url: str, site_name: str):
+    if site_name:
+        handler = get_handler_by_name(site_name)
+        if not handler:
+            sys.exit(f"Unknown site handler: {site_name}")
+        return handler
 
-
-def get_group_name(chapter_version: Dict) -> str:
-    """
-    Extracts the primary scanlation group name from a chapter version object.
-    It first checks the structured 'md_chapters_groups' and falls back to
-    the 'group_name' list if the former is empty.
-    """
-    # 1. Primary method: Check the structured data
-    structured_name = next(
-        (
-            g["md_groups"]["title"]
-            for g in chapter_version.get("md_chapters_groups", [])
-            if g.get("md_groups")
-        ),
-        None,
-    )
-    if structured_name:
-        return structured_name
-
-    # 2. Fallback method: Check the simple 'group_name' list
-    fallback_names = chapter_version.get("group_name")
-    if isinstance(fallback_names, list) and fallback_names:
-        return fallback_names[0]
-
-    # 3. If neither method works, return None
-    return None
-
-
-def select_best_chapter_version(
-    versions: List[Dict], preferred_groups: List[str], mix_by_upvote: bool
-) -> Dict:
-    """
-    Selects the best version of a chapter based on user preferences.
-
-    Args:
-        versions: A list of all available versions for a single chapter.
-        preferred_groups: A list of preferred scanlation group names.
-        mix_by_upvote: If True, pick the highest upvoted from preferred_groups.
-                       If False, use the order of preferred_groups as priority.
-
-    Returns:
-        The dictionary object for the selected best chapter version.
-    """
-    if not versions:
-        return None
-
-    # Default fallback: find the version with the most upvotes among all.
-    best_by_upvote = max(versions, key=lambda v: v.get("up_count", 0))
-
-    if not preferred_groups:
-        # No groups specified, default to highest upvotes.
-        log_debug(
-            f"    Ch {versions[0]['chap']}: No group specified. Selected by upvotes ({best_by_upvote.get('up_count', 0)})."
+    handler = get_handler_for_url(url)
+    if not handler:
+        sys.exit(
+            "Unable to auto-detect a site handler for the provided URL. "
+            "Please specify one with --site."
         )
-        return best_by_upvote
-
-    if mix_by_upvote:
-        # --mix-by-upvote: Find best by upvote within the set of preferred groups.
-        from_preferred = [
-            v for v in versions if get_group_name(v) in preferred_groups
-        ]
-        if from_preferred:
-            best = max(from_preferred, key=lambda v: v.get("up_count", 0))
-            log_debug(
-                f"    Ch {best['chap']}: Mix-by-upvote. Selected '{get_group_name(best)}' ({best.get('up_count', 0)} upvotes)."
-            )
-            return best
-        else:
-            log_debug(
-                f"    Ch {versions[0]['chap']}: Mix-by-upvote. No preferred groups found. Fallback to upvotes."
-            )
-            return best_by_upvote
-    else:
-        # Prioritized groups: Iterate through preferred groups in order.
-        for group_name in preferred_groups:
-            from_this_group = [
-                v for v in versions if get_group_name(v) == group_name
-            ]
-            if from_this_group:
-                # Found one or more versions from the highest-priority group available.
-                # Pick the best among them by upvotes.
-                best = max(from_this_group, key=lambda v: v.get("up_count", 0))
-                log_debug(
-                    f"    Ch {best['chap']}: Found in priority group '{group_name}'. Selected."
-                )
-                return best
-
-        # Fallback if no preferred groups have the chapter.
-        log_debug(
-            f"    Ch {versions[0]['chap']}: No priority groups found. Fallback to upvotes."
-        )
-        return best_by_upvote
+    return handler
 
 
 def is_chapter_wanted(chapter_num_float: float, range_spec: str) -> bool:
@@ -225,70 +142,201 @@ def is_chapter_wanted(chapter_num_float: float, range_spec: str) -> bool:
     return False
 
 
-def get_images(chid: str, scraper):
-    url = f"{API_BASE_URL}/chapter/{chid}"
-    return (
-        make_request(url, scraper).json().get("chapter", {}).get("md_images", [])
-    )
-
-
 # -----------------------------------------------------------
 # Metadata extractor
 # -----------------------------------------------------------
-def extract_more_info(soup: BeautifulSoup) -> Dict[str, List[str]]:
-    """Extracts metadata from the 'More Info' table in the HTML."""
-    metadata = {}
-    info_header = soup.find("h3", string=re.compile(r"More Info"))
-    if not info_header:
-        return metadata
-
-    table = info_header.find_next_sibling("table")
-    if not table:
-        return metadata
-
-    for row in table.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) == 2:
-            key = cells[0].get_text(strip=True).replace(":", "").lower()
-            values = [a.get_text(strip=True) for a in cells[1].find_all("a")]
-            if key and values:
-                metadata[key] = values
-    return metadata
-
-
 # -----------------------------------------------------------
 # file helpers
 # -----------------------------------------------------------
-def _try_download_url(url, pth, name, scraper, max_retries, retry_delay):
-    """Attempts to download a single URL with retries. Returns path or None."""
-    for attempt in range(max_retries):
+_RATE_LIMIT_SCHEDULE: Dict[str, float] = {}
+_RATE_LIMIT_LOCK = threading.Lock()
+_HOST_POLITE_DELAY: Dict[str, float] = {}
+
+
+def _record_rate_limit(host: str, delay: float) -> None:
+    if not host or delay <= 0:
+        return
+    wake_time = time.monotonic() + delay
+    with _RATE_LIMIT_LOCK:
+        current = _RATE_LIMIT_SCHEDULE.get(host, 0.0)
+        if wake_time > current:
+            _RATE_LIMIT_SCHEDULE[host] = wake_time
+
+
+def _bump_polite_delay(host: str, minimum: float = 0.75) -> None:
+    if not host:
+        return
+    with _RATE_LIMIT_LOCK:
+        current = _HOST_POLITE_DELAY.get(host, 0.0)
+        baseline = max(minimum, current if current else 0.0)
+        new_delay = min(8.0, max(minimum, baseline * 1.5 if baseline else minimum))
+        _HOST_POLITE_DELAY[host] = new_delay
+
+
+def _cool_polite_delay(host: str) -> None:
+    if not host:
+        return
+    with _RATE_LIMIT_LOCK:
+        current = _HOST_POLITE_DELAY.get(host, 0.0)
+        if not current:
+            return
+        new_delay = current * 0.7
+        if new_delay < 0.2:
+            _HOST_POLITE_DELAY.pop(host, None)
+        else:
+            _HOST_POLITE_DELAY[host] = new_delay
+
+
+def _respect_rate_limit(host: str) -> None:
+    if not host:
+        return
+    with _RATE_LIMIT_LOCK:
+        wake_time = _RATE_LIMIT_SCHEDULE.get(host, 0.0)
+        polite_delay = _HOST_POLITE_DELAY.get(host, 0.0)
+    remaining = wake_time - time.monotonic()
+    if remaining > 0:
+        wait = min(remaining, 30)
+        log_verbose(f"  Waiting {wait:.1f}s for {host} to honor rate limit...")
+        time.sleep(wait)
+    if polite_delay and polite_delay > 0:
+        jitter = min(0.5, polite_delay * 0.25)
+        extra = polite_delay + random.uniform(0, jitter)
+        log_verbose(f"  Throttling {host} for {extra:.2f}s to avoid CDN slowdowns...")
+        time.sleep(extra)
+
+
+def _extract_error_info(exc: requests.exceptions.RequestException) -> Tuple[Optional[int], str]:
+    response = getattr(exc, "response", None)
+    status = None
+    snippet = ""
+    if response is not None:
+        status = response.status_code
         try:
-            r = scraper.get(url, stream=True, timeout=30)
+            snippet = response.text[:200].lower()
+        except Exception:
+            snippet = ""
+    return status, snippet
+
+
+def _is_retryable_error(exc: requests.exceptions.RequestException) -> bool:
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    ):
+        return True
+    status, _ = _extract_error_info(exc)
+    if status is None:
+        return True
+    if status >= 500 or status in {429, 408}:
+        return True
+    return False
+
+
+def _looks_like_rate_limit(status: Optional[int], body_snippet: str) -> bool:
+    if status in {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}:
+        return True
+    keywords = (
+        "reduce your request rate",
+        "slowdownread",
+        "please slow down",
+        "rate limit",
+    )
+    body_lower = body_snippet or ""
+    return any(token in body_lower for token in keywords)
+
+
+def _try_download_url(
+    url, pth, name, scraper, max_retries, retry_delay, timeout=30
+) -> Tuple[bool, Optional[requests.exceptions.RequestException]]:
+    """Attempts to download a single URL with retries. Returns (success, last_error)."""
+
+    host = urlparse(url).netloc
+    last_error: Optional[requests.exceptions.RequestException] = None
+
+    for attempt in range(max_retries):
+        _respect_rate_limit(host)
+        try:
+            r = scraper.get(url, stream=True, timeout=timeout)
             r.raise_for_status()
             with open(pth, "wb") as fh:
                 for chunk in r.iter_content(8192):
                     fh.write(chunk)
-            return pth  # Success
+            _cool_polite_delay(host)
+            return True, None  # Success
         except requests.exceptions.RequestException as e:
+            last_error = e
             log_verbose(
                 f"  Warning: Attempt {attempt + 1}/{max_retries} failed for {os.path.basename(name)} ({os.path.basename(url)}): {e}"
             )
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-    return None
+            status, body_snippet = _extract_error_info(e)
+            retryable = _is_retryable_error(e)
+            looks_rate_limited = _looks_like_rate_limit(status, body_snippet)
+
+            if looks_rate_limited:
+                cooldown = max(3.0, min(20.0, retry_delay * (attempt + 1) * 2))
+                log_verbose(
+                    f"    Detected rate limiting from {host or 'remote host'}. Cooling down for {cooldown:.1f}s before retrying..."
+                )
+                _record_rate_limit(host, cooldown)
+                _bump_polite_delay(host)
+
+            if attempt < max_retries - 1 and retryable:
+                if not looks_rate_limited:
+                    delay = retry_delay * (2 ** attempt)
+                    time.sleep(delay)
+                continue
+            break
+
+    return False, last_error
 
 
-def dl_image(url: str, folder: str, name: str, scraper) -> str:
+def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) -> str:
     """
-    Downloads an image using a sophisticated fallback chain.
+    Downloads an image using a sophisticated fallback chain with parallel attempts.
     Returns the file path on success, or None on failure.
+    
+    Args:
+        url: URL to download
+        folder: Directory to save the image
+        name: Filename for the image
+        scraper: HTTP scraper object
+        cleanup: If True, clean up failed parallel temp files. If False, preserve them.
+    
+    Strategy:
+    1. Try the first variant (original URL) sequentially with full retries
+    2. If it fails, launch all remaining variants in parallel with reduced retries
+    3. Return first successful download
     """
-    max_retries = 2
-    retry_delay = 0.5  # seconds
+    max_retries = 5
+    retry_delay = 1.0  # seconds
+    parallel_retries = 1  # Reduced retries for parallel attempts
+    timeout = 30  # seconds
     extensions_to_try = [".webp", ".png", ".jpg", ".jpeg", ".avif"]
 
     os.makedirs(folder, exist_ok=True)
     pth = os.path.join(folder, name)
+
+    if url.startswith("data:"):
+        try:
+            header, encoded = url.split(",", 1)
+        except ValueError:
+            log_verbose(f"  Warning: Invalid data URI for {name}")
+            return None
+        try:
+            if ";base64" in header:
+                data = base64.b64decode(encoded)
+            else:
+                data = unquote_to_bytes(encoded)
+        except Exception as exc:
+            log_verbose(f"  Warning: Failed to decode data URI for {name} ({exc})")
+            return None
+        with open(pth, "wb") as fh:
+            fh.write(data)
+        return pth
 
     # 1. Generate the list of potential URLs to try
     urls_to_try = []
@@ -308,33 +356,534 @@ def dl_image(url: str, folder: str, name: str, scraper) -> str:
     # De-duplicate the list while preserving order
     unique_urls_to_try = list(dict.fromkeys(urls_to_try))
 
-    # 2. Loop through the generated URLs and attempt to download
-    has_failed_a_variant = False
-    for attempt_url in unique_urls_to_try:
-        if has_failed_a_variant:
-            log_verbose(f"  Trying next variant: {os.path.basename(attempt_url)}")
-        else:
-            log_debug(f"  Trying URL variant: {os.path.basename(attempt_url)}")
+    # 2. Try the first variant sequentially (fast path for working images)
+    first_url = unique_urls_to_try[0]
+    log_debug(f"  Trying URL variant: {os.path.basename(first_url)}")
+    
+    success, first_error = _try_download_url(
+        first_url, pth, name, scraper, max_retries, retry_delay, timeout
+    )
+    if success:
+        log_debug(f"  Successfully downloaded {os.path.basename(name)} using first variant.")
+        return pth  # Success on first try!
 
-        if _try_download_url(
-            attempt_url, pth, name, scraper, max_retries, retry_delay
+    def _should_force_sequential(err: Optional[requests.exceptions.RequestException]) -> bool:
+        if not err:
+            return False
+        if isinstance(
+            err,
+            (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+            ),
         ):
-            success_message = f"  Successfully downloaded {os.path.basename(name)} using this variant."
-            if has_failed_a_variant:
-                # If in a retry scenario, show success in verbose mode.
-                log_verbose(success_message)
-            else:
-                # Otherwise, only show success in debug mode.
-                log_debug(success_message)
-            return pth  # Success!
-        else:
-            has_failed_a_variant = True
+            return True
+        status, snippet = _extract_error_info(err)
+        return _looks_like_rate_limit(status, snippet)
 
-    # 3. If all attempts failed
+    force_sequential_fallback = _should_force_sequential(first_error)
+
+    # 3. First variant failed - try remaining variants (optionally sequentially)
+    remaining_urls = unique_urls_to_try[1:]
+    if not remaining_urls:
+        print(f"  Error: Skipping image {os.path.basename(name)} after trying the only available variant.")
+        return None
+
+    if force_sequential_fallback:
+        log_verbose(
+            f"  First variant failed due to throttling/timeouts. Retrying {len(remaining_urls)} variants sequentially..."
+        )
+        for alt_url in remaining_urls:
+            log_debug(f"    [Sequential Fallback] Attempting {os.path.basename(alt_url)}")
+            success, _ = _try_download_url(
+                alt_url,
+                pth,
+                name,
+                scraper,
+                max_retries,
+                retry_delay,
+                timeout,
+            )
+            if success:
+                log_verbose(
+                    f"  Successfully downloaded {os.path.basename(name)} via sequential fallback variant: {os.path.basename(alt_url)}"
+                )
+                return pth
+
+        print(
+            f"  Error: Skipping image {os.path.basename(name)} after throttled sequential retries across {len(unique_urls_to_try)} variants."
+        )
+        return None
+
+    log_verbose(f"  First variant failed. Trying {len(remaining_urls)} remaining variants in parallel...")
+
+    # Import here to avoid dependency at module level
+    import tempfile
+    import threading
+    
+    # Track all temp files created for cleanup
+    temp_files_created = []
+    temp_files_lock = threading.Lock()
+    
+    # Track which thread succeeded (if any)
+    success_lock = threading.Lock()
+    successful_temp_file = [None]  # Use list to allow modification in nested function
+
+    def try_variant(attempt_url, thread_id):
+        """Helper function for parallel execution - each thread uses its own temp file"""
+        temp_path = None
+        try:
+            # Create a unique temporary file for this thread
+            temp_fd, temp_path = tempfile.mkstemp(dir=folder, prefix=f".tmp_{name}_")
+            os.close(temp_fd)  # Close the file descriptor, we'll use the path
+            
+            # Track this temp file for cleanup
+            with temp_files_lock:
+                temp_files_created.append(temp_path)
+            
+            log_debug(f"    [Parallel] Attempting {os.path.basename(attempt_url)}")
+            success, _ = _try_download_url(
+                attempt_url,
+                temp_path,
+                name,
+                scraper,
+                parallel_retries,
+                retry_delay,
+                timeout,
+            )
+            if success:
+                # Successfully downloaded to temp file
+                log_debug(f"    [Parallel] Success: {os.path.basename(attempt_url)}")
+                
+                with success_lock:
+                    if successful_temp_file[0] is None:
+                        # We're the first successful download
+                        successful_temp_file[0] = (temp_path, attempt_url)
+                        return attempt_url
+                
+                # Another thread already succeeded, this will be cleaned up later
+                return None
+            else:
+                # Download failed, will be cleaned up later
+                return None
+        except Exception as e:
+            log_debug(f"    [Parallel] Exception for {os.path.basename(attempt_url)}: {e}")
+            return None
+
+    # Use ThreadPoolExecutor to try all remaining variants in parallel
+    # Limit workers to avoid overwhelming the server
+    max_workers = min(len(remaining_urls), 5)
+    
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all variant attempts with thread IDs
+            future_to_url = {
+                executor.submit(try_variant, url, i): url 
+                for i, url in enumerate(remaining_urls)
+            }
+            
+            # Wait for first successful result
+            for future in as_completed(future_to_url):
+                result = future.result()
+                if result:
+                    # Cancel remaining futures since we found a successful download
+                    for f in future_to_url:
+                        f.cancel()
+                    break
+    finally:
+        # Clean up ALL temp files except the successful one (unless cleanup is disabled)
+        if cleanup:
+            successful_path = successful_temp_file[0][0] if successful_temp_file[0] else None
+            
+            for temp_path in temp_files_created:
+                if temp_path != successful_path:
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                            log_debug(f"    [Cleanup] Removed temp file: {os.path.basename(temp_path)}")
+                    except Exception as e:
+                        log_debug(f"    [Cleanup] Failed to remove temp file {os.path.basename(temp_path)}: {e}")
+        else:
+            log_debug(f"    [Cleanup] Skipped - preserving {len(temp_files_created)} temp files for debugging")
+    
+    # Move successful temp file to final destination
+    if successful_temp_file[0]:
+        temp_path, successful_url = successful_temp_file[0]
+        try:
+            # Rename temp file to final path
+            shutil.move(temp_path, pth)
+            log_verbose(f"  Successfully downloaded {os.path.basename(name)} using variant: {os.path.basename(successful_url)}")
+            return pth
+        except Exception as e:
+            print(f"  Error: Failed to move temp file to {pth}: {e}")
+            # Clean up the temp file if move failed
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except:
+                pass
+            return None
+
+    # 4. All attempts failed
     print(
         f"  Error: Skipping image {os.path.basename(name)} after trying all {len(unique_urls_to_try)} URL variants."
     )
     return None
+
+
+def render_text_to_images(
+    paragraphs: List[str],
+    folder: str,
+    prefix: str,
+    title: str = None,
+    width: int = 1400,
+    height: int = 2000,
+    font_size: int = 42,
+    start_index: int = 1,
+) -> List[str]:
+    """
+    Renders text paragraphs into JPEG images so that text-based chapters can be
+    processed alongside normal image content.
+    """
+
+    if not paragraphs and not title:
+        return []
+
+    os.makedirs(folder, exist_ok=True)
+
+    font = _load_font(font_size)
+    margin = 100
+    max_text_width = width - margin * 2
+    line_height = _font_line_height(font)
+    line_gap = max(8, int(line_height * 0.35))
+
+    def new_canvas():
+        img = Image.new("RGB", (width, height), color="white")
+        draw = ImageDraw.Draw(img)
+        return img, draw
+
+    image, draw = new_canvas()
+    y = margin
+    page_index = start_index
+    page_has_content = False
+    output_paths: List[str] = []
+
+    def commit_page():
+        nonlocal image, draw, y, page_index, page_has_content
+        if not page_has_content:
+            return
+        out_path = os.path.join(folder, f"{prefix}_{page_index:04d}.jpg")
+        image.save(out_path, optimize=True, quality=95)
+        output_paths.append(out_path)
+        page_index += 1
+        image, draw = new_canvas()
+        y = margin
+        page_has_content = False
+
+    def ensure_space(additional_height: int):
+        nonlocal y, page_has_content
+        if y + additional_height > height - margin:
+            commit_page()
+
+    def add_text_line(text_line: str, fill="black"):
+        nonlocal y, page_has_content
+        ensure_space(line_height)
+        draw.text((margin, y), text_line, font=font, fill=fill)
+        y += line_height + line_gap
+        page_has_content = True
+
+    if title:
+        for line in _wrap_text_line(title, font, max_text_width):
+            add_text_line(line)
+        y += line_gap
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            ensure_space(line_height)
+            y += line_height  # Blank line separation
+            continue
+        lines = _wrap_text_line(paragraph, font, max_text_width)
+        if not lines:
+            continue
+        for line in lines:
+            add_text_line(line)
+        y += line_gap  # Paragraph spacing
+
+    if page_has_content:
+        commit_page()
+
+    return output_paths
+
+
+def write_text_file(
+    paragraphs: List[str],
+    path: str,
+    title: Optional[str] = None,
+) -> str:
+    with open(path, "w", encoding="utf-8") as fh:
+        if title:
+            fh.write(title.strip() + "\n\n")
+        for para in paragraphs:
+            fh.write(para.strip() + "\n")
+        fh.write("\n")
+    return path
+
+
+def render_text_to_xhtml(
+    paragraphs: List[str],
+    path: str,
+    title: Optional[str] = None,
+    lang: str = "en",
+) -> str:
+    body_lines = []
+    if title:
+        body_lines.append(f"<h2>{xml.sax.saxutils.escape(title.strip())}</h2>")
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            body_lines.append("<p>&nbsp;</p>")
+        else:
+            body_lines.append(
+                f"<p>{xml.sax.saxutils.escape(para)}</p>"
+            )
+    body_html = "\n        ".join(body_lines) if body_lines else "<p></p>"
+    xhtml_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="{lang}">
+<head>
+    <title>{xml.sax.saxutils.escape(title or "Text")}</title>
+    <meta charset="utf-8"/>
+    <link rel="stylesheet" type="text/css" href="text.css"/>
+</head>
+<body>
+        {body_html}
+</body>
+</html>'''
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(xhtml_content)
+    return path
+
+
+def _pdf_escape(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+    )
+
+
+def render_text_to_pdf(
+    paragraphs: List[str],
+    path: str,
+    title: Optional[str] = None,
+    font_size: int = 12,
+    max_chars_per_line: int = 90,
+) -> str:
+    page_width = 595  # A4 width in points
+    page_height = 842  # A4 height in points
+    margin = 72  # 1 inch
+    leading = int(font_size * 1.6)
+    usable_height = page_height - 2 * margin
+    max_lines_per_page = max(1, int(usable_height // leading))
+
+    lines: List[str] = []
+    if title:
+        lines.extend(textwrap.wrap(title.strip(), max_chars_per_line))
+        lines.append("")
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            lines.append("")
+            continue
+        lines.extend(textwrap.wrap(para, max_chars_per_line, replace_whitespace=False))
+        lines.append("")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        lines = [""]
+
+    # Split into pages
+    pages = [
+        lines[i : i + max_lines_per_page]
+        for i in range(0, len(lines), max_lines_per_page)
+    ]
+
+    objects: List[Optional[bytes]] = [None]
+
+    def reserve_object() -> int:
+        objects.append(None)
+        return len(objects) - 1
+
+    def set_object(obj_num: int, data: bytes) -> None:
+        objects[obj_num] = data
+
+    catalog_obj = reserve_object()
+    pages_obj = reserve_object()
+    font_obj = reserve_object()
+    set_object(
+        font_obj,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    )
+
+    page_objects = []
+    for page_lines in pages:
+        content_lines = [
+            "BT",
+            f"/F1 {font_size} Tf",
+            f"{leading} TL",
+            f"1 0 0 1 {margin} {page_height - margin} Tm",
+        ]
+        for line in page_lines:
+            if not line:
+                content_lines.append("T*")
+                continue
+            escaped = _pdf_escape(line)
+            content_lines.append(f"({escaped}) Tj")
+            content_lines.append("T*")
+        content_lines.append("ET")
+        content_stream = "\n".join(content_lines).encode("latin-1", "replace")
+        stream_obj = reserve_object()
+        stream_header = f"<< /Length {len(content_stream)} >>\nstream\n".encode(
+            "latin-1"
+        )
+        set_object(
+            stream_obj,
+            stream_header + content_stream + b"\nendstream",
+        )
+
+        page_obj = reserve_object()
+        page_dict = (
+            f"<< /Type /Page /Parent {pages_obj} 0 R "
+            f"/MediaBox [0 0 {page_width} {page_height}] "
+            f"/Resources << /Font << /F1 {font_obj} 0 R >> >> "
+            f"/Contents {stream_obj} 0 R >>"
+        ).encode("latin-1")
+        set_object(page_obj, page_dict)
+        page_objects.append(page_obj)
+
+    kids = " ".join(f"{num} 0 R" for num in page_objects) or ""
+    set_object(
+        pages_obj,
+        f"<< /Type /Pages /Kids [{kids}] /Count {len(page_objects)} >>".encode(
+            "latin-1"
+        ),
+    )
+    set_object(
+        catalog_obj,
+        f"<< /Type /Catalog /Pages {pages_obj} 0 R >>".encode("latin-1"),
+    )
+
+    with open(path, "wb") as fh:
+        fh.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets = []
+        for idx, obj in enumerate(objects[1:], start=1):
+            if obj is None:
+                obj = b"<<>>"
+            offsets.append(fh.tell())
+            fh.write(f"{idx} 0 obj\n".encode("latin-1"))
+            fh.write(obj)
+            fh.write(b"\nendobj\n")
+        xref_pos = fh.tell()
+        fh.write(f"xref\n0 {len(objects)}\n".encode("latin-1"))
+        fh.write(b"0000000000 65535 f \n")
+        for offset in offsets:
+            fh.write(f"{offset:010d} 00000 n \n".encode("latin-1"))
+        fh.write(
+            f"trailer\n<< /Size {len(objects)} /Root {catalog_obj} 0 R >>\n".encode(
+                "latin-1"
+            )
+        )
+        fh.write(f"startxref\n{xref_pos}\n%%EOF".encode("latin-1"))
+
+    return path
+
+
+def _epub_page_count(entries: List[Dict[str, Any]]) -> int:
+    return sum(
+        1
+        for item in entries
+        if isinstance(item, dict)
+        and item.get("type") in {"image", "xhtml"}
+    )
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    candidates = [
+        ("DejaVuSans.ttf", size),
+        ("Arial.ttf", size),
+        ("Helvetica.ttf", size),
+    ]
+    for font_name, font_size in candidates:
+        try:
+            return ImageFont.truetype(font_name, font_size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _font_line_height(font: ImageFont.ImageFont) -> int:
+    try:
+        bbox = font.getbbox("Hy")
+        return bbox[3] - bbox[1]
+    except Exception:
+        return font.getsize("Hy")[1]
+
+
+def _wrap_text_line(
+    text: str, font: ImageFont.ImageFont, max_width: int
+) -> List[str]:
+    words = text.split()
+    if not words:
+        return []
+
+    lines: List[str] = []
+    current = ""
+
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if not candidate:
+            continue
+        if _measure_text(font, candidate) <= max_width:
+            current = candidate
+            continue
+
+        if current:
+            lines.append(current)
+            current = ""
+
+        for segment in _split_long_word(word, font, max_width):
+            if _measure_text(font, segment) <= max_width and not current:
+                current = segment
+            else:
+                lines.append(segment)
+                current = ""
+
+    if current:
+        lines.append(current)
+
+    return lines
+
+
+def _split_long_word(word: str, font: ImageFont.ImageFont, max_width: int) -> List[str]:
+    segments: List[str] = []
+    buffer = ""
+    for ch in word:
+        trial = buffer + ch
+        if not buffer or _measure_text(font, trial) <= max_width:
+            buffer = trial
+        else:
+            segments.append(buffer)
+            buffer = ch
+    if buffer:
+        segments.append(buffer)
+    return segments if segments else [word]
+
+
+def _measure_text(font: ImageFont.ImageFont, text: str) -> float:
+    if hasattr(font, "getlength"):
+        return font.getlength(text)
+    return font.getsize(text)[0]
 
 
 def combine_images(images: List[Image.Image], width: int) -> Image.Image:
@@ -566,7 +1115,7 @@ def build_cbz(
 
 
 def build_epub(
-    slices: List[str],
+    items: List[Dict[str, Any]],
     out_path: str,
     title: str,
     lang: str,
@@ -606,9 +1155,12 @@ def build_epub(
 
     # --- Viewport & Styling ---
     view_w, view_h = 1200, 1920
-    if slices:
+    first_image = next(
+        (item for item in items if item.get("type") == "image"), None
+    )
+    if first_image:
         try:
-            with Image.open(slices[0]) as img:
+            with Image.open(first_image["path"]) as img:
                 view_w, view_h = img.size
         except Exception:
             pass
@@ -623,6 +1175,26 @@ svg, img { max-width: 100vw; max-height: 100vh; object-fit: contain; display: bl
     with open(style_path, "w") as f:
         f.write(style_content)
     manifest_items.append('<item id="css" href="style.css" media-type="text/css"/>')
+
+    text_style_content = '''@charset "UTF-8";
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    margin: 1.75em;
+    line-height: 1.5;
+    color: #111;
+}
+h1, h2, h3 {
+    margin: 0 0 0.6em 0;
+}
+p {
+    margin: 0 0 0.8em 0;
+    text-align: justify;
+}
+'''
+    text_style_path = os.path.join(epub_dir, "text.css")
+    with open(text_style_path, "w") as f:
+        f.write(text_style_content)
+    manifest_items.append('<item id="text_css" href="text.css" media-type="text/css"/>')
 
     nav_style_content = '''
 html, body { height: 100%; margin: 0; padding: 0; }
@@ -699,32 +1271,56 @@ a:hover, a:active { text-decoration: underline; }
             log_verbose(f"  Warning: Could not process cover image: {e}")
 
     # --- Content Pages ---
-    for i, p in enumerate(slices):
-        img_ext = os.path.splitext(p)[1]
-        img_filename = f"img_{i}{img_ext}"
-        shutil.copy(p, os.path.join(images_dir, img_filename))
-        manifest_items.append(
-            f'<item id="img_{i}" href="images/{img_filename}" media-type="{_media(p)}"/>'
-        )
+    page_docs = []
+    image_counter = 0
+    text_counter = 0
 
-        page_html_content = f'''<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{lang}">
+    for item in items:
+        item_type = item.get("type")
+        if item_type == "image":
+            image_path = item["path"]
+            img_ext = os.path.splitext(image_path)[1]
+            img_filename = f"img_{image_counter}{img_ext}"
+            shutil.copy(image_path, os.path.join(images_dir, img_filename))
+            manifest_items.append(
+                f'<item id="img_{image_counter}" href="images/{img_filename}" media-type="{_media(image_path)}"/>'
+            )
+
+            page_index = len(page_docs)
+            page_filename = f"page_{page_index}.xhtml"
+            page_html_content = f'''<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{lang}">
 <head>
-    <title>{title} - Page {i+1}</title>
+    <title>{title} - Page {page_index + 1}</title>
     <meta charset="utf-8"/>
     {viewport_meta}
     <link rel="stylesheet" type="text/css" href="style.css"/>
 </head>
 <body>
-    <img src="images/{img_filename}" alt="Page {i+1}"/>
+    <img src="images/{img_filename}" alt="Page {page_index + 1}"/>
 </body>
 </html>'''
-        page_filename = f"page_{i}.xhtml"
-        with open(os.path.join(epub_dir, page_filename), "w") as f:
-            f.write(page_html_content)
-        manifest_items.append(
-            f'<item id="page_{i}" href="{page_filename}" media-type="application/xhtml+xml"/>'
-        )
-        spine_items.append(f'<itemref idref="page_{i}"/>')
+            with open(os.path.join(epub_dir, page_filename), "w") as f:
+                f.write(page_html_content)
+            manifest_items.append(
+                f'<item id="page_{page_index}" href="{page_filename}" media-type="application/xhtml+xml"/>'
+            )
+            spine_items.append(f'<itemref idref="page_{page_index}"/>')
+            page_docs.append({"href": page_filename})
+            image_counter += 1
+        elif item_type == "xhtml":
+            source_path = item["path"]
+            basename = os.path.basename(source_path)
+            if not basename.lower().endswith(".xhtml"):
+                basename = f"text_{text_counter}.xhtml"
+            dest_path = os.path.join(epub_dir, basename)
+            shutil.copy(source_path, dest_path)
+            item_id = f"text_{text_counter}"
+            manifest_items.append(
+                f'<item id="{item_id}" href="{basename}" media-type="application/xhtml+xml"/>'
+            )
+            spine_items.append(f'<itemref idref="{item_id}"/>')
+            page_docs.append({"href": basename})
+            text_counter += 1
 
     # --- Table of Contents (Navigation Document) ---
     # This is identified by the "nav" property in the manifest and used by the
@@ -743,8 +1339,10 @@ a:hover, a:active { text-decoration: underline; }
 '''
         for marker in chapter_markers:
             page_index = marker["page_index"]
-            ch_title = f"Chapter {marker['ch']['chap']}"
-            nav_content += f'<li><a href="page_{page_index}.xhtml">{xml.sax.saxutils.escape(ch_title)}</a></li>'
+            if page_index < len(page_docs):
+                ch_title = f"Chapter {marker['ch']['chap']}"
+                nav_target = page_docs[page_index]["href"]
+                nav_content += f'<li><a href="{nav_target}">{xml.sax.saxutils.escape(ch_title)}</a></li>'
         nav_content += '''
         </ol>
     </nav>
@@ -765,7 +1363,7 @@ a:hover, a:active { text-decoration: underline; }
 
     # --- Metadata ---
     metadata_items.append(
-        f'<dc:identifier id="bookid">comick-{comic_info["hid"]}</dc:identifier>'
+        f'<dc:identifier id="bookid">series-{comic_info["hid"]}</dc:identifier>'
     )
     metadata_items.append(
         f"<dc:title>{xml.sax.saxutils.escape(title)}</dc:title>"
@@ -803,9 +1401,14 @@ a:hover, a:active { text-decoration: underline; }
             f"<dc:subject>{xml.sax.saxutils.escape(tag)}</dc:subject>"
         )
 
+    has_text_pages = any(item.get("type") == "xhtml" for item in items)
     rendition_spread = "none"
-    rendition_layout = "pre-paginated"
-    rendition_flow = "scrolled-continuous" if layout == "vertical" else "paginated"
+    if has_text_pages:
+        rendition_layout = "reflowable"
+        rendition_flow = "auto"
+    else:
+        rendition_layout = "pre-paginated"
+        rendition_flow = "scrolled-continuous" if layout == "vertical" else "paginated"
     metadata_items.append(
         f'<meta property="rendition:layout">{rendition_layout}</meta>'
     )
@@ -852,7 +1455,18 @@ a:hover, a:active { text-decoration: underline; }
                 arcname = os.path.relpath(file_path, temp_dir)
                 zf.write(file_path, arcname)
 
-    shutil.rmtree(temp_dir)
+    # Clean up temp directory with retry logic for file handle issues
+    try:
+        shutil.rmtree(temp_dir)
+    except OSError:
+        # If rmtree fails, try again with ignore_errors after brief delay
+        import time
+        time.sleep(0.1)  # Brief delay to allow file handles to close
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass  # Ignore cleanup errors - EPUB file was successfully created
+
     print(f"EPUB saved \u2192 {os.path.basename(out_path)}")
 
 def merge_pdf_files(input_paths, out_path, metadata):
@@ -927,21 +1541,28 @@ def build_book_part(
     title = comic_data["title"]
     part_title = f"{title} ({part_suffix})"
 
-    print(f"\nBuilding part: {part_suffix} ({len(book_content)} pages/chapters)")
-
     if args.format == "pdf":
         final_path = os.path.join(out_dir, f"{part_filename}.pdf")
-        merge_pdf_files(
-            book_content,
-            final_path,
-            {
-                "/Title": part_title,
-                "/Author": ", ".join(comic_data.get("authors", [])),
-            },
-        )
-        print(f"PDF part saved → {os.path.basename(final_path)}")
-        for p in book_content:
-            os.remove(p)
+        pdf_inputs = [
+            item["path"]
+            for item in book_content
+            if item.get("type") == "pdf"
+        ]
+        if pdf_inputs:
+            merge_pdf_files(
+                pdf_inputs,
+                final_path,
+                {
+                    "/Title": part_title,
+                    "/Author": ", ".join(comic_data.get("authors", [])),
+                },
+            )
+            print(f"PDF part saved → {os.path.basename(final_path)}")
+        for path in pdf_inputs:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     elif args.format == "epub":
         final_path = os.path.join(out_dir, f"{part_filename}.epub")
@@ -958,8 +1579,13 @@ def build_book_part(
         )
     elif args.format == "cbz":
         final_path = os.path.join(out_dir, f"{part_filename}.cbz")
+        cbz_images = [
+            item["path"]
+            for item in book_content
+            if item.get("type") == "image"
+        ]
         build_cbz(
-            book_content,
+            cbz_images,
             final_path,
             part_title,
             comic_data,
@@ -995,8 +1621,14 @@ def get_processing_params(args, calculated_width, calculated_aspect_ratio):
 # main
 # -----------------------------------------------------------
 def main():
-    p = argparse.ArgumentParser("comick downloader")
+    p = argparse.ArgumentParser("comic downloader")
     p.add_argument("comic_url")
+    p.add_argument(
+        "--site",
+        type=str,
+        default=None,
+        help="Explicitly select the site handler (auto-detected by URL when omitted).",
+    )
     p.add_argument("--cookies", default="")
     p.add_argument(
         "--group",
@@ -1099,6 +1731,10 @@ def main():
     )
     args = p.parse_args()
 
+    handler = resolve_site_handler(args.comic_url, args.site)
+    if not handler:
+        sys.exit("Unable to resolve site handler. Use --site to specify explicitly.")
+
     # Process the group argument to handle comma-separated strings
     if args.group:
         # Flatten the list of strings, splitting each by comma, and stripping whitespace.
@@ -1133,28 +1769,23 @@ def main():
             scraper = requests.Session()
     else:
         scraper = requests.Session()
-    scraper.headers.update(
-        {"Referer": "https://comick.io/", "Origin": "https://comick.io/"}
-    )
     if args.cookies:
         scraper.cookies.update(
             dict(kv.split("=", 1) for kv in args.cookies.split(";") if "=" in kv)
         )
+    handler.configure_session(scraper, args)
 
-    html = make_request(args.comic_url, scraper).text
-    # Prefer lxml when available, but fall back automatically if not
     try:
-        parser = "lxml" if _HAS_LXML else "html.parser"
-        soup = BeautifulSoup(html, parser)
-    except FeatureNotFound:
-        # If bs4 still can't use lxml for any reason, fall back
-        soup = BeautifulSoup(html, "html.parser")
+        context: SiteComicContext = handler.fetch_comic_context(
+            args.comic_url, scraper, make_request
+        )
+    except Exception as e:
+        if isinstance(e, SystemExit):
+            raise
+        sys.exit(f"Failed to fetch comic data: {e}")
 
-    m = soup.find("script", id="__NEXT_DATA__", type="application/json")
-    if not m:
-        sys.exit("Cannot locate __NEXT_DATA__.")
-    comic_data = json.loads(m.string)["props"]["pageProps"]["comic"]
-    hid, title = comic_data["hid"], comic_data["title"]
+    comic_data = context.comic
+    hid, title = context.identifier, context.title
     print(f"{title} (hid={hid})")
 
     main_tmp_dir = os.path.abspath(f"tmp_{hid}")
@@ -1266,21 +1897,22 @@ def main():
             f"  Final images will be scaled to {args.scaling}% of this size."
         )
 
-    more_info = extract_more_info(soup)
-    comic_data.update(more_info)
-    if more_info:
+    extra_metadata = handler.extract_additional_metadata(context)
+    if extra_metadata:
+        comic_data.update(extra_metadata)
         log_verbose("  Extracted metadata (Authors, Artists, Genres, etc.)")
 
     def sanitize_filename(name):
         return re.sub(r'[\\/*?:"<>|]', "", name).replace(" ", "_")
 
     safe_title = sanitize_filename(title)
-    base_filename = safe_title
+    safe_site = sanitize_filename(handler.name)
+    base_filename = f"{safe_title}_{safe_site}" if safe_site else safe_title
     if args.group:
         safe_group = sanitize_filename("_".join(args.group))
-        base_filename = f"{safe_title}_{safe_group}"
+        base_filename = f"{base_filename}_{safe_group}"
 
-    pool = get_chapters(hid, scraper, args.language)
+    pool = handler.get_chapters(context, scraper, args.language, make_request)
 
     # --- Chapter Selection Logic ---
     log_verbose("Filtering chapters based on preferences...")
@@ -1305,8 +1937,8 @@ def main():
     sorted_chap_nums = sorted(chapters_by_num.keys(), key=float)
     for num in sorted_chap_nums:
         versions = chapters_by_num[num]
-        best_version = select_best_chapter_version(
-            versions, args.group, args.mix_by_upvote
+        best_version = handler.select_best_chapter_version(
+            versions, args.group, args.mix_by_upvote, log_debug_fn=log_debug
         )
         if best_version:
             best_chapters.append(best_version)
@@ -1325,14 +1957,32 @@ def main():
         )
 
     if args.chapters.lower() != "all":
-        chapters = [
-            c
-            for c in chapters
-            if is_chapter_wanted(float(c["chap"]), args.chapters)
-        ]
-        log_verbose(
-            f"  --chapters '{args.chapters}': Filtered list down to {len(chapters)} chapters."
-        )
+        # Check for negative indexing (e.g. "-1" for last chapter, "-3" for last 3)
+        is_negative_index = False
+        try:
+            if args.chapters.strip().startswith("-") and "," not in args.chapters:
+                # Check if it's a valid integer (e.g. -1, -5)
+                # Note: This might conflict with actual negative chapter numbers (e.g. -12),
+                # but those are rare. We prioritize the "last N" semantics here.
+                val = int(args.chapters)
+                if val < 0:
+                    chapters = chapters[val:]
+                    is_negative_index = True
+                    log_verbose(
+                        f"  --chapters '{args.chapters}': Interpreted as last {-val} chapters. Selected {len(chapters)} chapters."
+                    )
+        except ValueError:
+            pass
+
+        if not is_negative_index:
+            chapters = [
+                c
+                for c in chapters
+                if is_chapter_wanted(float(c["chap"]), args.chapters)
+            ]
+            log_verbose(
+                f"  --chapters '{args.chapters}': Filtered list down to {len(chapters)} chapters."
+            )
 
     if not chapters:
         sys.exit("No chapters selected.")
@@ -1383,19 +2033,26 @@ def main():
 
     original_cover_path = None
     if args.format in ["epub", "cbz"]:
-        cover_tag = soup.find("meta", property="og:image")
-        if cover_tag and cover_tag.get("content"):
-            cover_url = cover_tag["content"]
+        cover_url = None
+        if context.soup:
+            cover_tag = context.soup.find("meta", property="og:image")
+            if cover_tag and cover_tag.get("content"):
+                cover_url = cover_tag["content"]
+        if not cover_url:
+            cover_url = comic_data.get("cover") or comic_data.get("thumb")
+        if cover_url:
             original_cover_path = dl_image(
-                cover_url, main_tmp_dir, "cover_orig.jpg", scraper
+                cover_url, main_tmp_dir, "cover_orig.jpg", scraper, cleanup=not args.no_cleanup
             )
             if args.format == "cbz" and original_cover_path:
-                current_book_content.append(original_cover_path)
+                current_book_content.append(
+                    {"type": "image", "path": original_cover_path}
+                )
                 current_book_size += os.path.getsize(original_cover_path)
 
     for ch in chapters:
         n = ch["chap"]
-        grp_name = get_group_name(ch)
+        grp_name = handler.get_group_name(ch)
         tdir = os.path.join(main_tmp_dir, f"ch_{n}")
         processed_tdir = os.path.join(tdir, "processed")
         chapter_content = []
@@ -1410,66 +2067,43 @@ def main():
 
         if resume_mode and os.path.exists(marker_path):
             print(f"\nChapter {n} (already processed, collecting files)")
-            # Source images:
-            # - no-processing: raw downloads from chapter dir
-            # - normal: processed images from 'processed' dir
-            if args.no_processing:
-                raw_images = glob.glob(os.path.join(tdir, f"{n}_*.jpg"))
-                try:
-                    source_images = sorted(
-                        raw_images,
-                        key=lambda p: int(
-                            os.path.splitext(os.path.basename(p))[0]
-                            .split("_")[-1]
-                        ),
-                    )
-                except Exception:
-                    source_images = sorted(raw_images)
-            else:
-                source_images = sorted(
-                    glob.glob(os.path.join(processed_tdir, "*.jpg"))
-                )
-
-            if not source_images:
+            if args.format in {"epub", "pdf", "none"}:
                 log_verbose(
-                    f"  Warning: Found process marker for Ch {n} but no images. Re-processing."
+                    "  Resume mode not supported for this format; re-processing."
                 )
                 rm_tree(tdir)
-                # process_this_chapter remains True
             else:
-                # We have the images, so we don't need to re-download/process.
-                process_this_chapter = False
-                if args.format == "pdf":
-                    # Re-create the temporary PDF from existing images.
-                    ch_pdf_path = os.path.join(
-                        main_tmp_dir, f"{base_filename}_Ch_{n}.pdf"
-                    )
-                    log_debug(f"  Re-building temp PDF for Ch {n}...")
-                    sheets = [Image.open(p).convert("RGB") for p in source_images]
-                    if sheets:
-                        sheets[0].save(
-                            ch_pdf_path,
-                            save_all=True,
-                            append_images=sheets[1:],
+                if args.no_processing:
+                    raw_images = glob.glob(os.path.join(tdir, f"{n}_*.jpg"))
+                    try:
+                        source_images = sorted(
+                            raw_images,
+                            key=lambda p: int(
+                                os.path.splitext(os.path.basename(p))[0]
+                                .split("_")[-1]
+                            ),
                         )
-                        chapter_content = [ch_pdf_path]
-                    else:
-                        chapter_content = []
+                    except Exception:
+                        source_images = sorted(raw_images)
                 else:
-                    # For EPUB/CBZ, just use the image paths.
-                    chapter_content = source_images
-
-                if chapter_content:
-                    chapter_content_size = sum(
-                        os.path.getsize(p) for p in chapter_content
+                    source_images = sorted(
+                        glob.glob(os.path.join(processed_tdir, "*.jpg"))
                     )
-                else:
-                    # This case is unlikely but safe to handle.
+
+                if not source_images:
                     log_verbose(
-                        f"  Warning: Could not assemble content for Ch {n}. Re-processing."
+                        f"  Warning: Found process marker for Ch {n} but no images. Re-processing."
                     )
                     rm_tree(tdir)
-                    process_this_chapter = True
+                    # process_this_chapter remains True
+                else:
+                    process_this_chapter = False
+                    chapter_content = [
+                        {"type": "image", "path": p} for p in source_images
+                    ]
+                    chapter_content_size = sum(
+                        os.path.getsize(p) for p in source_images
+                    )
 
         if process_this_chapter:
             if os.path.isdir(tdir):
@@ -1479,27 +2113,72 @@ def main():
                 rm_tree(tdir)
 
             print(f"\nChapter {n} ({grp_name or 'No Group'})")
-            imgs = get_images(ch["hid"], scraper)
-            downloaded_images = []
-            log_verbose(f"  Downloading {len(imgs)} images...")
-            for i, im in enumerate(imgs):
-                full_url = f"https://meo.comick.pictures/{im['b2key']}"
+            media_entries = handler.get_chapter_images(
+                ch, scraper, make_request
+            ) or []
+            raw_image_paths: List[str] = []
+            text_blocks: List[Dict[str, Any]] = []
+            page_counter = 1
+            log_verbose(
+                f"  Fetching {len(media_entries)} media item(s)..."
+            )
+            for entry in media_entries:
+                if isinstance(entry, dict):
+                    entry_type = entry.get("type")
+                    if entry_type == "text":
+                        paragraphs = entry.get("paragraphs", [])
+                        title_text = entry.get("title") or ch.get("title")
+                        if paragraphs or title_text:
+                            text_blocks.append(
+                                {
+                                    "paragraphs": paragraphs,
+                                    "title": title_text,
+                                }
+                            )
+                        continue
+                    if entry_type == "binary_image":
+                        blob = entry.get("data")
+                        if not blob:
+                            continue
+                        ext = entry.get("extension") or ".jpg"
+                        if not ext.startswith("."):
+                            ext = "." + ext
+                        custom_name = entry.get("name")
+                        filename = (
+                            custom_name
+                            if custom_name
+                            else f"{n}_{page_counter:04d}{ext}"
+                        )
+                        pth = os.path.join(tdir, filename)
+                        with open(pth, "wb") as fh:
+                            fh.write(blob)
+                        raw_image_paths.append(pth)
+                        page_counter += 1
+                        continue
+
+                full_url = entry if isinstance(entry, str) else entry.get("url")
+                if not full_url:
+                    continue
+                filename = f"{n}_{page_counter:04d}.jpg"
+                
                 pth = dl_image(
                     full_url,
                     tdir,
-                    f"{n}_{i+1}.jpg",
+                    filename,
                     scraper,
+                    cleanup=not args.no_cleanup,
                 )
                 if pth:
-                    downloaded_images.append(pth)
+                    raw_image_paths.append(pth)
+                    page_counter += 1
 
-            if not downloaded_images:
+            if not raw_image_paths and not text_blocks:
                 print(
-                    f"  Warning: No images downloaded for Chapter {n}. Skipping."
+                    f"  Warning: No media downloaded for Chapter {n}. Skipping."
                 )
                 continue
 
-            if args.keep_images:
+            if args.keep_images and raw_image_paths:
                 dest_dir = os.path.join(out_dir, safe_title, f"Chapter_{n}")
                 log_verbose(f"  Copying original images to: {dest_dir}")
                 # Python 3.7 doesn't support dirs_exist_ok. Fallback if needed.
@@ -1524,79 +2203,163 @@ def main():
                     else:
                         shutil.copytree(tdir, dest_dir)
 
-            if args.no_processing:
-                # No processing: use raw downloads directly.
-                chapter_content = downloaded_images
-                if args.format == "pdf":
-                    ch_pdf_path = os.path.join(
-                        main_tmp_dir, f"{base_filename}_Ch_{n}.pdf"
-                    )
-                    sheets = [Image.open(p).convert("RGB") for p in chapter_content]
-                    if sheets:
-                        sheets[0].save(
-                            ch_pdf_path, save_all=True, append_images=sheets[1:]
-                        )
-                        chapter_content = [ch_pdf_path]
-                    else:
-                        chapter_content = []
-            else:
-                log_verbose(f"  Processing {len(downloaded_images)} images...")
-                if args.format in ["epub", "cbz"]:
-                    pages_in_memory = process_chapter_images(
-                        downloaded_images, width, recombine_target_height
-                    )
+            os.makedirs(processed_tdir, exist_ok=True)
+
+            chapter_content = []
+
+            processed_page_images: List[str] = []
+            if raw_image_paths:
+                if args.no_processing:
+                    processed_page_images = list(raw_image_paths)
                 else:
-                    pages_in_memory = resize_chapter_images(
-                        downloaded_images, width
+                    log_verbose(
+                        f"  Processing {len(raw_image_paths)} downloaded images..."
+                    )
+                    if args.format == "cbz" or (
+                        args.format == "epub" and not text_blocks
+                    ):
+                        pages_in_memory = process_chapter_images(
+                            raw_image_paths, width, recombine_target_height
+                        )
+                    else:
+                        pages_in_memory = resize_chapter_images(
+                            raw_image_paths, width
+                        )
+
+                    log_verbose(f"  Applying {args.scaling}% scaling...")
+                    scaled_images_in_mem = [
+                        img.resize(
+                            (
+                                int(img.width * scale_factor),
+                                int(img.height * scale_factor),
+                            ),
+                            Image.LANCZOS,
+                        )
+                        for img in pages_in_memory
+                    ]
+
+                    images_to_save = scaled_images_in_mem
+                    if (
+                        args.scaling < 100
+                        and args.format in ["epub", "cbz"]
+                        and recombine_target_height > 0
+                    ):
+                        images_to_save = recombine_scaled_images(
+                            scaled_images_in_mem, recombine_target_height
+                        )
+
+                    processed_page_images = save_final_images(
+                        images_to_save, processed_tdir, f"p_{n}", args.quality
                     )
 
-                log_verbose(f"  Applying {args.scaling}% scaling...")
-                scaled_images_in_mem = [
-                    img.resize(
-                        (
-                            int(img.width * scale_factor),
-                            int(img.height * scale_factor),
-                        ),
-                        Image.LANCZOS,
+            if args.format == "cbz":
+                for idx, block in enumerate(text_blocks):
+                    text_paths = render_text_to_images(
+                        block["paragraphs"],
+                        processed_tdir,
+                        f"{n}_text_{idx:02d}",
+                        title=block.get("title") or ch.get("title"),
+                        start_index=len(processed_page_images) + 1,
                     )
-                    for img in pages_in_memory
+                    processed_page_images.extend(text_paths)
+
+                chapter_content = [
+                    {"type": "image", "path": p} for p in processed_page_images
                 ]
-
-                images_to_save = scaled_images_in_mem
-                if (
-                    args.scaling < 100
-                    and args.format in ["epub", "cbz"]
-                    and recombine_target_height > 0
-                ):
-                    images_to_save = recombine_scaled_images(
-                        scaled_images_in_mem, recombine_target_height
+            elif args.format == "epub":
+                chapter_content = [
+                    {"type": "image", "path": p} for p in processed_page_images
+                ]
+                for idx, block in enumerate(text_blocks):
+                    xhtml_path = os.path.join(
+                        processed_tdir, f"{n}_text_{idx:02d}.xhtml"
                     )
-
-                final_page_paths = save_final_images(
-                    images_to_save, processed_tdir, f"p_{n}", args.quality
-                )
-
-                chapter_content = final_page_paths
-                if args.format == "pdf":
-                    ch_pdf_path = os.path.join(
-                        main_tmp_dir, f"{base_filename}_Ch_{n}.pdf"
+                    render_text_to_xhtml(
+                        block["paragraphs"],
+                        xhtml_path,
+                        block.get("title") or ch.get("title"),
+                        args.language,
+                    )
+                    chapter_content.append(
+                        {
+                            "type": "xhtml",
+                            "path": xhtml_path,
+                            "title": block.get("title"),
+                        }
+                    )
+            elif args.format == "pdf":
+                pdf_parts: List[str] = []
+                if processed_page_images:
+                    image_pdf_path = os.path.join(
+                        processed_tdir, f"{n}_images.pdf"
                     )
                     sheets = [
-                        Image.open(p).convert("RGB") for p in final_page_paths
+                        Image.open(p).convert("RGB")
+                        for p in processed_page_images
                     ]
                     if sheets:
                         sheets[0].save(
-                            ch_pdf_path, save_all=True, append_images=sheets[1:]
+                            image_pdf_path,
+                            save_all=True,
+                            append_images=sheets[1:],
                         )
-                        chapter_content = [ch_pdf_path]
+                        pdf_parts.append(image_pdf_path)
+                for idx, block in enumerate(text_blocks):
+                    pdf_path = os.path.join(
+                        processed_tdir, f"{n}_text_{idx:02d}.pdf"
+                    )
+                    render_text_to_pdf(
+                        block["paragraphs"],
+                        pdf_path,
+                        block.get("title") or ch.get("title"),
+                    )
+                    pdf_parts.append(pdf_path)
+
+                if pdf_parts:
+                    if len(pdf_parts) == 1:
+                        final_pdf_path = pdf_parts[0]
                     else:
-                        chapter_content = []
+                        final_pdf_path = os.path.join(
+                            main_tmp_dir, f"{base_filename}_Ch_{n}.pdf"
+                        )
+                        merge_pdf_files(pdf_parts, final_pdf_path, None)
+                        for part_path in pdf_parts:
+                            if part_path != final_pdf_path:
+                                try:
+                                    os.remove(part_path)
+                                except OSError:
+                                    pass
+                    chapter_content = [
+                        {"type": "pdf", "path": final_pdf_path}
+                    ]
+            elif args.format == "none":
+                if text_blocks:
+                    combined_paragraphs: List[str] = []
+                    for idx, block in enumerate(text_blocks):
+                        if idx == 0 and block.get("title"):
+                            combined_paragraphs.append(block["title"])
+                        combined_paragraphs.extend(block["paragraphs"])
+                        combined_paragraphs.append("")
+                    txt_path = os.path.join(processed_tdir, f"{n}.txt")
+                    write_text_file(combined_paragraphs, txt_path)
+                    chapter_content.append(
+                        {"type": "text_file", "path": txt_path}
+                    )
+                # keep_images already preserved raw downloads
+            else:
+                chapter_content = [
+                    {"type": "image", "path": p} for p in processed_page_images
+                ]
 
             if chapter_content:
                 with open(marker_path, "w") as f:
                     pass
             chapter_content_size = sum(
-                os.path.getsize(p) for p in chapter_content
+                os.path.getsize(item["path"])
+                for item in chapter_content
+                if isinstance(item, dict)
+                and item.get("path")
+                and os.path.exists(item["path"])
             )
 
         if not chapter_content:
@@ -1623,8 +2386,13 @@ def main():
                     chapter_markers=chapter_marker,
                 )
             elif args.format == "cbz":
+                cbz_images = [
+                    item["path"]
+                    for item in chapter_content
+                    if item.get("type") == "image"
+                ]
                 build_cbz(
-                    chapter_content,
+                    cbz_images,
                     ch_out_path,
                     ch_title,
                     comic_data,
@@ -1632,7 +2400,8 @@ def main():
                     args.language,
                 )
             elif args.format == "pdf":
-                shutil.copy(chapter_content[0], ch_out_path)
+                if chapter_content:
+                    shutil.copy(chapter_content[0]["path"], ch_out_path)
                 print(f"PDF Chapter saved → {os.path.basename(ch_out_path)}")
 
         should_split_by_size = (
@@ -1662,13 +2431,14 @@ def main():
             current_book_size = 0
             current_epub_markers = []
 
+        if args.format == "epub":
+            start_page_index = _epub_page_count(current_book_content)
         current_book_content.extend(chapter_content)
         current_book_chapters.append(ch)
         if grp_name:
             current_book_scan_groups.add(grp_name)
         current_book_size += chapter_content_size
-        if args.format == "epub":
-            start_page_index = len(current_book_content) - len(chapter_content)
+        if args.format == "epub" and _epub_page_count(chapter_content) > 0:
             current_epub_markers.append(
                 {"ch": ch, "page_index": start_page_index}
             )
@@ -1703,8 +2473,13 @@ def main():
                     chapter_markers=current_epub_markers,
                 )
             elif args.format == "cbz":
+                cbz_images_all = [
+                    item["path"]
+                    for item in current_book_content
+                    if item.get("type") == "image"
+                ]
                 build_cbz(
-                    current_book_content,
+                    cbz_images_all,
                     final_path,
                     title,
                     comic_data,
@@ -1712,17 +2487,27 @@ def main():
                     args.language,
                 )
             elif args.format == "pdf":
-                merge_pdf_files(
-                    current_book_content,
-                    final_path,
-                    {
-                        "/Title": title,
-                        "/Author": ", ".join(comic_data.get("authors", [])),
-                    },
-                )
-                print(f"PDF saved → {os.path.basename(final_path)}")
-                for p in current_book_content:
-                    os.remove(p)
+                pdf_inputs = [
+                    item["path"]
+                    for item in current_book_content
+                    if item.get("type") == "pdf"
+                ]
+                if pdf_inputs:
+                    merge_pdf_files(
+                        pdf_inputs,
+                        final_path,
+                        {
+                            "/Title": title,
+                            "/Author": ", ".join(comic_data.get("authors", [])),
+                        },
+                    )
+                    print(f"PDF saved → {os.path.basename(final_path)}")
+                for item in current_book_content:
+                    if item.get("type") == "pdf" and item.get("path"):
+                        try:
+                            os.remove(item["path"])
+                        except OSError:
+                            pass
 
     if not args.no_cleanup:
         rm_tree(main_tmp_dir)

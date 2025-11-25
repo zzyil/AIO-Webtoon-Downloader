@@ -22,13 +22,62 @@ export PIP_NO_INPUT=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-PYTHON_SCRIPT_PATH="$ROOT_DIR/comick_downloader.py"
+PYTHON_SCRIPT_PATH="$ROOT_DIR/aio-dl.py"
 PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
 
 if [ ! -f "$PYTHON_SCRIPT_PATH" ]; then
-  echo "Error: 'comick_downloader.py' not found at: $PYTHON_SCRIPT_PATH"
+  echo "Error: 'aio-dl.py' not found at: $PYTHON_SCRIPT_PATH"
   exit 1
 fi
+
+ensure_python_version() {
+  local version="$1"
+  local major_minor="${version%.*}"
+  local formula="python@${major_minor}"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    if command -v brew >/dev/null 2>&1; then
+      if ! brew ls --versions "$formula" >/dev/null 2>&1; then
+        echo "  • Installing $formula via Homebrew..."
+        brew install "$formula" >/dev/null || true
+      fi
+    fi
+  fi
+  if command -v pyenv >/dev/null 2>&1; then
+    if [ ! -d "$PYENV_ROOT/versions/$version" ]; then
+      echo "  • Installing Python $version via pyenv..."
+      pyenv install "$version"
+    fi
+  elif [ "$(uname -s)" != "Darwin" ]; then
+    echo "✗ pyenv not found. Please install pyenv or provide the interpreter for $version."
+    return 1
+  fi
+}
+
+homebrew_python_bin() {
+  local version="$1"
+  local major_minor="${version%.*}"
+  if ! command -v brew >/dev/null 2>&1; then
+    return 1
+  fi
+  local prefix
+  prefix="$(brew --prefix "python@${major_minor}" 2>/dev/null)" || return 1
+  local candidate="$prefix/bin/python${major_minor}"
+  if [ -x "$candidate" ]; then
+    echo "$candidate"
+    return 0
+  fi
+  candidate="$prefix/bin/python${major_minor/./}"
+  if [ -x "$candidate" ]; then
+    echo "$candidate"
+    return 0
+  fi
+  candidate="$prefix/bin/python3"
+  if [ -x "$candidate" ]; then
+    echo "$candidate"
+    return 0
+  fi
+  return 1
+}
 
 pybin_for_version() {
   local version="$1"
@@ -37,10 +86,15 @@ pybin_for_version() {
     echo "$base/python"; return
   fi
   if [ -x "$base/python3" ]; then
-    echo "$base/python3"
-  else
-    echo "$base/python"
+    echo "$base/python3"; return
   fi
+  if [ -x "$base/python" ]; then
+    echo "$base/python"; return
+  fi
+  if brew_path="$(homebrew_python_bin "$version")"; then
+    echo "$brew_path"; return
+  fi
+  echo ""
 }
 
 has_module() {
@@ -177,9 +231,11 @@ for version in "${VERSIONS[@]}"; do
   echo ""
   echo "--- Testing Python $version ---"
 
+  ensure_python_version "$version" || { failed_versions+=("$version (install failed)"); continue; }
+
   PY_BIN="$(pybin_for_version "$version")"
-  if [ ! -x "$PY_BIN" ]; then
-    echo "✗ Python binary not found or not executable: $PY_BIN"
+  if [ -z "$PY_BIN" ] || [ ! -x "$PY_BIN" ]; then
+    echo "✗ Python binary not found or not executable for $version."
     failed_versions+=("$version (binary missing)")
     continue
   fi
@@ -189,6 +245,17 @@ for version in "${VERSIONS[@]}"; do
     successful_versions+=("$version (Skipped)")
     continue
   fi
+
+  RUN_DIR="$SCRIPT_DIR/$version"
+  mkdir -p "$RUN_DIR"
+
+  VENV_DIR="$RUN_DIR/venv"
+  if [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "  • Creating virtual environment at $VENV_DIR"
+    "$PY_BIN" -m venv "$VENV_DIR"
+  fi
+
+  PY_BIN="$VENV_DIR/bin/python"
 
   echo "Using interpreter: $PY_BIN"
   "$PY_BIN" -V || true
@@ -221,19 +288,17 @@ for version in "${VERSIONS[@]}"; do
 
   "$PY_BIN" -m pip install "cloudscraper" >/dev/null 2>&1 || true
 
-  RUN_DIR="$SCRIPT_DIR/$version"
-  mkdir -p "$RUN_DIR"
-  ln -sf "$PYTHON_SCRIPT_PATH" "$RUN_DIR/comick_downloader.py"
+  ln -sf "$PYTHON_SCRIPT_PATH" "$RUN_DIR/aio-dl.py"
 
   echo "Running in: $RUN_DIR"
   (
     cd "$RUN_DIR"
-    if "$PY_BIN" comick_downloader.py \
-      --group GROUP #REPLACE WITH GROUP \
+    if "$PY_BIN" aio-dl.py \
+      --site mangataro \
       --chapters "1-2" \
       --format pdf \
       --keep-chapters \
-      "https://comick.io/comic/#REPLACE_WITH_ACTUAL_URL"; then
+      "https://webtoon.url"; then
       echo "✓ Download task completed successfully for Python $version"
       successful_versions+=("$version")
     else
