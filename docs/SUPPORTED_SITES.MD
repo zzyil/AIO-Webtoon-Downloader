@@ -1,170 +1,140 @@
 
 | Site | Notes |
 | ----- | ----- |
-| [AloneScanlator](https://alonescanlator.com.br) | tested ✅ |
-| [Amuy](https://apenasmaisumyaoi.com) | tested ✅ |
-| [anisascans.in](https://anisascans.in) | tested ✅ | 
-| [apcomics.org](https://apcomics.org) | tested ✅ |
-| [ApollComics](https://apollcomics.es) | tested ✅ |
-| [aquamanga.com](https://aquareader.net) | tested ✅ |
-| [ArabToons](https://arabtoons.net) | tested ✅ |
-| [ArazNovel](https://araznovel.com) | tested ✅ |
-| [arc-relight.com](https://arc-relight.com) | tested ✅ |
-| [arcanescans.org](https://arcanescans.org) | tested ✅ |
-| [ArthurScan](https://arthurscan.xyz) | tested ✅ |
-| [Armageddon](https://www.silentquill.net) | tested ✅ · Series: https://www.silentquill.net/oops-were-rich/ |
-| [artlapsa.com](https://artlapsa.com) |  |
-| [aryascans.com/brainrotcomics.com](https://brainrotcomics.com/) | tested ✅ |
-| [asmotoon.com](https://asmotoon.com) |  |
-| [assortedscans.com](https://assortedscans.com) |  |
-| [asuracomic.net](https://asuracomic.net) |  |
-| [asurascans.net](https://asurascans.net) |  |
-| [atsu.moe](https://atsu.moe) |  |
-| [Azora](https://azoramoon.com) | tested ✅ |
-| [BegaTranslation](https://begatranslation.com) | tested ✅ |
-| [BiblioPanda](https://bibliopanda.com) | tested ✅ |
-| [BokugenTranslation](https://bokugents.com) | tested ✅ |
-| [boratscans.com](https://boratscans.com) |  |
-| [BorutoExplorer](https://leitor.borutoexplorer.com.br) | tested ✅ |
-| [CatManhwas](https://newcat1.xyz) | tested ✅ |
-| [CBHentai](https://hentaicb.live) | tested ✅ |
-| [CeriseScan](https://loverstoon.com) | tested ✅ |
-| [cocomic.co](https://cocomic.co) |  |
+| [AloneScanlator](https://alonescanlator.com.br) | recent check 11.25.25 ✅ |
+| [Amuy](https://apenasmaisumyaoi.com) | recent check 11.25.25 ✅ |
+| [anisascans.in](https://anisascans.in) | recent check 11.25.25 ✅ | 
+| [apcomics.org](https://apcomics.org) | recent check 11.25.25 ✅ |
+| [ApollComics](https://apollcomics.es) | recent check 11.25.25 ✅ |
+| [aquamanga.com](https://aquareader.net) | recent check 11.25.25 ✅ |
+| [ArabToons](https://arabtoons.net) | recent check 11.25.25 ✅ |
+| [ArazNovel](https://araznovel.com) | recent check 11.25.25 ✅ |
+| [arc-relight.com](https://arc-relight.com) | recent check 11.25.25 ✅ |
+| [arcanescans.org](https://arcanescans.org) | recent check 11.25.25 ✅ |
+| [ArthurScan](https://arthurscan.xyz) | recent check 11.25.25 ✅ |
+| [Armageddon](https://www.silentquill.net) | recent check 11.25.25 ✅  |
+| [artlapsa.com](https://artlapsa.com) | recent check 11.25.25 ✅ |
+| [aryascans.com/brainrotcomics.com](https://brainrotcomics.com/) | recent check 11.25.25 ✅ |
+| [asmotoon.com](https://asmotoon.com) | recent check 11.25.25 ✅ |
+| [asuracomic.net](https://asuracomic.net) | recent check 11.25.25 ✅ |
+| [asurascans.net](https://asurascans.net) | recent check 11.25.25 ✅ |
+| [atsu.moe](https://atsu.moe) | currently offline ⛓️‍💥 |
+| [Azora](https://azoramoon.com) | recent check 11.25.25 ✅ |
+| [Bato](https://bato.to) | recent check 11.25.25 ✅ · See [mirror list](#bato-mirrors) |
+| [BegaTranslation](https://begatranslation.com) | recent check 11.25.25 ✅ |
+| [BiblioPanda](https://bibliopanda.com) | recent check 11.25.25 ✅ |
+| [BokugenTranslation](https://bokugents.com) | recent check 11.25.25 ✅ |
+| [boratscans.com](https://boratscans.com) | tested, cover cropped ⚠️ |
+| [BorutoExplorer](https://leitor.borutoexplorer.com.br) | recent check 11.25.25 ✅ |
+| [CatManhwas](https://newcat1.xyz) | recent check 11.25.25 ✅ |
+| [CBHentai](https://hentaicb.live) | recent check 11.25.25 ✅ |
+| [CeriseScan](https://loverstoon.com) | recent check 11.25.25 ✅ |
+| [cocomic.co](https://cocomic.co) | currently offline ⛓️‍💥 |
 | [coffeemanga.io](https://coffeemanga.io) |  |
-| [comix.to](https://comix.to) | Supports scanlation group selection, tested ✅ |
-| [CovenScan](https://covendasbruxonas.com) | tested ✅ |
-| [culturedworks.com](https://culturedworks.com) | tested ✅ |
-| [darkscans.net](https://darkscans.net) |  |
-| [decadencescans.com](https://reader.decadencescans.com) |  |
-| [dragontea.ink](https://dragontea.ink) |  |
-| [DragonTranslationOrg](https://dragontranslation.org) | tested ✅ |
-| [dynasty-scans.com](https://dynasty-scans.com) | Supports scanlation group selection |
-| [Emperor Scan](https://emperorscan.mundoalterno.org) | tested ✅ |
-| [Empire Webtoon](https://webtoonempire-bl.com) | tested ✅ |
-| [erosvoid.xyz](https://erosvoid.xyz) | tested ✅ · Series: https://erosvoid.xyz/manga/chronicles-of-the-demon-faction/ |
-| [EuphoriaScan](https://euphoriascan.com) | tested ✅ |
-| [evascans.org](https://evascans.org) | tested ✅ · Series: https://evascans.org/series/back-to-chanbi/ |
+| [comix.to](https://comix.to) | Supports scanlation group selection, recent check 11.25.25 ✅ |
+| [CovenScan](https://covendasbruxonas.com) | recent check 11.25.25 ✅ |
+| [culturedworks.com](https://culturedworks.com) | recent check 11.25.25 ✅ |
+| [darkscans.net](https://darkscans.net) | currently offline ⛓️‍💥 |
+| [decadencescans.com](https://reader.decadencescans.com) | only first image downloads due to page style being default ⛔️ |
+| [dragontea.ink](https://dragontea.ink) | cloudflare protection currently, not working 💨 |
+| [DragonTranslationOrg](https://dragontranslation.org) | recent check 11.25.25 ✅ |
+| [dynasty-scans.com](https://dynasty-scans.com) | chapter filter broken ⛔️ |
+| [Emperor Scan](https://emperorscan.mundoalterno.org) | recent check 11.25.25 ✅ |
+| [Empire Webtoon](https://webtoonempire-bl.com) | recent check 11.25.25 ✅ |
+| [erosvoid.xyz](https://erosvoid.xyz) | recent check 11.25.25 ✅ |
+| [EuphoriaScan](https://euphoriascan.com) | recent check 11.25.25 ✅ |
+| [evascans.org](https://evascans.org) | recent check 11.25.25 ✅ |
 | [evilflowers.com](https://evilflowers.com) |  |
-| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) — both bare and `www.` variants |
-| [firescans.xyz](https://firescans.xyz) |  |
-| [flamecomics.xyz](https://flamecomics.xyz) | tested ✅ |
-| [FlowerMangaDotNet](https://flowermanga.net) | tested ✅ |
-| [freecomiconline.me](https://freecomiconline.me) |  |
-| [freemanga.me](https://freemanga.me) |  |
-| [freemangatop.com](https://freemangatop.com) |  |
-| [galaxydegenscans.com](https://gdscans.com) |  |
-| [galaxymanga.io](https://galaxymanga.io) | tested ✅ · Series: https://galaxymanga.io/manga/the-mafia-nanny/ |
-| [GarciaManga](https://garciamanga.com) | tested ✅ |
-| [gedecomix.com](https://gedecomix.com) |  |
-| [GhostScan](https://ghostscan.xyz) | tested ✅ |
-| [gourmetscans.com](https://gourmetsupremacy.com) |  |
-| [GrabberZone](https://grabber.zone) | tested ✅ |
-| [Harem de Kira](https://kiraproject.lat) | tested ✅ |
-| [harimanga.me](https://harimanga.me) |  |
-| [HarmonyScan](https://harmony-scan.fr) | tested ✅ |
-| [Hayalistic](https://hayalistic.net) | tested ✅ |
-| [Hentai Teca](https://hentaiteca.net) | tested ✅ |
-| [hentai20.io](https://hentai20.io) | tested ✅ |
-| [hentai4free.net](https://hentai4free.net) |  |
-| [hentaimanga.me](https://hentaimanga.me) |  |
-| [HentaiOrigines](https://hentai-origines.fr) | tested ✅ |
-| [hentairead.com](https://hentairead.com) |  |
-| [HentaiVN.plus](https://hentaivn.party) | tested ✅ |
-| [hentaiwebtoon.com](https://hentaiwebtoon.com) |  |
-| [hentaixcomic.com](https://hentaixcomic.com) |  |
-| [hentaixdickgirl.com](https://hentaixdickgirl.com) |  |
-| [hentaixyuri.com](https://hentaixyuri.com) |  |
-| [Hipercool](https://hiper.cool) | tested ✅ |
-| [hiperdex.com](https://hiperdex.com) |  |
-| [Hiperdex](https://hiperdex.com) | tested ✅ |
-| [HistoireDHentai](https://hhentai.fr) | tested ✅ |
-| [hm2d.com](https://doujindistrict.com) |  |
-| [HotCabaretScan](https://hotcabaretscan.com) | tested ✅ |
-| [ImperioScans](https://neroxus.com.br) | tested ✅ |
-| [inkreads.com](https://inkreads.com) |  |
-| [InventarioOculto](https://inventariooculto.com) | tested ✅ |
-| [isekaiscanmanga.com](https://isekaiscanmanga.com) |  |
-| [isekaiscantop.com](https://isekaiscan.top) |  |
-| [JeazScans](https://lectorhub.j5z.xyz) | tested ✅ |
-| [jimanga.com](https://s2manga.io) |  |
+| [fanfox.net](https://fanfox.net) | recent check 11.25.25 ✅ · Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) — both bare and `www.` variants |
+| [firescans.xyz](https://firescans.xyz) | image selection not working ⛔️ |
+| [flamecomics.xyz](https://flamecomics.xyz) | recent check 11.25.25 ✅ |
+| [FlowerMangaDotNet](https://flowermanga.net) | recent check 11.25.25 ✅ |
+| [freecomiconline.me](https://freecomiconline.me) | image selection not working ⛔️ |
+| [freemanga.me](https://freemanga.me) | recent check 11.25.25 ✅ |
+| [freemangatop.com](https://freemangatop.com) | recent check 11.25.25 ✅ |
+| [galaxydegenscans.com](https://gdscans.com) | image selection not working ⛔️ |
+| [galaxymanga.io](https://galaxymanga.io) | recent check 11.25.25 ✅ |
+| [GarciaManga](https://garciamanga.com) | recent check 11.25.25 ✅ |
+| [GhostScan](https://ghostscan.xyz) | recent check 11.25.25 ✅ |
+| [gourmetscans.com](https://gourmetsupremacy.com) | temporarily login protected ⛔️ |
+| [GrabberZone](https://grabber.zone) | recent check 11.25.25 ✅ |
+| [Harem de Kira](https://kiraproject.lat) | recent check 11.25.25 ✅ |
+| [harimanga.me](https://harimanga.me) | recent check 11.25.25 ✅ |
+| [HarmonyScan](https://harmony-scan.fr) | recent check 11.25.25 ✅ |
+| [Hayalistic](https://hayalistic.net) | recent check 11.25.25 ✅ |
+| [Hipercool](https://hiper.cool) | recent check 11.25.25 ✅ |
+| [HotCabaretScan](https://hotcabaretscan.com) | recent check 11.25.25 ✅ |
+| [ImperioScans](https://neroxus.com.br) | recent check 11.25.25 ✅ |
+| [inkreads.com](https://inkreads.com) | cloudflare protection currently, not working 💨 |
+| [InventarioOculto](https://inventariooculto.com) | recent check 11.25.25 ✅ |
+| [isekaiscantop.com](https://isekaiscan.top) | chapter filter broken ⛔️ |
+| [JeazScans](https://lectorhub.j5z.xyz) | recent check 11.25.25 ✅ |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |
-| [KamiSamaExplorer](https://leitor.kamisama.com.br) | tested ✅ |
-| [Kedito](https://kedi.to) | tested ✅ |
-| [kappabeast.com](https://kappabeast.com) | tested ✅ · Series: https://kappabeast.com/manga/you-wont-escape-fukuroji-kun/ |
-| [kingofshojo.com](https://kingofshojo.com) | tested ✅ |
-| [kirascans.com](https://kirascans.com) | tested ✅ · Series: https://kirascans.com/manga/the-dungeon-the-gal-and-the-saga-of-the-lagging-heroic-explorer/ |
-| [kissmangain.com](https://kissmanga.in) |  |
-| [KlikManga](https://klikmanga.org) | tested ✅ |
-| [ksgroupscans.com](https://ksgroupscans.com) |  |
-| [kunmanga.com](https://kunmanga.com) |  |
-| [KuroiManga](https://www.kuroimanga.com) | tested ✅ |
-| [lagoonscans.com](https://lagoonscans.com) | tested ✅ · Series: https://lagoonscans.com/manga/nano-machine/ |
-| [LaviniaFansub](https://laviniafansub.site) | tested ✅ |
-| [leemiau.com](https://leemiau.com) | tested ✅ |
-| [lhtranslation.net](https://lhtranslation.net) |  |
-| [likemanga.in](https://likemanga.in) |  |
-| [likemanga.ink](https://likemanga.ink) |  |
-| [lilymanga.net](https://lilymanga.net) |  |
-| [LittleTyrant](https://tiraninha.baby) | tested ✅ |
-| [Lmtos](https://www.lmtos.com) | tested ✅ |
-| [madaradex.org](https://madaradex.org) |  |
-| [MaidSecret](https://maidsecret.com) | tested ✅ |
-| [Manga Crab](https://mangacrab.org) | tested ✅ |
-| [manga18free.com](https://manga18free.com) |  |
-| [manga18fx.com](https://manga18fx.com) |  |
-| [manga18x.net](https://manga18x.net) |  |
-| [Manga3asq](https://3asq.org) | tested ✅ |
-| [manga3s.com](https://manga3s.com) |  |
-| [MangaBin](https://mangabin.com) | tested ✅ |
-| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](MANGABUDDY_MIRRORS.MD) |
-| [mangaclash.com](https://toonclash.com) |  |
-| [MangaCrazy](https://mangacrazy.net) | tested ✅ |
-| [mangadass.com](https://mangadass.com) |  |
-| [mangadex.org](https://mangadex.org) | tested ✅ · Supports scanlation group selection |
-| [mangadistrict.com](https://mangadistrict.com) |  |
-| [mangafire.to](https://mangafire.to) |  |
-| [mangaforfree.com](https://mangaforfree.com) |  |
-| [MangaForFreeFactory (Multi-language)](https://mangaforfree.net) | tested ✅ |
-| [mangafoxfull.com](https://mangafoxfull.com) |  |
-| [mangafreakonline.com](https://mangafreak.online) |  |
-| [mangagg.com](https://mangagg.com) |  |
-| [mangagojo.com](https://mangagojo.com) | tested ✅ |
-| [mangahub.io](https://mangahub.io) | tested ✅ |
-| [MangaKakalot / Manganato family](https://www.manganato.gg) | tested ✅ · See [mirror list](MANGAKAKALOT_MIRRORS.MD) |
-| [MangaLc](https://manga-lc.net) | tested ✅ |
-| [mangaleveling.com](https://mangaleveling.com) |  |
-| [mangamaniacs.org](https://mangamaniacs.org) |  |
-| [mangaonlineteam.com](https://mangaonlineteam.com) |  |
-| [mangaowl.io](https://mangaowl.io) |  |
-| [mangapark.net](https://mangapark.net) |  |
-| [mangapill.com](https://mangapill.com) | tested ✅ |
-| [mangaread.co](https://mangaread.co) |  |
-| [mangaread.org](https://www.mangaread.org) |  |
-| [mangareader.to](https://mangareader.to) |  |
-| [MangaRomance](https://mangaromance19.com) | tested ✅ |
-| [MangaSehri](https://manga-sehri.com) | tested ✅ |
-| [mangasushi.org](https://mangasushi.org) |  |
-| [mangataro.org](https://mangataro.org) | tested ✅ · Supports scanlation group selection |
-| [mangatone.com](https://mangatone.com) |  |
-| [MangaTRNet](https://mangatr.app) | tested ✅ |
-| [MangaTuk](https://mangatuk.com) | tested ✅ |
-| [mangatxunoriginal.com](https://mangaempress.com) |  |
-| [mangatyrant.com](https://mangatyrant.com) |  |
-| [mangatyun.com](https://mangatoto.com) |  |
-| [MangaWOW](https://mangawow.org) | tested ✅ |
-| [Manhatic](https://manhatic.com) | tested ✅ |
+| [KamiSamaExplorer](https://leitor.kamisama.com.br) | recent check 11.25.25 ✅ |
+| [Kedito](https://kedi.to) | recent check 11.25.25 ✅ |
+| [kappabeast.com](https://kappabeast.com) | recent check 11.25.25 ✅ |
+| [kingofshojo.com](https://kingofshojo.com) | recent check 11.25.25 ✅ |
+| [kirascans.com](https://kirascans.com) | recent check 11.25.25 ✅ |
+| [kissmangain.com](https://kissmanga.in) | cloudflare protection currently, not working 💨 |
+| [KlikManga](https://klikmanga.org) | recent check 11.25.25 ✅ |
+| [ksgroupscans.com](https://ksgroupscans.com) | chapter filter broken ⛔️ |
+| [kunmanga.com](https://kunmanga.com) | cloudflare protection currently, not working 💨 |
+| [KuroiManga](https://www.kuroimanga.com) | recent check 11.25.25 ✅ |
+| [lagoonscans.com](https://lagoonscans.com) | recent check 11.25.25 ✅ |
+| [LaviniaFansub](https://laviniafansub.site) | recent check 11.25.25 ✅ |
+| [leemiau.com](https://leemiau.com) | recent check 11.25.25 ✅ |
+| [lhtranslation.net](https://lhtranslation.net) | chapter filter broken ⛔️ |
+| [likemanga.in](https://likemanga.in) | recent check 11.25.25 ✅ |
+| [likemanga.ink](https://likemanga.ink) | chapter filter broken ⛔️ |
+| [lilymanga.net](https://lilymanga.net) | cloudflare protection currently, not working 💨 |
+| [LittleTyrant](https://tiraninha.baby) | recent check 11.25.25 ✅ |
+| [Lmtos](https://www.lmtos.com) | recent check 11.25.25 ✅ |
+| [MaidSecret](https://maidsecret.com) | recent check 11.25.25 ✅ |
+| [Manga Crab](https://mangacrab.org) | recent check 11.25.25 ✅ |
+| [Manga3asq](https://3asq.org) | recent check 11.25.25 ✅ |
+| [MangaBin](https://mangabin.com) | recent check 11.25.25 ✅ |
+| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](#mangabuddy-mirrors) |
+| [mangaclash.com](https://toonclash.com) | cloudflare protection currently, not working 💨 |
+| [MangaCrazy](https://mangacrazy.net) | recent check 11.25.25 ✅ |
+| [mangadex.org](https://mangadex.org) | recent check 11.25.25 ✅ · Supports scanlation group selection |
+| [mangafire.to](https://mangafire.to) | recent check 11.25.25 ✅ · Supports multiple languages |
+| [mangafoxfull.com](https://mangafoxfull.com) | currently offline ⛓️‍💥 |
+| [mangagg.com](https://mangagg.com) | chapter filter broken ⛔️ |
+| [mangagojo.com](https://mangagojo.com) | recent check 11.25.25 ✅ |
+| [mangahub.io](https://mangahub.io) | recent check 11.25.25 ✅ |
+| [MangaKakalot / Manganato family](https://www.manganato.gg) | recent check 11.25.25 ✅ · See [mirror list](#mangakakalot--manganato-mirrors) |
+| [MangaLc](https://manga-lc.net) | recent check 11.25.25 ✅ |
+| [mangaleveling.com](https://mangaleveling.com) | currently offline ⛓️‍💥 |
+| [mangaonlineteam.com](https://mangaonlineteam.com) | currently offline ⛓️‍💥 |
+| [mangaowl.io](https://mangaowl.io) | recent check 11.25.25 ✅ |
+| [mangapark.net](https://mangapark.net) | image selection not working ⛔️ |
+| [mangapill.com](https://mangapill.com) | recent check 11.25.25 ✅ |
+| [mangaread.co](https://mangaread.co) | only first image downloads due to page style being default ⛔️ |
+| [mangaread.org](https://www.mangaread.org) | recent check 11.25.25 ✅ |
+| [mangareader.to](https://mangareader.to) | slug detect broken ⛔️ |
+| [MangaRomance](https://mangaromance19.com) | recent check 11.25.25 ✅ |
+| [MangaSehri](https://manga-sehri.com) | recent check 11.25.25 ✅ |
+| [mangasushi.org](https://mangasushi.org) | recent check 11.25.25 ✅ |
+| [mangataro.org](https://mangataro.org) | recent check 11.25.25 ✅ · Supports scanlation group selection |
+| [mangatone.com](https://mangatone.com) | currently offline ⛓️‍💥 |
+| [MangaTRNet](https://mangatr.app) | recent check 11.25.25 ✅ |
+| [MangaTuk](https://mangatuk.com) | recent check 11.25.25 ✅ |
+| [mangatxunoriginal.com](https://mangaempress.com) | currently offline ⛓️‍💥 |
+| [mangatyun.com](https://mangatoto.com) | rently offline ⛓️‍💥 |
+| [MangaWOW](https://mangawow.org) | recent check 11.25.25 ✅ |
+| [Manhatic](https://manhatic.com) | recent check 11.25.25 ✅ |
 | [manhuaaz.com](https://manhuaaz.com) |  |
 | [manhuaes.com](https://manhuaes.com) |  |
-| [manhuafast.com](https://manhuafast.com) | tested ✅ |
-| [manhuafast.net](https://manhuafast.net) | tested ✅ |
+| [manhuafast.com](https://manhuafast.com) | recent check 11.25.25 ✅ |
+| [manhuafast.net](https://manhuafast.net) | recent check 11.25.25 ✅ |
 | [manhuaga.org](https://manhua-ga.org) |  |
 | [manhuahot.com](https://manhuahot.com) |  |
 | [manhuanext.com](https://manhuanext.com) |  |
-| [manhuaplus.com](https://manhuaplus.com) | tested ✅ |
-| [Manhuarm](https://manhuarmmtl.com) | tested ✅ |
-| [manhuascan.us](https://manhuascan.us) | tested ✅ |
+| [manhuaplus.com](https://manhuaplus.com) | recent check 11.25.25 ✅ |
+| [Manhuarm](https://manhuarmmtl.com) | recent check 11.25.25 ✅ |
+| [manhuascan.us](https://manhuascan.us) | recent check 11.25.25 ✅ |
 | [manhuatop.org](https://manhuatop.org) |  |
-| [manhuaus.com](https://manhuaus.com) | tested ✅ |
+| [manhuaus.com](https://manhuaus.com) | recent check 11.25.25 ✅ |
 | [manhuazonghe.com](https://www.manhuazonghe.com) |  |
 | [manhwa18.org](https://manhwa18.org) |  |
 | [manhwa68.com](https://manhwa68.com) |  |
@@ -175,116 +145,115 @@
 | [manhwas.men](https://manhwas.men) |  |
 | [manhwatoon.me](https://www.manhwatoon.me) |  |
 | [manhwatop.com](https://manhwatop.com) |  |
-| [manhwax.top](https://manhwax.top) | tested ✅ · Series: https://manhwax.top/manga/backseat-trip-with-my-stepmother/ |
+| [manhwax.top](https://manhwax.top) | recent check 11.25.25 ✅ · Series: https://manhwax.top/manga/backseat-trip-with-my-stepmother/ |
 | [manycomic.com](https://manycomic.com) |  |
 | [manytoon.com](https://manytoon.com) |  |
 | [manytoon.me](https://manytoon.me) |  |
-| [mihentai.net](https://mihentai.net) | tested ✅ |
-| [MilaSub](https://www.milascan.com) | tested ✅ |
+| [mihentai.net](https://mihentai.net) | recent check 11.25.25 ✅ |
+| [MilaSub](https://www.milascan.com) | recent check 11.25.25 ✅ |
 | [milftoon.xxx](https://milftoon.xxx) |  |
-| [MonteTai](https://montetaiscanlator.xyz) | tested ✅ |
-| [MRYaoi](https://mrtenzus.com) | tested ✅ |
-| [MugiwarasOficial](https://mugiwarasoficial.com) | tested ✅ |
-| [MundoManhwa](https://mundomanhwa.com) | tested ✅ |
+| [MonteTai](https://montetaiscanlator.xyz) | recent check 11.25.25 ✅ |
+| [MRYaoi](https://mrtenzus.com) | recent check 11.25.25 ✅ |
+| [MugiwarasOficial](https://mugiwarasoficial.com) | recent check 11.25.25 ✅ |
+| [MundoManhwa](https://mundomanhwa.com) | recent check 11.25.25 ✅ |
 | [murimscan.com](https://www.deatte5.com) |  |
-| [nikatoons.com](https://nikatoons.com) | tested ✅ |
-| [NinjaScan](https://ninjacomics.xyz) | tested ✅ |
-| [NiveraFansub](https://niverafansub.org) | tested ✅ |
-| [Noblesse Translations](https://nobledicion.yoveo.xyz) | tested ✅ |
-| [NocturneSummer](https://nocfsb.com) | tested ✅ |
-| [NoIndexScan](https://noindexscan.com) | tested ✅ |
+| [nikatoons.com](https://nikatoons.com) | recent check 11.25.25 ✅ |
+| [NinjaScan](https://ninjacomics.xyz) | recent check 11.25.25 ✅ |
+| [NiveraFansub](https://niverafansub.org) | recent check 11.25.25 ✅ |
+| [Noblesse Translations](https://nobledicion.yoveo.xyz) | recent check 11.25.25 ✅ |
+| [NocturneSummer](https://nocfsb.com) | recent check 11.25.25 ✅ |
+| [NoIndexScan](https://noindexscan.com) | recent check 11.25.25 ✅ |
 | [novelcrow.com](https://novelcrow.com) |  |
 | [novelmic.com](https://novelmic.com) |  |
-| [noxenscan.com](https://noxenscan.com) | tested ✅ |
-| [PantheonScan](https://pantheon-scan.com) | tested ✅ |
-| [ParadiseBL](https://paradise-bl.com) | tested ✅ |
+| [noxenscan.com](https://noxenscan.com) | recent check 11.25.25 ✅ |
+| [PantheonScan](https://pantheon-scan.com) | recent check 11.25.25 ✅ |
+| [ParadiseBL](https://paradise-bl.com) | recent check 11.25.25 ✅ |
 | [paritehaber.com](https://www.paritehaber.com) |  |
 | [pawmanga.com](https://pawmanga.com) |  |
 | [petrotechsociety.org](https://www.petrotechsociety.org) |  |
-| [PiedPiperFansubyy](https://piedpiperfansubyy.me) | tested ✅ |
+| [PiedPiperFansubyy](https://piedpiperfansubyy.me) | recent check 11.25.25 ✅ |
 | [platinumcrown.com](https://platinumscans.com) |  |
 | [plutoscans.com](https://flamescans.lol) |  |
 | [pomanga.com](https://pomanga.com) |  |
 | [porncomix.online](https://porncomix.online) |  |
-| [rackusreads.com](https://rackusreads.com) | tested ✅ |
-| [ragescans.com](https://ragescans.com) | tested ✅ |
-| [RagnarokScanlation](https://ragnarokscanlation.org) | tested ✅ |
-| [ravenscans.com](https://ravenscans.com) | tested ✅ |
-| [RawDEX](https://rawdex.net) | tested ✅ |
-| [razure.org](https://razure.org) | tested ✅ |
+| [rackusreads.com](https://rackusreads.com) | recent check 11.25.25 ✅ |
+| [ragescans.com](https://ragescans.com) | recent check 11.25.25 ✅ |
+| [RagnarokScanlation](https://ragnarokscanlation.org) | recent check 11.25.25 ✅ |
+| [ravenscans.com](https://ravenscans.com) | recent check 11.25.25 ✅ |
+| [RawDEX](https://rawdex.net) | recent check 11.25.25 ✅ |
+| [razure.org](https://razure.org) | recent check 11.25.25 ✅ |
 | [rdscans.com](https://rdscans.com) |  |
 | [readfreecomics.com](https://readfreecomics.com) |  |
 | [readmangafree.net](https://readmangafree.net) |  |
 | [resetscans.org](https://reset-scans.org) |  |
-| [restscans.com](https://restscans.com) | tested ✅ |
+| [restscans.com](https://restscans.com) | recent check 11.25.25 ✅ |
 | [retsu.org](https://retsu.org) |  |
-| [RichtoScan](https://r1.richtoon.top) | tested ✅ |
-| [rizzcomic.com](https://rizzcomic.com) | tested ✅ |
-| [rizzfables.com](https://rizzfables.com) | tested ✅ |
-| [rokaricomics.com](https://rokaricomics.com) | tested ✅ |
+| [RichtoScan](https://r1.richtoon.top) | recent check 11.25.25 ✅ |
+| [rizzcomic.com](https://rizzcomic.com) | recent check 11.25.25 ✅ |
+| [rizzfables.com](https://rizzfables.com) | recent check 11.25.25 ✅ |
+| [rokaricomics.com](https://rokaricomics.com) | recent check 11.25.25 ✅ |
 | [rosesquadscans.com](https://rosesquadscans.aishiteru.org) |  |
-| [RuyaManga](https://www.ruyamanga2.com) | tested ✅ |
+| [RuyaManga](https://www.ruyamanga2.com) | recent check 11.25.25 ✅ |
 | [s2manga.com](https://s2manga.com) |  |
 | [sectscans.com](https://sectscans.com) |  |
-| [SeitaCelestial](https://seitacelestial.com) | tested ✅ |
-| [SeraphicDeviltryFactory (Multi-language)](https://spanish.seraphic-deviltry.com) | tested ✅ |
+| [SeitaCelestial](https://seitacelestial.com) | recent check 11.25.25 ✅ |
+| [SeraphicDeviltryFactory (Multi-language)](https://spanish.seraphic-deviltry.com) | recent check 11.25.25 ✅ |
 | [setsuscans.com](https://setsuscans.com) |  |
 | [shibamanga.com](https://shibamanga.com) |  |
 | [shootingstarscans.com](https://shootingstarscans.com) |  |
-| [silentquill.net](https://silentquill.net) | tested ✅ |
+| [silentquill.net](https://silentquill.net) | recent check 11.25.25 ✅ |
 | [sitemanga.com](https://sitemanga.com) |  |
-| [skymanga.work](https://skymanga.work) | tested ✅ |
+| [skymanga.work](https://skymanga.work) | recent check 11.25.25 ✅ |
 | [sleepytranslations.com](https://sleepytranslations.com) |  |
 | [spiderscans.xyz](https://spiderscans.xyz) |  |
 | [spmanhwa.online](https://spmanhwa.online) |  |
-| [elftoon.com](https://elftoon.com) | tested ✅ |
-| [sweetmanhwa.online](https://sweetmanhwa.online) | tested ✅ · Series: https://sweetmanhwa.online/manga/the-castle-ghost-eyed-bride/ |
+| [elftoon.com](https://elftoon.com) | recent check 11.25.25 ✅ |
+| [sweetmanhwa.online](https://sweetmanhwa.online) | recent check 11.25.25 ✅ · Series: https://sweetmanhwa.online/manga/the-castle-ghost-eyed-bride/ |
 | [stonescape.xyz](https://stonescape.xyz) |  |
 | [summanga.com](https://summanga.com) |  |
-| [SummerToon](https://summertoons.com) | tested ✅ |
-| [TankouHentai](https://tankouhentai.com) | tested ✅ |
-| [tappytoon.net](https://tappytoon.net) |  |
-| [TatakaeScan](https://tatakaescan.com) | tested ✅ |
-| [tcbonepiecechapters.com](https://tcbonepiecechapters.com) | tested ✅ |
-| [TercoScans (tecnoxmoon.xyz)](https://tecnoxmoon.xyz) | tested ✅ |
-| [TerritorioLealtad](https://territorioleal.com) | tested ✅ |
+| [SummerToon](https://summertoons.com) | recent check 11.25.25 ✅ |
+| [TankouHentai](https://tankouhentai.com) | recent check 11.25.25 ✅ |
+| [TatakaeScan](https://tatakaescan.com) | recent check 11.25.25 ✅ |
+| [tcbonepiecechapters.com](https://tcbonepiecechapters.com) | recent check 11.25.25 ✅ |
+| [TercoScans (tecnoxmoon.xyz)](https://tecnoxmoon.xyz) | recent check 11.25.25 ✅ |
+| [TerritorioLealtad](https://territorioleal.com) | recent check 11.25.25 ✅ |
 | [theblank.net](https://theblank.net) |  |
-| [TiaManhwa](https://tiamanhwa.com) | tested ✅ |
-| [TimeNaight](https://timenaight.org) | tested ✅ |
-| [TonizuToon](https://tonizu.top) | tested ✅ |
+| [TiaManhwa](https://tiamanhwa.com) | recent check 11.25.25 ✅ |
+| [TimeNaight](https://timenaight.org) | recent check 11.25.25 ✅ |
+| [TonizuToon](https://tonizu.top) | recent check 11.25.25 ✅ |
 | [toonchill.com](https://toonchill.com) |  |
 | [toongod.org](https://www.toongod.org) |  |
-| [toonily.com](https://toonily.com) | tested ✅ |
+| [toonily.com](https://toonily.com) | recent check 11.25.25 ✅ |
 | [toonizy.com](https://toonizy.com) |  |
-| [TopComicPorno](https://topcomicporno.com) | tested ✅ |
+| [TopComicPorno](https://topcomicporno.com) | recent check 11.25.25 ✅ |
 | [topmanhua.net](https://topmanhua.net) |  |
-| [TopManhua](https://mangatop.org) | tested ✅ |
+| [TopManhua](https://mangatop.org) | recent check 11.25.25 ✅ |
 | [topreadmanhwa.com](https://topreadmanhwa.com) |  |
 | [tritiniascans.com](https://tritinia.org) |  |
-| [TruyenTranhDamMy](https://truyentranhdammyy.site) | tested ✅ |
-| [TruyenVN](https://truyenvn.shop) | tested ✅ |
-| [TurkceMangaOku](https://trmangaoku.com) | tested ✅ |
+| [TruyenTranhDamMy](https://truyentranhdammyy.site) | recent check 11.25.25 ✅ |
+| [TruyenVN](https://truyenvn.shop) | recent check 11.25.25 ✅ |
+| [TurkceMangaOku](https://trmangaoku.com) | recent check 11.25.25 ✅ |
 | [utoon.net](https://utoon.net) |  |
-| [violetscans.org](https://violetscans.org) | tested ✅ |
-| [VerManhwas](https://vermanhwa.com) | tested ✅ |
-| [voyce.me](https://voyce.me) | tested ✅ |
+| [violetscans.org](https://violetscans.org) | recent check 11.25.25 ✅ |
+| [VerManhwas](https://vermanhwa.com) | recent check 11.25.25 ✅ |
+| [voyce.me](https://voyce.me) | recent check 11.25.25 ✅ |
 | [vyvymanga.org](https://vyvymanga.org) |  |
 | [wearehunger.site](https://www.wearehunger.site) |  |
 | [webdexscans.com](https://webdexscans.com) |  |
 | [webniichan.online](https://webniichan.online) |  |
-| [WebtoonHatti](https://webtoonhatti.club) | tested ✅ |
+| [WebtoonHatti](https://webtoonhatti.club) | recent check 11.25.25 ✅ |
 | [webtoonscan.com](https://webtoonscan.com) |  |
-| [WebtoonTR](https://webtoontr.net) | tested ✅ |
+| [WebtoonTR](https://webtoontr.net) | recent check 11.25.25 ✅ |
 | [webtoonxyz.com](https://www.webtoon.xyz) |  |
 | [weebcentral.com](https://weebcentral.com) | Supports scanlation group selection |
 | [whalemanga.com](https://whalemanga.com) |  |
-| [witchscans.com](https://witchscans.com) | tested ✅ |
+| [witchscans.com](https://witchscans.com) | recent check 11.25.25 ✅ |
 | [woopread.com](https://woopread.com) |  |
 | [wuxiaworld.site](https://wuxiaworld.site) |  |
-| [XManga](https://x-manga.org) | tested ✅ |
+| [XManga](https://x-manga.org) | recent check 11.25.25 ✅ |
 | [yakshacomics.com](https://yakshacomics.com) |  |
 | [yakshascans.com](https://yakshascans.com) |  |
-| [Yaoibar](https://yaoibar.gay) | tested ✅ |
+| [Yaoibar](https://yaoibar.gay) | recent check 11.25.25 ✅ |
 | [yaoihub.com](https://yaoihub.com) |  |
 | [yaoiscan.com](https://yaoiscan.com) |  |
 | [yaoitoon.com](https://yaoitoon.com) |  |
@@ -295,7 +264,7 @@
 | [zinmanga.org](https://mangazin.org) |  |
 | [zinmangacom.com](https://zin-manga.com) |  |
 | [zinmanganet.com](https://zinmanga.net) |  |
-| [zscans.com](https://zscans.com) | tested ✅ |
+| [zscans.com](https://zscans.com) | recent check 11.25.25 ✅ |
 
 ## Bato mirrors
 

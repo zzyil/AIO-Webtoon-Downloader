@@ -1,21 +1,20 @@
-# AIO Webtoon & Light Novel Downloader 📚
+# AIO Webtoon Downloader 📚
 
 > [!IMPORTANT]
-> comick.io has ceased providing any media themselves. This project now targets multiple other platforms with the same feature set—thanks for sticking around!
+> comick.io seems to have been shutdown. Once a new platform establishes itself I will rewrite this project for said platform, thank you for your support everybody!
 
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/) [![GNU GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), manga, comics and light novels from [mangataro.org](https://mangataro.org), [mangafire.to](https://mangafire.to), [bato.to](https://bato.to), [asuracomic.net](https://asuracomic.net), [weebcentral.com](https://weebcentral.com), [manganato.gg](https://www.manganato.gg), [comix.to](https://comix.to) & many others, and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
+The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and manga from [comick.io](https://comick.io) and package them into **PDF**, **EPUB**, or **CBZ**—with intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
 
-![AIO Webtoon & Light Novel Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/main/AIO.png?raw=true)
+![AIO Webtoon Downloader Banner](https://github.com/zzyil/AIO-Webtoon-Downloader/blob/main/comick_downloader.png?raw=true)
 
 
 ## 📑 Table of Contents
 
 - [🚀 Features](#-features)  
 - [🛠️ Requirements](#%EF%B8%8F-requirements)  
-- [🌐 Supported Sites](#-supported-sites)
 - [🧰 Installation](#-installation)  
 - [🚀 Usage](#-usage)  
 - [⚙️ Options](#%EF%B8%8F-options)  
@@ -36,16 +35,12 @@ The most versatile, feature-rich & customizable command-line tool to download we
   Download specific chapters, ranges (`1-5`), or lists (`1,3,5-7`).
 - 🏷️ **Scanlation Group Control**  
   Prioritize your favorite scanlation group(s), or choose by highest upvotes.
-- 🖼️ **Smart Page Processing**  
-  Resize, scale, recombine, and compress image chapters. Webtoon strips stay continuous; page-style scans keep their page layout.
+- 🖼️ **Image Processing**  
+  Resize, scale, recombine, and compress images for optimal reading.
 - 🚫 **No-Processing Mode**  
   Package raw pages as-is into PDF/EPUB/CBZ (skip all resizing/recombining/scaling) via `--no-processing`.
 - 📁 **Multiple Formats**  
   Export as PDF, fixed-layout EPUB, vertical-scroll EPUB, or CBZ.
-- 📚 **Light-Novel Friendly**  
-  Detects prose chapters automatically—EPUB embeds true XHTML pages, PDF outputs selectable text, CBZ renders text blocks as images, and `--format none` saves plain `.txt` chapters.
-- 🧼 **Clean Chapter Content**  
-  Automatically strips Mangataro boilerplate (group avatars, site banners, copyright notices) so only true page content lands in your book.
 - 🔄 **Resumable Downloads**  
   Automatically picks up where it left off if interrupted.
 - ✂️ **Book Splitting**  
@@ -103,13 +98,11 @@ Notes:
 
 ---
 
-
-
 ## 🧰 Installation
 
 ```bash
-git clone https://github.com/zzyil/comick.io-Downloader.git
-cd comick.io-Downloader
+git clone https://github.com/zzyil/AIO-Webtoon-Downloader.git
+cd AIO-Webtoon-Downloader
 python3 -m pip install -r requirements.txt
 ```
 
@@ -121,37 +114,37 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 
 | Site | Notes | Integration Status |
 | ----- | ----- | ----- |
-| [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | tested ✅  |
+| [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | recent check 11.25.25 ✅  |
 | [atsu.moe](https://atsu.moe) |  | currently unavailable |
-| [bato.to](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) | tested ✅  |
-| [comix.to](https://comix.to) | Supports multiple scanlation groups | tested ✅  |
-| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | tested ✅  |
-| [flamecomics.xyz](https://flamecomics.xyz) |  | tested ✅  |
+| [bato.to](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
+| [comix.to](https://comix.to) | Supports multiple scanlation groups | recent check 11.25.25 ✅  |
+| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 11.25.25 ✅  |
+| [flamecomics.xyz](https://flamecomics.xyz) |  | recent check 11.25.25 ✅  |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |  |
-| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | tested ✅  |
-| [mangadex.org](https://mangadex.org) | Supports scanlation group selection | tested ✅ |
-| [mangafire.to](https://mangafire.to) | Supports multiple languages | tested ✅  |
-| [mangahub.io](https://mangahub.io) |  | tested ✅ |
-| [MangaKakalot / Manganato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) | tested ✅  |
-| [mangataro.org](https://mangataro.org) | Supports scanlation group selection | tested ✅ |
-| [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | tested ✅ |
+| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
+| [mangadex.org](https://mangadex.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
+| [mangafire.to](https://mangafire.to) | Supports multiple languages | recent check 11.25.25 ✅  |
+| [mangahub.io](https://mangahub.io) |  | recent check 11.25.25 ✅ |
+| [MangaKakalot / Manganato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
+| [mangataro.org](https://mangataro.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
+| [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | recent check 11.25.25 ✅ |
 | [manhuaga.org](https://manhua-ga.org) |  | currently unavailable |
-| [manhuaplus.com](https://manhuaplus.com) |  | tested ✅  |
-| [manhuaus.com](https://manhuaus.com) |  | tested ✅  |
-| [razure.org](https://razure.org) | light-novel support | tested ✅  |
-| [tcbonepiecechapters.com](https://tcbonepiecechapters.com) |  | tested ✅  |
-| [violetscans.org](https://violetscans.org) |  | tested ✅  |
-| [weebcentral.com](https://weebcentral.com) | Supports scanlation group selection | tested ✅  |
+| [manhuaplus.com](https://manhuaplus.com) |  | recent check 11.25.25 ✅  |
+| [manhuaus.com](https://manhuaus.com) |  | recent check 11.25.25 ✅  |
+| [razure.org](https://razure.org) | light-novel support | recent check 11.25.25 ✅  |
+| [tcbonepiecechapters.com](https://tcbonepiecechapters.com) |  | recent check 11.25.25 ✅  |
+| [violetscans.org](https://violetscans.org) |  | recent check 11.25.25 ✅  |
+| [weebcentral.com](https://weebcentral.com) | Supports scanlation group selection | recent check 11.25.25 ✅  |
 
 ---
 
 ## 🚀 Usage
 
 ```bash
-python3 aio-dl.py [OPTIONS] COMIC_URL
+python3 comick_downloader.py [OPTIONS] COMIC_URL
 ```
 
-Run `python3 aio-dl.py --help` for the full option list.
+Run `python3 comick_downloader.py --help` for the full option list.
 
 ---
 
@@ -159,7 +152,7 @@ Run `python3 aio-dl.py --help` for the full option list.
 
 | Option                        | Description                                                                                                                                                                                                                  | Default     |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| `COMIC_URL`                   | URL of the manga’s main page (e.g. `https://mangataro.org/manga/shadow-slave`)                                                                                                                                               | _required_  |
+| `COMIC_URL`                   | URL of the comic’s main page (e.g. `https://comick.io/comic/demo-comic`)                                                                                                                                                     | _required_  |
 | `--cookies STRING`            | HTTP cookie string for restricted content (e.g. `key1=val1; key2=val2`)                                                                                                                                                     | `""`        |
 | `--group STRING...`           | Preferred scanlation groups (comma-separated or multiple args).                                                                                                                                                              | `[]`        |
 | `--mix-by-upvote`             | When multiple `--group` entries exist, pick the version with the highest upvotes among them.                                                                                                                                 | `False`     |
@@ -185,17 +178,17 @@ Run `python3 aio-dl.py --help` for the full option list.
 
 ## 🔐 Cookie Setup
 
-If authentication is required, export your cookies as a single quoted string:
+If authentication is required, export your cookies:
 
 ```bash
-export COOKIES='session_token=…; another_cookie=…'
+export COOKIES='ads_provider2="…"; membership_alert=true; …'
 ```
 
-Then run (adding `--site` if auto-detection ever fails):
+Then run:
 
 ```bash
 python3 aio-dl.py --site mangataro --cookies "$COOKIES" \
-  "https://mangataro.org/manga/shadow-slave"
+  "https://awesome-webtoon.url/series/name"
 ```
 
 ---
@@ -206,80 +199,73 @@ python3 aio-dl.py --site mangataro --cookies "$COOKIES" \
 
    ```bash
    python3 aio-dl.py \
-     --site mangataro \
      --group Asura \
      --chapters "1-2" \
      --format epub \
      --epub-layout page \
      --verbose \
-     "https://mangataro.org/manga/re-zero-kara-hajimeru-isekai-seikatsu"
+     "https://awesome-webtoon.url/series/name"
    ```
 
 2. **Vertical EPUB**, chapters 1–20, split every 5 chapters, verbose & debug:
 
    ```bash
    python3 aio-dl.py \
-     --site mangataro \
      --chapters "1-20" \
      --format epub \
      --epub-layout vertical \
      --split 5ch \
      --verbose --debug \
-     "https://mangataro.org/manga/shadow-slave"
+     "https://awesome-webtoon.url/series/name"
    ```
 
-3. **Asura PDF**, chapters 1–2 from a series page:
+3. **CBZ**, chapters 1–2, one chapter per file:
 
    ```bash
    python3 aio-dl.py \
-     --site asura \
      --chapters "1-2" \
      --format pdf \
-     "https://asuracomic.net/series/regression-of-the-yong-clan-heir-9c9e0572"
+     "https://awesome-webtoon.url/series/name"
    ```
 
 4. **CBZ**, chapters 1–2, one chapter per file:
 
    ```bash
    python3 aio-dl.py \
-     --site mangataro \
      --chapters "1-2" \
      --format cbz \
      --keep-chapters \
-     "https://mangataro.org/manga/shadow-slave"
+     "https://awesome-webtoon.url/series/name"
    ```
 
-5. **PDF**, chapters 1–2, save each chapter separately:
+4. **PDF**, chapters 1–2, save each chapter separately:
 
    ```bash
    python3 aio-dl.py \
-     --site mangataro \
      --chapters "1-2" \
      --format pdf \
      --keep-chapters \
-     "https://mangataro.org/manga/re-zero-kara-hajimeru-isekai-seikatsu"
+     "https://awesome-webtoon.url/series/name"
    ```
 
-6. **Light-novel EPUB** (prose converted to XHTML, no image slicing):
+5. **Raw CBZ**, chapters 1–50 (no resizing/recombining/scaling):
 
    ```bash
    python3 aio-dl.py \
-    --site mangataro \
     --chapters "1-5" \
      --format epub \
      --epub-layout page \
-     "https://mangataro.org/manga/re-zero-kara-hajimeru-isekai-seikatsu"
+     "https://awesome-webtoon.url/series/name"
    ```
 
 7. **Raw CBZ** (pages copied as-is):
 
    ```bash
    python3 aio-dl.py \
-     --site mangataro \
      --chapters "1-50" \
      --format cbz \
      --no-processing \
-     "https://mangataro.org/manga/shadow-slave"
+     "https://awesome-webtoon.url/series/name"
    ```
 
 ---
@@ -370,26 +356,12 @@ This tool is provided strictly for educational purposes and to help you create p
 
 1. Fork the repo  
 2. Create a feature branch (`git checkout -b feature/foo`)  
-3. Test your update (where possible)  
-   - macOS (Apple Silicon): [`test_scripts/python_version_tester.sh`](test_scripts/python_version_tester.sh) automatically spins up per-version virtualenvs after installing missing `python@X.Y` formulae via Homebrew (pyenv is optional but supported).  
-   - Otherwise: run targeted unit/download tests that exercise your change.
+3. Test your update with `/test_scripts/python_version_tester.sh`
 4. Commit (`git commit -m "Add foo"`)  
 5. Push (`git push origin feature/foo`)  
 7. Open a Pull Request  
 
 Please follow the existing style and include tests where applicable.
-
-> Tip: The multi-version test script expects Homebrew to provide `python@X.Y`. If you're on another platform, mimic that matrix with your package manager or pyenv so we keep coverage consistent.
-
-### Madara handler regression sweep
-
-Use [`test_scripts/run_madara_site_tests.py`](test_scripts/run_madara_site_tests.py) to load every domain in [`madara_sites_urls.txt`](madara_sites_urls.txt), grab a random series from the homepage, and execute the [`test_scripts/test_new_sites.py`](test_scripts/test_new_sites.py) flow for that URL. Example:
-
-```bash
-python3 test_scripts/run_madara_site_tests.py --shuffle --max-sites 25
-```
-
-The script prints two rollups: (1) domains that successfully returned comic data and images, and (2) domains that need manual inspection (missing handlers, failing requests, no chapters/images, etc.).
 
 ---
 
