@@ -145,7 +145,7 @@
 | [manhwas.men](https://manhwas.men) |  |
 | [manhwatoon.me](https://www.manhwatoon.me) |  |
 | [manhwatop.com](https://manhwatop.com) |  |
-| [manhwax.top](https://manhwax.top) | recent check 11.25.25 ✅ · Series: https://manhwax.top/manga/backseat-trip-with-my-stepmother/ |
+| [manhwax.top](https://manhwax.top) | recent check 11.25.25 ✅ |
 | [manycomic.com](https://manycomic.com) |  |
 | [manytoon.com](https://manytoon.com) |  |
 | [manytoon.me](https://manytoon.me) |  |
@@ -208,7 +208,7 @@
 | [spiderscans.xyz](https://spiderscans.xyz) |  |
 | [spmanhwa.online](https://spmanhwa.online) |  |
 | [elftoon.com](https://elftoon.com) | recent check 11.25.25 ✅ |
-| [sweetmanhwa.online](https://sweetmanhwa.online) | recent check 11.25.25 ✅ · Series: https://sweetmanhwa.online/manga/the-castle-ghost-eyed-bride/ |
+| [sweetmanhwa.online](https://sweetmanhwa.online) | recent check 11.25.25 ✅ |
 | [stonescape.xyz](https://stonescape.xyz) |  |
 | [summanga.com](https://summanga.com) |  |
 | [SummerToon](https://summertoons.com) | recent check 11.25.25 ✅ |
