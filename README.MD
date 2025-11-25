@@ -1,20 +1,21 @@
-# AIO Webtoon Downloader 📚
+# AIO Webtoon & Light Novel Downloader 📚
 
 > [!IMPORTANT]
-> comick.io seems to have been shutdown. Once a new platform establishes itself I will rewrite this project for said platform, thank you for your support everybody!
+> comick.io has ceased providing any media themselves. This project now targets multiple other platforms with the same feature set—thanks for sticking around!
 
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/) [![GNU GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), comics and manga from [comick.io](https://comick.io) and package them into **PDF**, **EPUB**, or **CBZ**—with intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
+The most versatile, feature-rich & customizable command-line tool to download webtoons (manhwa), manga, comics and light novels from [mangataro.org](https://mangataro.org), [mangafire.to](https://mangafire.to), [bato.to](https://bato.to), [asuracomic.net](https://asuracomic.net), [weebcentral.com](https://weebcentral.com), [manganato.gg](https://www.manganato.gg), [comix.to](https://comix.to) & many others, and package them into **PDF**, **EPUB**, **CBZ**, or raw chapter bundles—complete with light-novel aware text handling, intelligent image processing, resumable downloads, scanlation group prioritization, and optional chapter/file-size splitting.
 
-![AIO Webtoon Downloader Banner](https://github.com/zzyil/AIO-Webtoon-Downloader/blob/main/comick_downloader.png?raw=true)
+![AIO Webtoon & Light Novel Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/main/AIO.png?raw=true)
 
 
 ## 📑 Table of Contents
 
 - [🚀 Features](#-features)  
 - [🛠️ Requirements](#%EF%B8%8F-requirements)  
+- [🌐 Supported Sites](#-supported-sites)
 - [🧰 Installation](#-installation)  
 - [🚀 Usage](#-usage)  
 - [⚙️ Options](#%EF%B8%8F-options)  
@@ -35,12 +36,16 @@ The most versatile, feature-rich & customizable command-line tool to download we
   Download specific chapters, ranges (`1-5`), or lists (`1,3,5-7`).
 - 🏷️ **Scanlation Group Control**  
   Prioritize your favorite scanlation group(s), or choose by highest upvotes.
-- 🖼️ **Image Processing**  
-  Resize, scale, recombine, and compress images for optimal reading.
+- 🖼️ **Smart Page Processing**  
+  Resize, scale, recombine, and compress image chapters. Webtoon strips stay continuous; page-style scans keep their page layout.
 - 🚫 **No-Processing Mode**  
   Package raw pages as-is into PDF/EPUB/CBZ (skip all resizing/recombining/scaling) via `--no-processing`.
 - 📁 **Multiple Formats**  
   Export as PDF, fixed-layout EPUB, vertical-scroll EPUB, or CBZ.
+- 📚 **Light-Novel Friendly**  
+  Detects prose chapters automatically—EPUB embeds true XHTML pages, PDF outputs selectable text, CBZ renders text blocks as images, and `--format none` saves plain `.txt` chapters.
+- 🧼 **Clean Chapter Content**  
+  Automatically strips Mangataro boilerplate (group avatars, site banners, copyright notices) so only true page content lands in your book.
 - 🔄 **Resumable Downloads**  
   Automatically picks up where it left off if interrupted.
 - ✂️ **Book Splitting**  
@@ -98,6 +103,8 @@ Notes:
 
 ---
 
+
+
 ## 🧰 Installation
 
 ```bash
@@ -136,15 +143,16 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [violetscans.org](https://violetscans.org) |  | recent check 11.25.25 ✅  |
 | [weebcentral.com](https://weebcentral.com) | Supports scanlation group selection | recent check 11.25.25 ✅  |
 
+
 ---
 
 ## 🚀 Usage
 
 ```bash
-python3 comick_downloader.py [OPTIONS] COMIC_URL
+python3 aio-dl.py [OPTIONS] COMIC_URL
 ```
 
-Run `python3 comick_downloader.py --help` for the full option list.
+Run `python3 aio-dl.py --help` for the full option list.
 
 ---
 
@@ -152,7 +160,7 @@ Run `python3 comick_downloader.py --help` for the full option list.
 
 | Option                        | Description                                                                                                                                                                                                                  | Default     |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| `COMIC_URL`                   | URL of the comic’s main page (e.g. `https://comick.io/comic/demo-comic`)                                                                                                                                                     | _required_  |
+| `COMIC_URL`                   | URL of the manga’s main page (e.g. `https://awesome-webtoon.url/series/name`)                                                                                                                                               | _required_  |
 | `--cookies STRING`            | HTTP cookie string for restricted content (e.g. `key1=val1; key2=val2`)                                                                                                                                                     | `""`        |
 | `--group STRING...`           | Preferred scanlation groups (comma-separated or multiple args).                                                                                                                                                              | `[]`        |
 | `--mix-by-upvote`             | When multiple `--group` entries exist, pick the version with the highest upvotes among them.                                                                                                                                 | `False`     |
@@ -178,10 +186,10 @@ Run `python3 comick_downloader.py --help` for the full option list.
 
 ## 🔐 Cookie Setup
 
-If authentication is required, export your cookies:
+If authentication is required, export your cookies as a single quoted string:
 
 ```bash
-export COOKIES='ads_provider2="…"; membership_alert=true; …'
+export COOKIES='session_token=…; another_cookie=…'
 ```
 
 Then run:
@@ -356,7 +364,9 @@ This tool is provided strictly for educational purposes and to help you create p
 
 1. Fork the repo  
 2. Create a feature branch (`git checkout -b feature/foo`)  
-3. Test your update with `/test_scripts/python_version_tester.sh`
+3. Test your update (where possible)  
+   - macOS (Apple Silicon): [`test_scripts/python_version_tester.sh`](test_scripts/python_version_tester.sh) automatically spins up per-version virtualenvs after installing missing `python@X.Y` formulae via Homebrew (pyenv is optional but supported).  
+   - Otherwise: run targeted unit/download tests that exercise your change.
 4. Commit (`git commit -m "Add foo"`)  
 5. Push (`git push origin feature/foo`)  
 7. Open a Pull Request  
