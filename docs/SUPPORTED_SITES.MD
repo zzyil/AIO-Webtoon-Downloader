@@ -168,7 +168,6 @@
 | [manhuazonghe.com](https://www.manhuazonghe.com) |  |
 | [manhwa18.org](https://manhwa18.org) |  |
 | [manhwa68.com](https://manhwa68.com) |  |
-| [manhwaclan.com](https://manhwaclan.com) |  |
 | [manhwaden.com](https://www.manhwaden.com) |  |
 | [manhwahentai.me](https://manhwahentai.me) |  |
 | [manhwahentai.to](https://manhwahentai.to) |  |

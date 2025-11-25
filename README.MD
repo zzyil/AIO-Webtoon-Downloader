@@ -137,7 +137,6 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection |  |
 | [manhuafast.net](https://manhuafast.net) |  |  |
 | [manhuaga.org](https://manhua-ga.org) |  |  |
-| [manhwaclan.com](https://manhwaclan.com) |  |  |
 | [manhuaplus.com](https://manhuaplus.com) |  | tested ✅  |
 | [manhuaus.com](https://manhuaus.com) |  | tested ✅  |
 | [razure.org](https://razure.org) | light-novel support | tested ✅  |

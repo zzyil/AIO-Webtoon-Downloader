@@ -144,7 +144,6 @@ MADARA_EXTRA_SITES = [
     ('manhuazonghe', 'https://www.manhuazonghe.com'),
     ('manhwa18org', 'https://manhwa18.org'),
     ('manhwa68', 'https://manhwa68.com'),
-    ('manhwaclan', 'https://manhwaclan.com'),
     ('manhwaden', 'https://www.manhwaden.com'),
     ('manhwahentai', 'https://manhwahentai.to'),
     ('manhwahentaime', 'https://manhwahentai.me'),
