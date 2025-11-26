@@ -122,17 +122,20 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | Site | Notes | Integration Status |
 | ----- | ----- | ----- |
 | [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | recent check 11.25.25 ✅  |
-| [atsu.moe](https://atsu.moe) |  | currently unavailable ⚠️ |
-| [bato.to](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
+| [Atsumaru / atsu.moe](https://atsu.moe) |  | recent check 11.26.25 ✅ |
+| [BATO.to](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
 | [comix.to](https://comix.to) | Supports multiple scanlation groups | recent check 11.25.25 ✅  |
 | [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 11.25.25 ✅  |
 | [flamecomics.xyz](https://flamecomics.xyz) |  | recent check 11.25.25 ✅  |
+| [galaxymanga.io](https://galaxymanga.io) | | recent check 11.25.25 ✅ |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) | currently untested due to .wvd requirement ⚠️ |
+| [kingofshojo.com](https://kingofshojo.com) | | recent check 11.25.25 ✅ |
 | [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
 | [mangadex.org](https://mangadex.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
 | [mangafire.to](https://mangafire.to) | Supports multiple languages | recent check 11.25.25 ✅  |
 | [mangahub.io](https://mangahub.io) |  | recent check 11.25.25 ✅ |
-| [MangaKakalot / Manganato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
+| [MangaKakalot / MangaNato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
+| [MangaPark](https://www.mangapark.net) | See [mirror list](docs/SUPPORTED_SITES.MD) |  |
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
 | [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | recent check 11.25.25 ✅ |
 | [manhuaga.org](https://manhua-ga.org) |  | currently unavailable ⚠️ |
