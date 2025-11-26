@@ -9,12 +9,6 @@ Each site can have custom settings:
 
 MANGATHEMESIA_SITES = [
     {
-        "name": "flonescans",
-        "display_name": "FloneScans",
-        "base_url": "https://sweetmanhwa.online",
-        "domains": ("sweetmanhwa.online", "www.sweetmanhwa.online"),
-    },
-    {
         "name": "erosscans",
         "display_name": "ErosScans",
         "base_url": "https://erosvoid.xyz",
