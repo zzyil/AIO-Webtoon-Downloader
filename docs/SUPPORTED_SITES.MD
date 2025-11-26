@@ -32,7 +32,7 @@
 | [Emperor Scan](https://emperorscan.mundoalterno.org) | recent check 11.26.25 ✅ |
 | [erosvoid.xyz](https://erosvoid.xyz) | recent check 11.25.25 ✅ Mirror: [erosxsun.xyz](https://erosxsun.xyz) |
 | [evilflowers.com](https://evilflowers.com) | image selection not working ⛔️ |
-| [fanfox.net](https://fanfox.net) | chapter filter broken ⛔️ · Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) — both bare and `www.` variants |
+| [fanfox.net](https://fanfox.net) | recent check 11.26.25 ✅ · Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) — both bare and `www.` variants |
 | [firescans.xyz](https://firescans.xyz) | image selection not working ⛔️ |
 | [flamecomics.xyz](https://flamecomics.xyz) | recent check 11.25.25 ✅ |
 | [FlowerMangaDotNet](https://flowermanga.net) | recent check 11.26.25 ✅ |

@@ -125,7 +125,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [Atsumaru / atsu.moe](https://atsu.moe) |  | recent check 11.26.25 ✅ |
 | [**BATO.to**](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
 | [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 11.26.25 ✅  |
-| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 11.25.25 ✅  |
+| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 11.26.25 ✅  |
 | [flamecomics.xyz](https://flamecomics.xyz) |  | recent check 11.25.25 ✅  |
 | [galaxymanga.io](https://galaxymanga.io) | | recent check 11.25.25 ✅ |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) | currently untested due to .wvd requirement ⚠️ |
