@@ -170,7 +170,7 @@
 | [topreadmanhwa.com](https://topreadmanhwa.com) | SSL Error ⛔️ |
 | [tritiniascans.com](https://tritinia.org) | recent check 11.26.25 ✅ |
 | [TurkceMangaOku](https://trmangaoku.com) | chapter filter broken ⛔️ |
-| [utoon.net](https://utoon.net) |chapter filter broken ⛔️ |
+| [utoon.net](https://utoon.net) |recent check 11.26.25 ✅ |
 | [violetscans.org](https://violetscans.org) | recent check 11.26.25 ✅ |
 | [voyce.me](https://voyce.me) | chapter filter broken ⛔️ |
 | [vyvymanga.org](https://vyvymanga.org) | currently offline ⛓️‍💥 |
