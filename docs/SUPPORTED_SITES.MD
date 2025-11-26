@@ -24,7 +24,7 @@
 | [CeriseScan](https://loverstoon.com) | chapter filter broken ⛔️ |
 | [cocomic.co](https://cocomic.co) | currently offline ⛓️‍💥 |
 | [coffeemanga.io](https://coffeemanga.io) | recent check 11.26.25 ✅ · Mirror: [coffeemanga.ink](https://coffeemanga.ink) |
-| [comix.to](https://comix.to) | image selection not working ⛔️ · Supports scanlation group selection |
+| [comix.to](https://comix.to) | recent check 11.26.25 ✅  · Supports scanlation group selection |
 | [culturedworks.com](https://culturedworks.com) | recent check 11.26.25 ✅ |
 | [darkscans.net](https://darkscans.net) | currently offline ⛓️‍💥 |
 | [decadencescans.com](https://reader.decadencescans.com) | only first image downloads due to page style being default ⛔️ |

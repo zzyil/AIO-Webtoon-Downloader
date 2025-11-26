@@ -23,45 +23,83 @@ class ComixSiteHandler(BaseSiteHandler):
     def _extract_next_data(self, html: str) -> List[Any]:
         """Extracts data pushed to self.__next_f."""
         data = []
-        # Regex to find self.__next_f.push calls
-        # Matches: self.__next_f.push([1, "string"])
-        # We capture the list content
-        matches = re.findall(r'self\.__next_f\.push\(\[(.*?)\]\)', html)
-        for match in matches:
-            try:
-                # The match is like: 1, "string"
-                # We wrap it in brackets to make it a valid JSON list: [1, "string"]
-                # But the string might contain escaped quotes, so simple wrapping might fail if not careful.
-                # However, the match is a string representation of arguments.
-                # Let's try to parse it as a JSON array if we can.
-                # Since it's JS code, it might not be valid JSON (e.g. single quotes).
-                # But looking at the HAR, it uses double quotes.
+        
+        # Robust parsing instead of regex
+        search_str = 'self.__next_f.push(['
+        start_idx = 0
+        
+        while True:
+            idx = html.find(search_str, start_idx)
+            if idx == -1:
+                break
+            
+            # Start parsing from after 'self.__next_f.push(['
+            content_start = idx + len(search_str)
+            current_idx = content_start
+            
+            balance = 1 # We are inside the first [
+            in_string = False
+            escape = False
+            
+            while current_idx < len(html):
+                char = html[current_idx]
                 
-                # A safer way might be to extract the string part.
-                # The format seems to be: index, "string_content"
-                parts = match.split(',', 1)
-                if len(parts) == 2:
-                    json_str = parts[1].strip()
-                    if json_str.startswith('"') and json_str.endswith('"'):
-                        # It's a JSON string. Deserialize it.
-                        inner_str = json.loads(json_str)
-                        # The inner string often starts with "c:" or similar prefixes for React Server Components
-                        # e.g. "c:[\"$\",\"$L15\",null,{\"manga\":{...}}]"
-                        if inner_str.startswith('c:'):
-                            inner_json = inner_str[2:]
-                            try:
-                                data.append(json.loads(inner_json))
-                            except json.JSONDecodeError:
-                                pass
-                        elif inner_str.startswith('0:'):
-                             # Sometimes it's 0:{"P":null,...}
-                            inner_json = inner_str[2:]
-                            try:
-                                data.append(json.loads(inner_json))
-                            except json.JSONDecodeError:
-                                pass
-            except Exception:
-                continue
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif char == '\\':
+                        escape = True
+                    elif char == '"':
+                        in_string = False
+                else:
+                    if char == '"':
+                        in_string = True
+                    elif char == '[':
+                        balance += 1
+                    elif char == ']':
+                        balance -= 1
+                        if balance == 0:
+                            break
+                
+                current_idx += 1
+            
+            if balance == 0:
+                # We found the matching closing bracket
+                arg_content = html[content_start:current_idx]
+                
+                # Try to parse as JSON list
+                try:
+                    # Wrap in brackets to make it a valid JSON list
+                    json_str = f"[{arg_content}]"
+                    args = json.loads(json_str)
+                    
+                    if len(args) >= 2:
+                        data_str = args[1]
+                        if isinstance(data_str, str):
+                            # Parse the inner string
+                            if data_str.startswith('c:'):
+                                inner_json = data_str[2:]
+                                try:
+                                    data.append(json.loads(inner_json))
+                                except json.JSONDecodeError:
+                                    pass
+                            elif data_str.startswith('0:'):
+                                inner_json = data_str[2:]
+                                try:
+                                    data.append(json.loads(inner_json))
+                                except json.JSONDecodeError:
+                                    pass
+                            else:
+                                # Try parsing directly if it looks like JSON
+                                try:
+                                    data.append(json.loads(data_str))
+                                except json.JSONDecodeError:
+                                    pass
+                except (json.JSONDecodeError, Exception):
+                    pass
+            
+            start_idx = idx + 1
+
         return data
 
     def _find_key_recursive(self, obj: Any, key: str) -> Any:
@@ -104,22 +142,49 @@ class ComixSiteHandler(BaseSiteHandler):
         html = response.text
         soup = BeautifulSoup(html, "html.parser")
         
-        # Extract Next.js data
-        next_data = self._extract_next_data(html)
+        # First, extract hash_id from URL
+        hash_id = None
+        path = urlparse(url).path
+        parts = path.split('/')
+        if len(parts) >= 3 and parts[1] == 'title':
+            slug_part = parts[2]
+            if '-' in slug_part:
+                hash_id = slug_part.split('-')[0]
+            else:
+                hash_id = slug_part
         
         manga_data = None
-        for item in next_data:
-            found = self._find_key_recursive(item, "manga")
-            if found:
-                manga_data = found
-                break
+        
+        # Try to fetch from API endpoint if we have hash_id
+        if hash_id:
+            try:
+                api_url = f"https://comix.to/api/v2/manga/{hash_id}"
+                api_response = make_request(api_url, scraper)
+                api_data = api_response.json()
+                
+                if api_data.get("status") == 200 and api_data.get("result"):
+                    manga_data = api_data["result"]
+                    # Ensure hid is set
+                    if "hid" not in manga_data:
+                        manga_data["hid"] = manga_data.get("hash_id", hash_id)
+            except Exception:
+                # API failed, fall back to HTML extraction
+                pass
+        
+        # Fallback: Extract Next.js data from HTML
+        if not manga_data:
+            next_data = self._extract_next_data(html)
+            
+            for item in next_data:
+                found = self._find_key_recursive(item, "manga")
+                if found:
+                    manga_data = found
+                    break
         
         if not manga_data:
-            # Fallback: try to find it in the raw HTML if regex failed
-            # Look for "manga_id":
+            # Fallback: try to find it in the raw HTML
             match = re.search(r'"manga_id":(\d+)', html)
             if match:
-                # If we found manga_id, we might be able to find the hash_id too
                 hash_match = re.search(r'"hash_id":"([^"]+)"', html)
                 title_match = re.search(r'"title":"([^"]+)"', html)
                 if hash_match and title_match:
@@ -131,20 +196,14 @@ class ComixSiteHandler(BaseSiteHandler):
                     }
 
         if not manga_data:
-             # Try to extract from URL if all else fails
-             # URL: https://comix.to/title/0kx0d-eternally-regressing-knight
-             path = urlparse(url).path
-             parts = path.split('/')
-             if len(parts) >= 3 and parts[1] == 'title':
-                 slug_part = parts[2]
-                 if '-' in slug_part:
-                     hash_id = slug_part.split('-')[0]
-                     title = slug_part.split('-', 1)[1].replace('-', ' ').title()
-                     manga_data = {
-                         "hash_id": hash_id,
-                         "title": title,
-                         "hid": hash_id,
-                     }
+             # Last resort: extract basic info from URL
+             if hash_id:
+                 title = slug_part.split('-', 1)[1].replace('-', ' ').title() if '-' in slug_part else slug_part
+                 manga_data = {
+                     "hash_id": hash_id,
+                     "title": title,
+                     "hid": hash_id,
+                 }
 
         if not manga_data:
             raise RuntimeError("Could not find manga data in page.")
@@ -154,23 +213,15 @@ class ComixSiteHandler(BaseSiteHandler):
             if "hash_id" in manga_data:
                 manga_data["hid"] = manga_data["hash_id"]
             elif "slug" in manga_data:
-                # Try to extract from slug if hash_id is missing
-                # slug might be "0kx0d-eternally-regressing-knight"
                 slug = manga_data["slug"]
                 if "-" in slug:
                     manga_data["hid"] = slug.split("-")[0]
                 else:
-                    manga_data["hid"] = slug # Fallback
+                    manga_data["hid"] = slug
             else:
                 # Last resort: try to extract from URL
-                path = urlparse(url).path
-                parts = path.split('/')
-                if len(parts) >= 3 and parts[1] == 'title':
-                     slug_part = parts[2]
-                     if '-' in slug_part:
-                         manga_data["hid"] = slug_part.split('-')[0]
-                     else:
-                         manga_data["hid"] = slug_part
+                if hash_id:
+                    manga_data["hid"] = hash_id
 
         poster = manga_data.get("poster") or manga_data.get("_poster")
         if isinstance(poster, dict):
@@ -322,6 +373,29 @@ class ComixSiteHandler(BaseSiteHandler):
                  img_list_str = match.group(1)
                  # Extract URLs
                  images = re.findall(r'"(https?://[^"]+)"', img_list_str)
+
+        if not images:
+             # Fallback for escaped JSON (inside Next.js data string)
+             # Matches \"images\":[\"url1\", \"url2\"]
+             match = re.search(r'\\"images\\":\[(.*?)\]', html)
+             if match:
+                 img_list_str = match.group(1)
+                 # Extract URLs (unescaped)
+                 # The URLs will be like \"https://...\"
+                 # We need to capture the URL inside the escaped quotes
+                 # The regex r'\\"(https?://[^"]+)\\"' might fail if there are escaped chars inside the URL, but usually not.
+                 # Safer: unescape the whole string first
+                 try:
+                     # Add brackets to make it a valid JSON list string: ["url1", "url2"]
+                     # But img_list_str is like \"url1\",\"url2\"
+                     # So we wrap it in brackets and unescape quotes? No.
+                     # img_list_str is literally: \"https://...\",\"https://...\"
+                     # We can just replace \" with " and then parse as JSON list
+                     unescaped = "[" + img_list_str.replace('\\"', '"') + "]"
+                     images = json.loads(unescaped)
+                 except Exception:
+                     # Regex fallback for escaped
+                     images = re.findall(r'\\"(https?://[^"]+)\\"', img_list_str)
 
         if not images:
             raise RuntimeError("Could not find images in chapter page.")
