@@ -44,6 +44,7 @@ from .omegascans import OmegaScansSiteHandler
 from .rizzfables import RizzFablesSiteHandler
 from .tecnoxmoon import TecnoxmoonSiteHandler
 from .violetscans import VioletScansSiteHandler
+from .boratscans import BoratScansSiteHandler
 
 # MangaThemesia sites - unified handler
 from .mangathemesia import MangaThemesiaSiteHandler
@@ -91,6 +92,7 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     RizzFablesSiteHandler(),
     TecnoxmoonSiteHandler(),
     VioletScansSiteHandler(),
+    BoratScansSiteHandler(),
 )
 
 # Create MangaThemesia handlers from configuration

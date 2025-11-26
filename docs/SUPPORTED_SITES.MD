@@ -19,9 +19,8 @@
 | [Bato](https://bato.to) | recent check 11.25.25 ✅ · See [mirror list](#bato-mirrors) |
 | [BiblioPanda](https://bibliopanda.com) | image selection not working ⛔️ |
 | [BokugenTranslation](https://bokugents.com) | recent check 11.26.25 ✅ |
-| [boratscans.com](https://boratscans.com) | tested, cover cropped ⚠️ |
+| [boratscans.com](https://boratscans.com) | recent check 11.26.25 ✅ |
 | [BorutoExplorer](https://leitor.borutoexplorer.com.br) | image selection not working ⛔️ |
-| [CeriseScan](https://loverstoon.com) | chapter filter broken ⛔️ |
 | [cocomic.co](https://cocomic.co) | currently offline ⛓️‍💥 |
 | [coffeemanga.io](https://coffeemanga.io) | recent check 11.26.25 ✅ · Mirror: [coffeemanga.ink](https://coffeemanga.ink) |
 | [comix.to](https://comix.to) | recent check 11.26.25 ✅  · Supports scanlation group selection |

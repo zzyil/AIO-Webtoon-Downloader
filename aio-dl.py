@@ -2033,13 +2033,13 @@ def main():
 
     original_cover_path = None
     if args.format in ["epub", "cbz"]:
-        cover_url = None
-        if context.soup:
+        # Prefer handler's extracted cover first (more reliable, can be customized per-site)
+        # Fall back to og:image only if handler didn't provide one
+        cover_url = comic_data.get("cover") or comic_data.get("thumb")
+        if not cover_url and context.soup:
             cover_tag = context.soup.find("meta", property="og:image")
             if cover_tag and cover_tag.get("content"):
                 cover_url = cover_tag["content"]
-        if not cover_url:
-            cover_url = comic_data.get("cover") or comic_data.get("thumb")
         if cover_url:
             original_cover_path = dl_image(
                 cover_url, main_tmp_dir, "cover_orig.jpg", scraper, cleanup=not args.no_cleanup
