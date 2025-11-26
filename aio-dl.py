@@ -1923,6 +1923,11 @@ def main():
         num_str = ch.get("chap")
         if num_str is None:
             continue
+            
+        # Treat "Oneshot" as Chapter 1
+        if num_str and num_str.lower() in ("oneshot", "one-shot"):
+            num_str = "1"
+            
         try:
             float(num_str)
             if num_str not in chapters_by_num:
