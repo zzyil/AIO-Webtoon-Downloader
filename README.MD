@@ -138,7 +138,6 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [MangaPark](https://www.mangapark.net) | See [mirror list](docs/SUPPORTED_SITES.MD) |  |
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
 | [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | recent check 11.25.25 ✅ |
-| [manhuaga.org](https://manhua-ga.org) |  | currently unavailable ⚠️ |
 | [manhuaplus.com](https://manhuaplus.com) |  | recent check 11.25.25 ✅  |
 | [manhuaus.com](https://manhuaus.com) |  | recent check 11.25.25 ✅  |
 | [razure.org](https://razure.org) | light-novel support | recent check 11.25.25 ✅  |
