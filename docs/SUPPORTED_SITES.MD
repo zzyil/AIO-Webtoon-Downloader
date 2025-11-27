@@ -70,7 +70,7 @@
 | [Manga Crab](https://mangacrab.org) | recent check 11.26.25 ✅ |
 | [Manga3asq](https://3asq.org) | recent check 11.26.25 ✅ |
 | [MangaBin](https://mangabin.com) | image selection not working ⛔️ |
-| [mangabuddy.com](https://mangabuddy.com) | chapter filter broken ⛔️ · See [MangaBuddy mirrors](#mangabuddy-mirrors) |
+| [mangabuddy.com](https://mangabuddy.com) | recent check 11.27.25 ✅ · See [MangaBuddy mirrors](#mangabuddy-mirrors) |
 | [mangaclash.com](https://toonclash.com) | cloudflare protection currently, not working 💨 |
 | [mangadex.org](https://mangadex.org) | recent check 11.26.25 ✅ · Supports scanlation group selection |
 | [mangafire.to](https://mangafire.to) | recent check 11.26.25 ✅ · Supports multiple languages |
