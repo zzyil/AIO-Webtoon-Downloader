@@ -167,6 +167,9 @@ class MadaraSiteHandler(BaseSiteHandler):
                 href = link.get("href")
                 if not href:
                     continue
+                # Ensure URL is absolute (fixes Mangabuddy relative URLs)
+                href = urljoin(self.base_url, href)
+                
                 title = link.get_text(" ", strip=True)
                 date_node = node.select_one(".chapter-release-date, .chapter-release-time, .chapter-release > span")
                 date_text = date_node.get_text(strip=True) if date_node else None

@@ -112,8 +112,20 @@ class MangaFoxSiteHandler(BaseSiteHandler):
         soup = self._make_soup(response.text)
         slug = self._slug_from_url(url)
 
-        title_node = soup.select_one("h1.detail-info-title")
-        title = title_node.get_text(strip=True) if title_node else slug
+        # Title: try specific span first, then fallback to h1 or og:title
+        title_node = soup.select_one("span.detail-info-right-title-font")
+        if not title_node:
+            title_node = soup.select_one("h1.detail-info-title")
+        
+        title = title_node.get_text(strip=True) if title_node else None
+        
+        if not title:
+            og_title = soup.find("meta", property="og:title")
+            if og_title:
+                title = og_title.get("content")
+        
+        if not title:
+            title = slug
 
         info = soup.select_one(".detail-info-right")
         authors = []
@@ -141,6 +153,35 @@ class MangaFoxSiteHandler(BaseSiteHandler):
 
         return SiteComicContext(comic=comic, title=title, identifier=slug, soup=soup)
 
+    def _parse_chapter_number(self, name: str) -> str:
+        import re
+        
+        def normalize(num_str):
+            try:
+                val = float(num_str)
+                if val.is_integer():
+                    return str(int(val))
+                return str(val)
+            except ValueError:
+                return num_str
+
+        # Try "Vol.XX Ch.XX" or "Ch.XX" pattern (case insensitive)
+        match = re.search(r"(?:Vol\.\d+\s+)?Ch\.(\d+(?:\.\d+)?)", name, re.IGNORECASE)
+        if match:
+            return normalize(match.group(1))
+        
+        # Fallback: try to find just a number if it looks like a chapter e.g. "Chapter 123"
+        match = re.search(r"Chapter\s+(\d+(?:\.\d+)?)", name, re.IGNORECASE)
+        if match:
+            return normalize(match.group(1))
+            
+        # Fallback: try to find any float at the start of the string e.g. "123 - Title"
+        match = re.match(r"^(\d+(?:\.\d+)?)", name)
+        if match:
+            return normalize(match.group(1))
+
+        return name
+
     def get_chapters(
         self,
         context: SiteComicContext,
@@ -161,6 +202,10 @@ class MangaFoxSiteHandler(BaseSiteHandler):
                 continue
             title_node = anchor.select_one(".detail-main-list-main p")
             name = title_node.get_text(strip=True) if title_node else anchor.get_text(strip=True)
+            
+            # Parse the chapter number for the 'chap' field, but keep full name in 'title'
+            chap_num = self._parse_chapter_number(name)
+            
             date_node = anchor.select(".detail-main-list-main p")
             uploaded = 0
             if len(date_node) >= 2:
@@ -168,7 +213,7 @@ class MangaFoxSiteHandler(BaseSiteHandler):
             chapters.append(
                 {
                     "hid": href.rstrip("/"),
-                    "chap": name,
+                    "chap": chap_num,
                     "title": name,
                     "url": urljoin(source_url, href),
                     "uploaded": uploaded,
