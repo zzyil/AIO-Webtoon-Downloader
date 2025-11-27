@@ -252,21 +252,38 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         if not chapter_url:
             raise RuntimeError("Chapter missing URL.")
         base = chapter_url.rstrip("/")
-        images_url = f"{base}/images?is_prev=False&reading_style=long_strip"
+        # Ensure we request the full list
+        images_url = f"{base}/images?is_prev=False&current_page=1&reading_style=long_strip"
         response = make_request(images_url, scraper)
         soup = self._make_soup(response.text)
+        
         images: List[str] = []
-        for img in soup.select("section[x-data~=scroll] img"):
+        # The images usually have class "maw-w-full" (max-width: full)
+        # Fallback to all images if specific class not found, but filter out small icons
+        candidates = soup.select("img.maw-w-full") or soup.select("img")
+        
+        for img in candidates:
             src = img.get("src") or img.get("data-src")
             if not src:
                 continue
+            # Filter out likely non-content images based on keywords or size if possible
+            # But for now, just filtering by extension or path might be enough if needed.
+            # The inspection showed valid images are like .../0001-001.png
+            
             if src.startswith("//"):
                 src = "https:" + src
             elif src.startswith("/"):
                 src = urljoin(images_url, src)
             elif not src.startswith("http"):
                 src = urljoin(images_url, src)
-            images.append(src)
+            
+            # Basic filtering to avoid site logos/icons if we fell back to "img"
+            if "static/images" in src or "brand" in src:
+                continue
+                
+            if src not in images:
+                images.append(src)
+                
         if not images:
             raise RuntimeError("Unable to locate images for chapter.")
         return images

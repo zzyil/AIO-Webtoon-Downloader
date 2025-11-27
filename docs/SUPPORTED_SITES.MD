@@ -178,7 +178,7 @@
 | [webniichan.online](https://webniichan.online) | SSL Error ⛔️ |
 | [WebtoonHatti](https://webtoonhatti.club) | SSL Error ⛔️ |
 | [WebtoonTR](https://webtoontr.net) | recent check 11.26.25 ✅ |
-| [weebcentral.com](https://weebcentral.com) | image selection not working ⛔️ · Supports scanlation group selection |
+| [weebcentral.com](https://weebcentral.com) | recent check 11.27.25 ✅ · Supports scanlation group selection |
 | [whalemanga.com](https://whalemanga.com) | recent check 11.26.25 ✅ |
 | [witchscans.com](https://witchscans.com) | recent check 11.26.25 ✅ |
 | [woopread.com](https://woopread.com) | chapter filter broken ⛔️ |

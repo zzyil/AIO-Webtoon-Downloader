@@ -143,7 +143,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [razure.org](https://razure.org) | light-novel support | recent check 11.25.25 ✅  |
 | [utoon.net](https://utoon.net) | |recent check 11.26.25 ✅ |
 | [violetscans.org](https://violetscans.org) |  | recent check 11.26.25 ✅  |
-| [**weebcentral.com**](https://weebcentral.com) | Supports scanlation group selection | recent check 11.25.25 ✅  |
+| [**weebcentral.com**](https://weebcentral.com) | Supports scanlation group selection | recent check 11.27.25 ✅  |
 
 
 ---
