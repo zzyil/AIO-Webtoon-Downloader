@@ -206,16 +206,15 @@ class MangaDexSiteHandler(BaseSiteHandler):
         if not chapter_id:
             raise RuntimeError("MangaDex chapter missing identifier.")
         resp = make_request(f"{self._API_BASE}/at-home/server/{chapter_id}", scraper).json()
-        base_url = resp.get("baseUrl")
         chapter_data = resp.get("chapter") or {}
-        if not base_url or not chapter_data:
-            raise RuntimeError("MangaDex At-Home API returned incomplete data.")
         file_hash = chapter_data.get("hash")
         data = chapter_data.get("data")
         if not file_hash or not data:
             raise RuntimeError("MangaDex chapter payload missing image list.")
+        # Use uploads.mangadex.org (official CDN) as primary source;
+        # the at-home network node can 404 on cached images.
         return [
-            f"{base_url}/data/{file_hash}/{filename}"
+            f"{self._UPLOADS_BASE}/data/{file_hash}/{filename}"
             for filename in data
         ]
 

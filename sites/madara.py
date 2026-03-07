@@ -381,6 +381,23 @@ class MadaraSiteHandler(BaseSiteHandler):
             if ajax_soup:
                 chapters = self._collect_chapter_elements(ajax_soup)
 
+        # Fallback: try ajax/chapters/ POST directly on the page URL (e.g. utoon.net)
+        # Some sites render chapter links as href="#" and have no #manga-chapters-holder,
+        # but still support the standard Madara ajax/chapters/ endpoint.
+        if not chapters and page_url:
+            try:
+                headers = {
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": page_url,
+                    "Origin": self.base_url,
+                }
+                ajax_url = urljoin(page_url.rstrip("/") + "/", "ajax/chapters/")
+                response = scraper.post(ajax_url, headers=headers)
+                if response.status_code == 200 and len(response.text) > 100 and "wp-manga-chapter" in response.text:
+                    chapters = self._collect_chapter_elements(self._make_soup(response.text))
+            except Exception:
+                pass
+
         # Fallback: Try to extract from chapter selector dropdown (used by manytoon, etc.)
         if not chapters and page_url:
             chapters = self._extract_from_chapter_selector(soup, page_url)

@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SiteComicContext
-
+from .hardening import configure_throttling
 
 class AsuraSiteHandler(BaseSiteHandler):
     name = "asura"
@@ -27,9 +27,24 @@ class AsuraSiteHandler(BaseSiteHandler):
                     "Origin": "https://asuracomic.net",
                 }
             )
+        
+        # Asura is notoriously sensitive to bots (Cloudflare Turnstile + hidden captchas).
+        # We increase the page delays slightly to avoid "Are you human?" checks.
+        configure_throttling(
+            scraper,
+            domains=self.domains,
+            gaps={
+                "default": 1.5,
+                "ajax": 2.0,
+                "page": 3.0, # Highly restricted
+                "image": 0.5, # Images usually fine once pageloaded
+            },
+            jitter=1.0 # High jitter to look human
+        )
 
     # -- Helpers -----------------------------------------------------
     def _fetch_html(self, url: str, scraper, make_request) -> str:
+        # Patching handles the text fetching logic if using scraper.request
         response = make_request(url, scraper)
         response.encoding = response.encoding or "utf-8"
         return response.text

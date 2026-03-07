@@ -13,6 +13,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -24,6 +25,278 @@ from urllib.parse import urlparse, unquote_to_bytes
 
 from sites import get_handler_by_name, get_handler_for_url
 from sites.base import SiteComicContext
+
+
+# -----------------------------------------------------------
+# Cross-process folder allocation (avoid mixing same-title series)
+# -----------------------------------------------------------
+class _AIOFileLock:
+    """A tiny cross-platform exclusive file lock."""
+    def __init__(self, path: str):
+        self.path = path
+        self._fh = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._fh = open(self.path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                # Lock 1 byte at start of file
+                self._fh.seek(0)
+                try:
+                    self._fh.write(b"0")
+                    self._fh.flush()
+                except Exception:
+                    pass
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            # If locking fails for any reason, proceed without lock (best effort).
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._fh:
+                if os.name == "nt":
+                    import msvcrt
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            if self._fh:
+                self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+
+
+
+# -----------------------------------------------------------
+# Cross-process coordination (NET vs CPU pipelining, shared cooldown)
+# -----------------------------------------------------------
+import contextlib as _contextlib
+import uuid as _uuid
+
+_COORD = None  # set in main() if enabled
+_WORKER_ID = os.getenv("AIO_WORKER_ID", "").strip() or f"pid{os.getpid()}"
+_HEARTBEAT_FILE = os.getenv("AIO_HEARTBEAT_FILE", "").strip()
+_LAST_HB_WRITE = 0.0
+
+def _hb(phase: str, detail: str = "") -> None:
+    """Best-effort heartbeat for the supervisor (cross-process)."""
+    global _LAST_HB_WRITE
+    if not _HEARTBEAT_FILE:
+        return
+    now = time.time()
+    # Throttle writes to avoid excessive IO
+    if now - _LAST_HB_WRITE < 0.5 and phase not in ("start", "done", "error", "killed"):
+        return
+    _LAST_HB_WRITE = now
+    try:
+        os.makedirs(os.path.dirname(_HEARTBEAT_FILE) or ".", exist_ok=True)
+        payload = {
+            "ts": now,
+            "pid": os.getpid(),
+            "worker_id": _WORKER_ID,
+            "phase": phase,
+            "detail": (detail or "")[:300],
+        }
+        with open(_HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+
+class _AIOCoordinator:
+    """Coordinates request pacing + NET/CPU phases across processes via file locks."""
+
+    def __init__(self, coord_dir: str, net_min_gap: float = 0.25):
+        self.coord_dir = os.path.abspath(coord_dir)
+        os.makedirs(self.coord_dir, exist_ok=True)
+
+        self._net_lock = _AIOFileLock(os.path.join(self.coord_dir, "phase_net.lock"))
+        self._cpu_lock = _AIOFileLock(os.path.join(self.coord_dir, "phase_cpu.lock"))
+        self._state_lock = _AIOFileLock(os.path.join(self.coord_dir, "state.lock"))
+        self._state_path = os.path.join(self.coord_dir, "state.json")
+
+        self.net_min_gap = max(0.0, float(net_min_gap or 0.0))
+
+    def _read_state(self) -> Dict[str, Any]:
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {"cooldown_until": 0.0, "last_net_ts": 0.0}
+
+    def _write_state(self, data: Dict[str, Any]) -> None:
+        try:
+            tmp = self._state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self._state_path)
+        except Exception:
+            pass
+
+    def set_cooldown(self, seconds: float, reason: str = "") -> None:
+        if seconds <= 0:
+            return
+        until = time.time() + float(seconds)
+        with self._state_lock:
+            st = self._read_state()
+            if until > float(st.get("cooldown_until", 0.0) or 0.0):
+                st["cooldown_until"] = until
+                if reason:
+                    st["cooldown_reason"] = str(reason)[:120]
+                self._write_state(st)
+
+    def _wait_for_net_slot(self) -> None:
+        """Wait for shared cooldown and min-gap, then reserve a NET slot.
+
+        NOTE: We intentionally do *not* hold the NET phase file lock while sleeping.
+        Holding the lock while waiting can starve other workers and looks like a hang.
+        """
+        while True:
+            with self._state_lock:
+                st = self._read_state()
+                until = float(st.get("cooldown_until", 0.0) or 0.0)
+                last_ts = float(st.get("last_net_ts", 0.0) or 0.0)
+
+            now = time.time()
+            wait_cd = max(0.0, until - now)
+            wait_gap = 0.0
+            if self.net_min_gap > 0 and last_ts > 0:
+                wait_gap = max(0.0, (last_ts + self.net_min_gap) - now)
+
+            wait = max(wait_cd, wait_gap)
+            if wait <= 0:
+                break
+            time.sleep(min(wait, 1.0))
+
+        with self._state_lock:
+            st = self._read_state()
+            st["last_net_ts"] = time.time()
+            self._write_state(st)
+
+    @_contextlib.contextmanager
+    def net_phase(self, label: str = ""):
+        # Wait outside the NET phase lock so other processes are not blocked while idling.
+        self._wait_for_net_slot()
+        with self._net_lock:
+            if label:
+                _hb("net", label)
+            yield
+
+    @_contextlib.contextmanager
+    def cpu_phase(self, label: str = ""):
+        with self._cpu_lock:
+            if label:
+                _hb("cpu", label)
+            yield
+
+
+def _net_guard(label: str = ""):
+    if _COORD is None:
+        return _contextlib.nullcontext()
+    return _COORD.net_phase(label=label)
+
+
+def _cpu_guard(label: str = ""):
+    if _COORD is None:
+        return _contextlib.nullcontext()
+    return _COORD.cpu_phase(label=label)
+
+
+def _sanitize_folder_component(name: str) -> str:
+    # Windows-illegal chars and trim.
+    name = re.sub(r'[\\/*?:"<>|]', "", str(name or "")).strip()
+    # Keep spaces in folder names for readability; collapse weird whitespace.
+    name = re.sub(r"\s+", " ", name)
+    # Avoid trailing dots/spaces on Windows
+    name = name.rstrip(" .")
+    return name or "comic"
+
+
+def allocate_series_output_dir(title: str, hid: str, root: str = "comics") -> str:
+    """Choose a per-series output folder.
+
+    Normally uses: root/<title>
+    If that folder is already claimed by a different hid (or looks non-empty with unknown hid),
+    uses: root/<title> (hid=<hid>)
+
+    A hidden marker file stores the hid so multiple runs and multiple processes stay consistent.
+    """
+    clean_title = re.sub(r"\s*\(hid=[^)]+\)\s*$", "", str(title or "")).strip() or "comic"
+    base = _sanitize_folder_component(clean_title)
+    os.makedirs(root, exist_ok=True)
+    lock_path = os.path.join(root, ".aio_folder_alloc.lock")
+
+    def _marker_path(folder: str) -> str:
+        return os.path.join(folder, ".series_hid")
+
+    def _read_marker(folder: str) -> str | None:
+        mp = _marker_path(folder)
+        try:
+            if os.path.exists(mp):
+                with open(mp, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read().strip() or None
+        except Exception:
+            return None
+        return None
+
+    def _folder_nonempty(folder: str) -> bool:
+        try:
+            items = [x for x in os.listdir(folder) if x not in (".series_hid", ".DS_Store")]
+            return len(items) > 0
+        except Exception:
+            return False
+
+    def _write_marker(folder: str):
+        try:
+            with open(_marker_path(folder), "w", encoding="utf-8") as f:
+                f.write(str(hid))
+        except Exception:
+            pass
+
+    with _AIOFileLock(lock_path):
+        preferred = os.path.join(root, base)
+        if os.path.exists(preferred):
+            existing = _read_marker(preferred)
+            if existing == str(hid):
+                return preferred
+            # If unclaimed AND empty-ish, claim it.
+            if existing is None and not _folder_nonempty(preferred):
+                _write_marker(preferred)
+                return preferred
+            # Otherwise collision: add hid suffix.
+            candidate_base = _sanitize_folder_component(f"{clean_title} (hid={hid})")
+            candidate = os.path.join(root, candidate_base)
+            k = 2
+            while os.path.exists(candidate):
+                ex = _read_marker(candidate)
+                if ex == str(hid):
+                    return candidate
+                candidate = os.path.join(root, f"{candidate_base} ({k})")
+                k += 1
+            os.makedirs(candidate, exist_ok=True)
+            _write_marker(candidate)
+            return candidate
+
+        # Preferred does not exist: create and claim it.
+        os.makedirs(preferred, exist_ok=True)
+        _write_marker(preferred)
+        return preferred
 
 # cloudscraper is optional; fall back to requests.Session if unavailable
 try:
@@ -58,19 +331,84 @@ def log_debug(*args, **kwargs):
         print(*args, **kwargs)
 
 
+
 def make_request(url: str, scraper):
-    try:
-        r = scraper.get(url)
-        # Some sites (like madarascans.com) return 403 but still serve content
-        # Only fail if we got a real error (4xx/5xx) AND no content
-        if r.status_code >= 400:
-            if not r.text or len(r.text) < 100:
-                r.raise_for_status()
-            # Otherwise, log but continue (it's likely Cloudflare sending content with 403)
-            log_verbose(f"  Warning: Got status {r.status_code} but response has content, continuing...")
-        return r
-    except requests.exceptions.RequestException as e:
-        sys.exit(f"Request failed: {e}")
+    """HTTP GET with retries/backoff + cross-process shared cooldown."""
+    host = urlparse(url).netloc
+
+    max_retries = int(globals().get("_HTTP_MAX_RETRIES", 6))
+    timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
+    base = float(globals().get("_HTTP_BACKOFF_BASE", 1.0))
+    cap = float(globals().get("_HTTP_BACKOFF_CAP", 45.0))
+
+    last_exc = None
+    for attempt in range(max_retries):
+        _hb("request", f"{host} {url}")
+        _respect_rate_limit(host)
+
+        try:
+            with _net_guard(f"GET {host}"):
+                r = scraper.get(url, timeout=timeout)
+
+            if r.status_code >= 400:
+                txt = ""
+                try:
+                    txt = (r.text or "")[:250].lower()
+                except Exception:
+                    txt = ""
+                if _looks_like_rate_limit(r.status_code, txt):
+                    retry_after = 0.0
+                    try:
+                        ra = r.headers.get("Retry-After")
+                        if ra:
+                            retry_after = float(ra)
+                    except Exception:
+                        retry_after = 0.0
+
+                    delay = max(5.0, retry_after, min(cap, base * (2 ** attempt)))
+                    delay *= random.uniform(0.7, 1.3)
+
+                    _record_rate_limit(host, delay)
+                    _bump_polite_delay(host)
+                    if _COORD is not None:
+                        _COORD.set_cooldown(delay, reason=f"rate_limit:{r.status_code}")
+                    raise requests.exceptions.HTTPError(f"Rate limited ({r.status_code})", response=r)
+
+                if not r.text or len(r.text) < 100:
+                    r.raise_for_status()
+                log_verbose(
+                    f"  Warning: Got status {r.status_code} but response has content, continuing..."
+                )
+
+            _cool_polite_delay(host)
+            return r
+
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            status, snippet = _extract_error_info(e)
+            looks_rl = _looks_like_rate_limit(status, snippet)
+            retryable = _is_retryable_error(e) or looks_rl
+
+            if attempt < max_retries - 1 and retryable:
+                delay = min(cap, base * (2 ** attempt))
+                if looks_rl:
+                    delay = max(delay, 7.5)
+                delay *= random.uniform(0.5, 1.5)
+
+                if looks_rl:
+                    _record_rate_limit(host, delay)
+                    _bump_polite_delay(host)
+                    if _COORD is not None:
+                        _COORD.set_cooldown(delay, reason=f"rate_limit:{status}")
+
+                time.sleep(delay)
+                continue
+
+            raise
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Request failed without exception")
 
 
 def parse_size(size_str: str) -> int:
@@ -127,8 +465,10 @@ def is_chapter_wanted(chapter_num_float: float, range_spec: str) -> bool:
     for part in range_spec.split(","):
         part = part.strip()
         if "-" in part:
+            pieces = part.split("-", 1)
             try:
-                start, end = map(float, part.split("-"))
+                start = float(pieces[0]) if pieces[0].strip() else float("-inf")
+                end = float(pieces[1]) if pieces[1].strip() else float("inf")
                 if start <= chapter_num_float <= end:
                     return True
             except ValueError:
@@ -244,56 +584,82 @@ def _looks_like_rate_limit(status: Optional[int], body_snippet: str) -> bool:
         "slowdownread",
         "please slow down",
         "rate limit",
+        "error 1015",
+        "you are being rate limited",
+        "ray id",
+        "access denied",
     )
     body_lower = body_snippet or ""
     return any(token in body_lower for token in keywords)
+
 
 
 def _try_download_url(
     url, pth, name, scraper, max_retries, retry_delay, timeout=30
 ) -> Tuple[bool, Optional[requests.exceptions.RequestException]]:
     """Attempts to download a single URL with retries. Returns (success, last_error)."""
-
     host = urlparse(url).netloc
     last_error: Optional[requests.exceptions.RequestException] = None
 
     for attempt in range(max_retries):
+        _hb("download", f"{host} {os.path.basename(name)}")
         _respect_rate_limit(host)
+
         try:
-            r = scraper.get(url, stream=True, timeout=timeout)
-            r.raise_for_status()
-            with open(pth, "wb") as fh:
-                for chunk in r.iter_content(8192):
-                    fh.write(chunk)
+            with _net_guard(f"IMG {host}"):
+                # For image downloads, use a plain requests.Session with the scraper's
+                # User-Agent but without cloudscraper session cookies/state, which can
+                # cause external CDN hosts (e.g. WordPress) to hang or reject requests.
+                # Hardened (domain-patched) scrapers retain stream=True via scraper directly.
+                if getattr(scraper, "_hardening_patched", False):
+                    r = scraper.get(url, stream=True, timeout=timeout)
+                    r.raise_for_status()
+                    with open(pth, "wb") as fh:
+                        for chunk in r.iter_content(8192):
+                            if chunk:
+                                fh.write(chunk)
+                else:
+                    img_session = requests.Session()
+                    ua = (getattr(scraper, "headers", {}) or {}).get("User-Agent", "")
+                    if ua:
+                        img_session.headers["User-Agent"] = ua
+                    r = img_session.get(url, stream=True, timeout=timeout)
+                    r.raise_for_status()
+                    with open(pth, "wb") as fh:
+                        for chunk in r.iter_content(8192):
+                            if chunk:
+                                fh.write(chunk)
+
             _cool_polite_delay(host)
-            return True, None  # Success
+            return True, None
+
         except requests.exceptions.RequestException as e:
             last_error = e
-            log_verbose(
-                f"  Warning: Attempt {attempt + 1}/{max_retries} failed for {os.path.basename(name)} ({os.path.basename(url)}): {e}"
-            )
             status, body_snippet = _extract_error_info(e)
             retryable = _is_retryable_error(e)
             looks_rate_limited = _looks_like_rate_limit(status, body_snippet)
 
             if looks_rate_limited:
-                cooldown = max(3.0, min(20.0, retry_delay * (attempt + 1) * 2))
+                cooldown = max(5.0, min(45.0, float(retry_delay) * (attempt + 1) * 2.0))
                 log_verbose(
                     f"    Detected rate limiting from {host or 'remote host'}. Cooling down for {cooldown:.1f}s before retrying..."
                 )
                 _record_rate_limit(host, cooldown)
                 _bump_polite_delay(host)
+                if _COORD is not None:
+                    _COORD.set_cooldown(cooldown, reason=f"img_rate_limit:{status}")
 
-            if attempt < max_retries - 1 and retryable:
-                if not looks_rate_limited:
-                    delay = retry_delay * (2 ** attempt)
-                    time.sleep(delay)
+            if attempt < max_retries - 1 and (retryable or looks_rate_limited):
+                delay = min(45.0, float(retry_delay) * (2 ** attempt))
+                if looks_rate_limited:
+                    delay = max(delay, 6.0)
+                delay *= random.uniform(0.6, 1.4)
+                time.sleep(delay)
                 continue
+
             break
 
     return False, last_error
-
-
 def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) -> str:
     """
     Downloads an image using a sophisticated fallback chain with parallel attempts.
@@ -1537,7 +1903,8 @@ def build_book_part(
     end_chap = book_chapters[-1]["chap"]
     part_suffix = f"Ch_{start_chap}-{end_chap}"
     part_filename = f"{base_filename}_{part_suffix}"
-    out_dir = "comics"
+    out_dir = args.output_dir
+    os.makedirs(out_dir, exist_ok=True)
     title = comic_data["title"]
     part_title = f"{title} ({part_suffix})"
 
@@ -1549,7 +1916,8 @@ def build_book_part(
             if item.get("type") == "pdf"
         ]
         if pdf_inputs:
-            merge_pdf_files(
+            with _cpu_guard('merge_pdf'):
+                merge_pdf_files(
                 pdf_inputs,
                 final_path,
                 {
@@ -1565,8 +1933,9 @@ def build_book_part(
                 pass
 
     elif args.format == "epub":
-        final_path = os.path.join(out_dir, f"{part_filename}.epub")
-        build_epub(
+        final_path = os.path.join(getattr(args, "epub_dir", None) or out_dir, f"{part_filename}.epub")
+        with _cpu_guard('build_epub'):
+            build_epub(
             book_content,
             final_path,
             part_title,
@@ -1584,7 +1953,8 @@ def build_book_part(
             for item in book_content
             if item.get("type") == "image"
         ]
-        build_cbz(
+        with _cpu_guard('build_cbz'):
+            build_cbz(
             cbz_images,
             final_path,
             part_title,
@@ -1617,12 +1987,154 @@ def get_processing_params(args, calculated_width, calculated_aspect_ratio):
     }
 
 
+_SAVED_PARAMS_FILE = "download_params.json"
+_CH_FILE_RE = re.compile(r"[ _]Ch[ _](\d+)", re.IGNORECASE)
+
+
+def _scan_saved_params(root: str) -> List[Dict]:
+    """Scan *root* for subdirectories that contain a download_params.json."""
+    results = []
+    if not os.path.isdir(root):
+        return results
+    for entry in sorted(os.listdir(root)):
+        folder = os.path.join(root, entry)
+        params_file = os.path.join(folder, _SAVED_PARAMS_FILE)
+        if not os.path.isdir(folder) or not os.path.isfile(params_file):
+            continue
+        try:
+            with open(params_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        url = data.get("url")
+        if not url:
+            continue
+        # Detect highest existing chapter from files on disk
+        nums: set = set()
+        for fn in os.listdir(folder):
+            m = _CH_FILE_RE.search(fn)
+            if m:
+                nums.add(int(m.group(1)))
+        highest = 0
+        while (highest + 1) in nums:
+            highest += 1
+        results.append({
+            "title": data.get("title", entry),
+            "url": url,
+            "folder": folder,
+            "highest_chapter": highest,
+            "params": data,
+        })
+    return results
+
+
+def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
+    """Persist download settings so --update-all can resume later."""
+    data = {
+        "url": url,
+        "title": title,
+        "format": args.format,
+        "language": args.language,
+        "quality": args.quality,
+        "scaling": args.scaling,
+        "cookies": args.cookies or "",
+        "group": args.group or [],
+        "mix_by_upvote": args.mix_by_upvote,
+        "no_partials": args.no_partials,
+        "keep_images": args.keep_images,
+        "verbose": args.verbose,
+        "debug": args.debug,
+    }
+    if args.format == "epub":
+        data["epub_layout"] = args.epub_layout
+    path = os.path.join(out_dir, _SAVED_PARAMS_FILE)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        log_verbose(f"  Saved download parameters to {path}")
+    except Exception as e:
+        print(f"  Warning: could not save download parameters: {e}")
+
+
 # -----------------------------------------------------------
 # main
 # -----------------------------------------------------------
 def main():
     p = argparse.ArgumentParser("comic downloader")
-    p.add_argument("comic_url")
+    p.add_argument("comic_url", nargs="*", help="One or more comic/manga URLs")
+    p.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Download multiple URLs concurrently using separate processes (safe with Playwright). "
+             "When multiple URLs are provided, up to this many downloads run at once.",
+    )
+    p.add_argument(
+        "--prompt-urls",
+        action="store_true",
+        help="Prompt for multiple URLs on stdin (one per line). Finish with an empty line.",
+    )
+
+    p.add_argument(
+        "--coord-dir",
+        default=os.getenv("AIO_COORD_DIR", os.path.join("comics", ".aio_coord")),
+        help="Directory for cross-process coordination state/locks (default: comics/.aio_coord).",
+    )
+    p.add_argument(
+        "--net-min-gap",
+        type=float,
+        default=float(os.getenv("AIO_NET_MIN_GAP", "0.25")),
+        help="Minimum delay (seconds) between network request starts across processes (default: 0.25).",
+    )
+    p.add_argument(
+        "--job-stall-timeout",
+        type=int,
+        default=int(os.getenv("AIO_JOB_STALL_TIMEOUT", "900")),
+        help="In batch mode, kill+retry a worker if it hasn't updated its heartbeat in this many seconds (default: 900).",
+    )
+    p.add_argument(
+        "--job-hard-timeout",
+        type=int,
+        default=int(os.getenv("AIO_JOB_HARD_TIMEOUT", "0")),
+        help="In batch mode, kill+retry a worker if total runtime exceeds this many seconds (0 disables).",
+    )
+    p.add_argument(
+        "--job-retries",
+        type=int,
+        default=int(os.getenv("AIO_JOB_RETRIES", "3")),
+        help="In batch mode, retry a failed/stalled URL this many times before giving up (default: 3).",
+    )
+    p.add_argument(
+        "--job-spawn-gap",
+        type=float,
+        default=float(os.getenv("AIO_JOB_SPAWN_GAP", "1.5")),
+        help="Delay between launching worker processes to avoid bursty request patterns (default: 1.5s).",
+    )
+    p.add_argument(
+        "--http-timeout",
+        type=float,
+        default=float(os.getenv("AIO_HTTP_TIMEOUT", "30")),
+        help="HTTP timeout in seconds for HTML/AJAX requests (default: 30).",
+    )
+    p.add_argument(
+        "--http-max-retries",
+        type=int,
+        default=int(os.getenv("AIO_HTTP_MAX_RETRIES", "6")),
+        help="Max retries for HTML/AJAX requests (default: 6).",
+    )
+    p.add_argument(
+        "--http-backoff-base",
+        type=float,
+        default=float(os.getenv("AIO_HTTP_BACKOFF_BASE", "1.0")),
+        help="Base seconds for exponential backoff (default: 1.0).",
+    )
+    p.add_argument(
+        "--http-backoff-cap",
+        type=float,
+        default=float(os.getenv("AIO_HTTP_BACKOFF_CAP", "45")),
+        help="Max seconds for backoff sleep (default: 45).",
+    )
+
     p.add_argument(
         "--site",
         type=str,
@@ -1650,6 +2162,24 @@ def main():
         help="Skip chapters with partial numbers (e.g., 1.5, 60.1).",
     )
     p.add_argument("--chapters", default="all")
+
+
+    p.add_argument(
+        "--no-retry-missed-chapters",
+        action="store_true",
+        help="Disable end-of-run retry for chapters that failed to download/process.",
+    )
+    p.add_argument(
+        "--missed-retries",
+        type=int,
+        default=2,
+        help="Number of retry attempts per missed chapter at the end of the run (default: 2).",
+    )
+    p.add_argument(
+        "--missed-log",
+        default=None,
+        help="Optional path for the temporary missed-chapter log (default: tmp_<hid>/missed_chapters.json).",
+    )
     p.add_argument("--language", default="en")
     p.add_argument(
         "--format", choices=["pdf", "epub", "cbz", "none"], default="epub"
@@ -1668,6 +2198,25 @@ def main():
         type=str,
         default=None,
         help="Target W:H ratio for processing (e.g., '4:3'). Not used for PDF.",
+    )
+    p.add_argument(
+        "-o",
+        "--output-dir",
+        type=str,
+        default="comics",
+        help="Directory to place the final outputs (default: 'comics').",
+    )
+    p.add_argument(
+        "--epub-dir",
+        type=str,
+        default=None,
+        help="Optional override directory specifically for EPUB outputs.",
+    )
+    p.add_argument(
+        "--temp-dir",
+        type=str,
+        default=None,
+        help="Optional override base directory for temporary processing folders.",
     )
     p.add_argument(
         "--quality",
@@ -1729,7 +2278,300 @@ def main():
         help="Skip all image post-processing (resize, recombine, scaling). "
         "Builds formats directly from the raw downloaded images.",
     )
+    p.add_argument(
+        "--save-params",
+        action="store_true",
+        help="Save download parameters to the series output folder so future "
+        "runs can use --update-all to fetch new chapters automatically.",
+    )
+    p.add_argument(
+        "--update-all",
+        action="store_true",
+        help="Scan --output-dir for previously saved download parameters "
+        "(from --save-params) and download new chapters for each series.",
+    )
     args = p.parse_args()
+
+    # Apply tunables to module globals (used by make_request / dl_image)
+    globals()["_HTTP_TIMEOUT"] = float(getattr(args, "http_timeout", 30.0))
+    globals()["_HTTP_MAX_RETRIES"] = int(getattr(args, "http_max_retries", 6))
+    globals()["_HTTP_BACKOFF_BASE"] = float(getattr(args, "http_backoff_base", 1.0))
+    globals()["_HTTP_BACKOFF_CAP"] = float(getattr(args, "http_backoff_cap", 45.0))
+
+    # Coordinator setup (cross-process NET/CPU pipelining)
+    coord_dir = os.getenv("AIO_COORD_DIR", "").strip() or getattr(args, "coord_dir", "")
+    coord_enabled = os.getenv("AIO_COORD_ENABLED", "").strip() not in ("", "0", "false", "False")
+    if coord_enabled and coord_dir:
+        try:
+            globals()["_COORD"] = _AIOCoordinator(coord_dir=coord_dir, net_min_gap=float(getattr(args, "net_min_gap", 0.25)))
+        except Exception:
+            globals()["_COORD"] = None
+
+    _hb("start", "parsed_args")
+
+    # ------------------------------------------------------------------
+    # --update-all: scan output dir for saved params and build URL list
+    # ------------------------------------------------------------------
+    if args.update_all:
+        scan_root = os.path.abspath(args.output_dir)
+        saved_series = _scan_saved_params(scan_root)
+        if not saved_series:
+            sys.exit(f"No saved parameters found in {scan_root}. Run with --save-params first.")
+        print(f"[*] Found {len(saved_series)} saved series in {scan_root}")
+        # Build child commands for each series
+        jobs = max(1, int(getattr(args, "jobs", 1) or 1))
+        child_procs = []
+        for sp in saved_series:
+            highest_ch = sp["highest_chapter"]
+            if highest_ch > 0:
+                chapters_arg = f"{highest_ch + 1}-"
+                print(f"  {sp['title']}: resuming from chapter {highest_ch + 1}")
+            else:
+                chapters_arg = "all"
+                print(f"  {sp['title']}: downloading all chapters")
+            child_cmd = [
+                sys.executable, os.path.abspath(__file__), sp["url"],
+                "--chapters", chapters_arg,
+                "--format", sp["params"].get("format", "epub"),
+                "--language", sp["params"].get("language", "en"),
+                "--quality", str(sp["params"].get("quality", 85)),
+                "--scaling", str(sp["params"].get("scaling", 100)),
+                "--output-dir", scan_root,
+                "--save-params",
+                "--keep-chapters",
+            ]
+            if sp["params"].get("epub_layout"):
+                child_cmd += ["--epub-layout", sp["params"]["epub_layout"]]
+            if sp["params"].get("cookies"):
+                child_cmd += ["--cookies", sp["params"]["cookies"]]
+            if sp["params"].get("group"):
+                for g in sp["params"]["group"]:
+                    child_cmd += ["--group", g]
+            if sp["params"].get("mix_by_upvote"):
+                child_cmd.append("--mix-by-upvote")
+            if sp["params"].get("no_partials"):
+                child_cmd.append("--no-partials")
+            if sp["params"].get("keep_images"):
+                child_cmd.append("--keep-images")
+            if sp["params"].get("verbose"):
+                child_cmd.append("--verbose")
+            if sp["params"].get("debug"):
+                child_cmd.append("--debug")
+            child_procs.append((sp["title"], child_cmd))
+
+        failed = []
+        up_to_date = []
+        for title, cmd in child_procs:
+            print(f"\n{'='*60}")
+            print(f"Updating: {title}")
+            print(f"{'='*60}")
+            proc = subprocess.run(
+                cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
+                capture_output=True, text=True,
+            )
+            sys.stdout.write(proc.stdout)
+            sys.stderr.write(proc.stderr)
+            combined = proc.stdout + proc.stderr
+            if proc.returncode != 0:
+                if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
+                    up_to_date.append(title)
+                    print(f"  Already up to date.")
+                else:
+                    failed.append(title)
+
+        print(f"\n{'='*60}")
+        updated = len(child_procs) - len(failed) - len(up_to_date)
+        print(f"Update complete: {updated} updated, {len(up_to_date)} up-to-date, {len(failed)} failed")
+        if failed:
+            print(f"Failed: {', '.join(failed)}")
+        sys.exit(1 if failed else 0)
+
+    # ------------------------------------------------------------------
+    # Multi-URL / multi-job runner
+    # ------------------------------------------------------------------
+    urls: List[str] = list(args.comic_url) if isinstance(args.comic_url, list) else [str(args.comic_url)]
+    if args.prompt_urls:
+        # If prompt mode is enabled, read additional URLs from stdin.
+        print("[*] Paste one or more URLs (one per line). Submit an empty line to start.")
+        while True:
+            try:
+                line = input().strip()
+            except EOFError:
+                break
+            if not line:
+                break
+            urls.append(line)
+
+    # Basic validation
+    urls = [u for u in urls if u]
+    if not urls:
+        sys.exit("No URL provided. Pass a URL or use --prompt-urls.")
+
+        # If multiple URLs were provided, run them sequentially (jobs=1) or concurrently (jobs>1)
+    if len(urls) > 1:
+        jobs = max(1, int(getattr(args, "jobs", 1) or 1))
+        job_retries = max(0, int(getattr(args, "job_retries", 3) or 3))
+        stall_timeout = max(30, int(getattr(args, "job_stall_timeout", 900) or 900))
+        hard_timeout = max(0, int(getattr(args, "job_hard_timeout", 0) or 0))
+        spawn_gap = float(getattr(args, "job_spawn_gap", 1.5) or 1.5)
+
+        coord_dir = os.getenv("AIO_COORD_DIR", "").strip() or getattr(args, "coord_dir", "") or os.path.join("comics", ".aio_coord")
+        coord_dir = os.path.abspath(coord_dir)
+        hb_dir = os.path.join(coord_dir, "heartbeats")
+        os.makedirs(hb_dir, exist_ok=True)
+
+        failures_path = os.path.join(coord_dir, "batch_failures.json")
+
+        print(f"[*] Starting {len(urls)} downloads with up to {jobs} worker(s)...")
+        print(f"[*] Coordinator dir: {coord_dir}")
+
+        orig_argv = sys.argv[1:]
+        url_set = set(urls)
+
+        child_base: List[str] = []
+        skip_next = False
+        for tok in orig_argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in url_set:
+                continue
+            if tok == "--jobs":
+                skip_next = True
+                continue
+            if tok.startswith("--jobs="):
+                continue
+            if tok in ("--prompt-urls", "--prompt_urls"):
+                continue
+            child_base.append(tok)
+
+        if "--coord-dir" not in " ".join(child_base):
+            child_base.extend(["--coord-dir", coord_dir])
+        if "--net-min-gap" not in " ".join(child_base):
+            child_base.extend(["--net-min-gap", str(getattr(args, "net_min_gap", 0.25))])
+
+        def _load_failures() -> Dict[str, Any]:
+            try:
+                with open(failures_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+
+        def _save_failures(data: Dict[str, Any]) -> None:
+            try:
+                tmp = failures_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, failures_path)
+            except Exception:
+                pass
+
+        failures_db = _load_failures()
+        failures_db.setdefault("failed", [])
+        failures_db.setdefault("attempts", {})
+
+        queue: List[Dict[str, Any]] = [{"url": u, "attempt": int(failures_db["attempts"].get(u, 0))} for u in urls]
+        running: Dict[int, Dict[str, Any]] = {}
+
+        def _spawn(job: Dict[str, Any]):
+            worker_id = _uuid.uuid4().hex[:10]
+            hb_path = os.path.join(hb_dir, f"{worker_id}.json")
+            env = os.environ.copy()
+            env["AIO_COORD_DIR"] = coord_dir
+            env["AIO_COORD_ENABLED"] = "1" if jobs > 1 else "0"
+            env["AIO_WORKER_ID"] = worker_id
+            env["AIO_HEARTBEAT_FILE"] = hb_path
+            env["AIO_TARGET_URL"] = job["url"]
+
+            cmd = [sys.executable, sys.argv[0], *child_base, job["url"]]
+            p = subprocess.Popen(cmd, env=env)
+            running[p.pid] = {
+                "p": p,
+                "job": job,
+                "worker_id": worker_id,
+                "hb": hb_path,
+                "start": time.time(),
+            }
+            time.sleep(max(0.0, spawn_gap))
+
+        def _read_hb(path: str) -> Optional[Dict[str, Any]]:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else None
+            except Exception:
+                return None
+
+        completed = 0
+        while queue or running:
+            while queue and len(running) < jobs:
+                _spawn(queue.pop(0))
+
+            now = time.time()
+
+            for pid, info in list(running.items()):
+                p = info["p"]
+                rc = p.poll()
+                job = info["job"]
+                hb_path = info["hb"]
+                started = info["start"]
+
+                if hard_timeout and (now - started) > hard_timeout and rc is None:
+                    print(f"[!] Hard timeout. Killing worker pid={pid} for URL: {job['url']}")
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    rc = -9
+
+                hb = _read_hb(hb_path)
+                last_ts = float(hb.get("ts", 0.0)) if hb else 0.0
+                if rc is None and last_ts and (now - last_ts) > stall_timeout:
+                    print(f"[!] Stall detected (> {stall_timeout}s). Killing worker pid={pid} for URL: {job['url']}")
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    rc = -9
+
+                if rc is None:
+                    continue
+
+                running.pop(pid, None)
+                try:
+                    if os.path.exists(hb_path):
+                        os.remove(hb_path)
+                except Exception:
+                    pass
+
+                if rc == 0:
+                    completed += 1
+                    print(f"[*] Completed ({completed}/{len(urls)}): {job['url']}")
+                    continue
+
+                job["attempt"] = int(job.get("attempt", 0)) + 1
+                failures_db["attempts"][job["url"]] = job["attempt"]
+                if job["attempt"] <= job_retries:
+                    print(f"[!] Worker failed (rc={rc}) for URL: {job['url']} → retry {job['attempt']}/{job_retries}")
+                    queue.append(job)
+                else:
+                    print(f"[!] Giving up after {job_retries} retries: {job['url']}")
+                    failures_db["failed"].append({"url": job["url"], "rc": rc, "attempts": job["attempt"]})
+
+                _save_failures(failures_db)
+
+            if queue or running:
+                time.sleep(0.25)
+
+        if failures_db.get("failed"):
+            print(f"[!] Batch finished with failures. See: {failures_path}")
+            if completed == 0:
+                sys.exit(1)
+        return
+
+    # Single-URL mode: unwrap the list into a string for the rest of the script.
+    args.comic_url = urls[0]
 
     handler = resolve_site_handler(args.comic_url, args.site)
     if not handler:
@@ -1771,7 +2613,7 @@ def main():
         scraper = requests.Session()
     if args.cookies:
         scraper.cookies.update(
-            dict(kv.split("=", 1) for kv in args.cookies.split(";") if "=" in kv)
+            dict(kv.strip().split("=", 1) for kv in args.cookies.split(";") if "=" in kv)
         )
     handler.configure_session(scraper, args)
 
@@ -1786,9 +2628,19 @@ def main():
 
     comic_data = context.comic
     hid, title = context.identifier, context.title
+
+    # Defensive cleanup: in some setups the title string may already include
+    # a suffix like "(hid=xxxx)". We always want the folder/file naming base
+    # to exclude that suffix.
+    title = re.sub(r"\s*\(hid=[^)]+\)\s*$", "", str(title or "")).strip() or "comic"
     print(f"{title} (hid={hid})")
 
-    main_tmp_dir = os.path.abspath(f"tmp_{hid}")
+    temp_dir_base = getattr(args, "temp_dir", None)
+    if temp_dir_base:
+        os.makedirs(temp_dir_base, exist_ok=True)
+        main_tmp_dir = os.path.abspath(os.path.join(temp_dir_base, f"tmp_{hid}"))
+    else:
+        main_tmp_dir = os.path.abspath(f"tmp_{hid}")
 
     if args.restore_parameters:
         params_path = os.path.join(main_tmp_dir, "run_params.json")
@@ -1902,16 +2754,73 @@ def main():
         comic_data.update(extra_metadata)
         log_verbose("  Extracted metadata (Authors, Artists, Genres, etc.)")
 
+    def sanitize_filename(name: str) -> str:
+        """Sanitize a filename component for Windows and remove underscores.
+        Keeps spaces for readability (and for your no-underscore preference).
+        """
+        s = re.sub(r'[\\/*?:"<>|]', "", str(name or ""))
+        # Remove underscores in the *output* filenames (replace with spaces).
+        s = s.replace("_", " ")
+        # Collapse whitespace and trim.
+        s = re.sub(r"\s+", " ", s).strip()
+        # Windows: avoid trailing dots/spaces.
+        s = s.rstrip(" .")
+        return s
+
+    def join_name(*parts: str) -> str:
+        s = " ".join([p for p in parts if p])
+        s = re.sub(r"\s+", " ", s).strip()
+        s = s.rstrip(" .")
+        return s
+
+    _DECIMAL_DOT_LAST_RE = re.compile(r'(\d)\.(\d)(?!.*\d\.\d)')  # last digit.dot.digit
+    _KNOWN_EXTS = {".pdf", ".cbz", ".epub", ".zip", ".png", ".jpg", ".jpeg", ".webp"}
+
+    def format_chap_for_filename(chap) -> str:
+        """Format chapter label for filenames so lexical sort matches chapter order.
+
+        - Keeps the original chapter number for logic/selection.
+        - Replaces a decimal dot with '~' so '1' sorts before '1~1'.
+        - If a full filename is passed in, only touches the chapter-number portion after the chapter marker.
+        - Avoids treating decimal chapters like '8.5' as having an extension ('.5').
+        """
+        s = str(chap).strip()
+
+        # Only treat trailing '.ext' as a real extension for known file types (e.g. '.pdf').
+        stem, ext = os.path.splitext(s)
+        if ext.lower() not in _KNOWN_EXTS:
+            stem, ext = s, ""
+
+        # The output naming uses " Ch " (no underscores).
+        marker = " Ch "
+        i = stem.rfind(marker)
+        if i != -1:
+            prefix = stem[: i + len(marker)]
+            chap_part = stem[i + len(marker) :]
+            chap_part = _DECIMAL_DOT_LAST_RE.sub(r"\1~\2", chap_part, count=1)
+            return prefix + chap_part + ext
+
+        # Otherwise, treat input as just the chapter label.
+        stem = _DECIMAL_DOT_LAST_RE.sub(r"\1~\2", stem, count=1)
+        return stem + ext
+
     def sanitize_filename(name):
-        return re.sub(r'[\\/*?:"<>|]', "", name).replace(" ", "_")
+        return re.sub(r'[\/*?:"<>|]', "", name).replace(" ", "_")
 
     safe_title = sanitize_filename(title)
     safe_site = sanitize_filename(handler.name)
     base_filename = f"{safe_title}_{safe_site}" if safe_site else safe_title
     if args.group:
-        safe_group = sanitize_filename("_".join(args.group))
+        safe_group = sanitize_filename(" ".join(args.group))
         base_filename = f"{base_filename}_{safe_group}"
-
+    out_dir = allocate_series_output_dir(title, hid, root=args.output_dir)
+    setattr(args, "output_dir", out_dir)
+    
+    # Assign EPUB dir if provided
+    epub_dir_base = getattr(args, "epub_dir", None)
+    if epub_dir_base:
+        epub_out_dir = allocate_series_output_dir(title, hid, root=epub_dir_base)
+        setattr(args, "epub_dir", epub_out_dir)
     pool = handler.get_chapters(context, scraper, args.language, make_request)
 
     # --- Chapter Selection Logic ---
@@ -1924,8 +2833,7 @@ def main():
         if num_str is None:
             continue
             
-        # Treat "Oneshot" as Chapter 1
-        if num_str and num_str.lower() in ("oneshot", "one-shot"):
+        if num_str is not None and str(num_str).lower() in ("oneshot", "one-shot"):
             num_str = "1"
             
         try:
@@ -1993,7 +2901,8 @@ def main():
         sys.exit("No chapters selected.")
     # --- End of Chapter Selection Logic ---
 
-    out_dir = "comics"
+    # Ensure output folder exists (shared by chapter files, final book, and split parts)
+    out_dir = getattr(args, "output_dir", args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     resume_mode = False
@@ -2055,7 +2964,58 @@ def main():
                 )
                 current_book_size += os.path.getsize(original_cover_path)
 
-    for ch in chapters:
+    # --- Missed chapter logging + end-of-run retries ---
+    retry_missed = not getattr(args, 'no_retry_missed_chapters', False)
+    missed_retries = max(0, int(getattr(args, 'missed_retries', 2) or 0))
+    missed_log_path = getattr(args, 'missed_log', None) or os.path.join(main_tmp_dir, 'missed_chapters.json')
+    missed_entries: List[Dict[str, Any]] = []
+
+    if retry_missed and missed_retries > 0 and (split_size_bytes > 0 or split_chapter_count > 0):
+        print('[*] Note: --split is disabled while missed-chapter retry is enabled (to keep output ordering correct).')
+        split_size_bytes = 0
+        split_chapter_count = 0
+
+    def _chapter_key(ch: Dict[str, Any]) -> str:
+        v = ch.get('id') or ch.get('chapter_id') or ch.get('url') or ch.get('chap')
+        return str(v)
+
+    def _load_missed() -> List[Dict[str, Any]]:
+        try:
+            if os.path.exists(missed_log_path):
+                with open(missed_log_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        return []
+
+    def _save_missed(entries: List[Dict[str, Any]]) -> None:
+        try:
+            os.makedirs(os.path.dirname(missed_log_path) or '.', exist_ok=True)
+            with open(missed_log_path, 'w', encoding='utf-8') as f:
+                json.dump(entries, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _record_missed(ch: Dict[str, Any], grp_name: str, reason: str, err: str, *, insert_list_index: int, insert_chapter_index: int, insert_marker_index: int, insert_page_index: int) -> None:
+        entry = {
+            'key': _chapter_key(ch),
+            'ch': ch,
+            'chap': ch.get('chap'),
+            'url': ch.get('url'),
+            'group': grp_name,
+            'reason': reason,
+            'error': (str(err) if err else '')[:500],
+            'insert_list_index': int(insert_list_index),
+            'insert_chapter_index': int(insert_chapter_index),
+            'insert_marker_index': int(insert_marker_index),
+            'insert_page_index': int(insert_page_index),
+        }
+        missed_entries.append(entry)
+        _save_missed(missed_entries)
+
+    def _process_chapter(ch: Dict[str, Any], *, force_redownload: bool = False):
         n = ch["chap"]
         grp_name = handler.get_group_name(ch)
         tdir = os.path.join(main_tmp_dir, f"ch_{n}")
@@ -2069,6 +3029,13 @@ def main():
             ".download_complete" if args.no_processing else ".processed_complete"
         )
         marker_path = os.path.join(tdir, marker_name)
+
+        if force_redownload:
+            # Force a clean re-download/re-process for this chapter (used by end-of-run retries)
+            if os.path.isdir(tdir):
+                rm_tree(tdir)
+            process_this_chapter = True
+
 
         if resume_mode and os.path.exists(marker_path):
             print(f"\nChapter {n} (already processed, collecting files)")
@@ -2181,10 +3148,12 @@ def main():
                 print(
                     f"  Warning: No media downloaded for Chapter {n}. Skipping."
                 )
-                continue
+                return None, grp_name, n, 0
 
             if args.keep_images and raw_image_paths:
-                dest_dir = os.path.join(out_dir, safe_title, f"Chapter_{n}")
+                # When --keep-images is enabled, keep raw downloads inside the manga's
+                # output folder to avoid mixing different series in the same directory.
+                dest_dir = os.path.join(out_dir, "images", f"Chapter_{n}")
                 log_verbose(f"  Copying original images to: {dest_dir}")
                 # Python 3.7 doesn't support dirs_exist_ok. Fallback if needed.
                 try:
@@ -2232,16 +3201,20 @@ def main():
                         )
 
                     log_verbose(f"  Applying {args.scaling}% scaling...")
-                    scaled_images_in_mem = [
-                        img.resize(
-                            (
-                                int(img.width * scale_factor),
-                                int(img.height * scale_factor),
-                            ),
-                            Image.LANCZOS,
-                        )
-                        for img in pages_in_memory
-                    ]
+                    scaled_images_in_mem = []
+                    with _cpu_guard("scale_images"):
+                        for idx_img, img in enumerate(pages_in_memory):
+                            if idx_img % 8 == 0:
+                                _hb("cpu", f"scaling {idx_img+1}/{len(pages_in_memory)}")
+                            scaled_images_in_mem.append(
+                                img.resize(
+                                    (
+                                        int(img.width * scale_factor),
+                                        int(img.height * scale_factor),
+                                    ),
+                                    Image.LANCZOS,
+                                )
+                            )
 
                     images_to_save = scaled_images_in_mem
                     if (
@@ -2325,9 +3298,10 @@ def main():
                         final_pdf_path = pdf_parts[0]
                     else:
                         final_pdf_path = os.path.join(
-                            main_tmp_dir, f"{base_filename}_Ch_{n}.pdf"
+                                                        main_tmp_dir, f"{base_filename} Ch {format_chap_for_filename(n)}.pdf"
                         )
-                        merge_pdf_files(pdf_parts, final_pdf_path, None)
+                        with _cpu_guard('merge_pdf'):
+                            merge_pdf_files(pdf_parts, final_pdf_path, None)
                         for part_path in pdf_parts:
                             if part_path != final_pdf_path:
                                 try:
@@ -2350,6 +3324,9 @@ def main():
                     chapter_content.append(
                         {"type": "text_file", "path": txt_path}
                     )
+                elif raw_image_paths:
+                    # Images were downloaded successfully; mark chapter as complete.
+                    chapter_content.append({"type": "none", "path": raw_image_paths[0]})
                 # keep_images already preserved raw downloads
             else:
                 chapter_content = [
@@ -2366,20 +3343,21 @@ def main():
                 and item.get("path")
                 and os.path.exists(item["path"])
             )
-
         if not chapter_content:
-            continue
+            return None, grp_name, n, 0
 
         if args.keep_chapters:
-            ch_suffix = f"Ch_{n}"
-            ch_filename = f"{base_filename}_{ch_suffix}.{args.format}"
-            ch_out_path = os.path.join(out_dir, ch_filename)
+            ch_suffix = f"Ch {format_chap_for_filename(n)}"
+            ch_filename = f"{join_name(base_filename, ch_suffix)}.{args.format}"
+            active_out_dir = getattr(args, "epub_dir", None) if args.format == "epub" else None
+            ch_out_path = os.path.join(active_out_dir or out_dir, ch_filename)
             ch_title = f"{title} ({ch_suffix})"
             log_verbose(f"  Saving individual chapter file...")
 
             if args.format == "epub":
                 chapter_marker = [{"ch": ch, "page_index": 0}]
-                build_epub(
+                with _cpu_guard('build_epub'):
+                    build_epub(
                     chapter_content,
                     ch_out_path,
                     ch_title,
@@ -2396,7 +3374,8 @@ def main():
                     for item in chapter_content
                     if item.get("type") == "image"
                 ]
-                build_cbz(
+                with _cpu_guard('build_cbz'):
+                    build_cbz(
                     cbz_images,
                     ch_out_path,
                     ch_title,
@@ -2408,6 +3387,25 @@ def main():
                 if chapter_content:
                     shutil.copy(chapter_content[0]["path"], ch_out_path)
                 print(f"PDF Chapter saved → {os.path.basename(ch_out_path)}")
+
+        return chapter_content, grp_name, n, chapter_content_size
+
+
+    for ch in chapters:
+        grp_name = handler.get_group_name(ch)
+        insert_list_index = len(current_book_content)
+        insert_chapter_index = len(current_book_chapters)
+        insert_marker_index = len(current_epub_markers)
+        insert_page_index = _epub_page_count(current_book_content) if args.format == 'epub' else 0
+        try:
+            chapter_content, grp_name, n, chapter_content_size = _process_chapter(ch)
+        except Exception as e:
+            _record_missed(ch, grp_name, 'exception', repr(e), insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
+            continue
+
+        if not chapter_content:
+            _record_missed(ch, grp_name, 'empty_content', 'No downloadable content', insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
+            continue
 
         should_split_by_size = (
             split_size_bytes > 0
@@ -2436,17 +3434,88 @@ def main():
             current_book_size = 0
             current_epub_markers = []
 
-        if args.format == "epub":
+        if args.format == 'epub':
             start_page_index = _epub_page_count(current_book_content)
         current_book_content.extend(chapter_content)
         current_book_chapters.append(ch)
         if grp_name:
             current_book_scan_groups.add(grp_name)
         current_book_size += chapter_content_size
-        if args.format == "epub" and _epub_page_count(chapter_content) > 0:
-            current_epub_markers.append(
-                {"ch": ch, "page_index": start_page_index}
-            )
+        if args.format == 'epub' and _epub_page_count(chapter_content) > 0:
+            current_epub_markers.append({'ch': ch, 'page_index': start_page_index})
+
+    # Retry missed chapters at the end (Option A: keep going, recover what we can)
+    if retry_missed and missed_entries and missed_retries > 0:
+        print(f"\n[*] Missed {len(missed_entries)} chapter(s). Retrying at the end...")
+        missed_entries.sort(key=lambda e: (int(e.get('insert_chapter_index', 0)), int(e.get('insert_list_index', 0))))
+        remaining: List[Dict[str, Any]] = []
+        content_shift_items = 0
+        chapter_shift = 0
+        marker_shift = 0
+        page_shift = 0
+
+        for entry in missed_entries:
+            ch_retry = entry.get('ch') or {}
+            grp_name_retry = entry.get('group') or handler.get_group_name(ch_retry)
+            ok = False
+            last_err = ''
+            for attempt in range(1, missed_retries + 1):
+                try:
+                    chapter_content, grp_name_retry, n, chapter_content_size = _process_chapter(ch_retry, force_redownload=True)
+                    if chapter_content:
+                        ok = True
+                        break
+                    last_err = 'No downloadable content'
+                except Exception as e:
+                    last_err = repr(e)
+                sleep_s = min(60.0, (2 ** attempt)) + random.uniform(0.0, 1.25)
+                log_verbose(f"  Retry backoff: sleeping {sleep_s:.1f}s (attempt {attempt}/{missed_retries})")
+                time.sleep(sleep_s)
+
+            if not ok:
+                entry['error'] = (last_err or entry.get('error') or '')[:500]
+                remaining.append(entry)
+                continue
+
+            insert_at = int(entry.get('insert_list_index', 0)) + content_shift_items
+            chap_insert_at = int(entry.get('insert_chapter_index', 0)) + chapter_shift
+            marker_insert_at = int(entry.get('insert_marker_index', 0)) + marker_shift
+            page_insert_at = int(entry.get('insert_page_index', 0)) + page_shift
+
+            delta_pages = _epub_page_count(chapter_content) if args.format == 'epub' else 0
+            if args.format == 'epub' and delta_pages > 0:
+                for m in current_epub_markers:
+                    if int(m.get('page_index', 0) or 0) >= page_insert_at:
+                        m['page_index'] = int(m.get('page_index', 0) or 0) + delta_pages
+
+            current_book_content[insert_at:insert_at] = chapter_content
+            current_book_chapters.insert(chap_insert_at, ch_retry)
+            if grp_name_retry:
+                current_book_scan_groups.add(grp_name_retry)
+            current_book_size += chapter_content_size
+            if args.format == 'epub' and delta_pages > 0:
+                current_epub_markers.insert(marker_insert_at, {'ch': ch_retry, 'page_index': page_insert_at})
+
+            content_shift_items += len(chapter_content)
+            chapter_shift += 1
+            marker_shift += 1
+            page_shift += delta_pages
+            print(f"  [+] Recovered chapter {n}")
+
+        missed_entries = remaining
+        _save_missed(missed_entries)
+        if missed_entries:
+            print(f"[!] Still missed {len(missed_entries)} chapter(s). A log was saved to: {missed_log_path}")
+            try:
+                out_log = os.path.join(out_dir, f"{base_filename} (missed chapters).json")
+                shutil.copy(missed_log_path, out_log)
+            except Exception:
+                pass
+        else:
+            try:
+                os.remove(missed_log_path)
+            except Exception:
+                pass
 
     if current_book_content:
         if args.format == "none":
@@ -2464,9 +3533,11 @@ def main():
             )
         else:
             print("\nBuilding final file...")
-            final_path = os.path.join(out_dir, f"{base_filename}.{args.format}")
+            active_out_dir = getattr(args, "epub_dir", None) if args.format == "epub" else None
+            final_path = os.path.join(active_out_dir or out_dir, f"{base_filename}.{args.format}")
             if args.format == "epub":
-                build_epub(
+                with _cpu_guard('build_epub'):
+                    build_epub(
                     current_book_content,
                     final_path,
                     title,
@@ -2483,7 +3554,8 @@ def main():
                     for item in current_book_content
                     if item.get("type") == "image"
                 ]
-                build_cbz(
+                with _cpu_guard('build_cbz'):
+                    build_cbz(
                     cbz_images_all,
                     final_path,
                     title,
@@ -2498,7 +3570,8 @@ def main():
                     if item.get("type") == "pdf"
                 ]
                 if pdf_inputs:
-                    merge_pdf_files(
+                    with _cpu_guard('merge_pdf'):
+                        merge_pdf_files(
                         pdf_inputs,
                         final_path,
                         {
@@ -2514,6 +3587,17 @@ def main():
                         except OSError:
                             pass
 
+    if args.save_params:
+        _save_download_params(out_dir, args.comic_url, args, title)
+        # Persist cover image for GUI library display
+        if original_cover_path and os.path.exists(original_cover_path):
+            dest_cover = os.path.join(out_dir, ".cover.jpg")
+            if not os.path.exists(dest_cover):
+                try:
+                    shutil.copy2(original_cover_path, dest_cover)
+                except Exception:
+                    pass
+
     if not args.no_cleanup:
         rm_tree(main_tmp_dir)
         print("\nDone.")
@@ -2522,4 +3606,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        _hb("done", "ok")
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        _hb("error", "keyboard_interrupt")
+        raise
+    except Exception as e:
+        _hb("error", str(e))
+        raise

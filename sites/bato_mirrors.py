@@ -39,6 +39,7 @@ _BASE_MIRRORS = (
     "mangatoto.com",
     "mangatoto.net",
     "mangatoto.org",
+    "mpark.to",
     "mto.to",
     "nto.to",
     "okok.to",
