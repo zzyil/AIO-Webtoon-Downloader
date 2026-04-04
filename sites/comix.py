@@ -60,6 +60,39 @@ class ComixSiteHandler(BaseSiteHandler):
 
         return response
 
+    def _get_api_token(self, url: str) -> Optional[str]:
+        """Temporarily launches Playwright to capture the token needed for the chapters API."""
+        try:
+            from playwright.sync_api import sync_playwright
+            from urllib.parse import parse_qsl
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+                page = browser.new_page()
+                
+                token_query = None
+                
+                def handle_req(request):
+                    nonlocal token_query
+                    if "chapters?" in request.url and "_=" in request.url:
+                        parts = request.url.split("?")
+                        if len(parts) > 1:
+                            token_query = parts[1]
+                            
+                page.on("request", handle_req)
+                page.goto(url)
+                
+                # Wait for API request
+                for _ in range(50):
+                    if token_query:
+                        break
+                    page.wait_for_timeout(100)
+                    
+                browser.close()
+                return token_query
+        except Exception as e:
+            print(f"[!] Playwright token capture failed: {e}")
+            return None
+
     def _extract_next_data(self, html: str) -> List[Any]:
         """Extracts data pushed to self.__next_f."""
         data = []
@@ -315,12 +348,25 @@ class ComixSiteHandler(BaseSiteHandler):
         if not hash_id:
              raise RuntimeError("Missing manga identifier (hash_id).")
 
+        # Capture token
+        manga_url = context.comic.get("url", f"https://comix.to/title/{hash_id}")
+        token_qs = self._get_api_token(manga_url)
+        token_params = ""
+        if token_qs:
+            from urllib.parse import parse_qsl, urlencode
+            params = dict(parse_qsl(token_qs))
+            if "_" in params:
+                token_params = urlencode({"time": params.get("time", "1"), "_": params.get("_")})
+
         chapters = []
         page = 1
         limit = 100 # Use a reasonable limit
         
         while True:
             api_url = f"https://comix.to/api/v2/manga/{hash_id}/chapters?order[number]=desc&limit={limit}&page={page}"
+            if token_params:
+                api_url += f"&{token_params}"
+                
             response = self._cf_aware_request(api_url, scraper, make_request)
             try:
                 data = response.json()
