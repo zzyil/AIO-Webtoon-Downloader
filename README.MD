@@ -21,6 +21,7 @@ The most versatile, feature-rich & customizable tool to download webtoons (manhw
 - [🌐 Supported Sites](#-supported-sites)
 - [🧰 Installation](#-installation)  
 - [🚀 Usage](#-usage)  
+- [🔌 REST API](#-rest-api)
 - [⚙️ Options](#%EF%B8%8F-options)  
 - [🔐 Cookie Setup](#-cookie-setup)  
 - [📖 Examples](#-examples)  
@@ -183,6 +184,32 @@ python3 gui.py
 ```
 
 Run `python3 aio-dl.py --help` for the full option list.
+
+---
+
+## 🔌 REST API
+
+The downloader includes a FastAPI-based REST backend (`api.py`) allowing you to interact with supported sites programmatically to retrieve metadata, active chapters, and image contents. (Thanks to [@norphiil](https://github.com/norphiil) for the REST API implementation!).
+
+**Start the API Server:**
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+**Available Endpoints:**
+
+- `GET /api/handlers`  
+  List all supported site handlers and their corresponding domains.
+- `GET /api/info?url=URL[&site=NAME]`  
+  Fetch comic metadata (title, author, cover image, status).
+- `GET /api/chapters?url=URL[&site=NAME][&language=en]`  
+  Retrieve a JSON list of available chapters for a comic.
+- `GET /api/chapter_images?url=URL&chapter_id=ID[&site=NAME]`  
+  Get the exact image URLs for a specific chapter ID.
+- `GET /api/download_image?url=IMG_URL`  
+  Downloads an image behind site protections and returns a local cache URL (`/api/temp/...`) for safe consumption.
+
+> **Note**: Cross-Origin Resource Sharing (CORS) is enabled by default for all origins, and intermediate images older than 1 hour are auto-purged from the temp directory.
 
 ---
 

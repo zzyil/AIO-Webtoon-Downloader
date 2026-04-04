@@ -5,6 +5,17 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
+### 04.04.26
+
+**New features:**
+- **REST API** (`api.py`): Implemented FastAPI-based REST backend allowing users to retrieve comic metadata, active chapters, and image contents programmatically. Includes auto-cleanup logic and Cloudflare bypass capability sharing. (Thanks to [@norphiil](https://github.com/norphiil)!)
+- **Comix token capture & API fix**: Resolved the "0 chapters" download failure by implementing a Playwright-based URL token capture. This automatically bypasses `comix.to`'s newly obfuscated JavaScript API requirements by generating the correct `time` and `_` query parameters, ensuring chapter lists and images load reliably again.
+
+**Fixes:**
+- **MangaFire VRF**: Fixed a crash caused by stale running event loops blocking Playwright's Sync API initialization in the `mangafire_vrf_simple.py` generator. (Thanks to XCSTech!)
+
+---
+
 ### 03.21.26
 
 **AsuraScans (`sites/asura.py`) — full rewrite:**
