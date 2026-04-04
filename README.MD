@@ -142,7 +142,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | ----- | ----- | ----- |
 | [asurascans.com](https://asurascans.com) | Alternative URLs: [asuracomic.net](https://asuracomic.net), [asurascans.net](https://asurascans.net) | recent check 03.21.26 ✅ |
 | [Atsumaru / atsu.moe](https://atsu.moe) | | recent check 03.08.26 ✅ |
-| [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 03.08.26 ✅ |
+| [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 04.04.26 ✅ |
 | [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 03.08.26 ✅ |
 | [flamecomics.xyz](https://flamecomics.xyz) | | recent check 03.08.26 ✅ |
 | [galaxymanga.io](https://galaxymanga.io) | | recent check 03.08.26 ✅ |
