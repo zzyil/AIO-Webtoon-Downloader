@@ -23,6 +23,11 @@ import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote_to_bytes
 
+from library_state import (
+    SAVED_PARAMS_FILE as LIBRARY_SAVED_PARAMS_FILE,
+    build_update_chapters_arg,
+    scan_downloaded_chapters,
+)
 from sites import get_handler_by_name, get_handler_for_url
 from sites.base import SiteComicContext
 
@@ -1987,8 +1992,7 @@ def get_processing_params(args, calculated_width, calculated_aspect_ratio):
     }
 
 
-_SAVED_PARAMS_FILE = "download_params.json"
-_CH_FILE_RE = re.compile(r"[ _]Ch[ _](\d+)", re.IGNORECASE)
+_SAVED_PARAMS_FILE = LIBRARY_SAVED_PARAMS_FILE
 
 
 def _scan_saved_params(root: str) -> List[Dict]:
@@ -2009,20 +2013,14 @@ def _scan_saved_params(root: str) -> List[Dict]:
         url = data.get("url")
         if not url:
             continue
-        # Detect highest existing chapter from files on disk
-        nums: set = set()
-        for fn in os.listdir(folder):
-            m = _CH_FILE_RE.search(fn)
-            if m:
-                nums.add(int(m.group(1)))
-        highest = 0
-        while (highest + 1) in nums:
-            highest += 1
+        chapter_numbers = scan_downloaded_chapters(folder)
+        latest_chapter = max(chapter_numbers) if chapter_numbers else None
         results.append({
             "title": data.get("title", entry),
             "url": url,
             "folder": folder,
-            "highest_chapter": highest,
+            "highest_chapter": latest_chapter,
+            "update_chapters_arg": build_update_chapters_arg(chapter_numbers),
             "params": data,
         })
     return results
@@ -2033,15 +2031,22 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
     data = {
         "url": url,
         "title": title,
+        "site": args.site,
         "format": args.format,
         "language": args.language,
+        "width": args.width,
+        "aspect_ratio": args.aspect_ratio,
         "quality": args.quality,
         "scaling": args.scaling,
         "cookies": args.cookies or "",
         "group": args.group or [],
+        "split": args.split,
         "mix_by_upvote": args.mix_by_upvote,
         "no_partials": args.no_partials,
+        "keep_chapters": args.keep_chapters,
         "keep_images": args.keep_images,
+        "no_processing": args.no_processing,
+        "no_cleanup": args.no_cleanup,
         "verbose": args.verbose,
         "debug": args.debug,
     }
@@ -2322,62 +2327,104 @@ def main():
         jobs = max(1, int(getattr(args, "jobs", 1) or 1))
         child_procs = []
         for sp in saved_series:
-            highest_ch = sp["highest_chapter"]
-            if highest_ch > 0:
-                chapters_arg = f"{highest_ch + 1}-"
-                print(f"  {sp['title']}: resuming from chapter {highest_ch + 1}")
-            else:
-                chapters_arg = "all"
+            chapters_arg = sp.get("update_chapters_arg", "all")
+            if chapters_arg == "all":
                 print(f"  {sp['title']}: downloading all chapters")
+            else:
+                print(f"  {sp['title']}: resuming from chapter {chapters_arg[:-1]}")
             child_cmd = [
                 sys.executable, os.path.abspath(__file__), sp["url"],
                 "--chapters", chapters_arg,
                 "--format", sp["params"].get("format", "epub"),
                 "--language", sp["params"].get("language", "en"),
-                "--quality", str(sp["params"].get("quality", 85)),
-                "--scaling", str(sp["params"].get("scaling", 100)),
                 "--output-dir", scan_root,
                 "--save-params",
                 "--keep-chapters",
             ]
+            if sp["params"].get("site"):
+                child_cmd += ["--site", str(sp["params"]["site"])]
             if sp["params"].get("epub_layout"):
                 child_cmd += ["--epub-layout", sp["params"]["epub_layout"]]
+            if sp["params"].get("width"):
+                child_cmd += ["--width", str(sp["params"]["width"])]
+            if sp["params"].get("aspect_ratio"):
+                child_cmd += ["--aspect-ratio", str(sp["params"]["aspect_ratio"])]
+            if not sp["params"].get("no_processing"):
+                child_cmd += ["--quality", str(sp["params"].get("quality", 85))]
+                child_cmd += ["--scaling", str(sp["params"].get("scaling", 100))]
             if sp["params"].get("cookies"):
                 child_cmd += ["--cookies", sp["params"]["cookies"]]
             if sp["params"].get("group"):
-                for g in sp["params"]["group"]:
+                groups = sp["params"]["group"]
+                if isinstance(groups, str):
+                    groups = [groups]
+                for g in groups:
                     child_cmd += ["--group", g]
+            if sp["params"].get("split"):
+                child_cmd += ["--split", str(sp["params"]["split"])]
             if sp["params"].get("mix_by_upvote"):
                 child_cmd.append("--mix-by-upvote")
             if sp["params"].get("no_partials"):
                 child_cmd.append("--no-partials")
             if sp["params"].get("keep_images"):
                 child_cmd.append("--keep-images")
+            if sp["params"].get("no_processing"):
+                child_cmd.append("--no-processing")
+            if sp["params"].get("no_cleanup"):
+                child_cmd.append("--no-cleanup")
             if sp["params"].get("verbose"):
                 child_cmd.append("--verbose")
             if sp["params"].get("debug"):
                 child_cmd.append("--debug")
             child_procs.append((sp["title"], child_cmd))
 
+        def _run_saved_update(title: str, cmd: List[str]) -> Tuple[str, int, str, str]:
+            proc = subprocess.run(
+                cmd,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                capture_output=True,
+                text=True,
+            )
+            return title, proc.returncode, proc.stdout, proc.stderr
+
         failed = []
         up_to_date = []
-        for title, cmd in child_procs:
-            print(f"\n{'='*60}")
-            print(f"Updating: {title}")
-            print(f"{'='*60}")
-            proc = subprocess.run(
-                cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
-                capture_output=True, text=True,
-            )
-            sys.stdout.write(proc.stdout)
-            sys.stderr.write(proc.stderr)
-            combined = proc.stdout + proc.stderr
-            if proc.returncode != 0:
-                if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
-                    up_to_date.append(title)
-                    print(f"  Already up to date.")
-                else:
-                    failed.append(title)
+        if jobs > 1:
+            print(f"[*] Running updates with up to {jobs} worker(s)...")
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                futures = [
+                    executor.submit(_run_saved_update, title, cmd)
+                    for title, cmd in child_procs
+                ]
+                for future in as_completed(futures):
+                    title, returncode, stdout, stderr = future.result()
+                    print(f"\n{'='*60}")
+                    print(f"Updating: {title}")
+                    print(f"{'='*60}")
+                    sys.stdout.write(stdout)
+                    sys.stderr.write(stderr)
+                    combined = stdout + stderr
+                    if returncode != 0:
+                        if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
+                            up_to_date.append(title)
+                            print(f"  Already up to date.")
+                        else:
+                            failed.append(title)
+        else:
+            for title, cmd in child_procs:
+                print(f"\n{'='*60}")
+                print(f"Updating: {title}")
+                print(f"{'='*60}")
+                _, returncode, stdout, stderr = _run_saved_update(title, cmd)
+                sys.stdout.write(stdout)
+                sys.stderr.write(stderr)
+                combined = stdout + stderr
+                if returncode != 0:
+                    if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
+                        up_to_date.append(title)
+                        print(f"  Already up to date.")
+                    else:
+                        failed.append(title)
 
         print(f"\n{'='*60}")
         updated = len(child_procs) - len(failed) - len(up_to_date)
@@ -2914,6 +2961,11 @@ def main():
     # Ensure output folder exists (shared by chapter files, final book, and split parts)
     out_dir = getattr(args, "output_dir", args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
+
+    # Persist params as soon as the series folder is known so the GUI library can
+    # track and reload the entry even if the run is interrupted later.
+    if args.save_params:
+        _save_download_params(out_dir, args.comic_url, args, title)
 
     resume_mode = False
     params_path = os.path.join(main_tmp_dir, "run_params.json")
@@ -3598,7 +3650,6 @@ def main():
                             pass
 
     if args.save_params:
-        _save_download_params(out_dir, args.comic_url, args, title)
         # Persist cover image for GUI library display
         if original_cover_path and os.path.exists(original_cover_path):
             dest_cover = os.path.join(out_dir, ".cover.jpg")
