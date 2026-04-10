@@ -119,6 +119,7 @@ class AIODownloaderGUI:
         self.keep_chapters = BooleanVar(value=self.prefs.get("keep_chapters", True))
         self.keep_images = BooleanVar(value=self.prefs.get("keep_images", False))
         self.mix_by_upvote = BooleanVar(value=self.prefs.get("mix_by_upvote", False))
+        self.no_group_fallback = BooleanVar(value=self.prefs.get("no_group_fallback", False))
         self.no_partials = BooleanVar(value=self.prefs.get("no_partials", False))
         self.no_processing = BooleanVar(value=self.prefs.get("no_processing", False))
         self.no_cleanup = BooleanVar(value=self.prefs.get("no_cleanup", False))
@@ -591,6 +592,7 @@ class AIODownloaderGUI:
             ("Keep individual chapter files", self.keep_chapters),
             ("Keep raw images", self.keep_images),
             ("Mix by upvote", self.mix_by_upvote),
+            ("No group fallback", self.no_group_fallback),
             ("Skip fractional chapters", self.no_partials),
             ("No image processing", self.no_processing),
             ("Keep temp folders", self.no_cleanup),
@@ -954,6 +956,7 @@ class AIODownloaderGUI:
             "keep_chapters": self.keep_chapters.get(),
             "keep_images": self.keep_images.get(),
             "mix_by_upvote": self.mix_by_upvote.get(),
+            "no_group_fallback": self.no_group_fallback.get(),
             "no_partials": self.no_partials.get(),
             "no_processing": self.no_processing.get(),
             "no_cleanup": self.no_cleanup.get(),
@@ -1000,6 +1003,8 @@ class AIODownloaderGUI:
             cmd.append("--keep-images")
         if self.mix_by_upvote.get():
             cmd.append("--mix-by-upvote")
+        if self.no_group_fallback.get():
+            cmd.append("--no-group-fallback")
         if self.no_partials.get():
             cmd.append("--no-partials")
         if self.no_processing.get():
@@ -1343,6 +1348,7 @@ class AIODownloaderGUI:
         self.keep_chapters.set(bool(params.get("keep_chapters", True)))
         self.keep_images.set(bool(params.get("keep_images", False)))
         self.mix_by_upvote.set(bool(params.get("mix_by_upvote", False)))
+        self.no_group_fallback.set(bool(params.get("no_group_fallback", False)))
         self.no_partials.set(bool(params.get("no_partials", False)))
         self.no_processing.set(bool(params.get("no_processing", False)))
         self.no_cleanup.set(bool(params.get("no_cleanup", False)))
@@ -1418,6 +1424,8 @@ class AIODownloaderGUI:
             cmd.extend(["--split", str(p["split"])])
         if p.get("mix_by_upvote"):
             cmd.append("--mix-by-upvote")
+        if p.get("no_group_fallback"):
+            cmd.append("--no-group-fallback")
         if p.get("no_partials"):
             cmd.append("--no-partials")
         if p.get("keep_images"):

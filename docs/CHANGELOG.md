@@ -9,13 +9,14 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 **Group selection safety (`sites/base.py`, `aio-dl.py`):**
 - Normalized scanlation-group matching so case, spacing, punctuation, and common `official` label variants no longer cause false mismatches
-- Changed `--group` behavior to be strict: if a requested scanlation group is not present for a chapter, that chapter is skipped instead of silently falling back to the highest-upvoted release from another group
+- If a requested scanlation group is not present for a chapter, the downloader now falls back to the highest-upvoted available release and reports the affected chapters at the end instead of switching silently
+- Added `--no-group-fallback` for users who want strict group-only downloads with skipped missing chapters
 - Updated `--mix-by-upvote` so it only compares releases from the groups explicitly allowed by the user
-- Added verbose reporting for chapters skipped by the group filter
+- Added verbose reporting plus an end-of-run notice for chapters that fell back to another scanlation group
 
 **Tests & docs:**
-- Added focused unit tests covering normalized group matching, `official` aliases, strict skip behavior, and `mix-by-upvote` filtering
-- Updated CLI/README help text to document that `--group` now skips chapters with no matching scanlation group
+- Added focused unit tests covering normalized group matching, `official` aliases, fallback behavior, strict no-fallback behavior, and `mix-by-upvote` filtering
+- Updated CLI/README help text to document both the default fallback behavior and the new strict no-fallback option
 
 ---
 

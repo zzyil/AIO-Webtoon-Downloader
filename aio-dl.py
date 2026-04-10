@@ -1987,6 +1987,7 @@ def get_processing_params(args, calculated_width, calculated_aspect_ratio):
         "chapters": args.chapters,
         "group": args.group,
         "mix_by_upvote": args.mix_by_upvote,
+        "no_group_fallback": args.no_group_fallback,
         "no_partials": args.no_partials,
         "no_processing": args.no_processing,
     }
@@ -2042,6 +2043,7 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         "group": args.group or [],
         "split": args.split,
         "mix_by_upvote": args.mix_by_upvote,
+        "no_group_fallback": args.no_group_fallback,
         "no_partials": args.no_partials,
         "keep_chapters": args.keep_chapters,
         "keep_images": args.keep_images,
@@ -2151,15 +2153,20 @@ def main():
         "--group",
         nargs="+",
         default=[],
-        help="Only download versions from the specified scanlation groups, in order of priority. "
+        help="Prefer the specified scanlation groups, in order of priority. "
         'Can be a single quoted string with commas (e.g., "A, B") '
-        'or multiple arguments (e.g., "A" "B"). Chapters without a matching group are skipped.',
+        'or multiple arguments (e.g., "A" "B"). If a chapter has no matching group, the downloader falls back to the highest-upvoted available release and reports it at the end.',
     )
     p.add_argument(
         "--mix-by-upvote",
         action="store_true",
         help="When multiple specified --group args are available for the same chapter, "
         "pick the matched version with the most upvotes.",
+    )
+    p.add_argument(
+        "--no-group-fallback",
+        action="store_true",
+        help="When --group is used, skip chapters that do not contain any of the requested groups instead of falling back to the highest-upvoted available release.",
     )
     p.add_argument(
         "--no-partials",
@@ -2364,6 +2371,8 @@ def main():
                 child_cmd += ["--split", str(sp["params"]["split"])]
             if sp["params"].get("mix_by_upvote"):
                 child_cmd.append("--mix-by-upvote")
+            if sp["params"].get("no_group_fallback"):
+                child_cmd.append("--no-group-fallback")
             if sp["params"].get("no_partials"):
                 child_cmd.append("--no-partials")
             if sp["params"].get("keep_images"):
@@ -2894,22 +2903,21 @@ def main():
 
     # 2. For each chapter number, select the best version
     best_chapters = []
-    skipped_group_chapters = 0
+    skipped_missing_group_chapters = []
     sorted_chap_nums = sorted(chapters_by_num.keys(), key=float)
     for num in sorted_chap_nums:
         versions = chapters_by_num[num]
         best_version = handler.select_best_chapter_version(
-            versions, args.group, args.mix_by_upvote, log_debug_fn=log_debug
+            versions,
+            args.group,
+            args.mix_by_upvote,
+            allow_group_fallback=not args.no_group_fallback,
+            log_debug_fn=log_debug,
         )
         if best_version:
             best_chapters.append(best_version)
-        elif args.group:
-            skipped_group_chapters += 1
-
-    if args.group and skipped_group_chapters:
-        log_verbose(
-            f"  Group filter skipped {skipped_group_chapters} chapter(s) with no matching scanlation group."
-        )
+        elif args.group and args.no_group_fallback:
+            skipped_missing_group_chapters.append({"chap": str(num)})
 
     # 3. Apply filters to the final list
     chapters = best_chapters
@@ -2953,10 +2961,44 @@ def main():
             )
 
     if not chapters:
-        if args.group:
-            sys.exit("No chapters selected. None of the requested scanlation groups matched the requested chapters.")
         sys.exit("No chapters selected.")
     # --- End of Chapter Selection Logic ---
+
+    selected_fallback_group_chapters = [
+        {
+            "chap": str(ch.get("chap", "?")),
+            "selected_group": handler.get_group_name(ch) or "Unknown",
+            "available_groups": ch.get("_available_groups") or "none",
+        }
+        for ch in chapters
+        if args.group and ch.get("_selection_kind") == "fallback_missing_group"
+    ]
+    selected_skipped_group_chapters = skipped_missing_group_chapters
+    if args.no_partials:
+        selected_skipped_group_chapters = [
+            ch
+            for ch in selected_skipped_group_chapters
+            if float(ch["chap"]) == int(float(ch["chap"]))
+        ]
+    if args.chapters.lower() != "all":
+        try:
+            negative_index_filter = args.chapters.strip().startswith("-") and "," not in args.chapters
+        except Exception:
+            negative_index_filter = False
+        if not negative_index_filter:
+            selected_skipped_group_chapters = [
+                ch
+                for ch in selected_skipped_group_chapters
+                if is_chapter_wanted(float(ch["chap"]), args.chapters)
+            ]
+    if selected_fallback_group_chapters:
+        log_verbose(
+            f"  Group filter fell back to the highest-upvoted release for {len(selected_fallback_group_chapters)} selected chapter(s) with no matching scanlation group."
+        )
+    if selected_skipped_group_chapters:
+        log_verbose(
+            f"  Group filter skipped {len(selected_skipped_group_chapters)} selected chapter(s) with no matching scanlation group because --no-group-fallback was enabled."
+        )
 
     # Ensure output folder exists (shared by chapter files, final book, and split parts)
     out_dir = getattr(args, "output_dir", args.output_dir)
@@ -3006,6 +3048,7 @@ def main():
     current_book_scan_groups = set()
     current_book_size = 0
     current_epub_markers = []
+    downloaded_fallback_group_chapters: List[Dict[str, str]] = []
 
     original_cover_path = None
     if args.format in ["epub", "cbz"]:
@@ -3503,6 +3546,14 @@ def main():
         if grp_name:
             current_book_scan_groups.add(grp_name)
         current_book_size += chapter_content_size
+        if ch.get("_selection_kind") == "fallback_missing_group":
+            downloaded_fallback_group_chapters.append(
+                {
+                    "chap": str(ch.get("chap", "?")),
+                    "selected_group": grp_name or "Unknown",
+                    "available_groups": ch.get("_available_groups") or "none",
+                }
+            )
         if args.format == 'epub' and _epub_page_count(chapter_content) > 0:
             current_epub_markers.append({'ch': ch, 'page_index': start_page_index})
 
@@ -3555,6 +3606,14 @@ def main():
             if grp_name_retry:
                 current_book_scan_groups.add(grp_name_retry)
             current_book_size += chapter_content_size
+            if ch_retry.get("_selection_kind") == "fallback_missing_group":
+                downloaded_fallback_group_chapters.append(
+                    {
+                        "chap": str(ch_retry.get("chap", "?")),
+                        "selected_group": grp_name_retry or "Unknown",
+                        "available_groups": ch_retry.get("_available_groups") or "none",
+                    }
+                )
             if args.format == 'epub' and delta_pages > 0:
                 current_epub_markers.insert(marker_insert_at, {'ch': ch_retry, 'page_index': page_insert_at})
 
@@ -3648,6 +3707,17 @@ def main():
                             os.remove(item["path"])
                         except OSError:
                             pass
+
+    if downloaded_fallback_group_chapters:
+        print("\n[!] Group fallback notice:")
+        print(
+            "Some requested scanlation groups were missing for the chapters below, so the highest-upvoted available release was downloaded instead."
+        )
+        for entry in downloaded_fallback_group_chapters:
+            print(
+                f"  - Chapter {entry['chap']}: downloaded '{entry['selected_group']}'"
+                f" (available groups: {entry['available_groups']})"
+            )
 
     if args.save_params:
         # Persist cover image for GUI library display

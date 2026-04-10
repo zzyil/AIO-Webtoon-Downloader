@@ -75,6 +75,7 @@ class BaseSiteHandler:
         versions: List[Dict],
         preferred_groups: List[str],
         mix_by_upvote: bool,
+        allow_group_fallback: bool = True,
         log_debug_fn=None,
     ) -> Optional[Dict]:
         if not versions:
@@ -98,6 +99,18 @@ class BaseSiteHandler:
                     groups.append(cleaned)
             return ", ".join(groups) if groups else "none"
 
+        def _annotate_selection(
+            version: Dict,
+            *,
+            selection_kind: str,
+            requested_group: Optional[str] = None,
+        ) -> Dict:
+            annotated = dict(version)
+            annotated["_selection_kind"] = selection_kind
+            annotated["_requested_group"] = requested_group
+            annotated["_available_groups"] = _available_groups()
+            return annotated
+
         chap_label = versions[0].get("chap", "?")
         best_by_upvote = max(versions, key=upvotes)
 
@@ -105,7 +118,7 @@ class BaseSiteHandler:
             _debug(
                 f"    Ch {chap_label}: No group specified. Selected by upvotes ({best_by_upvote.get('up_count', 0)})."
             )
-            return best_by_upvote
+            return _annotate_selection(best_by_upvote, selection_kind="upvote_no_group")
 
         preferred_entries = [
             (group_name, self.get_group_match_key(group_name))
@@ -120,7 +133,7 @@ class BaseSiteHandler:
             _debug(
                 f"    Ch {chap_label}: Group filter contained no usable names. Selected by upvotes ({best_by_upvote.get('up_count', 0)})."
             )
-            return best_by_upvote
+            return _annotate_selection(best_by_upvote, selection_kind="upvote_invalid_group_filter")
 
         if mix_by_upvote:
             preferred = [
@@ -134,11 +147,19 @@ class BaseSiteHandler:
                 _debug(
                     f"    Ch {chap_label}: Mix-by-upvote. Selected '{self.get_group_name(best)}' ({best.get('up_count', 0)} upvotes)."
                 )
-                return best
+                return _annotate_selection(best, selection_kind="preferred_mix_by_upvote")
+            if not allow_group_fallback:
+                _debug(
+                    f"    Ch {chap_label}: Mix-by-upvote. None of the requested groups were present. Skipping chapter. Available groups: {_available_groups()}."
+                )
+                return None
             _debug(
-                f"    Ch {chap_label}: Mix-by-upvote. None of the requested groups were present. Skipping chapter. Available groups: {_available_groups()}."
+                f"    Ch {chap_label}: Mix-by-upvote. None of the requested groups were present. Falling back to upvotes with '{self.get_group_name(best_by_upvote)}'. Available groups: {_available_groups()}."
             )
-            return None
+            return _annotate_selection(
+                best_by_upvote,
+                selection_kind="fallback_missing_group",
+            )
 
         for group_name, match_key in preferred_entries:
             candidates = [
@@ -151,11 +172,23 @@ class BaseSiteHandler:
                 _debug(
                     f"    Ch {chap_label}: Found in priority group '{group_name}'. Selected '{self.get_group_name(best)}'."
                 )
-                return best
+                return _annotate_selection(
+                    best,
+                    selection_kind="preferred_priority",
+                    requested_group=group_name,
+                )
+        if not allow_group_fallback:
+            _debug(
+                f"    Ch {chap_label}: None of the requested groups were present. Skipping chapter. Available groups: {_available_groups()}."
+            )
+            return None
         _debug(
-            f"    Ch {chap_label}: None of the requested groups were present. Skipping chapter. Available groups: {_available_groups()}."
+            f"    Ch {chap_label}: None of the requested groups were present. Falling back to upvotes with '{self.get_group_name(best_by_upvote)}'. Available groups: {_available_groups()}."
         )
-        return None
+        return _annotate_selection(
+            best_by_upvote,
+            selection_kind="fallback_missing_group",
+        )
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         raise NotImplementedError

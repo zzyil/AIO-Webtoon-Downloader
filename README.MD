@@ -226,8 +226,9 @@ uvicorn api:app --host 0.0.0.0 --port 8000
 | `--epub-dir PATH`             | Optional override directory specifically for EPUB outputs.                                                                                                                                                                    | _none_      |
 | `--temp-dir PATH`             | Optional override base directory for temporary processing folders.                                                                                                                                                            | _none_      |
 | `--cookies STRING`            | HTTP cookie string for restricted content (e.g. `key1=val1; key2=val2`)                                                                                                                                                     | `""`        |
-| `--group STRING...`           | Only download versions from the specified scanlation groups (comma-separated or multiple args). Chapters without a matching group are skipped.                                                                               | `[]`        |
+| `--group STRING...`           | Prefer the specified scanlation groups (comma-separated or multiple args). If a chapter has no matching group, the downloader falls back to the highest-upvoted available release and reports it at the end by default.    | `[]`        |
 | `--mix-by-upvote`             | When multiple specified `--group` entries exist for the same chapter, pick the matched version with the highest upvotes.                                                                                                    | `False`     |
+| `--no-group-fallback`         | When used with `--group`, disable fallback and skip chapters that do not contain any requested group.                                                                                                                       | `False`     |
 | `--no-partials`               | Skip fractional chapters (e.g. 1.5).                                                                                                                                                                                          | `False`     |
 | `--chapters STRING`           | Chapter filter: `all`, single (`5`), range (`1-10`), list/ranges (`1,3,5-7`), or open-ended (`-10`, `5-`).                                                                                                                   | `all`       |
 | `--language STRING`           | Language code (e.g. `en`, `ja`).                                                                                                                                                                                              | `en`        |
@@ -434,8 +435,9 @@ Here are some handy pointers to get the most out of your workflow:
   • Combine with `--split` to keep individual file sizes manageable.
 
 - 🏷️ **Best Scanlation Version**  
-  • `--group "YourFavGroup"` to only download that scanlation team, or use `--group "YourFavGroup1, YourFavGroup2"` to allow several teams in priority order. Chapters with no match are skipped.  
+  • `--group "YourFavGroup"` to prefer that scanlation team, or use `--group "YourFavGroup1, YourFavGroup2"` to allow several teams in priority order. If a chapter is missing from those groups, the downloader falls back to the highest-upvoted available release and reports it at the end by default.  
   • Add `--mix-by-upvote` to pick the highest-upvoted release among the groups you allowed for that chapter.
+  • Add `--no-group-fallback` if you want strict group-only downloads and would rather skip missing chapters.
 
 - 🔍 **Debugging & Verbose Logs**  
   • `-v` / `--verbose` for step-by-step progress.  
@@ -505,13 +507,14 @@ Please follow the existing style and include tests where applicable.
 
 **Group selection safety (`sites/base.py`, `aio-dl.py`):**
 - Normalized scanlation-group matching so case, spacing, punctuation, and common `official` label variants no longer cause false mismatches
-- Changed `--group` behavior to be strict: if a requested scanlation group is not present for a chapter, that chapter is skipped instead of silently falling back to the highest-upvoted release from another group
+- If a requested scanlation group is not present for a chapter, the downloader now falls back to the highest-upvoted available release and reports the affected chapters at the end instead of switching silently
+- Added `--no-group-fallback` for users who want strict group-only downloads with skipped missing chapters
 - Updated `--mix-by-upvote` so it only compares releases from the groups explicitly allowed by the user
-- Added verbose reporting for chapters skipped by the group filter
+- Added verbose reporting plus an end-of-run notice for chapters that fell back to another scanlation group
 
 **Tests & docs:**
-- Added focused unit tests covering normalized group matching, `official` aliases, strict skip behavior, and `mix-by-upvote` filtering
-- Updated CLI/README help text to document that `--group` now skips chapters with no matching scanlation group
+- Added focused unit tests covering normalized group matching, `official` aliases, fallback behavior, strict no-fallback behavior, and `mix-by-upvote` filtering
+- Updated CLI/README help text to document both the default fallback behavior and the new strict no-fallback option
 
 ## 🙏 Acknowledgements
 
