@@ -116,6 +116,7 @@ class AIODownloaderGUI:
         self.library_detail = StringVar(value="Select a series to inspect its saved settings.")
 
         self.save_params = BooleanVar(value=bool(self.prefs.get("save_params", True)))
+        self.download_volumes = BooleanVar(value=bool(self.prefs.get("download_volumes", False)))
         self.keep_chapters = BooleanVar(value=self.prefs.get("keep_chapters", True))
         self.keep_images = BooleanVar(value=self.prefs.get("keep_images", False))
         self.mix_by_upvote = BooleanVar(value=self.prefs.get("mix_by_upvote", False))
@@ -589,6 +590,7 @@ class AIODownloaderGUI:
 
         flag_rows = [
             ("Save params (for --update-all)", self.save_params),
+            ("Download volumes instead of chapters", self.download_volumes),
             ("Keep individual chapter files", self.keep_chapters),
             ("Keep raw images", self.keep_images),
             ("Mix by upvote", self.mix_by_upvote),
@@ -962,6 +964,7 @@ class AIODownloaderGUI:
             "no_cleanup": self.no_cleanup.get(),
             "verbose": self.verbose.get(),
             "debug_mode": self.debug_mode.get(),
+            "download_volumes": self.download_volumes.get(),
         })
         save_prefs(self.prefs)
 
@@ -997,6 +1000,8 @@ class AIODownloaderGUI:
             cmd.extend(["--jobs", str(self.jobs.get())])
         if self.save_params.get():
             cmd.append("--save-params")
+        if self.download_volumes.get():
+            cmd.append("--download-volumes")
         if self.keep_chapters.get():
             cmd.append("--keep-chapters")
         if self.keep_images.get():

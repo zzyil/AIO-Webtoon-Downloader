@@ -196,7 +196,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
 
     # ----------------------------- Chapters -----------------------------
 
-    def get_chapters(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
+    def _fetch_items(self, context: SiteComicContext, scraper, language: str, make_request, item_type: str = "chapter") -> List[Dict]:
         from .crawlee_utils import get_cf_session
         manga_id = context.identifier
         if not manga_id:
@@ -206,26 +206,26 @@ class MangaFireSiteHandler(BaseSiteHandler):
         cf_session = get_cf_session(self._BASE_URL)
 
         # Primary endpoint (VRF-protected):
-        # https://mangafire.to/ajax/read/{id}/chapter/{lang}?vrf=...
-        read_ajax_path = f"/ajax/read/{manga_id}/chapter/{lang_code}"
+        # e.g. https://mangafire.to/ajax/read/{id}/chapter/{lang}?vrf=... or /volume/
+        read_ajax_path = f"/ajax/read/{manga_id}/{item_type}/{lang_code}"
         read_ajax_url = self._BASE_URL + read_ajax_path
 
         if VRF_AVAILABLE:
             try:
                 vrf_gen = get_vrf_generator()
-                init_reader_url = f"{self._BASE_URL}/read/manga.{manga_id}/{lang_code}/chapter-1"
+                init_reader_url = f"{self._BASE_URL}/read/manga.{manga_id}/{lang_code}/{item_type}-1"
                 vrf = vrf_gen.ensure_vrf(read_ajax_path, init_url=init_reader_url)
                 read_ajax_url = f"{read_ajax_url}?vrf={vrf}"
             except Exception as e:
-                print(f"[!] Chapter list VRF failed: {e}")
+                print(f"[!] {item_type.capitalize()} list VRF failed: {e}")
                 print("    (continuing without VRF; fallback endpoint may still work)")
 
         # Try read endpoint (with IDs)
         try:
-            print(f"[*] Fetching chapters from: {read_ajax_url}")
+            print(f"[*] Fetching {item_type}s from: {read_ajax_url}")
             _mf_throttle('request')
             resp = cf_session.get(read_ajax_url, timeout=20)
-            data = self._safe_json(resp, label="chapter-list", url=read_ajax_url)
+            data = self._safe_json(resp, label=f"{item_type}-list", url=read_ajax_url)
             if not data or data.get("status") != 200:
                 raise RuntimeError(f"status={None if not data else data.get('status')}")
 
@@ -239,38 +239,39 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 raise RuntimeError("missing result HTML")
 
             soup = self._make_soup(html_content)
-            chapters: List[Dict] = []
+            items: List[Dict] = []
             for a in soup.select("a[data-id]"):
                 chap_id = a.get("data-id")
-                chap_num = a.get("data-number") or a.get("data-num") or a.get("data-chapter")
+                chap_num = a.get("data-number") or a.get("data-num") or a.get(f"data-{item_type}")
                 title = a.get("title") or a.get_text(strip=True)
                 href = a.get("href") or ""
                 full_url = urljoin(self._BASE_URL, href)
 
                 if chap_id:
-                    chapters.append(
+                    items.append(
                         {
                             "hid": chap_id,
                             "chap": chap_num,
                             "title": title,
                             "url": full_url,
                             "uploaded": 0,
+                            "_item_type": item_type,
                         }
                     )
-            if chapters:
-                return chapters
-            print("[!] Read endpoint returned no <a data-id> items; will fall back.")
+            if items:
+                return items
+            print(f"[!] Read endpoint returned no <a data-id> items; will fall back.")
         except Exception as e:
             print(f"[!] Read endpoint failed: {e}")
 
         # Fallback endpoint (often works, but lacks internal IDs)
-        fallback_url = f"{self._BASE_URL}/ajax/manga/{manga_id}/chapter/{lang_code}"
+        fallback_url = f"{self._BASE_URL}/ajax/manga/{manga_id}/{item_type}/{lang_code}"
         print(f"[*] Falling back to: {fallback_url}")
 
         try:
             _mf_throttle('request')
             resp = cf_session.get(fallback_url, timeout=20)
-            data = self._safe_json(resp, label="chapter-list-fallback", url=fallback_url)
+            data = self._safe_json(resp, label=f"{item_type}-list-fallback", url=fallback_url)
             if not data or data.get("status") != 200:
                 return []
             html = data.get("result")
@@ -278,10 +279,10 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 return []
             soup = self._make_soup(html)
         except Exception as e:
-            print(f"[!] Fallback chapter list failed: {e}")
+            print(f"[!] Fallback {item_type} list failed: {e}")
             return []
 
-        chapters: List[Dict] = []
+        items: List[Dict] = []
         for li in soup.select("li.item"):
             a_tag = li.select_one("a")
             if not a_tag:
@@ -290,8 +291,14 @@ class MangaFireSiteHandler(BaseSiteHandler):
             title = a_tag.get("title") or a_tag.get_text(strip=True)
             chap_num = li.get("data-number")
             full_url = urljoin(self._BASE_URL, href)
-            chapters.append({"hid": chap_num, "chap": chap_num, "title": title, "url": full_url, "uploaded": 0})
-        return chapters
+            items.append({"hid": chap_num, "chap": chap_num, "title": title, "url": full_url, "uploaded": 0, "_item_type": item_type})
+        return items
+
+    def get_chapters(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
+        return self._fetch_items(context, scraper, language, make_request, item_type="chapter")
+
+    def get_volumes(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
+        return self._fetch_items(context, scraper, language, make_request, item_type="volume")
 
     # ----------------------------- Images -----------------------------
 
@@ -354,7 +361,8 @@ class MangaFireSiteHandler(BaseSiteHandler):
             print("[!] Chapter missing ID; cannot fetch images.")
             return []
 
-        ajax_path = f"/ajax/read/chapter/{chapter_id}"
+        item_type = chapter.get("_item_type", "chapter")
+        ajax_path = f"/ajax/read/{item_type}/{chapter_id}"
         ajax_url_base = self._BASE_URL + ajax_path
 
         vrf_gen = get_vrf_generator()

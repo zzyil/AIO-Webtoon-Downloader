@@ -48,6 +48,11 @@ class BaseSiteHandler:
     ) -> List[Dict]:
         raise NotImplementedError
 
+    def get_volumes(
+        self, context: SiteComicContext, scraper, language: str, make_request
+    ) -> List[Dict]:
+        return []
+
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
         return None
 

@@ -2174,6 +2174,11 @@ def main():
         help="Skip chapters with partial numbers (e.g., 1.5, 60.1).",
     )
     p.add_argument("--chapters", default="all")
+    p.add_argument(
+        "--download-volumes",
+        action="store_true",
+        help="Download volumes instead of chapters (if supported by the site).",
+    )
 
 
     p.add_argument(
@@ -2877,7 +2882,10 @@ def main():
     if epub_dir_base:
         epub_out_dir = allocate_series_output_dir(title, hid, root=epub_dir_base)
         setattr(args, "epub_dir", epub_out_dir)
-    pool = handler.get_chapters(context, scraper, args.language, make_request)
+    if getattr(args, 'download_volumes', False):
+        pool = handler.get_volumes(context, scraper, args.language, make_request)
+    else:
+        pool = handler.get_chapters(context, scraper, args.language, make_request)
 
     # --- Chapter Selection Logic ---
     log_verbose("Filtering chapters based on preferences...")

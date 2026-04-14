@@ -78,14 +78,17 @@ def get_comic_info(url: str, site: Optional[str] = None):
     return context.comic
 
 @app.get("/api/chapters")
-def get_chapters(url: str, site: Optional[str] = None, language: str = "en"):
+def get_chapters(url: str, site: Optional[str] = None, language: str = "en", type: str = "chapter"):
     handler = get_handler_by_name(site) if site else get_handler_for_url(url)
     if not handler:
         raise HTTPException(404, "No handler found for this site")
     scraper = get_scraper()
     context = handler.fetch_comic_context(url, scraper, lambda u, s=scraper: s.get(u))
-    chapters = handler.get_chapters(context, scraper, language, lambda u, s=scraper: s.get(u))
-    return chapters
+    if type == "volume":
+        items = handler.get_volumes(context, scraper, language, lambda u, s=scraper: s.get(u))
+    else:
+        items = handler.get_chapters(context, scraper, language, lambda u, s=scraper: s.get(u))
+    return items
 
 @app.get("/api/chapter_images")
 def get_chapter_images(url: str, chapter_id: str, site: Optional[str] = None):

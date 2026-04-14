@@ -5,6 +5,15 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
+### 04.14.26
+
+**Volume downloading (`sites/`, `aio-dl.py`, `gui.py`, `api.py`):**
+- Added a `--download-volumes` flag to the CLI and a matching checkbox in the GUI to fetch volumes instead of chapters on supported sites (like MangaFire)
+- The existing `--chapters` range filter applies natively to volumes when this mode is toggled (e.g. `--chapters 1-5` downloads volumes 1-5)
+- Expanded the `/api/chapters` REST endpoint to support an optional `?type=volume` parameter
+
+---
+
 ### 04.09.26
 
 **Group selection safety (`sites/base.py`, `aio-dl.py`):**

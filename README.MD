@@ -503,18 +503,12 @@ Please follow the existing style and include tests where applicable.
 
 > Full changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
-### 04.09.26
+### 04.14.26
 
-**Group selection safety (`sites/base.py`, `aio-dl.py`):**
-- Normalized scanlation-group matching so case, spacing, punctuation, and common `official` label variants no longer cause false mismatches
-- If a requested scanlation group is not present for a chapter, the downloader now falls back to the highest-upvoted available release and reports the affected chapters at the end instead of switching silently
-- Added `--no-group-fallback` for users who want strict group-only downloads with skipped missing chapters
-- Updated `--mix-by-upvote` so it only compares releases from the groups explicitly allowed by the user
-- Added verbose reporting plus an end-of-run notice for chapters that fell back to another scanlation group
-
-**Tests & docs:**
-- Added focused unit tests covering normalized group matching, `official` aliases, fallback behavior, strict no-fallback behavior, and `mix-by-upvote` filtering
-- Updated CLI/README help text to document both the default fallback behavior and the new strict no-fallback option
+**Volume downloading (`sites/`, `aio-dl.py`, `gui.py`, `api.py`):**
+- Added a `--download-volumes` flag to the CLI and a matching checkbox in the GUI to fetch volumes instead of chapters on supported sites (like MangaFire)
+- The existing `--chapters` range filter applies natively to volumes when this mode is toggled (e.g. `--chapters 1-5` downloads volumes 1-5)
+- Expanded the `/api/chapters` REST endpoint to support an optional `?type=volume` parameter
 
 ## 🙏 Acknowledgements
 
