@@ -32,6 +32,7 @@ from library_state import (
     list_saved_books,
     scan_library,
 )
+from metadata_dialog import MetadataEditorDialog
 
 try:
     from PIL import Image, ImageTk
@@ -661,6 +662,8 @@ class AIODownloaderGUI:
         self.load_selected_btn.pack(side="left", padx=(0, 6))
         self.update_selected_btn = ttk.Button(actions, text="Update Selected", command=self._update_selected, style="Accent.TButton")
         self.update_selected_btn.pack(side="left", padx=(0, 6))
+        self.edit_metadata_btn = ttk.Button(actions, text="Edit Metadata", command=self._open_metadata_editor)
+        self.edit_metadata_btn.pack(side="left", padx=(0, 6))
         self.update_all_btn = ttk.Button(actions, text="Update All", command=self._update_all)
         self.update_all_btn.pack(side="left")
 
@@ -1483,7 +1486,34 @@ class AIODownloaderGUI:
             on_done=self._refresh_library,
             status_text=f"Updating all tracked series ({len(entries)})...",
         )
-
+    def _open_metadata_editor(self):
+        selected = self.lib_tree.selection()
+        if not selected:
+            messagebox.showinfo("Select Series", "Please select a series from the library first.")
+            return
+        
+        item_id = selected[0]
+        lib_item = self.library_index.get(item_id)
+        if not lib_item:
+            return
+            
+        folder_path = lib_item.get("folder")
+        if not folder_path or not os.path.isdir(folder_path):
+            messagebox.showerror("Error", "Invalid folder path.")
+            return
+            
+        from library_state import list_saved_books
+        all_books = list_saved_books(folder_path)
+        primary_book = lib_item.get("primary_book") or (all_books[0] if all_books else None)
+        
+        if not all_books:
+            messagebox.showinfo("No Books", "No downloaded CBZ, EPUB, or PDF files found in this series folder.")
+            return
+            
+        dialog = MetadataEditorDialog(self.root, folder_path, primary_book, all_books)
+        # We don't await dialog.wait_window() strictly if we want to let them edit, but it's cleaner to wait
+        # Then refresh optionally. But let's just show it.
+        
     def _open_library_folder(self):
         selected = self.lib_tree.selection()
         folder = selected[0] if selected else self.output_dir.get()

@@ -510,6 +510,13 @@ Please follow the existing style and include tests where applicable.
 - The existing `--chapters` range filter applies natively to volumes when this mode is toggled (e.g. `--chapters 1-5` downloads volumes 1-5)
 - Expanded the `/api/chapters` REST endpoint to support an optional `?type=volume` parameter
 
+**Hindsight metadata editing (`metadata_editor.py`, `metadata_dialog.py`, `gui.py`):**
+- Added an "Edit Metadata" button to the GUI Library tab, enabling retroactive metadata modification for previously downloaded series
+- Included a dedicated metadata editor script to safely rewrite internal metadata for CBZ (`ComicInfo.xml`), EPUB (`content.opf`), and PDF (`pypdf` Document Properties) in place
+- Added support for seamlessly replacing the cover image inside downloaded archives (injecting into ZIP or prepending as a new PDF page)
+- Provided a toggle to instantly apply the new metadata and cover across all individual chapters and volumes in a series folder
+- Implemented an animated indeterminate progress wheel to visually indicate background save operations
+
 ## 🙏 Acknowledgements
 
 This project stands on the shoulders of many wonderful open-source tools and libraries—thank you to all the maintainers and contributors who make these possible, thank you:
