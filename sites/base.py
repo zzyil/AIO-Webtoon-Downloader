@@ -59,7 +59,7 @@ class BaseSiteHandler:
             return None
         cleaned = re.sub(r"[_./-]+", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        if re.search(r"\bofficial\b", cleaned):
+        if re.search(r"\b(?:official|webtoons?|naver)\b", cleaned):
             return "official"
         return cleaned
 
