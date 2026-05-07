@@ -5,6 +5,15 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
+### 05.07.26
+
+**Atsumaru (`sites/atsumaru.py`):**
+- Fixed a bug where adult-content manga would fail with "No chapters selected" because the dedicated `/api/manga/chapters` endpoint returns an empty list without an authenticated session.
+- The downloader now uses a two-stage fallback: it extracts the first batch of chapters embedded in the `/api/manga/page` response, and pages through the rest using the `index` offset parameter.
+- Handled edge cases where adult chapters return non-numeric titles instead of chapter numbers, preventing them from being silently skipped during filtering.
+
+---
+
 ### 04.14.26
 
 **Volume downloading (`sites/`, `aio-dl.py`, `gui.py`, `api.py`):**

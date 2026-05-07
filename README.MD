@@ -505,19 +505,12 @@ Please follow the existing style and include tests where applicable.
 
 > Full changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
-### 04.14.26
+### 05.07.26
 
-**Volume downloading (`sites/`, `aio-dl.py`, `gui.py`, `api.py`):**
-- Added a `--download-volumes` flag to the CLI and a matching checkbox in the GUI to fetch volumes instead of chapters on supported sites (like MangaFire)
-- The existing `--chapters` range filter applies natively to volumes when this mode is toggled (e.g. `--chapters 1-5` downloads volumes 1-5)
-- Expanded the `/api/chapters` REST endpoint to support an optional `?type=volume` parameter
-
-**Hindsight metadata editing (`metadata_editor.py`, `metadata_dialog.py`, `gui.py`):**
-- Added an "Edit Metadata" button to the GUI Library tab, enabling retroactive metadata modification for previously downloaded series
-- Included a dedicated metadata editor script to safely rewrite internal metadata for CBZ (`ComicInfo.xml`), EPUB (`content.opf`), and PDF (`pypdf` Document Properties) in place
-- Added support for seamlessly replacing the cover image inside downloaded archives (injecting into ZIP or prepending as a new PDF page)
-- Provided a toggle to instantly apply the new metadata and cover across all individual chapters and volumes in a series folder
-- Implemented an animated indeterminate progress wheel to visually indicate background save operations
+**Atsumaru (`sites/atsumaru.py`):**
+- Fixed a bug where adult-content manga would fail with "No chapters selected" because the dedicated `/api/manga/chapters` endpoint returns an empty list without an authenticated session.
+- The downloader now uses a two-stage fallback: it extracts the first batch of chapters embedded in the `/api/manga/page` response, and pages through the rest using the `index` offset parameter.
+- Handled edge cases where adult chapters return non-numeric titles instead of chapter numbers, preventing them from being silently skipped during filtering.
 
 ## 🙏 Acknowledgements
 
