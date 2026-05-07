@@ -16,6 +16,7 @@ from .dynasty import DynastySiteHandler
 from .likemanga import LikeMangaSiteHandler
 from .kagane import KaganeSiteHandler
 from .madara import MadaraSiteHandler
+from .manhwaread import ManhwaReadHandler
 from .madara_extra_sites import MADARA_EXTRA_SITES
 from .mangadex import MangaDexSiteHandler
 from .mangabuddy import MangaBuddySiteHandler
@@ -88,6 +89,7 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     TecnoxmoonSiteHandler(),
     VioletScansSiteHandler(),
     BoratScansSiteHandler(),
+    ManhwaReadHandler(),
 )
 
 # Create MangaThemesia handlers from configuration

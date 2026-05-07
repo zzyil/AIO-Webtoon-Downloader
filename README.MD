@@ -159,6 +159,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | recent check 11.25.25 ✅ |
 | [manhuaplus.com](https://manhuaplus.com) | | recent check 03.08.26 ✅ |
 | [manhuaus.com](https://manhuaus.com) | | recent check 03.08.26 ✅ |
+| [manhwaread.com](https://manhwaread.com) | Unique Base64 image encoding support | recent check 05.07.26 ✅ |
 | [ragescans.com](https://ragescans.com) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
 | [razure.org](https://razure.org) | light-novel support | recent check 03.08.26 ✅ |
 | [utoon.net](https://utoon.net) | | recent check 11.26.25 ✅ |
@@ -506,6 +507,14 @@ Please follow the existing style and include tests where applicable.
 > Full changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
 ### 05.07.26
+
+**ManhwaRead Support (`sites/manhwaread.py`, `sites/__init__.py`):**
+- Added a dedicated `ManhwaReadHandler` to handle `manhwaread.com`'s unique Base64-encoded image data structure.
+- Implemented automatic Base64 padding correction to resolve "Incorrect padding" errors on certain chapters.
+- Optimized title and chapter list extraction with site-specific selectors.
+
+**Image Downloader & Referer Fix (`aio-dl.py`):**
+- Modified the image download logic to pass the `Referer` header from the main scraper session to the individual image requests. This resolves 403 Forbidden errors on CDNs like `manread.xyz` that enforce hotlink protection.
 
 **Atsumaru (`sites/atsumaru.py`):**
 - Fixed a bug where adult-content manga would fail with "No chapters selected" because the dedicated `/api/manga/chapters` endpoint returns an empty list without an authenticated session.

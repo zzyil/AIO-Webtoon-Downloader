@@ -56,6 +56,7 @@
 | [manhwaden.com](https://www.manhwaden.com) |  |
 | [manhwahentai.me](https://manhwahentai.me) |  |
 | [manhwahentai.to](https://manhwahentai.to) | currently offline ⛓️‍💥 |
+| [manhwaread.com](https://manhwaread.com) | recent check 05.07.26 ✅ |
 | [manhwatoon.me](https://www.manhwatoon.me) |  |
 | [manycomic.com](https://manycomic.com) |  |
 | [manytoon.com](https://manytoon.com) | image selection not working ⛔️ |

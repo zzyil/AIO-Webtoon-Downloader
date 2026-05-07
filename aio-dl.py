@@ -625,9 +625,11 @@ def _try_download_url(
                                 fh.write(chunk)
                 else:
                     img_session = requests.Session()
-                    ua = (getattr(scraper, "headers", {}) or {}).get("User-Agent", "")
-                    if ua:
-                        img_session.headers["User-Agent"] = ua
+                    headers = getattr(scraper, "headers", {}) or {}
+                    if "User-Agent" in headers:
+                        img_session.headers["User-Agent"] = headers["User-Agent"]
+                    if "Referer" in headers:
+                        img_session.headers["Referer"] = headers["Referer"]
                     r = img_session.get(url, stream=True, timeout=timeout)
                     r.raise_for_status()
                     with open(pth, "wb") as fh:
