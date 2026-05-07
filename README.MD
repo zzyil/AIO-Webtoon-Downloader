@@ -512,6 +512,11 @@ Please follow the existing style and include tests where applicable.
 - The downloader now uses a two-stage fallback: it extracts the first batch of chapters embedded in the `/api/manga/page` response, and pages through the rest using the `index` offset parameter.
 - Handled edge cases where adult chapters return non-numeric titles instead of chapter numbers, preventing them from being silently skipped during filtering.
 
+**Bug Fixes (`aio-dl.py`, `gui.py`):**
+- Fixed a crash (`Invalid size format: NONE`) that occurred when resuming or updating series with blank split settings; the GUI no longer accidentally translates empty parameters into the literal string `"None"`.
+- Improved parameter loading in `gui.py` to correctly handle `null` JSON values across all inputs (split, site, cookies).
+- Added strict fallback safeguards to `aio-dl.py` parsers (`parse_size`, `parse_aspect_ratio`) so they explicitly ignore `"NONE"` strings to prevent similar edge-case crashes.
+
 ## 🙏 Acknowledgements
 
 This project stands on the shoulders of many wonderful open-source tools and libraries—thank you to all the maintainers and contributors who make these possible, thank you:

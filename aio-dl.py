@@ -418,9 +418,9 @@ def make_request(url: str, scraper):
 
 def parse_size(size_str: str) -> int:
     """Parses a human-readable size string (e.g., '400MB') into bytes."""
-    if not size_str:
+    if not size_str or str(size_str).strip().upper() == "NONE":
         return 0
-    size_str = size_str.strip().upper()
+    size_str = str(size_str).strip().upper()
     match = re.match(r"^([\d.]+)\s*([KMGT]?B?)$", size_str)
     if not match:
         raise ValueError(f"Invalid size format: {size_str}")
@@ -436,10 +436,10 @@ def parse_size(size_str: str) -> int:
 
 def parse_aspect_ratio(spec: str) -> float:
     """Converts 'W:H' or a direct H/W float string to a float ratio (H/W)."""
-    if not spec:
+    if not spec or str(spec).strip().upper() == "NONE":
         return 0
-    if ":" in spec:
-        w, h = map(float, spec.split(":"))
+    if ":" in str(spec):
+        w, h = map(float, str(spec).split(":"))
         if w == 0:
             return float("inf")  # Avoid division by zero
         return h / w  # Return H/W for calculation

@@ -1338,7 +1338,7 @@ class AIODownloaderGUI:
         if params.get("url"):
             self.url_entry.insert("1.0", params["url"])
         self.chapters.set("all")
-        self.site_name.set(params.get("site", ""))
+        self.site_name.set(params.get("site") or "")
         self.fmt.set(params.get("format", "epub"))
         self.epub_layout.set(params.get("epub_layout", "vertical"))
         self.language.set(params.get("language", "en"))
@@ -1346,12 +1346,12 @@ class AIODownloaderGUI:
         self.aspect_ratio.set(params.get("aspect_ratio") or "")
         self.quality.set(int(params.get("quality", 85)))
         self.scaling.set(int(params.get("scaling", 100)))
-        self.cookies.set(params.get("cookies", ""))
+        self.cookies.set(params.get("cookies") or "")
         groups = params.get("group", [])
         if isinstance(groups, str):
             groups = [groups]
         self.group.set(", ".join(groups))
-        self.split.set(params.get("split", ""))
+        self.split.set(params.get("split") or "")
         self.save_params.set(True)
         self.keep_chapters.set(bool(params.get("keep_chapters", True)))
         self.keep_images.set(bool(params.get("keep_images", False)))
