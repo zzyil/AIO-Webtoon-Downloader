@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from PIL import Image
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class MangaReaderSiteHandler(BaseSiteHandler):
@@ -214,6 +214,121 @@ class MangaReaderSiteHandler(BaseSiteHandler):
                 }
             )
         return results
+
+    # ----------------------------------------------------------------- search
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        """Search MangaReader via /search?keyword=… (HTML page).
+
+        Best-effort: returns [] on any error. mangareader.to is fronted by
+        Cloudflare and occasionally throws 522/523 (origin error) — those just
+        produce an empty list so the orchestrator's parallel fan-out keeps
+        going. When the site recovers, search() works again with no code change.
+
+        Selector strategy: tries the aniwatch-family canonical container
+        `.flw-item` first (used across mangareader.to / kaido.to / zoro.to-style
+        layouts), falls back to broader patterns if the page DOM shifts. Cross-
+        file: the URL we emit (https://mangareader.to/manga/<slug>-<id>) feeds
+        straight into _extract_series_id() above (mangareader.py:38).
+        """
+        clean = (query or "").strip()
+        if not clean:
+            return []
+
+        from urllib.parse import quote_plus
+
+        url = f"{self._BASE_URL}/search?keyword={quote_plus(clean)}"
+        # HTTP errors propagate (the search shim raises on 5xx / CF 522 so the
+        # probe-failure cache catches the dead host).
+        resp = make_request(url, scraper)
+        html = resp.text
+        if not html or len(html) < 200:
+            return []
+
+        soup = BeautifulSoup(html, "html.parser")
+        # Try selectors in order of specificity. .flw-item is the canonical
+        # aniwatch family container; the generic '.item' fallback catches
+        # alternate layouts the family has shipped historically.
+        items = (
+            soup.select(".flw-item")
+            or soup.select(".manga_list-sbs .item, .preview-list .item")
+            or soup.select(".item")
+        )
+        if not items:
+            return []
+
+        hits: List[SearchHit] = []
+        seen: set = set()
+        for idx, item in enumerate(items):
+            if len(hits) >= limit:
+                break
+            link = (
+                item.select_one(".manga-name a, .name a, h3 a, a.dynamic-name")
+                or item.find("a", href=True)
+            )
+            if not link or not link.get("href"):
+                continue
+            href = link.get("href") or ""
+            # Only manga detail pages — skip /read/ links.
+            if "/manga/" not in href:
+                continue
+            abs_url = self._absolute(href)
+            # Drop query strings / anchors so dedupe works.
+            abs_url = abs_url.split("?")[0].split("#")[0]
+            if abs_url in seen:
+                continue
+            seen.add(abs_url)
+
+            title = (link.get("title") or link.get_text(strip=True) or "").strip()
+            if not title:
+                continue
+
+            img = item.select_one(".manga-poster img, .item-thumb img, img")
+            cover: Optional[str] = None
+            if img is not None:
+                cover = (
+                    img.get("data-src")
+                    or img.get("data-cfsrc")
+                    or img.get("src")
+                )
+                if cover and cover.startswith("//"):
+                    cover = "https:" + cover
+
+            # alt-titles: aniwatch search cards sometimes carry a .alias-name
+            # or a [data-jname] attribute on the link with the romaji/japanese.
+            alt_titles: List[str] = []
+            for sel in (".alias-name", ".name-jp", ".manga-name-jp"):
+                node = item.select_one(sel)
+                if node:
+                    txt = node.get_text(strip=True)
+                    if txt and txt != title:
+                        alt_titles.append(txt)
+            jname = link.get("data-jname")
+            if isinstance(jname, str) and jname and jname != title:
+                alt_titles.append(jname)
+
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(items))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=abs_url,
+                    cover=cover,
+                    alt_titles=alt_titles,
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
     # ----------------------------------------------------------------- parsing
     def _parse_chapter_number(self, text: str) -> Optional[str]:

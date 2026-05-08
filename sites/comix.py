@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import re
 from typing import Dict, List, Optional, Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class ComixSiteHandler(BaseSiteHandler):
@@ -399,5 +399,81 @@ class ComixSiteHandler(BaseSiteHandler):
 
         if not images:
             raise RuntimeError("Could not find images in chapter page.")
-            
+
         return images
+
+    # ----------------------------------------------------------------- search
+    # Comix uses /api/v1/manga?keyword=<query>. The /api/v1/search endpoint
+    # in their JS bundle config IS a thing but returns 404 for unauth GETs;
+    # /api/v1/manga is the public list endpoint with a 'keyword' filter that
+    # behaves as substring/relevance match. (axios baseURL=/api/v1; bundle
+    # exposes a top-level routes.search="/search" but that's a UI route, not
+    # an API one.) The list endpoint is the supported public search path.
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = (
+            f"https://comix.to/api/v1/manga"
+            f"?keyword={quote_plus(clean)}"
+            f"&limit={int(limit)}"
+        )
+        response = make_request(url, scraper)
+        try:
+            data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            return []
+        items = (data.get("result") or {}).get("items") or []
+        if not isinstance(items, list):
+            return []
+
+        hits: List[SearchHit] = []
+        for idx, it in enumerate(items):
+            hid = it.get("hid")
+            title = (it.get("title") or "").strip()
+            if not hid or not title:
+                continue
+            poster = it.get("poster") or {}
+            cover = None
+            if isinstance(poster, dict):
+                cover = poster.get("large") or poster.get("medium") or poster.get("small")
+            # latestChapter is float (e.g., 686.5 for half chapters); finalChapter
+            # is the canonical end. Use finalChapter when available, else
+            # int(latestChapter).
+            chapter_count = it.get("finalChapter") or it.get("latestChapter")
+            if isinstance(chapter_count, (int, float)):
+                chapter_count = int(chapter_count)
+            else:
+                chapter_count = None
+            year = it.get("year")
+            if not isinstance(year, int):
+                year = None
+            # URL: /title/<hid> works without slug — verified live. The
+            # fetch_comic_context handler takes hid from slug_part.split('-')[0]
+            # so the no-slug form is parsed correctly.
+            url_full = f"https://comix.to/title/{hid}"
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(items))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=url_full,
+                    cover=cover,
+                    alt_titles=[],
+                    year=year,
+                    language=None,
+                    chapter_count_hint=chapter_count,
+                    raw_score=raw_score,
+                )
+            )
+        return hits

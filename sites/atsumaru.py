@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 from typing import Dict, List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class AtsumaruSiteHandler(BaseSiteHandler):
@@ -175,6 +175,97 @@ class AtsumaruSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("No images returned for Atsumaru chapter.")
         return images
+
+    # ----------------------------------------------------------------- search
+    # Atsumaru is a Vite SPA backed by a Typesense-style document search at
+    # /collections/manga/documents/search. The frontend bundle constructs
+    # this endpoint dynamically (no `/api/...` literal); confirmed via JS
+    # bundle scan. Endpoint accepts plain `?q=<query>&query_by=title` and
+    # returns rich JSON including poster, chapterCount, otherNames, id.
+    # The id maps directly to the URL slug (/manga/<id>) so fetch_comic_context
+    # works without an extra round-trip.
+    _SEARCH_URL = "/collections/manga/documents/search"
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = (
+            f"{self._BASE_URL}{self._SEARCH_URL}"
+            f"?q={quote_plus(clean)}"
+            f"&query_by=title,englishTitle,otherNames"
+            f"&per_page={limit}"
+        )
+        response = make_request(url, scraper)
+        try:
+            data = response.json()
+        except ValueError:
+            return []
+        raw_hits = data.get("hits") or []
+        if not isinstance(raw_hits, list):
+            return []
+
+        hits: List[SearchHit] = []
+        for idx, h in enumerate(raw_hits):
+            doc = h.get("document") if isinstance(h, dict) else None
+            if not isinstance(doc, dict):
+                continue
+            mid = doc.get("id")
+            if not mid:
+                continue
+            # Prefer English title for cross-site dedupe; fall back to native.
+            title = (doc.get("englishTitle") or doc.get("title") or "").strip()
+            if not title:
+                continue
+
+            other_names = doc.get("otherNames") or []
+            alt_titles: List[str] = []
+            if isinstance(other_names, list):
+                for nm in other_names:
+                    if isinstance(nm, str) and nm and nm != title:
+                        alt_titles.append(nm)
+            # Also expose `title` as alt when englishTitle was the primary —
+            # romaji match is helpful for cross-site dedupe.
+            native = (doc.get("title") or "").strip()
+            if native and native != title and native not in alt_titles:
+                alt_titles.append(native)
+
+            poster_path = doc.get("poster") or doc.get("posterMedium") or doc.get("posterSmall")
+            cover = None
+            if isinstance(poster_path, str) and poster_path:
+                cover = urljoin(self._BASE_URL + "/", poster_path.lstrip("/"))
+
+            chapter_count = doc.get("chapterCount")
+            if not isinstance(chapter_count, int):
+                chapter_count = None
+
+            year = doc.get("releaseYear") or doc.get("year")
+            if not isinstance(year, int):
+                year = None
+
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(raw_hits))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=f"{self._BASE_URL}/manga/{mid}",
+                    cover=cover,
+                    alt_titles=alt_titles,
+                    year=year,
+                    language=None,
+                    chapter_count_hint=chapter_count,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
 
 __all__ = ["AtsumaruSiteHandler"]

@@ -9,7 +9,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup, FeatureNotFound
 import requests
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 @dataclass
@@ -460,6 +460,24 @@ class MadaraSiteHandler(BaseSiteHandler):
             page_url = source_url
         return self._parse_chapters(soup, scraper, page_url=page_url)
 
+    # ---------------------------------------------------------------- search
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        return madara_search_via_admin_ajax(
+            base_url=self.base_url,
+            site_name=self.name,
+            query=query,
+            scraper=scraper,
+            limit=limit,
+        )
+
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")
         if not chapter_url:
@@ -497,4 +515,110 @@ class MadaraSiteHandler(BaseSiteHandler):
         return image_urls
 
 
-__all__ = ["MadaraSiteHandler"]
+def madara_search_via_admin_ajax(
+    *,
+    base_url: str,
+    site_name: str,
+    query: str,
+    scraper,
+    limit: int = 20,
+) -> List[SearchHit]:
+    """Cross-site Madara search via the standard admin-ajax endpoint.
+
+    All Madara/MadTheme WordPress sites expose:
+      POST /wp-admin/admin-ajax.php
+        action=wp-manga-search-manga
+        title=<query>
+    Returns JSON with two shapes seen in the wild:
+      1. Rich (toonily, manhwa-flavored): {success, data:[{label, value, url,
+         thumbnail, author, artist, is_mature}]}
+      2. Simple (manhuaus, generic Madara): {success, data:[{title, url, type}]}
+    On no-match: data is a single dict {error:"not found", message:...} rather
+    than an empty list. We normalize both shapes to a list of SearchHit.
+
+    Module-level helper so MadaraSiteHandler subclasses get this for free,
+    AND non-MadaraSiteHandler-but-still-Madara handlers (ManhuaPlus, ManhuaUS)
+    can call it without inheriting the rest of MadaraSiteHandler. Cross-file:
+    sites/manhuaplus.py:search and sites/manhuaus.py:search both call this.
+
+    HTTP errors propagate to the caller — orchestrator's _run_one catches and
+    records in probe-failure cache. Wraps only JSON-parse and result-extraction
+    in try/except (those should never blow up on malformed data; surfacing the
+    parse error as an empty result is correct behavior).
+    """
+    clean = (query or "").strip()
+    if not clean:
+        return []
+
+    base = base_url.rstrip("/")
+    url = f"{base}/wp-admin/admin-ajax.php"
+    response = scraper.post(
+        url,
+        data={"action": "wp-manga-search-manga", "title": clean},
+        headers={
+            "Referer": base + "/",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        timeout=10,
+    )
+    if 500 <= response.status_code < 600:
+        response.raise_for_status()
+    if response.status_code != 200:
+        return []
+
+    try:
+        payload = response.json()
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if isinstance(data, dict):
+        if data.get("error"):
+            return []
+        data = [data]
+    if not isinstance(data, list):
+        return []
+
+    hits: List[SearchHit] = []
+    seen: set = set()
+    for idx, item in enumerate(data):
+        if len(hits) >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("label") or item.get("value") or item.get("title") or "").strip()
+        if not title:
+            continue
+        hit_url = (item.get("url") or "").strip()
+        if not hit_url:
+            continue
+        if hit_url.startswith("/"):
+            hit_url = urljoin(base, hit_url)
+        hit_url = hit_url.split("?")[0].split("#")[0]
+        if hit_url in seen:
+            continue
+        seen.add(hit_url)
+
+        cover = item.get("thumbnail") or item.get("cover")
+        if isinstance(cover, str) and cover.startswith("/"):
+            cover = urljoin(base, cover)
+
+        raw_score = max(0.05, 1.0 - (idx / max(1, len(data))))
+        hits.append(
+            SearchHit(
+                site=site_name,
+                title=title,
+                url=hit_url,
+                cover=cover if isinstance(cover, str) else None,
+                alt_titles=[],
+                year=None,
+                language=None,
+                chapter_count_hint=None,
+                raw_score=raw_score,
+            )
+        )
+    return hits
+
+
+__all__ = ["MadaraSiteHandler", "madara_search_via_admin_ajax"]

@@ -2,7 +2,8 @@ from __future__ import annotations
 from typing import Dict, List
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
+from .madara import madara_search_via_admin_ajax
 
 class ManhuaUSSiteHandler(BaseSiteHandler):
     name = "manhuaus"
@@ -12,6 +13,12 @@ class ManhuaUSSiteHandler(BaseSiteHandler):
         scraper.headers.update({"Referer": f"{self._BASE_URL}/"})
     def _make_soup(self, html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
+    def search(self, query: str, scraper, make_request, *, language: str = "en", limit: int = 20) -> List[SearchHit]:
+        # ManhuaUS is a Madara WordPress site — reuse the shared admin-ajax
+        # search helper (sites/madara.py:madara_search_via_admin_ajax).
+        return madara_search_via_admin_ajax(
+            base_url=self._BASE_URL, site_name=self.name, query=query, scraper=scraper, limit=limit,
+        )
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         soup = self._make_soup(make_request(url, scraper).text)
         title = soup.select_one("h1, .post-title")

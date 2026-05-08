@@ -79,6 +79,14 @@ class MangaParkSiteHandler(BaseSiteHandler):
     }
     """.strip()
 
+    # No search() override — mangapark.net's WAF blocks our scraper at search
+    # time (the GraphQL /apo/ endpoint either timeouts or 4xxs from cloudscraper),
+    # so participating would just hang the orchestrator's parallel fan-out and
+    # rack up probe-failure-cache strikes. Direct URLs still work via
+    # fetch_comic_context (HTML scrape with HTML state extraction). Quality
+    # seed entry at 0.70 still applies for ranking when mangapark surfaces via
+    # template handlers or direct URLs.
+
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault(
             "User-Agent",

@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Callable
 from urllib.parse import urljoin, quote
 import re
 from bs4 import BeautifulSoup, NavigableString
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 from .mangathemesia_utils import (
     extract_ts_reader_images,
     extract_ts_reader_payload,
@@ -62,7 +62,113 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         if self._url_normalizer:
             return self._url_normalizer(url)
         return url
-    
+
+    # ---------------------------------------------------------------- search
+    # MangaThemesia framework search: GET /?s=<query> returns the standard
+    # WordPress search-results page with manga cards under .listupd .bs.
+    # Each card structure:
+    #   <div class="bs">
+    #     <div class="bsx">
+    #       <a href="/manga/<slug>/" title="<Title>">
+    #         <div class="limit">
+    #           <img class="ts-post-image" src="<cover>" />
+    #         </div>
+    #         <div class="bigor">
+    #           <div class="tt"><h2 itemprop="headline"><Title></h2></div>
+    #         </div>
+    #       </a>
+    #     </div>
+    #   </div>
+    # Single implementation covers ~50 sites in MANGATHEMESIA_SITES at once.
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = f"{self.base_url.rstrip('/')}/?s={quote(clean)}"
+        # HTTP errors propagate to orchestrator's _run_one for probe-cache
+        # tracking. Sites that return tiny bodies (some MangaThemesia sites
+        # serve a JS-only search and return ~24 bytes from the static path)
+        # produce empty results without raising.
+        response = make_request(url, scraper)
+        html = response.text or ""
+        if len(html) < 200:
+            return []
+        soup = self._make_soup(html)
+
+        # Primary: cards in .listupd .bs .bsx > a. Fallback: any .bs with
+        # a /manga/ link if the .bsx wrapper changed.
+        cards = soup.select(".listupd .bs, .bs")
+        if not cards:
+            return []
+
+        hits: List[SearchHit] = []
+        seen: set = set()
+        for idx, card in enumerate(cards):
+            if len(hits) >= limit:
+                break
+            link = card.select_one("a[href]")
+            if not link:
+                continue
+            href = (link.get("href") or "").strip()
+            if not href:
+                continue
+            # Filter to series/manga URLs only — skip nav links, ads, etc.
+            if not re.search(r"/(manga|series|comic|comics)/[^/?#]+", href):
+                continue
+            abs_url = href if href.startswith("http") else urljoin(self.base_url, href)
+            abs_url = abs_url.split("?")[0].split("#")[0]
+            if abs_url in seen:
+                continue
+            seen.add(abs_url)
+
+            # Title preference: <a title="..."> attribute → <h2 itemprop>
+            # → fallback to slug-derived. The title attribute is the most
+            # reliable across MangaThemesia variants.
+            title = (link.get("title") or "").strip()
+            if not title:
+                t = card.select_one(".tt h2, h2[itemprop='headline'], .tt, h2, h3")
+                if t:
+                    title = t.get_text(strip=True)
+            if not title:
+                continue
+
+            # Cover from img inside the card (data-src for lazy-load).
+            cover: Optional[str] = None
+            img = card.select_one("img")
+            if img is not None:
+                src = (
+                    img.get("data-src")
+                    or img.get("data-lazy-src")
+                    or img.get("data-cfsrc")
+                    or img.get("src")
+                )
+                if src:
+                    cover = src if src.startswith("http") else urljoin(self.base_url, src)
+
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(cards))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=abs_url,
+                    cover=cover,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
+
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         url = self._normalize_url(url)
         if self.use_playwright:

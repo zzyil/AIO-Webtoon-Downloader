@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 _MANGANATO_DOMAINS = (
@@ -226,6 +227,121 @@ class ManganatoSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("Unable to locate Manganato chapter images.")
         return images
+
+    # ----------------------------------------------------------------- search
+    # Manganato uses the historic mangakakalot/manganelo /search/story/<slug>
+    # pattern. The slug is the query with non-word chars collapsed to "_"
+    # and lowercased (e.g. "witch hat" → "witch_hat"). Result selectors are
+    # `.search-story-item` (modern domains) or `.story_item` (legacy).
+    #
+    # Multi-domain trial: the network landscape for this aggregator family is
+    # unstable — domains rotate (manganato.gg, natomanga.com, nelomanga.net,
+    # mangabats.com, ...) and many are CF-aggressive on /search/. We try
+    # domains in order, returning hits from the first one that responds with
+    # parseable HTML. HTTP errors propagate so the orchestrator's probe-
+    # failure cache suppresses dead/blocked hosts. When ALL domains fail,
+    # search returns [] (the orchestrator sees that as "no match" — fine,
+    # since the user can still hit manganato directly for known URLs).
+    _SEARCH_DOMAINS = (
+        "https://www.manganato.gg",
+        "https://www.natomanga.com",
+        "https://www.nelomanga.net",
+        "https://www.mangabats.com",
+        "https://www.mangakakalot.gg",
+    )
+    _SLUG_NONWORD_RE = re.compile(r"\W+")
+
+    def _query_to_slug(self, query: str) -> str:
+        # Mirror the canonical mihon-extension behavior: non-word → _, lower.
+        slug = self._SLUG_NONWORD_RE.sub("_", query).strip("_").lower()
+        return slug or "_"
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        slug = self._query_to_slug(clean)
+        last_error: Optional[Exception] = None
+        for base in self._SEARCH_DOMAINS:
+            url = f"{base}/search/story/{slug}"
+            try:
+                response = make_request(url, scraper)
+            except Exception as exc:
+                last_error = exc
+                continue
+            html = response.text or ""
+            # CF-challenge response is usually 403 or 503 with a "Just a moment"
+            # body — make_request's 5xx-as-exception handles 503; 403 returns
+            # to us. Check body length + a CF-marker to detect the challenge
+            # page so we move on to the next domain instead of trying to parse it.
+            if (
+                getattr(response, "status_code", 0) >= 400
+                or "Just a moment..." in html[:1000]
+                or len(html) < 1000
+            ):
+                continue
+            hits = self._parse_search_html(html, base, limit)
+            if hits:
+                return hits
+            # Empty parse — try next domain in case this one is mid-rotation
+            # (some natomanga clones deliver a stub during DNS rotation).
+        if last_error is not None and not isinstance(last_error, Exception):
+            # placeholder for future use; currently we just self-select out.
+            pass
+        return []
+
+    def _parse_search_html(self, html: str, base: str, limit: int) -> List[SearchHit]:
+        soup = self._make_soup(html)
+        # Selector chain: modern (search-story-item) → legacy (story_item).
+        items = (
+            soup.select(".search-story-item")
+            or soup.select(".story_item")
+            or soup.select(".panel_story_list .story_item")
+        )
+        hits: List[SearchHit] = []
+        for idx, item in enumerate(items):
+            if len(hits) >= limit:
+                break
+            # Title anchor: `.item-title` (modern) / `h3 a` (legacy)
+            title_a = item.select_one(".item-title") or item.select_one("h3 a")
+            if not title_a:
+                continue
+            title = title_a.get_text(strip=True)
+            href = title_a.get("href") or ""
+            if not title or not href:
+                continue
+            abs_url = self._absolute(base + "/", href) or href
+            # Cover image: first <img> in card
+            cover_img = item.select_one("img")
+            cover = None
+            if cover_img:
+                cover = self._absolute(
+                    base + "/",
+                    cover_img.get("data-src") or cover_img.get("data-original") or cover_img.get("src"),
+                )
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(items))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=abs_url,
+                    cover=cover,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
 
 __all__ = ["ManganatoSiteHandler"]

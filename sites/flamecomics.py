@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class FlameComicsSiteHandler(BaseSiteHandler):
@@ -264,6 +264,95 @@ class FlameComicsSiteHandler(BaseSiteHandler):
             if page_name:
                 img_url = f"{cdn_base}/{series_id}/{token}/{page_name}"
                 image_urls.append(img_url)
-                
+
         return image_urls
+
+    # -- Cross-site search ------------------------------------------
+    # FlameComics has no server-side search via its Next.js data API. The
+    # /browse.json endpoint accepts a `?q=…` param but ignores it server-side
+    # — verified live: 153 entries returned regardless of query. So search()
+    # fetches the full catalog and client-side filters on title. The catalog
+    # is small (~150 series), and we cache the build-id from fetch_comic_context's
+    # path so subsequent searches are cheap.
+    #
+    # Schema of each /browse.json entry: series_id (int), title, description,
+    # cover (filename), year, type, status, language, country, author[], artist[],
+    # publisher[], categories[], likes, last_edit, time. NO altTitles on the
+    # browse listing (those live on the per-series /series/{id}.json detail).
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        # Walk the same build-id-refresh path as fetch_comic_context to keep
+        # behavior consistent when FlameComics rebuilds (the build_id rotates).
+        build_id = self._fetch_build_id(scraper, make_request)
+        url = self._get_data_api_url("browse", build_id) + f"?q={clean}"
+        response = make_request(url, scraper)
+        try:
+            data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return []
+        series_list = (data.get("pageProps") or {}).get("series") or []
+        if not isinstance(series_list, list):
+            return []
+
+        ql = clean.lower()
+        query_tokens = set(t for t in ql.split() if t)
+
+        scored: List[tuple] = []
+        for entry in series_list:
+            if not isinstance(entry, dict):
+                continue
+            title = (entry.get("title") or "").strip()
+            if not title:
+                continue
+            tl = title.lower()
+            if ql in tl:
+                relevance = 1.0
+            elif query_tokens and all(tok in tl for tok in query_tokens):
+                relevance = 0.7
+            else:
+                continue
+            scored.append((relevance, entry))
+
+        scored.sort(key=lambda x: -x[0])
+
+        cdn_base = "https://cdn.flamecomics.xyz/uploads/images/series"
+        hits: List[SearchHit] = []
+        for idx, (relevance, entry) in enumerate(scored[:limit]):
+            sid = entry.get("series_id")
+            if sid is None:
+                continue
+            cover_filename = entry.get("cover")
+            cover = f"{cdn_base}/{sid}/{cover_filename}" if cover_filename else None
+            year = entry.get("year")
+            if not isinstance(year, int):
+                year = None
+            url_full = f"https://flamecomics.xyz/series/{sid}"
+            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=entry.get("title") or "",
+                    url=url_full,
+                    cover=cover,
+                    alt_titles=[],
+                    year=year,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
+
+
+__all__ = ["FlameComicsSiteHandler"]
 

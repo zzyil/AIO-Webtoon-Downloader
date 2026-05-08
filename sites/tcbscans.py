@@ -6,12 +6,13 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class TCBScansSiteHandler(BaseSiteHandler):
     name = "tcbscans"
     domains = ("tcbonepiecechapters.com", "www.tcbonepiecechapters.com", "tcbscans.com", "www.tcbscans.com")
+    _BASE_URL = "https://tcbonepiecechapters.com"
 
     def configure_session(self, scraper, args) -> None:
         # TCB Scans often requires standard headers
@@ -142,3 +143,105 @@ class TCBScansSiteHandler(BaseSiteHandler):
         parsed = urlparse(url)
         parts = [p for p in parsed.path.split("/") if p]
         return parts[-1] if parts else "unknown"
+
+    # ----------------------------------------------------------------- search
+    # TCBScans has no /search endpoint. Their /projects page is the entire
+    # catalog (~38 series — TCB only does One Piece + a small curated set
+    # of weekly Shonen Jump titles). Client-side filter on title; the catalog
+    # is small enough that we don't need pagination or relevance scoring
+    # beyond substring match. Same pattern as flamecomics/zeroscans.
+    #
+    # Domain fallback: tcbscans.com is geo-blocked from some networks
+    # ("Supplied countryName is invalid" 200-byte response); use
+    # tcbonepiecechapters.com as the canonical search domain. The handler's
+    # domains tuple includes both so resolved URLs still match the right
+    # handler downstream.
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = f"{self._BASE_URL}/projects"
+        response = make_request(url, scraper)
+        html = response.text or ""
+        if len(html) < 200:
+            return []
+        soup = self._make_soup(html)
+
+        # Each project lives under TWO anchors (image-only and title-text)
+        # both pointing to /mangas/<id>/<slug>. We dedupe by href and pick
+        # the title-text anchor when present (image-only has no text content).
+        anchors = soup.select('a[href*="/mangas/"]')
+        by_href: Dict[str, List] = {}
+        for a in anchors:
+            href = (a.get("href") or "").strip()
+            if not href.startswith("/mangas/"):
+                continue
+            by_href.setdefault(href, []).append(a)
+
+        ql = clean.lower()
+        query_tokens = set(t for t in ql.split() if t)
+
+        scored: List = []
+        for href, anchor_list in by_href.items():
+            # Pick the title-text anchor (has non-empty text); fall back to
+            # the image's alt attribute on the image-only anchor.
+            text_anchor = next(
+                (a for a in anchor_list if a.get_text(strip=True)), None
+            )
+            img_anchor = next(
+                (a for a in anchor_list if a.find("img")), None
+            )
+            title = ""
+            cover = None
+            if text_anchor:
+                title = text_anchor.get_text(strip=True)
+            if img_anchor:
+                img = img_anchor.find("img")
+                if img:
+                    if not title:
+                        title = (img.get("alt") or "").strip()
+                    src = img.get("src")
+                    if src:
+                        cover = src if src.startswith("http") else urljoin(self._BASE_URL, src)
+            if not title:
+                continue
+            tl = title.lower()
+            if ql in tl:
+                relevance = 1.0
+            elif query_tokens and all(tok in tl for tok in query_tokens):
+                relevance = 0.7
+            else:
+                continue
+            scored.append((relevance, title, href, cover))
+
+        scored.sort(key=lambda x: -x[0])
+
+        hits: List[SearchHit] = []
+        for idx, (relevance, title, href, cover) in enumerate(scored[:limit]):
+            url_full = urljoin(self._BASE_URL, href)
+            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=url_full,
+                    cover=cover,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
+
+
+__all__ = ["TCBScansSiteHandler"]

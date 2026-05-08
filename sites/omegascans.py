@@ -1,7 +1,8 @@
 import re
 import json
-from urllib.parse import urljoin, urlparse
-from .base import BaseSiteHandler
+import sys
+from urllib.parse import quote_plus, urljoin, urlparse
+from .base import BaseSiteHandler, SearchHit
 
 class OmegaScansSiteHandler(BaseSiteHandler):
     name = "omegascans"
@@ -186,7 +187,7 @@ class OmegaScansSiteHandler(BaseSiteHandler):
             try:
                 response = scraper.get(direct_url)
                 if response.status_code != 200:
-                    print(f"Failed to fetch chapter page: {response.status_code}")
+                    print(f"Failed to fetch chapter page: {response.status_code}", file=sys.stderr)
                     return []
                 
                 html = response.text
@@ -240,3 +241,81 @@ class OmegaScansSiteHandler(BaseSiteHandler):
         except Exception as e:
             # print(f"Error extracting images from data: {e}")
             return []
+
+    # -- Cross-site search ------------------------------------------
+    # OmegaScans is a heancms-framework site. The public search endpoint is
+    # /query on api.omegascans.org with query_string + paging params. Same
+    # shape as other heancms sites (asuracomic.net, reaperscans, etc.) so
+    # other heancms handlers added later in Phase D can crib this. Series URL
+    # constructed from the slug returned by the API; cover from `thumbnail`
+    # which is either a relative path or a fully-qualified media.omegascans.org
+    # URL — we normalize both shapes.
+    _API_BASE = "https://api.omegascans.org"
+    _SERIES_BASE = "https://omegascans.org/series"
+    _MEDIA_BASE = "https://media.omegascans.org"
+
+    def search(self, query, scraper, make_request, *, language="en", limit=20):
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        # heancms /query: adult=true keeps mature series visible (the user's
+        # ranking/feedback layer can downscore those if they don't want them).
+        # series_type=Comic excludes Novel results which the handler wouldn't
+        # know how to download anyway. orderBy=total_views gives a stable
+        # relevance proxy when the substring match is the only signal.
+        url = (
+            f"{self._API_BASE}/query"
+            f"?adult=true"
+            f"&page=1"
+            f"&perPage={int(limit)}"
+            f"&query_string={quote_plus(clean)}"
+            f"&order=desc"
+            f"&orderBy=total_views"
+            f"&series_type=Comic"
+        )
+        response = make_request(url, scraper)
+        try:
+            data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return []
+        items = data.get("data") or []
+        if not isinstance(items, list):
+            return []
+
+        hits = []
+        for idx, it in enumerate(items):
+            if not isinstance(it, dict):
+                continue
+            slug = it.get("series_slug") or it.get("slug")
+            title = (it.get("title") or "").strip()
+            if not slug or not title:
+                continue
+            # thumbnail can be a relative filename ("foo.webp") or a full URL
+            # (`https://media.omegascans.org/file/...`) depending on heancms
+            # version. Normalize.
+            thumb = it.get("thumbnail") or it.get("cover")
+            cover = None
+            if isinstance(thumb, str) and thumb:
+                if thumb.startswith("http"):
+                    cover = thumb
+                else:
+                    cover = f"{self._MEDIA_BASE}/cover/{thumb.lstrip('/')}"
+            year = it.get("year")
+            if not isinstance(year, int):
+                year = None
+            url_full = f"{self._SERIES_BASE}/{slug}"
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(items))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=url_full,
+                    cover=cover,
+                    alt_titles=[],
+                    year=year,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits

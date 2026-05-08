@@ -4,7 +4,7 @@ import json
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class MangaHubSiteHandler(BaseSiteHandler):
@@ -54,6 +54,28 @@ class MangaHubSiteHandler(BaseSiteHandler):
         id
         number
         pages
+      }
+    }
+    """
+
+    # GraphQL search field signature confirmed via introspection (2026-05-07):
+    #   search(x: MangaSource, mod: SearchMod!, q: String, alt: Boolean,
+    #          status: Status, genreID: [Int], hideLicensed: Boolean,
+    #          limit: Int, offset: Int) → { rows: [MangaListItem] }
+    # MangaListItem fields exposed: id, title, slug, image, latestChapter, author.
+    # alternativeTitle is NOT exposed on MangaListItem (only on the full Manga
+    # type returned by manga(...)), so alt_titles is always empty here.
+    _SEARCH_QUERY = """
+    query Search($q: String!, $limit: Int!) {
+      search(x: m01, mod: ALPHABET, q: $q, limit: $limit) {
+        rows {
+          id
+          title
+          slug
+          image
+          latestChapter
+          author
+        }
       }
     }
     """
@@ -190,6 +212,63 @@ class MangaHubSiteHandler(BaseSiteHandler):
             rel = path_prefix + filename.lstrip("/")
             urls.append(urljoin(self._IMAGE_BASE, rel))
         return urls
+
+    # ----------------------------------------------------------------- search
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        # GraphQL POST — same scraper.post path as fetch_comic_context. Errors
+        # propagate via raise_for_status / RuntimeError so probe-failure cache
+        # catches dead host. Wrap parsing only.
+        try:
+            data = self._post_graphql(
+                scraper,
+                self._SEARCH_QUERY,
+                {"q": clean, "limit": int(limit)},
+            )
+        except (json.JSONDecodeError, ValueError):
+            return []
+        rows = (data.get("search") or {}).get("rows") or []
+        if not isinstance(rows, list):
+            return []
+
+        hits: List[SearchHit] = []
+        for idx, row in enumerate(rows):
+            slug = row.get("slug")
+            title = (row.get("title") or "").strip()
+            if not slug or not title:
+                continue
+            cover = self._absolute_thumb(row.get("image"))
+            # latestChapter is an int representing the most recent chapter
+            # number — useful as chapter_count_hint (close-enough for series
+            # where chapters are sequentially numbered from 1).
+            chapter_count = row.get("latestChapter")
+            if not isinstance(chapter_count, int):
+                chapter_count = None
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(rows))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=f"{self._BASE_URL}/manga/{slug}",
+                    cover=cover,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=chapter_count,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
 
 __all__ = ["MangaHubSiteHandler"]

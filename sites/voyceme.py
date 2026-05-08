@@ -4,7 +4,7 @@ import json
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class VoyceMeSiteHandler(BaseSiteHandler):
@@ -66,6 +66,29 @@ class VoyceMeSiteHandler(BaseSiteHandler):
                 order_by: { sort_order: asc }
             ) {
                 image
+            }
+        }
+    """
+
+    # Hasura ilike-based search; same series filter as DETAILS_QUERY (publish=1,
+    # type ∈ {2,4} which are manga/manhwa per the kotlin extension) so we don't
+    # surface novels or unpublished drafts. chapters_aggregate gives us a free
+    # chapter_count_hint without needing a second query.
+    SEARCH_QUERY = """
+        query($search: String!, $limit: Int!) {
+            voyce_series(
+                where: {
+                    publish: { _eq: 1 },
+                    type: { id: { _in: [2, 4] } },
+                    title: { _ilike: $search }
+                },
+                limit: $limit,
+            ) {
+                id
+                slug
+                thumbnail
+                title
+                chapters_aggregate { aggregate { count } }
             }
         }
     """
@@ -185,18 +208,91 @@ class VoyceMeSiteHandler(BaseSiteHandler):
              url = chapter.get("url")
              if url:
                  chap_id = int(url.split("/")[-1])
-        
+
         if not chap_id:
             raise RuntimeError("Chapter ID missing.")
-            
+
         data = self._post_graphql(self.PAGES_QUERY, {"chapterId": chap_id}, scraper)
-        
+
         images_data = data.get("data", {}).get("voyce_chapter_images", [])
-        
+
         image_urls = []
         for img in images_data:
             path = img.get("image")
             if path:
                 image_urls.append(self.STATIC_URL + path)
-                
+
         return image_urls
+
+    # ----------------------------------------------------------------- search
+    # voyce.me hosts indie/original webcomics, so most cross-site queries for
+    # licensed series (One Piece, Frieren) return empty here. That's expected
+    # — search() participates honestly and the orchestrator's title-match
+    # filter drops empty results without flagging the host.
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        # Hasura's _ilike requires the % wildcards to be in the value, not the
+        # operator. Wrap the user's query for substring match.
+        ilike = f"%{clean}%"
+        # We use scraper.post() directly rather than make_request because
+        # make_request is GET-only in the search-time fast-fail wrapper. The
+        # GraphQL endpoint requires POST + JSON body. HTTP errors from
+        # scraper.post still propagate (raise_for_status), so the orchestrator's
+        # probe-failure cache still works for dead/CF-blocked hosts.
+        try:
+            response = scraper.post(
+                self.GRAPHQL_URL,
+                json={
+                    "query": self.SEARCH_QUERY,
+                    "variables": {"search": ilike, "limit": int(limit)},
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (json.JSONDecodeError, ValueError):
+            return []
+        series_list = (data or {}).get("data", {}).get("voyce_series") or []
+        if not isinstance(series_list, list):
+            return []
+
+        hits: List[SearchHit] = []
+        for idx, series in enumerate(series_list):
+            slug = series.get("slug")
+            title = (series.get("title") or "").strip()
+            if not slug or not title:
+                continue
+            thumb = series.get("thumbnail")
+            cover = self.STATIC_URL + thumb if thumb else None
+            chapter_count = (
+                (series.get("chapters_aggregate") or {})
+                .get("aggregate", {})
+                .get("count")
+            )
+            if not isinstance(chapter_count, int):
+                chapter_count = None
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(series_list))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=f"https://www.voyce.me/series/{slug}",
+                    cover=cover,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=chapter_count,
+                    raw_score=raw_score,
+                )
+            )
+        return hits

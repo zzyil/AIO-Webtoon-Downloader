@@ -1,361 +1,346 @@
+"""Asura Scans handler — rewritten 2026-05-07 for the Astro-based asurascans.com.
+
+History: asuracomic.net used to be a Next.js App Router site. The handler
+parsed `self.__next_f.push([1, ...])` flight payloads to extract series,
+chapter list, and chapter pages. Asura migrated to Astro v5 on a new domain
+group (asurascans.com / asurascans.org / asuracomic.com); the old
+asuracomic.net domain now serves a static SPA shell with no embedded data.
+This rewrite targets the new Astro structure.
+
+What this module owns:
+  - configure_session: standard headers
+  - search: HTML scrape /browse?search=<query> (already shipped Phase D)
+  - fetch_comic_context: parses series page /comics/<slug>-<id>
+  - get_chapters: parses chapter list from same series page
+  - get_chapter_images: parses chapter reader /comics/<slug>-<id>/chapter/<N>
+
+What reads from it:
+  - aio-dl.py main download loop
+  - sites.search_orchestrator probe path (chapter-aggregate v3)
+  - sites/__init__.py registry
+
+Cross-file:
+  - SearchHit / SiteComicContext from .base
+  - The Astro structure is reasonably stable but selectors should be
+    treated as brittle — if asurascans.com redesigns again, expect to
+    re-run probes and update CSS selectors. grep for `selector hint:`
+    comments in this file to find the load-bearing ones.
+"""
+
 from __future__ import annotations
 
-import json
+import datetime as _dt
 import re
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class AsuraSiteHandler(BaseSiteHandler):
     name = "asura"
+    # Live site as of 2026-05-07: asurascans.com (Astro v5). The .net + asuracomic
+    # domains are kept in the tuple so old bookmarks still route to this handler
+    # even though their actual content is dead — at least we'll fail with a
+    # clear error rather than "no handler matches this URL".
     domains = (
+        "asurascans.com",
+        "www.asurascans.com",
+        "asurascans.org",
+        "www.asurascans.org",
+        "asuracomic.com",
+        "www.asuracomic.com",
         "asuracomic.net",
         "www.asuracomic.net",
         "asurascans.net",
         "www.asurascans.net",
     )
+    _BASE_URL = "https://asurascans.com"
+    _CDN_BASE = "https://cdn.asurascans.com"
 
     def configure_session(self, scraper, args) -> None:
         if "Referer" not in scraper.headers:
             scraper.headers.update(
                 {
-                    "Referer": "https://asuracomic.net/",
-                    "Origin": "https://asuracomic.net",
+                    "Referer": f"{self._BASE_URL}/",
+                    "Origin": self._BASE_URL,
                 }
             )
 
-    # -- Helpers -----------------------------------------------------
+    # --------------------------------------------------------- helpers
+    def _make_soup(self, html: str) -> BeautifulSoup:
+        return BeautifulSoup(html, "html.parser")
+
     def _fetch_html(self, url: str, scraper, make_request) -> str:
         response = make_request(url, scraper)
-        response.encoding = response.encoding or "utf-8"
+        # Force UTF-8 — Asura's Astro server sends HTML without an explicit
+        # charset header, so cloudscraper falls back to ISO-8859-1 per
+        # requests defaults. That mangles Korean author names ("추공") and
+        # smart quotes (' ') in the description into latin-1 mojibake.
+        response.encoding = "utf-8"
         return response.text
 
-    def _extract_flight_content(self, html: str) -> str:
+    def _slug_from_url(self, url: str) -> str:
+        """Extract the canonical /comics/<slug-with-id-suffix> identifier.
+
+        Both the series page (/comics/<slug>) and the chapter page
+        (/comics/<slug>/chapter/<N>) share the same first-segment slug —
+        which itself includes a stable per-series ID suffix (e.g.
+        `solo-leveling-b6e039fe`). We keep the full string with suffix as
+        the slug because it's required for URL construction.
         """
-        Next.js App Router streams data via self.__next_f pushes. We decode the
-        escaped payload into plain text for easier parsing.
+        path = urlparse(url).path
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return ""
+        if parts[0] == "comics" and len(parts) > 1:
+            return parts[1]
+        # Legacy /series/<slug> from the dead Next.js site — best-effort
+        # only. Series page won't actually load on the new domain.
+        if parts[0] == "series" and len(parts) > 1:
+            return parts[1]
+        return parts[0]
+
+    def _series_url(self, slug: str) -> str:
+        return f"{self._BASE_URL}/comics/{slug}"
+
+    def _chapter_url(self, slug: str, chapter_no: str) -> str:
+        return f"{self._BASE_URL}/comics/{slug}/chapter/{chapter_no}"
+
+    @staticmethod
+    def _parse_uploaded(text: Optional[str]) -> int:
+        """Convert 'May 24, 2023' / 'Jul 13, 2024' to a Unix timestamp.
+
+        Asura's chapter list shows English month-day-year strings. Unparseable
+        strings → 0 (matches the convention used elsewhere in the codebase
+        for missing dates).
         """
-        chunks: List[str] = []
-        search = 'self.__next_f.push([1,"'
-        idx = 0
-        while True:
-            start = html.find(search, idx)
-            if start == -1:
-                break
-            start += len(search)
-            end = html.find('"])', start)
-            if end == -1:
-                break
-            raw = html[start:end]
-            chunks.append(bytes(raw, "utf-8").decode("unicode_escape"))
-            idx = end
-        return "\n".join(chunks)
-
-    def _extract_json_block(self, text: str, pattern: str) -> Optional[Dict]:
-        idx = text.find(pattern)
-        if idx == -1:
-            return None
-        start = text.find("{", idx)
-        if start == -1:
-            return None
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    block = text[start : i + 1]
-                    return json.loads(block)
-        return None
-
-    def _extract_array_block(self, text: str, pattern: str) -> Optional[List]:
-        idx = text.find(pattern)
-        if idx == -1:
-            return None
-        start = text.find("[", idx)
-        if start == -1:
-            return None
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    block = text[start : i + 1]
-                    return json.loads(block)
-        return None
-
-    def _build_pointer_map(self, content: str) -> Dict[str, object]:
-        pattern = re.compile(r"^([0-9a-z]+):(.*)$", re.MULTILINE)
-        values: Dict[str, object] = {}
-        for match in pattern.finditer(content):
-            key = match.group(1)
-            raw = match.group(2).strip()
-            if not raw:
-                continue
-            if raw.startswith("$"):
-                values[key] = raw
-                continue
-            if raw.startswith('"'):
-                try:
-                    values[key] = json.loads(raw)
-                except json.JSONDecodeError:
-                    values[key] = raw
-                continue
+        if not text:
+            return 0
+        text = text.strip()
+        for fmt in ("%b %d, %Y", "%B %d, %Y"):
             try:
-                if raw.startswith("[") or raw.startswith("{"):
-                    values[key] = json.loads(raw)
-                else:
-                    values[key] = raw
-            except json.JSONDecodeError:
-                values[key] = raw
-        return values
+                d = _dt.datetime.strptime(text, fmt)
+                return int(d.replace(tzinfo=_dt.timezone.utc).timestamp())
+            except ValueError:
+                continue
+        return 0
 
-    def _resolve(
-        self,
-        value,
-        mapping: Dict[str, object],
-        visited: Optional[set] = None,
-    ):
-        if visited is None:
-            visited = set()
-        if isinstance(value, str) and value.startswith("$"):
-            token = value[1:]
-            if token in visited:
-                return None
-            visited.add(token)
-            return self._resolve(mapping.get(token), mapping, visited)
-        if isinstance(value, list):
-            return [self._resolve(v, mapping, set()) for v in value]
-        if isinstance(value, dict):
-            return {k: self._resolve(v, mapping, set()) for k, v in value.items()}
-        return value
+    @staticmethod
+    def _normalize_chapter_number(value) -> str:
+        """Same convention as the rest of the codebase: int when whole, else
+        decimal (e.g. 4.0 → '4', 4.5 → '4.5'). String input passed through."""
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and not value.is_integer():
+                return str(value).rstrip("0").rstrip(".")
+            return str(int(value))
+        return str(value)
 
-    def _find_chapter_map(self, mapping: Dict[str, object]) -> Optional[List[Dict]]:
-        for value in mapping.values():
-            resolved = self._resolve(value, mapping)
-            if (
-                isinstance(resolved, list)
-                and resolved
-                and isinstance(resolved[0], dict)
-                and {"label", "value"}.issubset(resolved[0].keys())
-            ):
-                return resolved
+    @staticmethod
+    def _extract_label_block(soup: BeautifulSoup, label: str) -> Optional[str]:
+        """Find a label-value pair in the Astro layout where the layout is:
+            <div>...><span>Status</span></div> ...<span>completed</span>...
+
+        We scan for any element whose direct text matches `label`, then walk
+        forward to the next block of meaningful text within the same logical
+        container. Used for Status, Type, Updated, Released — fields that
+        appear as `<label>:<value>` boxes.
+
+        Selector hint: the actual layout uses `<div class="text-xs ...">`
+        for labels and `<span class="text-base font-bold">` for values, but
+        the class names are utility-CSS and likely to drift. Walking the DOM
+        from a label match is more resilient.
+        """
+        for el in soup.find_all(string=re.compile(rf"^\s*{re.escape(label)}\s*$", re.IGNORECASE)):
+            # Walk to the parent and its next-sibling block — heuristic but
+            # works for the current 2026-05 layout.
+            parent = el.parent
+            if not parent:
+                continue
+            container = parent.parent
+            if not container:
+                continue
+            for sib in container.find_all(["span", "div"], recursive=True):
+                txt = sib.get_text(strip=True)
+                if txt and txt.lower() != label.lower():
+                    return txt
         return None
 
-    def _find_pages(self, mapping: Dict[str, object]) -> Optional[List[Dict]]:
-        for value in mapping.values():
-            resolved = self._resolve(value, mapping)
-            if (
-                isinstance(resolved, list)
-                and resolved
-                and isinstance(resolved[0], dict)
-                and {"order", "url"}.issubset(resolved[0].keys())
-            ):
-                return resolved
-        return None
-
-    def _split_people(self, text: str) -> List[str]:
-        parts = re.split(r"[,/]", text)
-        return [p.strip() for p in parts if p.strip()]
-
-    def _extract_people_from_html(self, html: str) -> Dict[str, List[str]]:
-        soup = BeautifulSoup(html, "html.parser")
-        authors: List[str] = []
-        artists: List[str] = []
-        info_section = soup.select_one(
-            "div.grid.grid-cols-1.md\\:grid-cols-2.gap-5.mt-8"
-        )
-        if info_section:
-            for row in info_section.find_all("div", recursive=False):
-                labels = row.find_all("h3")
-                if len(labels) < 2:
-                    continue
-                label_text = labels[0].get_text(strip=True).lower()
-                value_text = labels[1].get_text(strip=True)
-                if "author" in label_text or "writer" in label_text:
-                    authors = self._split_people(value_text)
-                elif "artist" in label_text or "illustrator" in label_text:
-                    artists = self._split_people(value_text)
-        result: Dict[str, List[str]] = {}
-        if authors:
-            result["authors"] = authors
-        if artists:
-            result["artists"] = artists
-            if not authors:
-                result.setdefault("authors", artists)
-        return result
-
-    def _parse_chapter_page(self, html: str) -> Dict:
-        content = self._extract_flight_content(html)
-        pointer_map = self._build_pointer_map(content)
-        comic = self._extract_json_block(content, '"comic":{')
-        chapter = self._extract_json_block(content, '"chapter":{"id"')
-        chapter_map = self._extract_array_block(content, '"chapterMapData":[')
-        if comic:
-            comic = self._resolve(comic, pointer_map)
-        if chapter:
-            chapter = self._resolve(chapter, pointer_map)
-        if chapter_map:
-            chapter_map = self._resolve(chapter_map, pointer_map)
-        else:
-            chapter_map = self._find_chapter_map(pointer_map) or []
-        if chapter and not chapter.get("pages"):
-            chapter["pages"] = self._find_pages(pointer_map) or []
-        return {
-            "comic": comic or {},
-            "chapter": chapter or {},
-            "chapter_map": chapter_map or [],
-            "pointers": pointer_map,
-        }
-
-    def _chapter_url(self, base: str, slug: str, chapter_value: str) -> str:
-        return f"{base}/series/{slug}/chapter/{chapter_value}"
-
-    # -- Base overrides ----------------------------------------------
+    # ----------------------------------------------------- Base overrides
     def fetch_comic_context(
         self, url: str, scraper, make_request
     ) -> SiteComicContext:
-        html = self._fetch_html(url, scraper, make_request)
-        data = self._parse_chapter_page(html)
-        comic = data["comic"] or {}
-        if not comic:
-            raise RuntimeError("Unable to parse comic metadata from Asura page.")
+        slug = self._slug_from_url(url)
+        if not slug:
+            raise RuntimeError("Unable to determine Asura slug from URL.")
 
-        parsed = urlparse(url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
-        slug = comic.get("slug") or self._slug_from_url(url)
-        title = comic.get("name") or slug
-        comic.setdefault("slug", slug)
-        comic.setdefault("name", title)
-        comic.setdefault("hid", str(comic.get("id") or slug))
-        if comic.get("thumb") and not comic.get("cover"):
-            comic["cover"] = comic["thumb"]
-        comic["_base_url"] = base_url
-        extra_people = self._extract_people_from_html(html)
-        for key, value in extra_people.items():
-            if value:
-                comic[key] = value
+        # Always fetch the canonical series page even if user passed a chapter
+        # URL — the chapter page doesn't expose the chapter list, only the
+        # current chapter's images.
+        series_url = self._series_url(slug)
+        html = self._fetch_html(series_url, scraper, make_request)
+        soup = self._make_soup(html)
 
-        # inject helpers
-        comic["_chapter_map"] = data.get("chapter_map", [])
+        # Title — h1 is the series title in the new layout.
+        h1 = soup.find("h1")
+        title = h1.get_text(strip=True) if h1 else slug
 
-        if not comic["_chapter_map"]:
-            series_url = self._series_base(base_url, slug)
-            series_html = self._fetch_html(series_url, scraper, make_request)
-            series_data = self._parse_chapter_page(series_html)
-            if series_data.get("chapter_map"):
-                comic["_chapter_map"] = series_data["chapter_map"]
-            if series_data.get("comic"):
-                for key, value in series_data["comic"].items():
-                    if key not in comic or comic[key] in (None, "", []):
-                        comic[key] = value
-            extra_people = self._extract_people_from_html(series_html)
-            for key, value in extra_people.items():
-                if not comic.get(key):
-                    comic[key] = value
-        if not comic["_chapter_map"]:
-            try:
-                first_html = self._fetch_html(
-                    self._chapter_url(base_url, slug, "1"), scraper, make_request
-                )
-                first_data = self._parse_chapter_page(first_html)
-                if first_data.get("chapter_map"):
-                    comic["_chapter_map"] = first_data["chapter_map"]
-                if first_data.get("comic"):
-                    for key, value in first_data["comic"].items():
-                        if key not in comic or comic[key] in (None, "", []):
-                            comic[key] = value
-                extra_people = self._extract_people_from_html(first_html)
-                for key, value in extra_people.items():
-                    if not comic.get(key):
-                        comic[key] = value
-            except Exception:
-                pass
+        # Cover — og:image holds the full-resolution cover URL on
+        # cdn.asurascans.com/asura-images/covers/<slug>.<short>.webp
+        cover = None
+        og_img = soup.find("meta", attrs={"property": "og:image"})
+        if og_img and og_img.get("content"):
+            cover = og_img["content"].strip()
+
+        # Description — meta name=description has the synopsis (Astro
+        # populates this server-side from the same source as the visible
+        # description block).
+        description = None
+        desc_meta = soup.find("meta", attrs={"name": "description"})
+        if desc_meta and desc_meta.get("content"):
+            description = desc_meta["content"].strip()
+
+        # Authors / artists — anchors with /browse?author= or /browse?artist=
+        # query params (both visible-text + URL-encoded). Asura sometimes
+        # lists the same author multiple times across translation credits;
+        # dedupe.
+        authors: List[str] = []
+        for a in soup.select('a[href*="/browse?author="]'):
+            t = a.get_text(strip=True)
+            if t and t not in authors:
+                authors.append(t)
+        artists: List[str] = []
+        for a in soup.select('a[href*="/browse?artist="]'):
+            t = a.get_text(strip=True)
+            if t and t not in artists:
+                artists.append(t)
+
+        # Genres — anchors with /browse?genres=<g>
+        genres: List[str] = []
+        for a in soup.select('a[href*="/browse?genres="]'):
+            t = a.get_text(strip=True)
+            if t and t not in genres:
+                genres.append(t)
+
+        # Status (completed/ongoing/dropped/etc.) — captured from the label
+        # block heuristic. Asura uses lowercase status words ('completed',
+        # 'ongoing', 'hiatus'); we normalize to title case for the comic dict.
+        status_raw = self._extract_label_block(soup, "Status")
+        status = status_raw.title() if status_raw else None
+
+        # Series type (manhwa/manga/manhua) — same heuristic. Stored as
+        # additional metadata for downstream display only.
+        series_type_raw = self._extract_label_block(soup, "Type")
+        series_type = series_type_raw.lower() if series_type_raw else None
+
+        comic: Dict[str, object] = {
+            "hid": slug,
+            "title": title,
+            "url": series_url,
+            "_slug": slug,
+        }
+        if description:
+            comic["desc"] = description
+        if cover:
+            comic["cover"] = cover
+        if authors:
+            comic["authors"] = authors
+        if artists:
+            comic["artists"] = artists
+        if genres:
+            comic["genres"] = genres
+        if status:
+            comic["status"] = status
+        if series_type:
+            comic["type"] = series_type
 
         return SiteComicContext(
             comic=comic,
             title=title,
             identifier=slug,
-            soup=None,
+            soup=soup,
         )
-
-    def extract_additional_metadata(
-        self, context: SiteComicContext
-    ) -> Dict[str, List[str]]:
-        comic = context.comic or {}
-        metadata: Dict[str, List[str]] = {}
-
-        description = comic.get("description") or comic.get("summary")
-        if description:
-            # store in comic for downstream builder
-            comic["desc"] = description
-
-        # genres may be available as a list under "genres"
-        genres = comic.get("genres")
-        if isinstance(genres, list):
-            metadata["genres"] = [g["name"] for g in genres if isinstance(g, dict) and g.get("name")]
-
-        # authors / artists might be included under different keys; handle gracefully
-        for key, target in (("authors", "authors"), ("artists", "artists")):
-            if key in comic and isinstance(comic[key], list):
-                if comic[key] and isinstance(comic[key][0], dict):
-                    metadata[target] = [
-                        item["name"]
-                        for item in comic[key]
-                        if isinstance(item, dict) and item.get("name")
-                    ]
-                else:
-                    metadata[target] = [str(item).strip() for item in comic[key] if str(item).strip()]
-
-        return metadata
 
     def get_chapters(
         self, context: SiteComicContext, scraper, language: str, make_request
     ) -> List[Dict]:
-        comic = context.comic or {}
+        soup = context.soup
+        if soup is None:
+            # Re-fetch if context didn't carry the soup (shouldn't happen in
+            # the normal flow but be defensive).
+            html = self._fetch_html(self._series_url(context.identifier), scraper, make_request)
+            soup = self._make_soup(html)
+
         slug = context.identifier
-        base_url = comic.get("_base_url") or "https://asuracomic.net"
-        chapter_map: List[Dict] = context.comic.get("_chapter_map", [])
+        # Selector hint: Astro chapter list rows are anchors with the
+        # `data-astro-prefetch="hover"` attribute pointing to /comics/<slug>/chapter/<N>.
+        # The "First Chapter" / "Latest Chapter" jump buttons at the top of the
+        # page do NOT have data-astro-prefetch — that's our filter.
+        href_re = re.compile(rf"^/comics/{re.escape(slug)}/chapter/[0-9]+(?:\.[0-9]+)?/?$")
+        chap_anchors = [
+            a for a in soup.select('a[data-astro-prefetch="hover"]')
+            if href_re.match((a.get("href") or "").strip())
+        ]
+
         chapters: List[Dict] = []
-
-        normalized_entries = []
-        for entry in chapter_map:
-            if not isinstance(entry, dict):
+        seen: set = set()
+        for a in chap_anchors:
+            href = (a.get("href") or "").strip().rstrip("/")
+            if href in seen:
                 continue
-            label = entry.get("label") or ""
-            value = entry.get("value")
-            if value is None:
+            seen.add(href)
+            # Chapter number from the URL — authoritative (matches the row
+            # text "Chapter N" but immune to whitespace/comment quirks the
+            # span text can have, like the inline HTML comment between
+            # "Chapter" and the number).
+            m = re.search(r"/chapter/([0-9]+(?:\.[0-9]+)?)$", href)
+            if not m:
                 continue
-            chapter_no = self._normalize_chapter_number(value)
-            normalized_entries.append((chapter_no, label))
+            chap_no = self._normalize_chapter_number(m.group(1))
 
-        def chapter_sort_key(item):
-            chap_no, _ = item
-            try:
-                return float(chap_no)
-            except ValueError:
-                return float("inf")
+            # Optional sub-title (e.g., "Side Story 20" — many series have
+            # a per-chapter subtitle in a span.block.truncate).
+            sub_title = None
+            sub_span = a.select_one("span.block.truncate")
+            if sub_span:
+                t = sub_span.get_text(strip=True)
+                if t:
+                    sub_title = t
 
-        for chapter_no, label in sorted(normalized_entries, key=chapter_sort_key):
+            # Date in the right-aligned span. Pattern is "Mon DD, YYYY";
+            # we scan from the end since the chapter-number span comes
+            # first in DOM order.
+            uploaded = 0
+            for sp in reversed(a.find_all("span")):
+                txt = sp.get_text(strip=True)
+                if not txt:
+                    continue
+                if re.match(r"^[A-Z][a-z]{2,9}\s+\d{1,2},\s*\d{4}$", txt):
+                    uploaded = self._parse_uploaded(txt)
+                    break
+
             chapters.append(
                 {
-                    "hid": f"{slug}-{chapter_no}",
-                    "chap": chapter_no,
-                    "title": label or f"Chapter {chapter_no}",
-                    "url": self._chapter_url(base_url, slug, chapter_no),
+                    "hid": f"{slug}-{chap_no}",
+                    "chap": chap_no,
+                    "title": sub_title or f"Chapter {chap_no}",
+                    "url": urljoin(self._BASE_URL, href),
+                    "uploaded": uploaded,
                     "group_name": None,
                 }
             )
 
+        # Sort ascending by chapter number — the DOM order is descending
+        # (newest first) but downstream code expects ascending.
+        def _sort_key(ch):
+            try:
+                return float(ch.get("chap") or 0)
+            except (ValueError, TypeError):
+                return 0.0
+
+        chapters.sort(key=_sort_key)
         return chapters
 
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
@@ -364,41 +349,121 @@ class AsuraSiteHandler(BaseSiteHandler):
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")
         if not chapter_url:
-            raise RuntimeError("Chapter URL missing for Asura chapter.")
-
+            raise RuntimeError("Asura chapter URL missing.")
         html = self._fetch_html(chapter_url, scraper, make_request)
-        data = self._parse_chapter_page(html)
-        pages = data.get("chapter", {}).get("pages", [])
+        soup = self._make_soup(html)
 
-        image_urls: List[str] = []
-        for page in sorted(
-            pages,
-            key=lambda p: p.get("order", 0) if isinstance(p, dict) else 0,
-        ):
-            if isinstance(page, dict) and page.get("url"):
-                image_urls.append(page["url"])
-        return image_urls
+        # Selector hint: chapter pages are served by cdn.asurascans.com under
+        # /asura-images/chapters/<slug>/<N>/<page>.webp. Other CDN images
+        # appear on the page (the cover thumbnail in the "now reading" card,
+        # site logo, etc.); the /chapters/ path filter excludes them.
+        images: List[str] = []
+        seen: set = set()
+        for img in soup.find_all("img"):
+            src = (img.get("src") or "").strip()
+            if not src:
+                continue
+            if "/asura-images/chapters/" not in src:
+                continue
+            if src in seen:
+                continue
+            seen.add(src)
+            images.append(src)
 
-    # -- Internal helpers --------------------------------------------
-    def _series_base(self, base: str, slug: str) -> str:
-        return f"{base}/series/{slug}"
+        if not images:
+            raise RuntimeError(
+                f"No chapter images found for {chapter_url} — selectors may "
+                "have drifted (Astro layout). Re-probe and update the "
+                "/asura-images/chapters/ filter."
+            )
+        return images
 
-    def _slug_from_url(self, url: str) -> str:
-        path = urlparse(url).path
-        # path like /series/<slug>/chapter/<name> or /series/<slug>
-        parts = [part for part in path.split("/") if part]
-        if not parts:
-            return ""
-        if parts[0] == "series":
-            return parts[1] if len(parts) > 1 else ""
-        return parts[0]
+    # ----------------------------------------------------------------- search
+    # asurascans.com (Astro v5) exposes /browse?search=<query> as a server-
+    # side filtered HTML page. Plain GET, no auth, no XHR — Cloudflare-fronted
+    # but cloudscraper passes. Each result has TWO anchors with the same
+    # `/comics/<slug>-<id-suffix>` href (a cover-image anchor and an h3-text
+    # anchor). We dedupe by href and pick whichever has the title text + the
+    # cover img.
+    #
+    # Notes:
+    # - URL pattern: `/comics/<slug>-<8-char-suffix>` — the suffix is a
+    #   stable per-series ID, not a hash. Returned URLs include it.
+    # - Cover URL: cdn.asurascans.com/asura-images/covers/<slug>.<short>-400.webp
+    #   for the listing thumbnail; full-res is the same path without `-400`.
+    # - `?q=<query>` and `?search=<query>` both work server-side. We use
+    #   `search` since it's slightly clearer.
+    # - Param `name=<query>` does NOT filter (returns full browse) — known
+    #   gotcha; don't use it.
+    _COMICS_HREF_RE = re.compile(r"^/comics/[a-z0-9\-]+/?$")
 
-    def _normalize_chapter_number(self, value) -> str:
-        if isinstance(value, (int, float)):
-            if isinstance(value, float) and not value.is_integer():
-                return str(value).rstrip("0").rstrip(".")
-            return str(int(value))
-        return str(value)
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = f"{self._BASE_URL}/browse?search={quote_plus(clean)}"
+        response = make_request(url, scraper)
+        html = response.text or ""
+        if len(html) < 1000:
+            return []
+        soup = self._make_soup(html)
+
+        # Group anchors by href — one href = one series, but appears under
+        # both a cover-image anchor and a title-text anchor.
+        by_href: Dict[str, List] = {}
+        for a in soup.select('a[href^="/comics/"]'):
+            href = (a.get("href") or "").strip()
+            if not self._COMICS_HREF_RE.match(href):
+                continue
+            by_href.setdefault(href, []).append(a)
+
+        hits: List[SearchHit] = []
+        for idx, (href, anchor_list) in enumerate(by_href.items()):
+            if len(hits) >= limit:
+                break
+            title = ""
+            cover = None
+            for a in anchor_list:
+                if not title:
+                    h3 = a.select_one("h3")
+                    if h3:
+                        title = h3.get_text(strip=True)
+                if not cover:
+                    img = a.select_one("img")
+                    if img:
+                        if not title:
+                            alt = (img.get("alt") or "").strip()
+                            if alt:
+                                title = alt
+                        src = (img.get("src") or "").strip()
+                        if src:
+                            cover = src if src.startswith("http") else urljoin(self._BASE_URL, src)
+            if not title:
+                continue
+            url_full = urljoin(self._BASE_URL, href)
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(by_href))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=url_full,
+                    cover=cover,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
 
 __all__ = ["AsuraSiteHandler"]

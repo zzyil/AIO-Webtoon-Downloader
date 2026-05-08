@@ -4,7 +4,7 @@ import json
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class ZeroScansSiteHandler(BaseSiteHandler):
@@ -152,13 +152,96 @@ class ZeroScansSiteHandler(BaseSiteHandler):
         
         api_url = f"{self.API_BASE}/comic/{slug}/chapters/{chap_id}"
         data = self._fetch_json(api_url, scraper)
-        
+
         chap_detail = data.get("data", {}).get("chapter", {})
-        
+
         # Kotlin: highQuality.takeIf { it.isNotEmpty() } ?: goodQuality
         high_quality = chap_detail.get("high_quality", [])
         good_quality = chap_detail.get("good_quality", [])
-        
+
         images = high_quality if high_quality else good_quality
-        
+
         return images
+
+    # -- Cross-site search ------------------------------------------
+    # ZeroScans has no dedicated /search endpoint. Their /swordflake/comics
+    # endpoint returns the FULL catalog in one JSON payload (~50-200 entries),
+    # so we client-side filter on `name` substring match. Fast on first call,
+    # essentially free on subsequent queries via the orchestrator's per-host
+    # request coordination. Same pattern as fetch_comic_context which already
+    # walks the full list to find a slug.
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        # Use make_request so retries/cooldowns flow through. Let HTTP errors
+        # propagate (e.g., the site returns 525 when CF can't reach origin —
+        # that's a probe-failure-cache signal, not silent empty results).
+        response = make_request(f"{self.API_BASE}/comics", scraper)
+        try:
+            data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return []
+        all_comics = data.get("data", {}).get("comics") or []
+        if not isinstance(all_comics, list):
+            return []
+
+        ql = clean.lower()
+        # Score by token overlap so multi-word queries match meaningfully.
+        # We let the orchestrator's rapidfuzz reweight against title/alt_titles
+        # — our raw_score is just a stable per-site relevance hint.
+        query_tokens = set(t for t in ql.split() if t)
+
+        scored: List[tuple] = []
+        for c in all_comics:
+            name = (c.get("name") or "").strip()
+            if not name:
+                continue
+            nl = name.lower()
+            # Substring or token-overlap match. Conservative: require either
+            # the full query as a substring OR every query token to appear.
+            if ql in nl:
+                relevance = 1.0
+            elif query_tokens and all(tok in nl for tok in query_tokens):
+                relevance = 0.7
+            else:
+                continue
+            scored.append((relevance, c))
+
+        scored.sort(key=lambda x: -x[0])
+
+        hits: List[SearchHit] = []
+        for idx, (relevance, c) in enumerate(scored[:limit]):
+            slug = c.get("slug")
+            if not slug:
+                continue
+            cover_v = (c.get("cover") or {}).get("vertical")
+            url = f"https://zscans.com/comics/{slug}"
+            # Position-based raw_score, scaled by relevance so substring
+            # matches outrank token-overlap ones.
+            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=c.get("name") or slug,
+                    url=url,
+                    cover=cover_v,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
+
+
+__all__ = ["ZeroScansSiteHandler"]

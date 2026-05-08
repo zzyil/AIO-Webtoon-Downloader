@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class AsmotoonSiteHandler(BaseSiteHandler):
@@ -249,6 +249,101 @@ class AsmotoonSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("No images found for this chapter.")
         return images
+
+    # ----------------------------------------------------------------- search
+    # asmotoon's /?s=<query> doesn't actually filter (returns the homepage
+    # regardless — the search box is JS-driven). Their /series/ page lists
+    # the full catalog (~156 series). Client-side substring match — same
+    # pattern as flamecomics/zeroscans/tcbscans.
+    #
+    # Series cards: <a href="/series/<slug>/" title="..."> with a child div
+    # whose `style="background-image:url(<cover_url>)"` carries the cover.
+    # The cover URL goes through the wsrv.nl image proxy
+    # (https://wsrv.nl/?url=cdn.meowing.org/uploads/<id>&w=600); we keep
+    # that wrapper so the chapter-probe path uses the same proxy as the
+    # site's frontend.
+    _COVER_BG_RE = re.compile(r"background-image:url\((https?://[^)]+)\)", re.IGNORECASE)
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = f"{self._BASE_URL}/series/"
+        response = make_request(url, scraper)
+        html = response.text or ""
+        if len(html) < 200:
+            return []
+        soup = self._make_soup(html)
+
+        # Find anchors pointing to /series/<id>/ with a title attribute.
+        slug_re = re.compile(r"^/series/[a-z0-9]+/?$")
+        seen: Dict[str, Tuple[str, Optional[str]]] = {}  # href -> (title, cover)
+        for a in soup.find_all("a"):
+            href = (a.get("href") or "").strip()
+            if not slug_re.match(href):
+                continue
+            title = (a.get("title") or a.get("alt") or "").strip()
+            if not title:
+                # Fallback: text content of the inner title div
+                inner = a.select_one(".line-clamp-2, .font-bold")
+                if inner:
+                    title = inner.get_text(strip=True)
+            if not title:
+                continue
+            # Cover from background-image style on a descendant div
+            cover = None
+            for div in a.find_all("div"):
+                style = (div.get("style") or "")
+                m = self._COVER_BG_RE.search(style)
+                if m:
+                    cover = m.group(1).replace("&amp;", "&")
+                    break
+            href_norm = href.rstrip("/")
+            if href_norm not in seen:
+                seen[href_norm] = (title, cover)
+
+        ql = clean.lower()
+        query_tokens = set(t for t in ql.split() if t)
+
+        scored: List = []
+        for href, (title, cover) in seen.items():
+            tl = title.lower()
+            if ql in tl:
+                relevance = 1.0
+            elif query_tokens and all(tok in tl for tok in query_tokens):
+                relevance = 0.7
+            else:
+                continue
+            scored.append((relevance, title, href, cover))
+
+        scored.sort(key=lambda x: -x[0])
+
+        hits: List[SearchHit] = []
+        for idx, (relevance, title, href, cover) in enumerate(scored[:limit]):
+            url_full = urljoin(self._BASE_URL, href + "/")
+            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=url_full,
+                    cover=cover,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
 
 __all__ = ["AsmotoonSiteHandler"]

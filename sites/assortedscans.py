@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class AssortedScansSiteHandler(BaseSiteHandler):
@@ -267,3 +267,82 @@ class AssortedScansSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("No images were extracted for this chapter.")
         return images
+
+    # ----------------------------------------------------------------- search
+    # AssortedScans-family sites (assortedscans + arc_relight via inheritance)
+    # don't have a server-side search endpoint. Their /reader/ page is the
+    # full catalog (~56 series for assortedscans) listed as
+    # <a href="/reader/<slug>/" title="Title">Title</a>. Client-side filter
+    # on title — same pattern as flamecomics/zeroscans/tcbscans.
+    #
+    # Uses self._BASE_URL so subclasses (arcrelight) route to their own
+    # domain via the same code path with no override needed.
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = f"{self._BASE_URL}/reader/"
+        response = make_request(url, scraper)
+        html = response.text or ""
+        if len(html) < 200:
+            return []
+        soup = self._make_soup(html)
+
+        # Each series is a single anchor with both an href like /reader/<slug>/
+        # AND a title= attr. Filter to those — there are other anchors on the
+        # page (chapter links, navigation, etc.) we don't want.
+        slug_re = re.compile(r"^/reader/[^/]+/?$")
+        seen_hrefs: Dict[str, str] = {}  # href -> title (dedupe; keep first non-empty)
+        for a in soup.select("a[href]"):
+            href = (a.get("href") or "").strip()
+            if not slug_re.match(href):
+                continue
+            title = (a.get("title") or "").strip() or a.get_text(strip=True)
+            if not title:
+                continue
+            href_norm = href.rstrip("/")
+            if href_norm not in seen_hrefs:
+                seen_hrefs[href_norm] = title
+
+        ql = clean.lower()
+        query_tokens = set(t for t in ql.split() if t)
+
+        scored: List = []
+        for href, title in seen_hrefs.items():
+            tl = title.lower()
+            if ql in tl:
+                relevance = 1.0
+            elif query_tokens and all(tok in tl for tok in query_tokens):
+                relevance = 0.7
+            else:
+                continue
+            scored.append((relevance, title, href))
+
+        scored.sort(key=lambda x: -x[0])
+
+        hits: List[SearchHit] = []
+        for idx, (relevance, title, href) in enumerate(scored[:limit]):
+            url_full = urljoin(self._BASE_URL, href + "/")
+            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=url_full,
+                    cover=None,  # /reader/ index has no thumbnails — chapter probe fetches via fetch_comic_context which has og:image
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits

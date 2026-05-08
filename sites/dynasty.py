@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class DynastySiteHandler(BaseSiteHandler):
@@ -207,6 +208,82 @@ class DynastySiteHandler(BaseSiteHandler):
         if pages:
             return urljoin(self._BASE_URL, pages[0].get("url", ""))
         return None
+
+    # ----------------------------------------------------------------- search
+    # Dynasty has no JSON search API: /search.json returns 500. Only the HTML
+    # /search?q=<query>&classes[]=... path works. Search results live in
+    # `<dd>` blocks, each containing `<a class="name" href="/<dir>/<slug>">Title</a>`
+    # where <dir> ∈ {series, anthologies, doujins, issues}. There are no
+    # cover thumbnails in the search HTML — the chapter-probe path fetches
+    # /<dir>/<slug>.json which has the cover, so cover=None here is fine
+    # (probe_sample_image's chapter path doesn't need hit.cover).
+    _SEARCH_HREF_RE = re.compile(r"^/(series|anthologies|doujins|issues)/[^/?#]+/?$")
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        # `classes[]` filter keeps results to series-like containers; without it,
+        # /search returns chapter results (single uploads), tags, and authors
+        # mixed in — those don't map to SiteComicContext-fetchable URLs.
+        url = (
+            f"{self._BASE_URL}/search"
+            f"?q={quote_plus(clean)}"
+            f"&classes%5B%5D=Series"
+            f"&classes%5B%5D=Anthology"
+            f"&classes%5B%5D=Doujin"
+        )
+        response = make_request(url, scraper)
+        html = response.text
+        if not html or len(html) < 200:
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+
+        anchors = [
+            a for a in soup.select("dd a.name[href]")
+            if self._SEARCH_HREF_RE.match((a.get("href") or "").strip())
+        ]
+        hits: List[SearchHit] = []
+        seen: set = set()
+        for idx, a in enumerate(anchors):
+            if len(hits) >= limit:
+                break
+            href = (a.get("href") or "").strip().rstrip("/")
+            abs_url = urljoin(self._BASE_URL, href)
+            if abs_url in seen:
+                continue
+            seen.add(abs_url)
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+            # Author is the next sibling anchor under /authors/. Used as an
+            # alt_title hint so cross-site dedupe can still match when other
+            # sites expose the romaji-only title (Dynasty consistently uses
+            # the displayed/EN form so this rarely fires, but it's free).
+            alt_titles: List[str] = []
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(anchors))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=abs_url,
+                    cover=None,
+                    alt_titles=alt_titles,
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
 
 __all__ = ["DynastySiteHandler"]

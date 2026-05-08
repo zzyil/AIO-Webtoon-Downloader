@@ -1,261 +1,1640 @@
-"""Simple VRF token generator for MangaFire using Playwright.
+"""MangaFire VRF token capture using Playwright (Sync API).
 
-This implementation captures VRF tokens by letting the page naturally generate them,
-then intercepting the network requests to extract the VRF parameter.
+This module captures the `vrf=` query parameter from the same network requests
+your browser makes after navigating to reader pages.
+
+v11 fixes (from your log):
+- Playwright Python **does not** have `Page.wait_for_request()` (Node has it). Use
+  `Page.expect_request()` instead.
+- Remove NameError: `net_phase` (use the module's cross-process net guard).
+- Make `ensure_vrf()` / `generate_vrf()` safe if called inside an asyncio loop
+  by executing Playwright sync work in a dedicated helper thread.
 """
+
 from __future__ import annotations
 
 import atexit
+import asyncio
+import concurrent.futures
+import contextlib
+import json
+import os
+import random
 import re
-from typing import Optional, Dict
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
+
+# ----------------------------- cross-process coordination -----------------------------
+
+
+class _AIOFileLock:
+    """A tiny cross-process lock (best-effort).
+
+    This is intentionally small and dependency-free; it only needs to serialize
+    Playwright *navigation* across downloader workers.
+    """
+
+    def __init__(self, lock_path: str):
+        self.lock_path = lock_path
+        self._fh = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.lock_path) or ".", exist_ok=True)
+        self._fh = open(self.lock_path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            # best-effort: if locking fails, we still continue
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._fh:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            if self._fh:
+                self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+
+
+class _AIOCoordinator:
+    """Shared cooldown + a NET phase lock.
+
+    - NET lock serializes Playwright navigation across processes.
+    - State.json shares a cooldown window + min-gap so other workers slow down.
+    """
+
+    def __init__(self, coord_dir: str, net_min_gap: float = 0.25):
+        self.coord_dir = os.path.abspath(coord_dir)
+        os.makedirs(self.coord_dir, exist_ok=True)
+        self.net_min_gap = max(0.0, float(net_min_gap or 0.0))
+        self._net_lock = _AIOFileLock(os.path.join(self.coord_dir, "phase_vrf.lock"))
+        self._state_lock = _AIOFileLock(os.path.join(self.coord_dir, "state.lock"))
+        self._state_path = os.path.join(self.coord_dir, "state.json")
+
+    def _read_state(self) -> dict:
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {"cooldown_until": 0.0, "last_net_ts": 0.0}
+
+    def _write_state(self, data: dict) -> None:
+        try:
+            tmp = self._state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self._state_path)
+        except Exception:
+            pass
+
+    def set_cooldown(self, seconds: float, reason: str = "") -> None:
+        if seconds <= 0:
+            return
+        until = time.time() + float(seconds)
+        with self._state_lock:
+            st = self._read_state()
+            if until > float(st.get("cooldown_until", 0.0) or 0.0):
+                st["cooldown_until"] = until
+                if reason:
+                    st["cooldown_reason"] = str(reason)[:160]
+                self._write_state(st)
+
+    def _wait_ready_unlocked(self) -> None:
+        while True:
+            with self._state_lock:
+                st = self._read_state()
+                until = float(st.get("cooldown_until", 0.0) or 0.0)
+                last_ts = float(st.get("last_net_ts", 0.0) or 0.0)
+
+            now = time.time()
+            wait_cd = max(0.0, until - now)
+            wait_gap = 0.0
+            if self.net_min_gap > 0 and last_ts > 0:
+                wait_gap = max(0.0, (last_ts + self.net_min_gap) - now)
+
+            wait = max(wait_cd, wait_gap)
+            if wait <= 0:
+                break
+            time.sleep(min(wait, 1.0))
+
+        with self._state_lock:
+            st = self._read_state()
+            st["last_net_ts"] = time.time()
+            self._write_state(st)
+
+    @contextlib.contextmanager
+    def net_phase(self, label: str = ""):
+        # Wait outside the phase lock so other processes are not blocked while idling.
+        self._wait_ready_unlocked()
+        with self._net_lock:
+            yield
+
+
+_COORD: Optional[_AIOCoordinator] = None
+
+
+def _init_coord() -> None:
+    global _COORD
+    coord_dir = os.getenv("AIO_COORD_DIR", "").strip()
+    enabled = os.getenv("AIO_COORD_ENABLED", "").strip() not in ("", "0", "false", "False")
+    if enabled and coord_dir:
+        try:
+            _COORD = _AIOCoordinator(
+                coord_dir=coord_dir,
+                net_min_gap=float(os.getenv("AIO_NET_MIN_GAP", "0.25")),
+            )
+        except Exception:
+            _COORD = None
+
+
+_init_coord()
+
+
+def _net_guard(label: str = ""):
+    if _COORD is None:
+        return contextlib.nullcontext()
+    return _COORD.net_phase(label)
+
+
+# ----------------------------- Playwright import -----------------------------
+
+
 try:
-    from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
+    from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+
     PLAYWRIGHT_AVAILABLE = True
-except ImportError:
+except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
 
-class SimpleMangaFireVRFGenerator:
-    """Generates VRF tokens by capturing them from actual page requests."""
+_BASE_URL = "https://mangafire.to"
 
-    def __init__(self):
+# Resource types needed for VRF capture. Everything else is blocked
+# to speed up navigation (no stylesheets, images, fonts, media, etc.)
+_VRF_ALLOWED_TYPES = {"document", "script", "xhr", "fetch"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _now() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def _pid_tid() -> str:
+    return f"pid={os.getpid()} tid={threading.get_ident()}"
+
+
+def _short(s: str, n: int = 220) -> str:
+    s = str(s).replace("\r", " ").replace("\n", " ")
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def _classify_exc(e: BaseException) -> str:
+    msg = str(e).lower()
+    if "target page, context or browser has been closed" in msg:
+        return "TargetClosed"
+    if "interrupted by another navigation" in msg:
+        return "InterruptedByNavigation"
+    if "timeout" in msg:
+        return "Timeout"
+    if "net::err_aborted" in msg or "err_aborted" in msg:
+        return "ErrAborted"
+    if "frame was detached" in msg:
+        return "FrameDetached"
+    return e.__class__.__name__
+
+
+@dataclass
+class _AttemptInfo:
+    attempt: int
+    total: int
+    stage: str
+    page_url: str
+    expected_path: str
+    pre_url: str = ""
+    post_url: str = ""
+    goto_status: Optional[int] = None
+    error_class: str = ""
+    error_msg: str = ""
+
+
+class SimpleMangaFireVRFGenerator:
+    """Captures VRF tokens by listening to browser network requests."""
+
+    def __init__(self) -> None:
         if not PLAYWRIGHT_AVAILABLE:
             raise ImportError(
                 "Playwright is required. Install with: pip install playwright && playwright install chromium"
             )
+
+        self._NAV_RETRIES = _env_int("MANGAFIRE_VRF_NAV_RETRIES", 4)
+        self._RETRY_DELAY = _env_float("MANGAFIRE_VRF_RETRY_DELAY", 0.5)
+        self._RETRY_CAP = _env_float("MANGAFIRE_VRF_RETRY_CAP", 5.0)
+        self._RETRY_JITTER = _env_float("MANGAFIRE_VRF_RETRY_JITTER", 0.25)
+        self._DOM_TIMEOUT_MS = _env_int("MANGAFIRE_VRF_NAV_TIMEOUT_MS", 45000)
+        self._WAIT_REQ_MS = _env_int("MANGAFIRE_VRF_WAIT_REQUEST_MS", 12000)
+        self._POST_NAV_SETTLE_MS = _env_int("MANGAFIRE_VRF_POST_NAV_SETTLE_MS", 350)
+        self._HEADLESS = os.getenv("MANGAFIRE_VRF_HEADLESS", "1").strip() not in ("0", "false", "False")
 
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._initialized = False
+        self._warmup_url: Optional[str] = None
 
-        # Cache VRF tokens based on URL patterns
         self._vrf_cache: Dict[str, str] = {}
+        self._vrf_meta: Dict[str, Dict[str, Any]] = {}
 
+        self._op_lock = threading.Lock()
         atexit.register(self.close)
 
-    def _initialize(self, init_url: Optional[str] = None) -> None:
-        """Initialize the browser context.
+    # ----------------------------- logging -----------------------------
 
-        Args:
-            init_url: Optional URL to load for initialization. If not provided,
-                     uses a fallback manga page.
+    def _log(self, msg: str) -> None:
+        # stderr, not stdout — diagnostic output must not pollute JSON
+        # consumers (aio-dl.py --search emits JSON on stdout).
+        import sys as _sys
+        print(f"[VRF {_pid_tid()} {_now()}] {msg}", file=_sys.stderr)
+
+    def _route_handler(self, route, request):
+        """Resource-type filter applied at the context level. Allows only
+        document/script/xhr/fetch — saves ~200-500ms per navigation in the
+        VRF capture path. capture_series_meta unroutes this temporarily
+        because rendering a series page reliably needs stylesheets too."""
+        rt = getattr(request, "resource_type", "")
+        if rt in _VRF_ALLOWED_TYPES:
+            return route.continue_()
+        return route.abort()
+
+    def _page_url(self) -> str:
+        try:
+            return (self._page.url if self._page else "<no-page>") or "<empty>"
+        except Exception:
+            return "<unavailable>"
+
+    def _log_attempt(self, info: _AttemptInfo) -> None:
+        base = (
+            f"attempt {info.attempt}/{info.total} stage={info.stage} "
+            f"expected={info.expected_path} page={info.page_url}"
+        )
+        extras: List[str] = []
+        if info.pre_url:
+            extras.append(f"pre_url={info.pre_url}")
+        if info.post_url:
+            extras.append(f"post_url={info.post_url}")
+        if info.goto_status is not None:
+            extras.append(f"goto_status={info.goto_status}")
+        if info.error_class:
+            extras.append(f"err={info.error_class}")
+        if info.error_msg:
+            extras.append(f"msg={_short(info.error_msg)}")
+        if extras:
+            base += " | " + " ".join(extras)
+        self._log(base)
+
+    def _sleep_retry(self, attempt_index: int) -> None:
+        base = max(0.0, float(self._RETRY_DELAY or 0.0))
+        cap = max(base, float(self._RETRY_CAP or 5.0))
+        delay = min(cap, base * (2 ** max(0, attempt_index - 1)))
+        if self._RETRY_JITTER:
+            delay += random.uniform(0.0, float(self._RETRY_JITTER))
+        delay = max(0.0, delay)
+        if delay:
+            self._log(f"sleeping {delay:.1f}s before retry…")
+            time.sleep(delay)
+
+    @staticmethod
+    def _is_homepage_landing(url: Optional[str], target_host: str) -> bool:
+        """True iff `url` is the bare site root for `target_host` — i.e., the
+        page is currently at `https://mangafire.to/` (or its `www.` variant)
+        with no chapter path. Signals MangaFire's anti-bot redirect that
+        bounces rapid sequential chapter-N → chapter-N+1 navigations back to
+        the homepage. The page is in a clean baseline state in that case,
+        so the next retry's goto from `/` to the chapter URL typically
+        succeeds — no need to wait the usual jitter sleep.
         """
+        if not url or not target_host:
+            return False
+        if url.startswith("<"):
+            return False  # _page_url's sentinels: "<no-page>", "<empty>", "<unavailable>"
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        if not parsed.netloc:
+            return False
+        host_match = (
+            parsed.netloc == target_host
+            or parsed.netloc.endswith("." + target_host)
+        )
+        if not host_match:
+            return False
+        return parsed.path in ("", "/")
+
+    # ----------------------------- init -----------------------------
+
+    def _initialize(self, init_url: Optional[str] = None) -> None:
         if self._initialized:
             return
 
-        print("[*] Initializing MangaFire VRF generator...")
-
+        self._log("initializing Playwright…")
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=True)
-        self._context = self._browser.new_context(
-            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        # Extra args reduce Chromium startup time and memory when we only
+        # need it for network request interception (VRF capture).
+        _LAUNCH_ARGS = [
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-default-apps",
+        ]
+        self._browser = self._playwright.chromium.launch(
+            headless=self._HEADLESS,
+            args=_LAUNCH_ARGS,
         )
+        self._context = self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        )
+
+        # Faster VRF capture: only allow resource types needed for VRF.
+        # document = page HTML, script = JS that computes VRF,
+        # xhr/fetch = AJAX requests that carry VRF tokens.
+        # Blocking stylesheets, images, fonts, media etc. saves 200-500ms per navigation.
+        # The handler is saved as an instance attribute so capture_series_meta
+        # can temporarily unroute it (series page rendering needs more resource
+        # types than VRF capture does).
+        try:
+            self._context.route("**/*", self._route_handler)
+        except Exception:
+            pass
+
         self._page = self._context.new_page()
 
-        # Capture network requests with VRF parameters
-        self._captured_vrfs = []
+        def handle_request(request) -> None:
+            try:
+                url = request.url
+            except Exception:
+                return
+            if "vrf=" not in url:
+                return
+            parsed = urlparse(url)
+            q = parse_qs(parsed.query)
+            vrfs = q.get("vrf") or []
+            if not vrfs:
+                return
+            vrf = vrfs[0]
+            path = parsed.path
+            self._vrf_cache[path] = vrf
+            self._vrf_meta[path] = {
+                "ts": time.time(),
+                "full_url": url,
+                "page_url": self._page_url(),
+            }
+            self._log(f"captured {path} vrf={vrf[:30]}…")
+        def handle_response(resp) -> None:
+            # Soft-block signals: share a cooldown.
+            try:
+                st = getattr(resp, "status", None)
+                if st in (403, 429, 503) and _COORD is not None:
+                    _COORD.set_cooldown(12.0, reason=f"playwright_resp:{st}")
+            except Exception:
+                pass
 
-        def handle_request(request):
-            url = request.url
-            if 'vrf=' in url:
-                parsed = urlparse(url)
-                query = parse_qs(parsed.query)
-                if 'vrf' in query:
-                    vrf = query['vrf'][0]
-                    path = parsed.path
-                    self._vrf_cache[path] = vrf
-                    self._captured_vrfs.append({
-                        'path': path,
-                        'vrf': vrf,
-                        'full_url': url
-                    })
-                    print(f"[+] Captured VRF for {path}: {vrf[:30]}...")
+        self._handle_request = handle_request
+        self._handle_response = handle_response
+        self._page.on("request", handle_request)
+        self._page.on("response", handle_response)
 
-        self._page.on('request', handle_request)
-
-        # Load a MangaFire page to initialize the JS environment
-        # Use the provided URL or fall back to a known working page
         if not init_url:
-            init_url = "https://mangafire.to/read/hoegwija-sayongseolmyeongseo22.jjx8y/en/chapter-1"
+            init_url = f"{_BASE_URL}/"
 
-        print(f"[*] Loading page to capture VRF tokens: {init_url}")
-
+        self._log(f"warm-up navigate: {init_url}")
         try:
-            self._page.goto(init_url, wait_until='networkidle', timeout=60000)
-            self._page.wait_for_timeout(2000)  # Wait for async requests
+            with _net_guard("vrf:warmup"):
+                resp = self._page.goto(init_url, wait_until="commit", timeout=60000)
+            status = resp.status if resp is not None else None
+            self._log(f"warm-up done status={status} url={self._page_url()}")
+            if self._POST_NAV_SETTLE_MS:
+                self._page.wait_for_timeout(self._POST_NAV_SETTLE_MS)
         except Exception as e:
-            print(f"[!] Warning: {e}")
+            self._log(f"warm-up navigation warning: {_classify_exc(e)}: {_short(e)}")
 
-        print(f"[+] Captured {len(self._captured_vrfs)} VRF tokens")
+        self._warmup_url = init_url
         self._initialized = True
 
-    def _navigate_and_capture(self, page_url: str, expected_ajax_path: str) -> None:
-        """Navigate to a page and wait to capture VRF for a specific AJAX endpoint.
-
-        Args:
-            page_url: Full URL to navigate to (e.g., chapter reader page)
-            expected_ajax_path: The AJAX path we're trying to capture VRF for
-        """
-        if not self._initialized:
-            self._initialize()
-
+    def _recreate_page(self, reason: str = "") -> None:
+        if self._context is None:
+            return
         try:
-            print(f"[*] Navigating to {page_url} to capture VRF...")
-            self._page.goto(page_url, wait_until='domcontentloaded', timeout=30000)
-            self._page.wait_for_timeout(3000)  # Wait for AJAX calls
+            if self._page is not None:
+                # Remove route intercepts before closing to avoid EPIPE
+                try:
+                    self._context.unroute_all()
+                except Exception:
+                    pass
+                try:
+                    self._page.close()
+                except Exception:
+                    pass
+            self._page = self._context.new_page()
 
-            if expected_ajax_path in self._vrf_cache:
-                print(f"[+] Successfully captured VRF for {expected_ajax_path}")
-            else:
-                print(f"[!] Navigation completed but VRF for {expected_ajax_path} not captured")
+            # Re-register the route handler on the context (unroute_all removed it)
+            try:
+                self._context.route("**/*", self._route_handler)
+            except Exception:
+                pass
 
+            if hasattr(self, "_handle_request"):
+                self._page.on("request", self._handle_request)
+            if hasattr(self, "_handle_response"):
+                self._page.on("response", self._handle_response)
+            if reason:
+                self._log(f"recreated page ({reason})")
         except Exception as e:
-            print(f"[!] Navigation error: {e}")
+            self._log(f"page recreate warning: {_classify_exc(e)}: {_short(e)}")
 
-    def generate_vrf(self, url_path: str, init_url: Optional[str] = None) -> str:
-        """Generate VRF for a URL path.
+    # ----------------------------- core capture -----------------------------
 
-        Since we can't easily call the Ph function directly, we use a cached approach:
-        1. Check if we have a similar URL cached
-        2. If not, try to trigger the page to generate it
-        3. Fall back to requesting it via a new page load
+    def _navigate_and_capture(self, page_url: str, expected_ajax_path: str, init_url: Optional[str] = None) -> None:
+        if expected_ajax_path in self._vrf_cache:
+            return
 
-        Args:
-            url_path: Path like '/ajax/read/jjx8y/chapter/en'
-            init_url: Optional URL to use for browser initialization
+        with self._op_lock:
+            if not self._initialized:
+                self._initialize(init_url or page_url)
+            if expected_ajax_path in self._vrf_cache:
+                return
 
-        Returns:
-            VRF token string
+            assert self._page is not None
+            last_exc: Optional[BaseException] = None
+
+            def _pred(req) -> bool:
+                try:
+                    u = req.url
+                except Exception:
+                    return False
+                if "vrf=" not in u:
+                    return False
+                try:
+                    return urlparse(u).path == expected_ajax_path
+                except Exception:
+                    return False
+
+            # If warmup already navigated to the target page, the page's
+            # JS is still loading.  Wait briefly for the VRF XHR to fire
+            # from the ongoing warmup page load instead of navigating
+            # to the same URL a second time.
+            if self._warmup_url and self._warmup_url == page_url:
+                self._warmup_url = None  # only try once
+                try:
+                    with self._page.expect_request(_pred, timeout=3000):
+                        pass  # just wait for the XHR from warmup JS
+                except Exception:
+                    pass  # timed out – fall through to normal capture
+                if expected_ajax_path in self._vrf_cache:
+                    self._log(f"captured VRF during warmup for {expected_ajax_path}")
+                    return
+
+            # Target host for the redirect-to-homepage detector below — we
+            # extract it from the chapter URL once and reuse it on each
+            # retry. Falls back to "mangafire.to" if the URL is malformed
+            # (defensive; shouldn't happen since callers pass full URLs).
+            try:
+                _retry_target_host = urlparse(page_url).netloc or "mangafire.to"
+            except Exception:
+                _retry_target_host = "mangafire.to"
+
+            for i in range(1, self._NAV_RETRIES + 1):
+                if expected_ajax_path in self._vrf_cache:
+                    self._log(f"success: captured expected VRF for {expected_ajax_path}")
+                    return
+                info = _AttemptInfo(
+                    attempt=i,
+                    total=self._NAV_RETRIES,
+                    stage="goto",
+                    page_url=page_url,
+                    expected_path=expected_ajax_path,
+                    pre_url=self._page_url(),
+                )
+                try:
+                    # Cross-process serialization (NET lock + cooldown/gap).
+                    with _net_guard("vrf:navigate"):
+                        # Start request expectation *before* goto so we never miss the XHR.
+                        try:
+                            with self._page.expect_request(_pred, timeout=self._WAIT_REQ_MS) as req_info:
+                                resp = self._page.goto(page_url, wait_until="commit", timeout=self._DOM_TIMEOUT_MS)
+                            req = req_info.value
+                            # ensure cache has it (handler should, but belt & suspenders)
+                            try:
+                                u = req.url
+                                parsed = urlparse(u)
+                                q = parse_qs(parsed.query)
+                                vrf = (q.get("vrf") or [""])[0]
+                                if vrf:
+                                    self._vrf_cache[parsed.path] = vrf
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            # Expectation timed out or goto raised. Either way, we may have captured via handler.
+                            resp = None
+                            last_exc = e
+
+                        info.goto_status = resp.status if resp is not None else None
+                        info.post_url = self._page_url()
+                        self._log_attempt(info)
+
+                        # Only settle-wait if VRF wasn't captured yet (the
+                        # expect_request handler usually gets it instantly).
+                        # Skipping this 350ms sleep per chapter adds up fast.
+                        if expected_ajax_path not in self._vrf_cache and self._POST_NAV_SETTLE_MS:
+                            self._page.wait_for_timeout(self._POST_NAV_SETTLE_MS)
+
+                    if expected_ajax_path in self._vrf_cache:
+                        self._log(f"success: captured expected VRF for {expected_ajax_path}")
+                        return
+
+                    # No exception, but still no VRF.
+                    self._log_attempt(
+                        _AttemptInfo(
+                            attempt=i,
+                            total=self._NAV_RETRIES,
+                            stage="no-vrf-after-nav",
+                            page_url=page_url,
+                            expected_path=expected_ajax_path,
+                            pre_url=info.pre_url,
+                            post_url=info.post_url,
+                        )
+                    )
+
+                except BaseException as e:
+                    last_exc = e
+                    # Sometimes a redirect interrupts goto; clear page and retry quickly.
+                    msg = str(e)
+                    if ("InterruptedByNavigation" in msg) or ("interrupted by another navigation" in msg.lower()):
+                        self._recreate_page("InterruptedByNavigation")
+                        if i < self._NAV_RETRIES:
+                            d = 0.2 + random.uniform(0.0, 0.2)
+                            self._log(f"fast retry sleep {d:.1f}s after InterruptedByNavigation…")
+                            time.sleep(d)
+                            continue
+
+                    self._log_attempt(
+                        _AttemptInfo(
+                            attempt=i,
+                            total=self._NAV_RETRIES,
+                            stage="goto-exception",
+                            page_url=page_url,
+                            expected_path=expected_ajax_path,
+                            pre_url=info.pre_url,
+                            post_url=self._page_url(),
+                            error_class=_classify_exc(e),
+                            error_msg=str(e),
+                        )
+                    )
+
+                if expected_ajax_path in self._vrf_cache:
+                    self._log(f"success: captured expected VRF for {expected_ajax_path}")
+                    return
+
+                if i < self._NAV_RETRIES:
+                    # Smart-retry shortcut (2026-05-08): when the page is
+                    # currently at the bare homepage, MangaFire's anti-bot
+                    # detection has redirected this rapid sequential nav
+                    # back to `/`. The next goto from `/` to the chapter URL
+                    # typically succeeds — no need to wait the jitter sleep
+                    # since we're already at a "cold-start" baseline. Saves
+                    # ~0.6s per occurrence (typical retry sleep). Falls back
+                    # to the normal exponential-backoff sleep otherwise.
+                    if self._is_homepage_landing(self._page_url(), _retry_target_host):
+                        self._log(
+                            "redirect-to-homepage detected; immediate retry "
+                            "(skipping jitter sleep — page already at clean baseline)"
+                        )
+                    else:
+                        self._sleep_retry(i)
+
+            # One last check — the background request handler may have
+            # captured the VRF during the final retry's exception path or
+            # right after the last sleep.  This prevents a spurious error.
+            if expected_ajax_path in self._vrf_cache:
+                self._log(f"success: late capture of VRF for {expected_ajax_path}")
+                return
+
+            recent_paths = list(self._vrf_cache.keys())[-8:]
+            summary = (
+                f"Could not capture VRF for {expected_ajax_path} after {self._NAV_RETRIES} attempt(s). "
+                f"page_now={self._page_url()} cache_size={len(self._vrf_cache)} recent_paths={recent_paths}"
+            )
+            if last_exc is not None:
+                summary += f" last_error={_classify_exc(last_exc)}:{_short(last_exc)}"
+            raise RuntimeError(summary)
+
+    # ----------------------------- public API -----------------------------
+
+    def ensure_vrf(
+        self,
+        url_path: str,
+        *,
+        page_url: Optional[str] = None,
+        init_url: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+        retry_backoff: Optional[float] = None,
+        retry_cap: Optional[float] = None,
+        retry_jitter: Optional[float] = None,
+        nav_timeout_ms: Optional[int] = None,
+        wait_request_ms: Optional[int] = None,
+    ) -> str:
+        """Ensure a VRF token for a specific AJAX path is present in the cache.
+
+        Typical callers:
+        - Chapter list endpoint:  url_path = /ajax/read/{hid}/chapter/{lang}
+          Provide init_url pointing to a reader URL that triggers the request, e.g.
+          https://mangafire.to/read/manga.{hid}/{lang}/chapter-1
+
+        - Chapter payload endpoint: url_path = /ajax/read/chapter/{chapter_id}
+          Provide page_url as the reader URL for that chapter; VRF is chapter-specific.
+
+        This function is sync-only; when used from an asyncio application, callers should
+        go through the module's get_vrf_generator() (which returns a thread-bridge).
         """
-        if not self._initialized:
-            self._initialize(init_url)
+        s = (str(url_path or "").strip() or "")
+        if not s.startswith("/"):
+            s = "/" + s
 
-        # Check cache first
-        if url_path in self._vrf_cache:
-            print(f"[+] Using cached VRF for {url_path}")
-            return self._vrf_cache[url_path]
+        # Temporary per-call overrides (restore no matter what).
+        old = (
+            self._NAV_RETRIES,
+            self._RETRY_DELAY,
+            self._RETRY_CAP,
+            self._RETRY_JITTER,
+            self._DOM_TIMEOUT_MS,
+            self._WAIT_REQ_MS,
+        )
+        try:
+            if max_attempts is not None:
+                self._NAV_RETRIES = max(1, int(max_attempts))
+            if retry_backoff is not None:
+                self._RETRY_DELAY = max(0.05, float(retry_backoff))
+            if retry_cap is not None:
+                self._RETRY_CAP = max(0.1, float(retry_cap))
+            if retry_jitter is not None:
+                self._RETRY_JITTER = max(0.0, float(retry_jitter))
+            if nav_timeout_ms is not None:
+                self._DOM_TIMEOUT_MS = max(1000, int(nav_timeout_ms))
+            if wait_request_ms is not None:
+                self._WAIT_REQ_MS = max(500, int(wait_request_ms))
 
-        # For chapter list URLs, try to trigger it by navigating
-        # Extract manga ID from path if possible
-        match = re.match(r'/ajax/read/([^/]+)/chapter/([^/]+)', url_path)
+            if s in self._vrf_cache:
+                return self._vrf_cache[s]
+
+            # Chapter payloads are chapter-specific; require navigation to the chapter reader page.
+            if re.match(r"^/ajax/read/chapter/\d+$", s):
+                if not page_url:
+                    raise RuntimeError(
+                        f"VRF for {s} is chapter-specific; provide page_url (the chapter reader URL) to capture it."
+                    )
+                self._navigate_and_capture(page_url, s, init_url=init_url or page_url)
+                if s in self._vrf_cache:
+                    return self._vrf_cache[s]
+                raise RuntimeError(f"VRF capture failed for {s}. cache_size={len(self._vrf_cache)}")
+
+            # For other endpoints, best effort: navigate to a page that triggers the request.
+            trigger = page_url or init_url
+            if trigger:
+                self._navigate_and_capture(trigger, s, init_url=init_url or trigger)
+                if s in self._vrf_cache:
+                    return self._vrf_cache[s]
+
+            # Final fallback: use generate_vrf which may know how to trigger-capture specific endpoints.
+            return self.generate_vrf(s, init_url=init_url or trigger)
+        finally:
+            (
+                self._NAV_RETRIES,
+                self._RETRY_DELAY,
+                self._RETRY_CAP,
+                self._RETRY_JITTER,
+                self._DOM_TIMEOUT_MS,
+                self._WAIT_REQ_MS,
+            ) = old
+    def generate_vrf(self, url_path: str, init_url: Optional[str] = None) -> str:
+        """Generate (capture) a VRF token for a non-chapter-specific endpoint.
+
+        This is mainly used for the chapter-list endpoint:
+          /ajax/read/{hid}/chapter/{lang}
+
+        If init_url is provided, it should be a reader URL that naturally triggers the
+        desired AJAX request so we can capture the VRF from the outgoing request.
+        """
+        s = (str(url_path or "").strip() or "")
+        if not s.startswith("/"):
+            s = "/" + s
+
+        if s in self._vrf_cache:
+            return self._vrf_cache[s]
+
+        # Chapter payload tokens cannot be generated without navigation to that specific chapter.
+        if re.match(r"^/ajax/read/chapter/\d+$", s):
+            raise RuntimeError(
+                f"Could not generate VRF for {s}. This endpoint is chapter-specific; "
+                "call ensure_vrf(url_path, page_url=CHAPTER_URL) first."
+            )
+
+        match = re.match(r"^/ajax/read/([^/]+)/chapter/([^/]+)$", s)
         if match:
-            manga_id = match.group(1)
+            hid = match.group(1)
             lang = match.group(2)
 
-            # VRF tokens are URL-specific, so we need to navigate to the actual manga
-            # to trigger the request and capture its VRF
-            # Try multiple URL patterns to find the manga
-            url_patterns = [
-                f"https://mangafire.to/read/manga.{manga_id}/{lang}/chapter-1",
-                f"https://mangafire.to/read/title.{manga_id}/{lang}/chapter-1",
-                f"https://mangafire.to/read/unknown.{manga_id}/{lang}/chapter-1",
-            ]
+            trigger = init_url
+            if not trigger:
+                # Reasonable default; may redirect, but usually enough to trigger the XHR.
+                trigger = f"{_BASE_URL}/read/manga.{hid}/{lang}/chapter-1"
 
-            for target_url in url_patterns:
-                print(f"[*] Trying {target_url} to capture VRF...")
+            self._log(f"trigger-capture via {trigger}")
+            self._navigate_and_capture(trigger, s, init_url=trigger)
+            if s in self._vrf_cache:
+                return self._vrf_cache[s]
 
+            raise RuntimeError(
+                f"Could not capture VRF for {s} (chapter list). cache_size={len(self._vrf_cache)}"
+            )
+
+        raise RuntimeError(f"Could not generate VRF for {s}. No cached token available.")
+    # ----------------------------- search capture -----------------------------
+    # MangaFire's /filter endpoint is CF-WAF-blocked for HTTP scrapers (cloudscraper,
+    # curl_cffi-with-Chrome-impersonation all return 403; verified 2026-05-06).
+    # The site's own typeahead bypasses this: jQuery in mangafire's JS bundle binds a
+    # keyup handler to .search-inner input[name=keyword] that fires
+    # GET /ajax/manga/search?keyword=&vrf=<TOKEN>, which DOES pass CF and returns
+    # JSON-wrapped HTML cards for the top 5-6 matches.
+    #
+    # Recipe (mirrors keiyoushi/extensions-source PR #11396):
+    #   1. Navigate to /home (or /) to load the JS bundle and pass any CF challenge.
+    #   2. Use jQuery to set the input's value AND trigger 'keyup' — page.fill()
+    #      doesn't fire the keyup event so the typeahead doesn't activate.
+    #   3. Wait briefly for the XHR response; capture body via page.expect_response.
+    #   4. Parse the JSON envelope's result.html for <a class="unit" href="/manga/..."> cards.
+    #
+    # Reuses the existing browser/context/page across calls (one Chromium per process,
+    # warmed up on first capture). Subsequent searches reuse the warm context so they
+    # cost ~1-2s each instead of the ~3-5s cold start.
+    def capture_search(
+        self,
+        query: str,
+        *,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Drive the typeahead and capture /ajax/manga/search?keyword=&vrf= response.
+
+        Returns a dict shaped like the upstream JSON: {status: 200, result: {count, html, linkMore}}.
+        Caller is responsible for parsing result.html (cards with /manga/<slug>.<id> hrefs).
+        Raises RuntimeError on capture failure.
+        """
+        if not query or not query.strip():
+            raise RuntimeError("capture_search: query is empty")
+        # Default 12s gives the setInterval typeahead-trigger ~12 chances at
+        # 1s intervals. The typeahead occasionally rejects the first trigger
+        # (especially for some specific titles like 'Witch Hat Atelier' where
+        # something in mangafire's debounce/cache stack short-circuits the
+        # initial keyup); retry-firing reliably catches those within 4-5
+        # iterations. Bumped from 8s after observing ~20% intermittent failures
+        # at the 8s budget.
+        wait_ms = int(timeout_ms or _env_int("MANGAFIRE_SEARCH_TIMEOUT_MS", 12000))
+        # Sanitize the query for jQuery embedding: the call site passes user input
+        # directly into a JS string. We disallow quotes and backslashes which would
+        # break out of the literal — anything else is fine for typeahead matching.
+        clean = re.sub(r"[\"\\\\]", " ", query.strip())
+
+        with self._op_lock:
+            if not self._initialized:
+                self._initialize(f"{_BASE_URL}/")
+
+            assert self._page is not None
+            # Always re-navigate to homepage with wait_until='networkidle'
+            # before driving the typeahead. wait_until='load' was racing the
+            # keyup handler binding for some queries — the bundle runs scripts
+            # in deferred chunks and the typeahead's debounce wires up after
+            # an additional setTimeout that 'load' doesn't wait for. 'networkidle'
+            # (500ms of no network activity) reliably catches that final tick.
+            # Cost is ~500ms extra per first-call vs 'load' — acceptable for
+            # the reliability win.
+            try:
+                with _net_guard("search:nav-home"):
+                    self._page.goto(
+                        f"{_BASE_URL}/",
+                        wait_until="networkidle",
+                        timeout=self._DOM_TIMEOUT_MS,
+                    )
+            except Exception as e:
+                self._log(f"search nav warning: {_classify_exc(e)}: {_short(e)}")
+
+            # Belt-and-suspenders check: probe that jQuery has actually bound
+            # a keyup handler to the search input. wait_until='load' should be
+            # sufficient, but some bundles defer handler binding into a small
+            # setTimeout after DOMContentLoaded.
+            try:
+                self._page.wait_for_function(
+                    """() => {
+                        if (typeof window.jQuery === 'undefined') return false;
+                        const $el = window.jQuery('.search-inner input[name=keyword]');
+                        if ($el.length === 0) return false;
+                        const data = window.jQuery._data ? window.jQuery._data($el[0], 'events') : null;
+                        return !!(data && data.keyup && data.keyup.length > 0);
+                    }""",
+                    timeout=min(self._DOM_TIMEOUT_MS, 5000),
+                )
+            except Exception as e:
+                raise RuntimeError(f"capture_search: typeahead handler not bound: {_classify_exc(e)}")
+
+            def _is_search_xhr(resp) -> bool:
                 try:
-                    self._page.goto(target_url, wait_until='domcontentloaded', timeout=30000)
-                    self._page.wait_for_timeout(3000)  # Wait for AJAX calls
+                    return "/ajax/manga/search" in resp.url
+                except Exception:
+                    return False
 
-                    # Check if we captured the exact path we need
-                    if url_path in self._vrf_cache:
-                        print(f"[+] Successfully captured VRF for {url_path}")
-                        return self._vrf_cache[url_path]
+            # Capture body via response listener — not via expect_response.
+            # The context's route handler does route.continue_() for XHR which
+            # makes the resp.text() call AFTER the with-block fail with
+            # "Network.getResponseBody: No resource with given identifier found"
+            # because the renderer has already discarded the body buffer.
+            # Reading inside the response event handler (synchronous from CDP's
+            # perspective) catches the body while it's still alive.
+            captured: Dict[str, Any] = {"body": None, "status": None, "url": None}
+            search_event = threading.Event()
 
+            def _on_resp(resp):
+                try:
+                    if "/ajax/manga/search" in resp.url and not search_event.is_set():
+                        try:
+                            captured["body"] = resp.text()
+                            captured["status"] = resp.status
+                            captured["url"] = resp.url
+                        except Exception as e:
+                            captured["err"] = _short(e)
+                        finally:
+                            search_event.set()
+                except Exception:
+                    pass
+
+            self._page.on("response", _on_resp)
+            try:
+                self._log(f"capture_search: triggering typeahead for '{clean[:40]}'")
+                # Mirror Tachiyomi's PR #11396 strategy: use setInterval inside
+                # the page so triggers keep firing even if the first one is
+                # ignored (the typeahead skips when input value hasn't changed,
+                # or when a debounce window is still open). The interval is
+                # cleared on the page side once we get a response — but we
+                # also clear it from Python via a final evaluate to be safe.
+                # Focus the input first — typeahead handlers may check
+                # document.activeElement and skip events when the input isn't
+                # focused. Click is the most browser-realistic focus.
+                try:
+                    self._page.click(".search-inner input[name=keyword]")
+                except Exception:
+                    pass
+                eval_result = self._page.evaluate(
+                    """(q) => {
+                        try {
+                            const $el = window.jQuery('.search-inner input[name=keyword]');
+                            window.__aioMfTickerId && clearInterval(window.__aioMfTickerId);
+                            // Mirror Tachiyomi PR #11396 exactly — they run
+                            // setInterval forever firing val+trigger keyup
+                            // because the typeahead's debounce occasionally
+                            // eats the first trigger or de-dupes identical
+                            // input. Toggling appended-space ensures val()
+                            // sees a different string each tick.
+                            let toggle = false;
+                            const fire = () => {
+                                toggle = !toggle;
+                                $el.val(q + (toggle ? ' ' : '')).trigger('keyup');
+                            };
+                            fire();
+                            window.__aioMfTickerId = setInterval(fire, 1000);
+                            return 'ok';
+                        } catch (e) { return 'err:' + e.message; }
+                    }""",
+                    clean,
+                )
+                self._log(f"capture_search: jQuery trigger returned {eval_result!r}")
+                # Poll the page event loop while waiting for the response.
+                deadline = time.monotonic() + wait_ms / 1000.0
+                tick_count = 0
+                while not search_event.is_set() and time.monotonic() < deadline:
+                    self._page.wait_for_timeout(100)
+                    tick_count += 1
+                self._log(f"capture_search: polling loop done, ticks={tick_count}, captured={search_event.is_set()}, url={captured.get('url')}, err={captured.get('err')}")
+            finally:
+                try:
+                    # Stop the interval ticker so it doesn't keep firing AJAX
+                    # while the next capture_search runs (or the page navigates).
+                    self._page.evaluate(
+                        "() => { window.__aioMfTickerId && clearInterval(window.__aioMfTickerId); window.__aioMfTickerId = null; }"
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._page.remove_listener("response", _on_resp)
+                except Exception:
+                    pass
+
+            if not search_event.is_set():
+                raise RuntimeError(f"capture_search timed out after {wait_ms}ms waiting for /ajax/manga/search")
+
+            if captured.get("err"):
+                raise RuntimeError(f"capture_search body read failed: {captured['err']}")
+            status = captured.get("status")
+            body = captured.get("body") or ""
+            if status != 200:
+                raise RuntimeError(f"search response status {status}")
+
+            try:
+                data = json.loads(body)
+            except Exception as e:
+                raise RuntimeError(f"capture_search: response not JSON: {_short(e)}")
+
+            if not isinstance(data, dict):
+                raise RuntimeError(f"capture_search: unexpected payload shape: {type(data).__name__}")
+            if data.get("status") != 200:
+                raise RuntimeError(f"capture_search: payload status={data.get('status')} body={_short(body)}")
+            return data
+
+    # ----------------------------- URL-mode metadata capture -----------------
+    # capture_series_meta: navigate a MangaFire series URL via the persistent
+    # browser and scrape the title/cover/chapter-count without going through
+    # the autocomplete typeahead. Used by aio_search_cli.run_search_mode when
+    # the user supplies --search "<mangafire_url>" — bypasses the unreliable
+    # typeahead so MangaFire is GUARANTEED to participate in cross-site
+    # comparison even when its keyword search would have failed.
+    #
+    # Cross-file: the synthesized SearchHit is wired into search_all via the
+    # seed_hits parameter (sites/search_orchestrator.py).
+    def capture_chapter_count(self, manga_id: str, language: str = "en") -> Optional[int]:
+        """Get the latest chapter number from MangaFire's VRF-protected
+        chapter-list AJAX endpoint.
+
+        Reliable: this is the same endpoint `MangaFireSiteHandler.get_chapters`
+        uses for chapter-image downloads — it's what powers the user's actual
+        downloads, so it works even when the typeahead and series-page nav
+        both fail. The VRF capture happens via Playwright navigation to a
+        reader URL (which triggers the AJAX automatically), and we listen
+        for the response on that page to grab the body.
+
+        Returns max chapter number (int) or None if capture failed.
+        """
+        if not manga_id:
+            return None
+        ajax_path = f"/ajax/read/{manga_id}/chapter/{language}"
+        reader_url = f"{_BASE_URL}/read/manga.{manga_id}/{language}/chapter-1"
+
+        with self._op_lock:
+            if not self._initialized:
+                self._initialize(f"{_BASE_URL}/")
+            assert self._page is not None
+
+            # Capture the response body in a listener (route.continue_ on the
+            # XHR makes resp.text() unreliable after the navigation completes).
+            captured: Dict[str, Any] = {"body": None, "status": None}
+            captured_event = threading.Event()
+
+            def _on_resp(resp):
+                try:
+                    if ajax_path in resp.url and not captured_event.is_set():
+                        try:
+                            captured["body"] = resp.text()
+                            captured["status"] = resp.status
+                        except Exception as e:
+                            captured["err"] = _short(e)
+                        finally:
+                            captured_event.set()
+                except Exception:
+                    pass
+
+            self._page.on("response", _on_resp)
+            try:
+                # The reader URL passes CF reliably (it's been the user's
+                # working download path for years). Navigation triggers the
+                # chapter-list AJAX during page load.
+                try:
+                    with _net_guard("series:chapters-nav"):
+                        self._page.goto(
+                            reader_url,
+                            wait_until="commit",
+                            timeout=self._DOM_TIMEOUT_MS,
+                        )
                 except Exception as e:
-                    print(f"[!] Failed with {target_url}: {e}")
+                    self._log(
+                        f"capture_chapter_count: reader nav warning: {_classify_exc(e)}: {_short(e)}"
+                    )
+                # Poll for response. ~10s budget; the AJAX usually fires
+                # within 1-2s of page load.
+                deadline = time.monotonic() + 10.0
+                while not captured_event.is_set() and time.monotonic() < deadline:
+                    self._page.wait_for_timeout(100)
+            finally:
+                try:
+                    self._page.remove_listener("response", _on_resp)
+                except Exception:
+                    pass
+
+            if not captured_event.is_set():
+                self._log(f"capture_chapter_count: no AJAX response within budget")
+                return None
+            body = captured.get("body") or ""
+            status = captured.get("status")
+            if status != 200 or not body:
+                self._log(f"capture_chapter_count: bad response status={status}")
+                return None
+            try:
+                data = json.loads(body)
+            except Exception as e:
+                self._log(f"capture_chapter_count: non-JSON body: {_short(e)}")
+                return None
+
+            # Response shape: {"status":200,"result":{"html":"<a data-id=... data-number='N' ...> ..."}}
+            html_content = None
+            result = data.get("result")
+            if isinstance(result, dict):
+                html_content = result.get("html") or result.get("result") or result.get("data")
+            elif isinstance(result, str):
+                html_content = result
+            if not html_content:
+                return None
+            try:
+                from bs4 import BeautifulSoup
+            except ImportError:
+                return None
+            soup = BeautifulSoup(html_content, "html.parser")
+            nums: List[float] = []
+            for a in soup.select("a[data-id]"):
+                num_str = a.get("data-number") or a.get("data-num") or a.get("data-chapter")
+                if not num_str:
                     continue
+                try:
+                    nums.append(float(num_str))
+                except ValueError:
+                    continue
+            if not nums:
+                return None
+            self._log(f"capture_chapter_count: max={int(max(nums))} (over {len(nums)} entries)")
+            return int(max(nums))
 
-            # If we still don't have it, check if we got any similar VRF from the attempts
-            if url_path in self._vrf_cache:
-                return self._vrf_cache[url_path]
+    @staticmethod
+    def _slug_to_query(series_url: str) -> Optional[str]:
+        """Extract a search-query candidate from a /manga/<slug>.<id> URL.
 
-        # Check for chapter-specific URLs
-        match = re.match(r'/ajax/read/chapter/(\d+)', url_path)
-        if match:
-            chapter_id = match.group(1)
+        MangaFire slugs sometimes carry a trailing duplicated-char suffix to
+        disambiguate (e.g., 'eleceed' → 'eleceedd' when there's a slug
+        collision). The trailing duplicate doesn't help fuzzy match, so we
+        strip it. Dashes become spaces. Title-case the result.
+        """
+        try:
+            parsed = urlparse(series_url)
+        except Exception:
+            return None
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2 or parts[0] != "manga":
+            return None
+        slug_with_id = parts[1]
+        # Format: <slug>.<id>
+        slug = slug_with_id.split(".")[0]
+        if not slug:
+            return None
+        # Strip trailing duplicate-char disambiguator if present.
+        # Examples: 'eleceedd' → 'eleceed', 'witch-hat-atelierr' → 'witch-hat-atelier'.
+        # Heuristic: if the last char appears twice and removing one yields
+        # something with at least 3 chars, strip it.
+        if len(slug) >= 4 and slug[-1] == slug[-2]:
+            stripped = slug[:-1]
+            if len(stripped) >= 3:
+                slug = stripped
+        return slug.replace("-", " ").strip().title() or None
 
-            # For chapter images, we can't easily trigger the exact request
-            # But VRF tokens for /ajax/read/chapter/{id} appear to follow a pattern
-            # Try to generate by navigating to the chapter reader
-            # However, we don't know the manga ID, so we can't construct the reader URL
+    def _lookup_via_typeahead(
+        self, series_url: str, query: str
+    ) -> Optional[Dict[str, Any]]:
+        """Run the typeahead and find the entry whose URL matches series_url.
 
-            # Try to find a similar cached token (same endpoint type)
-            # Note: This might not work due to VRF being chapter-specific
-            for cached_path, vrf in self._vrf_cache.items():
-                if '/ajax/read/chapter/' in cached_path:
-                    cached_id = cached_path.split('/')[-1]
-                    # Check if IDs are close (sequential chapters might have similar VRFs)
+        Returns the meta dict on match, None if the typeahead succeeded but
+        didn't include our URL (caller should fall back to series-page nav).
+        Raises on typeahead failure (caller will catch and fall back).
+        """
+        # Reuse capture_search; it acquires the op_lock too, so we must call
+        # it WITHOUT holding op_lock here. capture_series_meta hasn't acquired
+        # the lock yet (we're still in stage 1 before any lock-acquire), so
+        # we're safe to call.
+        data = self.capture_search(query)
+        result = (data or {}).get("result") or {}
+        html = result.get("html") or ""
+        if not html:
+            return None
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+        # Normalize the input URL for comparison: strip query/fragment, ensure
+        # leading slash. Match against href on autocomplete cards.
+        target_path = urlparse(series_url).path
+        for a in soup.select("a.unit[href]"):
+            href = (a.get("href") or "").strip()
+            if not href:
+                continue
+            if href.split("?")[0].split("#")[0] != target_path:
+                continue
+            # Match!
+            title_node = a.select_one(".info h6, .info .title, h6, h3")
+            title = title_node.get_text(strip=True) if title_node else None
+            if not title:
+                return None
+            cover: Optional[str] = None
+            img = a.select_one(".poster img, img")
+            if img is not None:
+                src = img.get("data-src") or img.get("src")
+                if src:
+                    cover = src if src.startswith("http") else f"{_BASE_URL}{src}"
+            chapter_count: Optional[int] = None
+            for span in a.select(".info span"):
+                m = re.match(r"(?:Chap|Chapter)\s*([\d.]+)", span.get_text(strip=True), re.I)
+                if m:
                     try:
-                        if abs(int(cached_id) - int(chapter_id)) < 5:
-                            print(f"[+] Using VRF from nearby chapter {cached_id} for chapter {chapter_id}")
-                            return vrf
+                        chapter_count = int(float(m.group(1)))
                     except ValueError:
                         pass
+                    break
+            self._log(
+                f"capture_series_meta(typeahead): title={title!r} chN={chapter_count}"
+            )
+            return {
+                "title": title,
+                "cover": cover,
+                "chapter_count": chapter_count,
+                "final_url": series_url,
+            }
+        return None
 
-                    # Fallback: use any cached chapter VRF
-                    print(f"[!] Warning: Using VRF from different chapter ({cached_path}), may fail")
-                    return vrf
+    def capture_series_meta(self, series_url: str) -> Dict[str, Any]:
+        """Get title + cover + chapter_count for a MangaFire series URL.
 
-        raise RuntimeError(f"Could not generate VRF for {url_path}. No cached token available.")
+        Three escalating strategies because CF aggressively bounces direct
+        series-page navigation (~80% redirect-to-homepage rate even with
+        cf_clearance set, verified empirically):
+
+        1. **Slug-derived typeahead lookup.** Extract slug from URL, run
+           capture_search with the slug-as-query, find the autocomplete entry
+           whose URL matches the input. Returns accurate title + chN when it
+           works. Note: slug ≠ displayed title for licensed series (e.g.,
+           'mato-seihei-no-slavee' → query 'Mato Seihei No Slave' → returns
+           card titled 'Chained Soldier'); the typeahead's alt-title matching
+           handles this correctly.
+        2. **Series-page navigation.** Navigate to the URL and scrape the h1.
+           Unreliable (CF bounces) but covers cases where typeahead fails.
+        3. **Slug-derived fallback.** When both fail, return the slug-derived
+           query as the title with chapter_count=None. Guarantees the URL
+           gets included as a MangaFire seed in the orchestrator's candidate
+           list — the user always sees their URL alongside other sites'
+           results, even when we couldn't enrich it. Cross-site merge still
+           works via alt-title matching (the slug is usually the romaji,
+           which appears in MangaDex's alt-titles).
+
+        Returns a dict with keys: title, cover, chapter_count, final_url.
+        Never raises — always provides at least a slug-derived title so the
+        seed-hit path doesn't fail. Logs the strategy that succeeded.
+        """
+        if not series_url or "mangafire.to" not in series_url:
+            raise RuntimeError(f"capture_series_meta: not a MangaFire URL: {series_url}")
+
+        slug_query = self._slug_to_query(series_url)
+
+        # Stage 1: typeahead lookup using the slug as the query.
+        if slug_query:
+            try:
+                ta_meta = self._lookup_via_typeahead(series_url, slug_query)
+                if ta_meta is not None:
+                    return ta_meta
+            except Exception as e:
+                self._log(f"typeahead lookup failed: {_classify_exc(e)}: {_short(e)}; falling back to series-page nav")
+
+        with self._op_lock:
+            if not self._initialized:
+                self._initialize(f"{_BASE_URL}/")
+            assert self._page is not None
+
+            # Series-page rendering needs more resource types than VRF
+            # capture: the SPA's redirect-to-homepage logic triggers when
+            # critical resources fail to load. Drop the route filter for
+            # this call so the page can fully load (CSS, images, etc.),
+            # then restore it before returning so subsequent VRF calls
+            # keep their fast-load behavior.
+            unrouted = False
+            try:
+                self._context.unroute_all()
+                unrouted = True
+            except Exception as e:
+                self._log(f"unroute warning: {_classify_exc(e)}: {_short(e)}")
+
+            try:
+                # Pre-step: load the homepage with networkidle so CF's JS
+                # challenge runs to completion and cf_clearance gets set in
+                # the browser cookies. Without this, the FIRST goto to the
+                # series URL hits CF's anti-bot redirect-to-homepage flow
+                # (no cf_clearance yet → bounce). The warmup in _initialize
+                # uses wait_until='commit' which is too fast for cf_clearance
+                # establishment but is correct for VRF capture, so we do an
+                # extra full-load pass here.
+                try:
+                    with _net_guard("series:warmup"):
+                        self._page.goto(
+                            f"{_BASE_URL}/",
+                            wait_until="networkidle",
+                            timeout=self._DOM_TIMEOUT_MS,
+                        )
+                    # Extra settle for the cf_clearance cookie to land.
+                    self._page.wait_for_timeout(800)
+                except Exception as e:
+                    self._log(f"series:warmup pre-load warning: {_classify_exc(e)}: {_short(e)}")
+
+                last_err: Optional[Exception] = None
+                meta: Optional[Dict[str, Any]] = None
+                for attempt in range(1, 4):
+                    try:
+                        with _net_guard("series:nav"):
+                            self._page.goto(
+                                series_url,
+                                wait_until="networkidle",
+                                timeout=self._DOM_TIMEOUT_MS,
+                            )
+                    except Exception as e:
+                        last_err = e
+                        self._log(
+                            f"series:nav attempt {attempt} raised: {_classify_exc(e)}: {_short(e)}"
+                        )
+                        time.sleep(0.5 * attempt)
+                        continue
+
+                    final_url = self._page_url()
+                    parsed_final = urlparse(final_url)
+                    if parsed_final.path in ("", "/"):
+                        # Redirected to homepage despite the warmup — likely
+                        # the CF JS just installed cf_clearance during this
+                        # navigation; one more retry should hit the cleared
+                        # path.
+                        self._log(
+                            f"series:nav attempt {attempt} landed on homepage; retrying"
+                        )
+                        time.sleep(1.0)
+                        continue
+                    try:
+                        meta = self._extract_series_meta(series_url)
+                        break
+                    except RuntimeError as e:
+                        last_err = e
+                        self._log(
+                            f"series:nav attempt {attempt} extract failed: {_short(e)}"
+                        )
+                        continue
+
+                if meta is not None:
+                    return meta
+                self._log(
+                    f"capture_series_meta: series-page nav failed after retries (last_err={last_err}); "
+                    "using slug-derived fallback"
+                )
+            finally:
+                if unrouted:
+                    try:
+                        self._context.route("**/*", self._route_handler)
+                    except Exception:
+                        pass
+
+        # Stage 3: both typeahead and series-page nav failed. Build the
+        # slug-derived fallback. Title is approximate (slug → romaji-ish)
+        # but it's enough to merge the seed into the right candidate via
+        # alt-title matching at the orchestrator level. We then try a
+        # last-resort chapter-count probe via the VRF-protected AJAX
+        # endpoint (same one that powers the user's actual downloads, so
+        # it's the most reliable path we have).
+        chapter_count: Optional[int] = self._try_chapter_count_via_vrf(series_url)
+        return {
+            "title": slug_query or "MangaFire series",
+            "cover": None,
+            "chapter_count": chapter_count,
+            "final_url": series_url,
+        }
+
+    def _try_chapter_count_via_vrf(self, series_url: str) -> Optional[int]:
+        """Last-resort chapter-count probe for capture_series_meta. Extracts
+        manga_id from the URL and calls capture_chapter_count. Wrapped in
+        try/except so any failure just leaves chN=None (the user still gets
+        the URL-mode seed hit, just without a chN signal for cross-site DMCA
+        detection)."""
+        try:
+            parsed = urlparse(series_url)
+        except Exception:
+            return None
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2 or parts[0] != "manga":
+            return None
+        slug_with_id = parts[1]
+        if "." not in slug_with_id:
+            return None
+        manga_id = slug_with_id.split(".")[-1]
+        if not manga_id:
+            return None
+        try:
+            return self.capture_chapter_count(manga_id)
+        except Exception as e:
+            self._log(f"_try_chapter_count_via_vrf failed: {_classify_exc(e)}: {_short(e)}")
+            return None
+
+    def _extract_series_meta(self, series_url: str) -> Dict[str, Any]:
+        """Scrape the rendered series page DOM for title/cover/chapter_count.
+        Called from capture_series_meta after navigation. Separated so the
+        unroute/re-route lifecycle stays in one place."""
+        assert self._page is not None
+
+        final_url = self._page_url()
+
+        # Title — the canonical h1 with itemprop=name. If missing, the
+        # page redirected to homepage (invalid slug) or failed to render.
+        title: Optional[str] = None
+        try:
+            title_el = self._page.query_selector("h1[itemprop='name']")
+            if title_el:
+                title = (title_el.text_content() or "").strip()
+        except Exception:
+            title = None
+        if not title:
+            # Series page didn't render the h1 — likely invalid URL.
+            raise RuntimeError(
+                f"capture_series_meta: no title found on {final_url} "
+                "(URL may not be a valid MangaFire series page)"
+            )
+
+        # Cover — series page exposes the full-size cover at .poster img.
+        cover: Optional[str] = None
+        try:
+            cover_el = self._page.query_selector(".poster img[itemprop='image']")
+            if cover_el:
+                cover = cover_el.get_attribute("src")
+        except Exception:
+            cover = None
+
+        # Chapter count — regex over the rendered page text. The chapter
+        # list is rendered client-side via AJAX after networkidle; once
+        # present, every chapter row contributes a "Chap N" label so the
+        # max across matches is the latest chapter number. More resilient
+        # than depending on a specific [data-number] selector that the
+        # site has churned through.
+        chapter_count: Optional[int] = None
+        try:
+            body_text = self._page.evaluate("() => document.body.innerText")
+            if isinstance(body_text, str):
+                nums: List[float] = []
+                for m in re.finditer(r"Chap(?:ter)?\s*([\d.]+)", body_text, re.I):
+                    try:
+                        nums.append(float(m.group(1)))
+                    except ValueError:
+                        continue
+                if nums:
+                    chapter_count = int(max(nums))
+        except Exception:
+            chapter_count = None
+
+        self._log(
+            f"capture_series_meta: title={title!r} cover={'yes' if cover else 'no'} "
+            f"chapter_count={chapter_count}"
+        )
+        return {
+            "title": title,
+            "cover": cover,
+            "chapter_count": chapter_count,
+            "final_url": final_url,
+        }
 
     def close(self) -> None:
-        """Clean up resources."""
+        with self._op_lock:
+            # ── Step 1: Remove all route intercepts FIRST ──
+            # This prevents the EPIPE error. Without this, closing the
+            # page/context can trigger pending route handlers that try to
+            # write (route.continue_/route.abort) through the Playwright
+            # pipe after the browser process has already started shutting
+            # down. Unrouting first tells Playwright "stop intercepting
+            # requests" so nothing writes to a dead pipe.
+            try:
+                if self._context:
+                    self._context.unroute_all()
+            except Exception:
+                pass
+
+            # ── Step 2: Close page, context, browser, playwright (in order) ──
+            try:
+                if self._page:
+                    self._page.close()
+            except Exception:
+                pass
+            self._page = None
+
+            try:
+                if self._context:
+                    self._context.close()
+            except Exception:
+                pass
+            self._context = None
+
+            try:
+                if self._browser:
+                    self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+
+            try:
+                if self._playwright:
+                    self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+            self._initialized = False
+            self._warmup_url = None
+
+    def dump_state(self) -> None:
+        with self._op_lock:
+            recent = list(self._vrf_meta.items())[-8:]
+            self._log(
+                f"state: initialized={self._initialized} cache_size={len(self._vrf_cache)} page={self._page_url()}"
+            )
+            for path, meta in recent:
+                self._log(
+                    f"  cached: {path} ts={meta.get('ts')} from_page={meta.get('page_url')} full={_short(meta.get('full_url',''))}"
+                )
+
+
+# ----------------------------- generator singleton + asyncio-safe bridge -----------------------------
+
+
+
+# ---------------------------------------------------------------------------
+# VRF generator access
+# ---------------------------------------------------------------------------
+# Playwright Sync API objects must be used from the same thread they were
+# created in, and Playwright will raise if Sync API is used from inside an
+# asyncio event loop. To make this robust (and faster by reusing one browser
+# per process), we route all VRF work through a dedicated background thread.
+
+import concurrent.futures as _futures
+
+_VRF_EXECUTOR: _futures.ThreadPoolExecutor = _futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="MF-VRF"
+)
+_VRF_GEN = None  # created lazily inside the VRF thread
+
+
+def _vrf_thread_entry(fn_name: str, args: tuple, kwargs: dict):
+    global _VRF_GEN
+    if _VRF_GEN is None:
+        _VRF_GEN = SimpleMangaFireVRFGenerator()
+    fn = getattr(_VRF_GEN, fn_name)
+    return fn(*args, **kwargs)
+
+
+def _vrf_call(fn_name: str, *args, **kwargs):
+    fut = _VRF_EXECUTOR.submit(_vrf_thread_entry, fn_name, args, kwargs)
+    return fut.result()
+
+
+class _VRFBridge:
+    def ensure_vrf(
+        self,
+        expected_path: str,
+        page_url: str | None = None,
+        init_url: str | None = None,
+        *,
+        max_attempts: int = 4,
+        retry_backoff: float = 0.5,
+    ) -> str:
+        return _vrf_call(
+            "ensure_vrf",
+            expected_path,
+            page_url=page_url,
+            init_url=init_url,
+            max_attempts=max_attempts,
+            retry_backoff=retry_backoff,
+        )
+
+    def generate_vrf(self, url_path: str, init_url: str | None = None) -> str:
+        return _vrf_call("generate_vrf", url_path, init_url=init_url)
+
+    def capture_search(self, query: str, *, timeout_ms: int | None = None) -> dict:
+        """Run the typeahead-driven search via the persistent browser. Returns
+        the upstream JSON envelope; caller parses result.html. Used by
+        MangaFireSiteHandler.search() to bypass the CF-WAF block on /filter."""
+        return _vrf_call("capture_search", query, timeout_ms=timeout_ms)
+
+    def capture_series_meta(self, series_url: str) -> dict:
+        """Scrape title + cover + chapter count from a MangaFire series URL.
+        Used by URL-mode --search to guarantee MangaFire participation when
+        the typeahead would fail. See SimpleMangaFireVRFGenerator.capture_series_meta."""
+        return _vrf_call("capture_series_meta", series_url)
+
+    def capture_chapter_count(self, manga_id: str, language: str = "en") -> Optional[int]:
+        """Get latest chapter number via the VRF-protected chapter-list
+        endpoint. Reliable fallback when typeahead can't return chN.
+        See SimpleMangaFireVRFGenerator.capture_chapter_count."""
+        return _vrf_call("capture_chapter_count", manga_id, language=language)
+
+    # Back-compat: some callers expect a dump_state() method.
+    def dump_state(self) -> None:
         try:
-            if self._page:
-                self._page.close()
-                self._page = None
+            _vrf_call("dump_state")
         except Exception:
             pass
 
+    def debug_state(self) -> str:
+        return _vrf_call("debug_state")
+
+    def close(self) -> None:
         try:
-            if self._context:
-                self._context.close()
-                self._context = None
+            _vrf_call("close")
         except Exception:
             pass
 
-        try:
-            if self._browser:
-                self._browser.close()
-                self._browser = None
-        except Exception:
-            pass
 
-        try:
-            if self._playwright:
-                self._playwright.stop()
-                self._playwright = None
-        except Exception:
-            pass
-
-        self._initialized = False
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+_VRF_BRIDGE = _VRFBridge()
 
 
-# Singleton instance
-_vrf_generator: Optional[SimpleMangaFireVRFGenerator] = None
+def get_vrf_generator() -> _VRFBridge:
+    """Return a process-local VRF helper.
 
-
-def get_vrf_generator() -> SimpleMangaFireVRFGenerator:
-    """Get or create the global VRF generator."""
-    global _vrf_generator
-    if _vrf_generator is None:
-        _vrf_generator = SimpleMangaFireVRFGenerator()
-    return _vrf_generator
+    All Playwright operations happen on a single background thread so callers
+    can remain fully synchronous.
+    """
+    return _VRF_BRIDGE
 
 
 def generate_vrf_token(url_path: str) -> str:
-    """Generate a VRF token for the given URL path."""
-    generator = get_vrf_generator()
-    return generator.generate_vrf(url_path)
+    """Backward-compatible helper."""
+    return get_vrf_generator().generate_vrf(url_path)
+
+
+def _shutdown_vrf_bridge():
+    # Best-effort: close the browser/context and stop the worker thread.
+    # Use a timeout so this never hangs during Python interpreter shutdown.
+    global _VRF_GEN
+    try:
+        if _VRF_GEN is not None:
+            fut = _VRF_EXECUTOR.submit(_vrf_thread_entry, "close", (), {})
+            fut.result(timeout=5.0)  # give it 5 seconds max
+    except Exception:
+        pass
+    try:
+        _VRF_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
+import atexit as _atexit
+_atexit.register(_shutdown_vrf_bridge)

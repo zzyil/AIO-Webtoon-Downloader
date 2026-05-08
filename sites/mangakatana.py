@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class MangaKatanaSiteHandler(BaseSiteHandler):
@@ -145,6 +145,109 @@ class MangaKatanaSiteHandler(BaseSiteHandler):
                 }
             )
         return chapters
+
+    # ----------------------------------------------------------------- search
+    # MangaKatana behaviour: GET /?search=<query>&search_by=book_name
+    # If exactly one match → 302 redirect to /manga/<slug>.<id>.
+    # If multiple → 200 results page with .item h3 a per result.
+    # We follow redirects (default) so both shapes resolve to a parseable
+    # response.text, then detect the single-vs-multi case via response.url.
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        from urllib.parse import quote_plus
+        url = f"{self._BASE_URL}/?search={quote_plus(clean)}&search_by=book_name"
+        # HTTP errors propagate; orchestrator records the host in the
+        # probe-failure cache.
+        response = make_request(url, scraper)
+        html = response.text
+        final_url = getattr(response, "url", "") or ""
+        if not html or len(html) < 200:
+            return []
+
+        # Single-result redirect case: /manga/<slug>.<id>
+        single_match = re.search(r"/manga/[\w\-]+\.\w+", final_url)
+        if single_match:
+            soup = self._make_soup(html)
+            title_node = soup.select_one("h1.heading")
+            title = title_node.get_text(strip=True) if title_node else self._slug_from_url(final_url)
+            cover = self._extract_thumbnail(soup, final_url)
+            alt_node = soup.select_one(".alt_name")
+            alt_titles: List[str] = []
+            if alt_node:
+                for piece in re.split(r"[;,/]", alt_node.get_text(" ", strip=True)):
+                    p = piece.strip()
+                    if p and p != title:
+                        alt_titles.append(p)
+            return [
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=final_url.split("?")[0].split("#")[0],
+                    cover=cover,
+                    alt_titles=alt_titles,
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=1.0,
+                )
+            ]
+
+        # Multi-result case: parse .item h3 a per row.
+        soup = self._make_soup(html)
+        rows = soup.select("h3 a[href*='/manga/']")
+        hits: List[SearchHit] = []
+        seen: set = set()
+        for idx, link in enumerate(rows):
+            if len(hits) >= limit:
+                break
+            href = (link.get("href") or "").strip()
+            if not href or "/manga/" not in href:
+                continue
+            abs_url = href if href.startswith("http") else urljoin(self._BASE_URL, href)
+            abs_url = abs_url.split("?")[0].split("#")[0]
+            if abs_url in seen:
+                continue
+            seen.add(abs_url)
+            title = link.get_text(strip=True) or self._slug_from_url(abs_url)
+            container = link.find_parent("div", class_=lambda c: c and "item" in c)
+            cover: Optional[str] = None
+            alt_titles: List[str] = []
+            if container is not None:
+                img = container.select_one("img")
+                if img is not None:
+                    src = img.get("data-src") or img.get("src")
+                    if src:
+                        cover = src if src.startswith("http") else urljoin(self._BASE_URL, src)
+                alt_node = container.select_one(".text, .alt_name")
+                if alt_node:
+                    txt = alt_node.get_text(" ", strip=True)
+                    if txt and txt != title:
+                        alt_titles.append(txt)
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(rows))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=abs_url,
+                    cover=cover,
+                    alt_titles=alt_titles,
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")

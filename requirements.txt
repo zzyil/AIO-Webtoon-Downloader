@@ -7,3 +7,4 @@ requests
 pywidevine
 cryptography
 playwright>=1.40.0  # Required for MangaFire VRF generation
+rapidfuzz  # Cross-site search title matching (sites/search_orchestrator.py)
