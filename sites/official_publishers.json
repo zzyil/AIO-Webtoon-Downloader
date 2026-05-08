@@ -1,0 +1,111 @@
+{
+  "_meta": {
+    "purpose": "Authoritative list of MangaDex scanlation_group UUIDs that represent official publishers (licensed publishing platforms, not fan scanlation groups). Used by sites/_publishers.py to annotate chapter dicts with is_official=True + publisher=name. The chapter_merger then prefers these sources when building the per-chapter rank within multi-source.",
+    "added": "2026-05-07",
+    "review_cadence_days": 90,
+    "review_notes": "Corporate events shift this list — INKR shut down 2024, MangaPlus Creators launched 2024, etc. Re-verify UUIDs every 90 days via: GET https://api.mangadex.org/group?name=<publisher> and check attributes.official=true. Add new entries with `added` date and existing entries with `removed` + `status=defunct` rather than deleting.",
+    "schema": {
+      "name": "Display name shown to users (matches MangaDex's group attributes.name)",
+      "mangadex_group_id": "UUID — primary match key. Prefer this over name match because group names can drift across rebrands.",
+      "name_aliases": "Optional list of alternate strings to also match the chapter's group_name against (case-insensitive). Useful when other sites' handlers populate group_name with a slightly different spelling.",
+      "added": "ISO date when added to this catalog",
+      "status": "active | defunct (kept for historical bookmarks but won't gain new chapters)"
+    }
+  },
+  "last_reviewed": "2026-05-07",
+  "review_cadence_days": 90,
+  "publishers": [
+    {
+      "name": "MangaPlus",
+      "mangadex_group_id": "4f1de6a2-f0c5-4ac5-bce5-02c7dbb67deb",
+      "name_aliases": ["MangaPlus by Shueisha", "Manga Plus", "MANGA Plus"],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "MangaPlus Creators",
+      "mangadex_group_id": "d8c141e1-963e-4df9-a689-085479b98516",
+      "name_aliases": [],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "Viz Media",
+      "mangadex_group_id": "7448be24-6fe5-4c8d-b8b2-f0c5c8cbce04",
+      "name_aliases": ["Viz", "VIZ Media"],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "Kodansha USA",
+      "mangadex_group_id": "1a650edc-fc18-417d-91d5-6c0df538973d",
+      "name_aliases": ["Kodansha Comics", "Kodansha"],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "Comikey",
+      "mangadex_group_id": "8d8ecf83-8d42-4f8c-add8-60963f9f28d9",
+      "name_aliases": [],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "TappyToon",
+      "mangadex_group_id": "d4423cd8-4dbf-4c1f-b1ed-29a867395a71",
+      "name_aliases": ["Tappytoon"],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "INKR Comics",
+      "mangadex_group_id": "caa63201-4a17-4b7f-95ff-ed884a2b7e60",
+      "name_aliases": ["INKR"],
+      "added": "2026-05-07",
+      "status": "defunct",
+      "defunct_note": "INKR Comics shut down operations in 2024. UUID retained for historical chapters that may still be hosted on MangaDex."
+    },
+    {
+      "name": "Webnovel",
+      "mangadex_group_id": "0b52e04c-d2ff-49cc-8b49-fdb4443bf544",
+      "name_aliases": [],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "Bilibili Comics",
+      "mangadex_group_id": "06a9fecb-b608-4f19-b93c-7caab06b7f44",
+      "name_aliases": ["Bilibili"],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "Coolmic",
+      "mangadex_group_id": "b6767658-5c86-4791-85d7-0654169fee54",
+      "name_aliases": [],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "Pocket Comics",
+      "mangadex_group_id": "46d93505-29be-4489-8a44-a7dd1b992d44",
+      "name_aliases": [],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "Lezhin",
+      "mangadex_group_id": "59517115-3893-4d8f-b426-4a3ff9fdab2b",
+      "name_aliases": ["Lezhin Comics"],
+      "added": "2026-05-07",
+      "status": "active"
+    },
+    {
+      "name": "Flying Lines",
+      "mangadex_group_id": "3cb7ed98-2bbe-42b5-b31b-a057740354c0",
+      "name_aliases": [],
+      "added": "2026-05-07",
+      "status": "active"
+    }
+  ]
+}
