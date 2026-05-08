@@ -25,3 +25,19 @@ node_modules/
 __pycache__/
 rip/
 test_scripts/internal/
+
+# Local manga library — downloaded books, not source.
+mangas/
+
+# Dev tooling outputs (calibrate_quality_probe.py + webp_pdf_test.py scratch).
+# The committed sites/quality_seed.json is a curated seed; these underscored
+# outputs are regenerated runs and should never be tracked.
+_calibration_series.json
+_quality_calibration.json
+_webp_test/
+.pytest_cache/
+
+# Old/stray top-level artifacts.
+UI-binary/
+python3
+exclude.txt
