@@ -25,6 +25,11 @@
           "**/*",
           "!**/__pycache__/**"
         ]
+      },
+      {
+        "from": "build-resources/vcruntime",
+        "to": "vcruntime",
+        "filter": ["*.dll"]
       }
     ],
     "win": {

@@ -100,12 +100,21 @@ function classifyLogLevel(line) {
 }
 
 class Searcher {
-  constructor({ onLog }) {
+  constructor({ onLog, extraEnv }) {
     // Single callback for streaming stderr lines into the UI's log feed.
     // Result/error are returned by the runSearch() promise rather than via
     // separate events because search is blocking — there's no incremental
     // result to push.
     this._onLog = onLog;
+
+    // Extra environment variables to pass to every search subprocess. In
+    // packaged mode this carries PLAYWRIGHT_BROWSERS_PATH so MangaFire's
+    // VRF bridge (and the other Playwright-using handlers — violetscans,
+    // rizzfables, mangathemesia w/ use_playwright=True) can find the
+    // bundled Chromium. Without this, those handlers throw at search()
+    // and silently drop out of the candidate list. Same shape as
+    // Downloader._extraEnv — see main.js:initDownloader.
+    this._extraEnv = extraEnv || {};
 
     // The currently-running child process. Only one search at a time
     // (the UI prevents concurrent invocations via searchState.status).
@@ -146,8 +155,11 @@ class Searcher {
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
           // PYTHONUNBUFFERED so stderr progress lines appear live, not in
-          // 4KB-buffered bursts (same fix as downloader.js).
-          env: { ...process.env, PYTHONUNBUFFERED: "1" },
+          // 4KB-buffered bursts (same fix as downloader.js). _extraEnv
+          // carries PLAYWRIGHT_BROWSERS_PATH in packaged mode so handlers
+          // that use Playwright (mangafire, violetscans, rizzfables, etc.)
+          // can find the bundled Chromium. Same merge order as downloader.js.
+          env: { ...process.env, ...this._extraEnv, PYTHONUNBUFFERED: "1" },
         });
       } catch (err) {
         reject(new Error(`Failed to spawn search: ${err.message}`));

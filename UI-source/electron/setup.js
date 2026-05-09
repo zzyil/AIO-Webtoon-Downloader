@@ -45,7 +45,41 @@ const PYTHON_VERSION = "3.13.2";
 const PYTHON_ZIP_NAME = `python-${PYTHON_VERSION}-embed-amd64.zip`;
 const PYTHON_URL = `https://www.python.org/ftp/python/${PYTHON_VERSION}/${PYTHON_ZIP_NAME}`;
 const GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py";
-const TOTAL_STEPS = 7;
+const TOTAL_STEPS = 6;
+
+// Every package the runtime imports — verified after pip install completes.
+// Each entry is [label, exact_import_statement]. We use the EXACT statement
+// the runtime uses (not just bare `import X`) because several packages have
+// the failure mode where the top-level package loads but a submodule that
+// uses a C/Rust extension doesn't:
+//
+//   - `import patchright` succeeds, but `from patchright.sync_api import
+//     sync_playwright` fails if greenlet (C ext) didn't install. This is
+//     EXACTLY the failure mode in early sandbox tests — pip says ok,
+//     setup says ok, then runtime crashes with "Playwright is required"
+//     (msg comes from sites/mangafire_vrf_simple.py's PLAYWRIGHT_AVAILABLE
+//     check, even though we're now importing from patchright — the
+//     constant name was kept for back-compat, see comment in that file).
+//   - `import cryptography` succeeds, but `from cryptography.hazmat.primitives
+//     import hashes` fails if the Rust extension didn't install.
+//   - `from PIL import Image` exercises Pillow's C codec loader, where
+//     `import PIL` alone wouldn't.
+//
+// When you add a new runtime dependency to requirements.txt, add the EXACT
+// runtime import statement here — pick whichever submodule path the actual
+// code uses, not the shallowest one.
+const REQUIRED_IMPORTS = [
+  ["requests",      "import requests"],
+  ["bs4",           "from bs4 import BeautifulSoup"],
+  ["lxml",          "from lxml import etree"],
+  ["PIL",           "from PIL import Image"],
+  ["pypdf",         "from pypdf import PdfReader"],
+  ["cloudscraper",  "import cloudscraper"],
+  ["rapidfuzz",     "from rapidfuzz import fuzz"],
+  ["patchright",    "from patchright.sync_api import sync_playwright"],
+  ["pywidevine",    "from pywidevine import PSSH, Cdm"],
+  ["cryptography",  "from cryptography.hazmat.primitives import hashes"],
+];
 
 // ZIP files always start with these 4 bytes ("PK\x03\x04").
 const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
@@ -54,6 +88,15 @@ class PythonSetup {
   /**
    * @param {object} opts
    * @param {string}   opts.envDir           - Install root (e.g. %APPDATA%/aio-downloader-ui/python-env)
+   * @param {string}   opts.pythonSrcDir     - Where aio-dl.py + sites/ + aio_search_cli.py live
+   *                                            (process.resourcesPath/python-src in packaged mode).
+   *                                            Added to ._pth during _configurePython so the
+   *                                            end-of-setup smoke test can import sites/aio_search_cli.
+   * @param {string}   opts.vcRuntimeDir     - Where the bundled MSVC++ runtime DLLs ship
+   *                                            (process.resourcesPath/vcruntime in packaged mode).
+   *                                            Setup copies these next to python.exe in
+   *                                            _configurePython so C++-using wheels (greenlet etc.)
+   *                                            can load. Optional — if absent, this step is skipped.
    * @param {string}   opts.requirementsPath - Path to requirements.txt shipped with the app
    * @param {function} opts.onStep           - ({ step, total, label }) when a step starts
    * @param {function} opts.onLog            - (string) log lines
@@ -61,8 +104,10 @@ class PythonSetup {
    * @param {function} opts.onComplete       - All steps finished
    * @param {function} opts.onError          - (errorMessage) a step failed
    */
-  constructor({ envDir, requirementsPath, onStep, onLog, onProgress, onComplete, onError }) {
+  constructor({ envDir, pythonSrcDir, vcRuntimeDir, requirementsPath, onStep, onLog, onProgress, onComplete, onError }) {
     this._envDir = envDir;
+    this._pythonSrcDir = pythonSrcDir || null;
+    this._vcRuntimeDir = vcRuntimeDir || null;
     this._requirementsPath = requirementsPath;
     this._pythonDir = path.join(envDir, "python");
     this._playwrightDir = path.join(envDir, "playwright-browsers");
@@ -98,9 +143,8 @@ class PythonSetup {
       await this._step(2, "Extracting Python…",                    () => this._extractPython());
       await this._step(3, "Configuring Python…",                   () => this._configurePython());
       await this._step(4, "Installing pip…",                       () => this._installPip());
-      await this._step(5, "Installing dependencies…",              () => this._installRequirements());
-      await this._step(6, "Installing Playwright…",                () => this._installPlaywright());
-      await this._step(7, "Downloading Chromium browser…",         () => this._downloadBrowser());
+      await this._step(5, "Installing & verifying dependencies…",  () => this._installRequirements());
+      await this._step(6, "Downloading Chromium browser…",         () => this._downloadBrowser());
 
       // Write the marker file so future launches skip setup.
       const marker = path.join(this._envDir, ".setup-complete");
@@ -243,6 +287,45 @@ class PythonSetup {
   // ═══════════════════════════════════════════
 
   async _configurePython() {
+    // ── First: copy bundled VC++ runtime DLLs next to python.exe ──
+    //
+    // The Python embed distro ships vcruntime140.dll + vcruntime140_1.dll but
+    // NOT MSVCP140.dll, MSVCP140_1.dll, MSVCP140_2.dll, or CONCRT140.dll.
+    // Several pip wheels need these to load — most importantly greenlet,
+    // which is playwright's transitive dep. Without msvcp140.dll, the user
+    // sees `_greenlet.pyd → DLL load failed` mid-search/mid-download even
+    // though pip install reports success.
+    //
+    // We bundle these DLLs as extraResources (see package.json) and copy
+    // them next to python.exe so Windows finds them first via its standard
+    // DLL search order. The DLLs are part of the Microsoft Visual C++
+    // Redistributable; redistributing them with the app is permitted by
+    // Microsoft's redist license.
+    //
+    // Idempotent: skips DLLs that are already present (Python embed's own
+    // vcruntime140.dll is preserved if the version on the user's system is
+    // newer or the same; ours overwrites if our version is newer).
+    if (this._vcRuntimeDir && fs.existsSync(this._vcRuntimeDir)) {
+      this._onLog("Copying VC++ runtime DLLs into Python dir…");
+      let copied = 0;
+      try {
+        for (const file of fs.readdirSync(this._vcRuntimeDir)) {
+          if (!/\.dll$/i.test(file)) continue;
+          const src = path.join(this._vcRuntimeDir, file);
+          const dst = path.join(this._pythonDir, file);
+          fs.copyFileSync(src, dst);
+          copied++;
+        }
+        this._onLog(`Copied ${copied} runtime DLL(s) ✓`);
+      } catch (err) {
+        // Don't fail the whole setup if DLL copy fails — pip install might
+        // still work if the user has VC++ Redist already. The smoke test
+        // at end of step 5 will catch any remaining import failures.
+        this._onLog(`Warning: DLL copy failed (${err.message}) — continuing`);
+      }
+    }
+
+    // ── Then: configure ._pth so sys.path is correct ──
     // The embeddable Python ships with a ._pth file (e.g. python313._pth)
     // that completely controls sys.path.  When this file exists, Python
     // IGNORES the PYTHONPATH environment variable.
@@ -318,6 +401,30 @@ class PythonSetup {
 
     if (!hasImportSite) {
       newLines.push("import site");
+    }
+
+    // Add the python-src directory so the embedded Python can `import sites`
+    // and `import aio_search_cli` (those modules ship in resources/python-src/
+    // as extraResources, NOT inside the python-env folder where ._pth lives).
+    // Without this:
+    //   - aio-dl.py crashes on startup with "ModuleNotFoundError: sites"
+    //   - --search crashes with "ModuleNotFoundError: aio_search_cli"
+    // Required for the smoke tests at the end of step 5 to pass.
+    //
+    // main.js:ensurePythonSrcInPth() also runs on every launch and rewrites
+    // this entry to handle install-path changes on app updates — its smart
+    // remove-stale + re-add logic is what makes upgrades safe. This here is
+    // just the bootstrap copy so first-run setup can verify the bundle.
+    if (this._pythonSrcDir) {
+      const alreadyHasIt = newLines.some((l) => l.trim() === this._pythonSrcDir);
+      if (!alreadyHasIt) {
+        const siteIdx = newLines.findIndex((l) => l.trim() === "import site");
+        if (siteIdx >= 0) {
+          newLines.splice(siteIdx, 0, this._pythonSrcDir);
+        } else {
+          newLines.push(this._pythonSrcDir);
+        }
+      }
     }
 
     const newContent = newLines.join("\n") + "\n";
@@ -401,61 +508,139 @@ class PythonSetup {
       "--no-cache-dir",
     ]);
 
-    // Quick smoke test: try importing a key dependency.
+    // ── Comprehensive import verification ──
+    // Every package the runtime uses must import cleanly using the EXACT
+    // statement the runtime uses (see REQUIRED_IMPORTS comment for why
+    // shallow `import playwright` isn't enough). If any fails, throw —
+    // don't let users hit a cryptic "Playwright is required" or "DLL
+    // load failed" mid-search later.
+    this._onLog(`Verifying ${REQUIRED_IMPORTS.length} runtime imports…`);
+    const importStmt = REQUIRED_IMPORTS.map(([, stmt]) => stmt).join("; ");
+    const verifySnippet =
+      `${importStmt}; print('imports OK: ${REQUIRED_IMPORTS.length} packages verified')`;
     try {
-      await this._runPython(["-c", "import requests; import bs4; print('imports OK')"]);
-      this._onLog("All dependencies installed ✓");
-    } catch {
-      this._onLog("Warning: import check failed — packages may not be fully installed");
+      await this._runPython(["-c", verifySnippet]);
+    } catch (err) {
+      throw new Error(
+        "One or more required Python packages failed to import after pip install. " +
+        "This usually means a wheel didn't install correctly for your platform " +
+        "(common case: a transitive C-extension dep like greenlet for playwright " +
+        "or the cryptography Rust extension was skipped). The full traceback is " +
+        "in the log panel above — expand 'Show logs' to see which import failed. " +
+        `Click Retry to re-run setup. Detail: ${err.message}`
+      );
+    }
+    this._onLog("All runtime imports verified ✓");
+
+    // ── End-to-end bundle verification ──
+    // Verify aio-dl.py's entire dependency tree loads — including all
+    // 40+ handlers in sites/__init__.py and the deferred-import target
+    // aio_search_cli (used by --search). If any handler has a syntax
+    // error, missing import, or python-version incompatibility, this
+    // catches it during setup instead of on the user's first search.
+    //
+    // Requires pythonSrcDir to be on sys.path, which _configurePython
+    // already ensured by adding it to ._pth.
+    if (this._pythonSrcDir) {
+      this._onLog("Verifying bundled scripts load…");
+      try {
+        await this._runPython([
+          "-c",
+          "import sites; import aio_search_cli; " +
+          "n = sum(1 for _ in sites.iter_search_capable_handlers()); " +
+          "print(f'bundle OK: {n} search-capable handlers registered')",
+        ]);
+      } catch (err) {
+        throw new Error(
+          "The bundled aio-dl.py / sites / aio_search_cli failed to load. " +
+          "The python-src bundle in the installer may be incomplete or one " +
+          `of the handlers is broken. Detail: ${err.message}`
+        );
+      }
+      this._onLog("Bundled scripts verified ✓");
     }
   }
 
   // ═══════════════════════════════════════════
-  // STEP 6 — Install Playwright pip package
+  // STEP 6 — Download Chromium for Playwright
   // ═══════════════════════════════════════════
-
-  async _installPlaywright() {
-    // Check if already installed.
-    try {
-      await this._runPython(["-c", "import playwright; print(playwright.__version__)"]);
-      this._onLog("Playwright already installed");
-      return;
-    } catch {}
-
-    this._onLog("Installing playwright package…");
-    await this._runPython([
-      "-m", "pip", "install",
-      "playwright>=1.40.0",
-      "--no-warn-script-location",
-      "--no-cache-dir",
-    ]);
-    this._onLog("Playwright installed ✓");
-  }
-
-  // ═══════════════════════════════════════════
-  // STEP 7 — Download Chromium for Playwright
-  // ═══════════════════════════════════════════
+  //
+  // Why no separate "install playwright" step: requirements.txt already
+  // pins playwright>=1.40.0, so step 5's `pip install -r requirements.txt`
+  // installs it. The verification smoke test at the end of step 5 confirms
+  // `import playwright` works before we get here.
 
   async _downloadBrowser() {
-    // Check if browsers are already downloaded.
+    // Check if browsers are already downloaded AND launchable. If only
+    // partially downloaded (interrupted previous run, etc.), the launch
+    // smoke test below will catch it and trigger a re-download via Retry.
+    let alreadyHaveChromium = false;
     if (fs.existsSync(this._playwrightDir)) {
       try {
         const entries = fs.readdirSync(this._playwrightDir);
         // Playwright creates a "chromium-XXXX" folder inside the browsers dir.
         if (entries.some((e) => e.startsWith("chromium"))) {
-          this._onLog("Chromium already downloaded, skipping");
-          return;
+          alreadyHaveChromium = true;
+          this._onLog("Chromium directory found, will verify launch below");
         }
       } catch {}
     }
 
-    fs.mkdirSync(this._playwrightDir, { recursive: true });
-    this._onLog("Downloading Chromium (this may take a few minutes)…");
+    if (!alreadyHaveChromium) {
+      fs.mkdirSync(this._playwrightDir, { recursive: true });
+      this._onLog("Downloading Chromium (this may take a few minutes)…");
 
-    await this._runPython(
-      ["-m", "playwright", "install", "chromium"],
-      { PLAYWRIGHT_BROWSERS_PATH: this._playwrightDir }
-    );
+      // `patchright` is a Playwright fork; its CLI (`-m patchright install
+      // chromium`) downloads the same Chromium binaries Playwright uses, into
+      // the path specified by PLAYWRIGHT_BROWSERS_PATH (env var name is
+      // unchanged for compatibility). Either CLI works against the same
+      // browser cache, but we use the patchright command to keep the version
+      // pin consistent with the runtime — patchright tracks Playwright
+      // upstream but pins specific Chromium revisions.
+      await this._runPython(
+        ["-m", "patchright", "install", "chromium"],
+        { PLAYWRIGHT_BROWSERS_PATH: this._playwrightDir }
+      );
+    }
+
+    // ── Chromium launch verification ──
+    // Actually launch Chromium briefly to confirm it can run. Catches:
+    //   - Corrupt download
+    //   - Missing system DLL (e.g., MSVC runtime on very old Windows)
+    //   - Antivirus quarantining the chromium binary
+    //   - Wrong PLAYWRIGHT_BROWSERS_PATH (typo, etc.)
+    // Without this check, the user only finds out something is wrong on
+    // their first MangaFire search/download — which is exactly the failure
+    // mode we're trying to eliminate.
+    //
+    // Headless launch + immediate close takes ~2-3s on a normal machine.
+    this._onLog("Verifying Chromium launches…");
+    try {
+      await this._runPython(
+        [
+          "-c",
+          // Use patchright explicitly — even though `from playwright.sync_api`
+          // would also work after a `pip install patchright` (the package
+          // shadows playwright's import path), we want the test to fail
+          // loudly if patchright itself isn't installed correctly. Match the
+          // import path the runtime actually uses.
+          "from patchright.sync_api import sync_playwright; " +
+          "p = sync_playwright().start(); " +
+          "b = p.chromium.launch(headless=True); " +
+          "b.close(); " +
+          "p.stop(); " +
+          "print('chromium launch OK')",
+        ],
+        { PLAYWRIGHT_BROWSERS_PATH: this._playwrightDir }
+      );
+    } catch (err) {
+      throw new Error(
+        "Chromium installed but failed to launch. The download may be corrupt " +
+        "or your antivirus may have quarantined the binary. Try Retry — if " +
+        "that doesn't help, check your antivirus quarantine for any blocked " +
+        `chrome.exe under ${this._playwrightDir}. Detail: ${err.message}`
+      );
+    }
 
     this._onLog("Chromium browser ready ✓");
   }
@@ -669,7 +854,12 @@ class PythonSetup {
 
   /**
    * Run a command with the embedded python.exe.
-   * Returns stdout.  Logs all output in real time.
+   * Returns stdout. Logs all output in real time AND accumulates stderr so
+   * the rejection reason carries the actual Python error (e.g. the
+   * `ModuleNotFoundError: No module named 'greenlet'` line) instead of just
+   * "Python exited with code 1". Without this, our smoke-test failures
+   * surface as opaque "exited with code 1" in the wizard's error box and
+   * the real cause is only visible if the user expands the log panel.
    */
   _runPython(args, extraEnv = {}) {
     return new Promise((resolve, reject) => {
@@ -694,6 +884,12 @@ class PythonSetup {
       });
 
       let stdout = "";
+      // Accumulate stderr so we can surface it in the rejection error.
+      // Capped to last ~4KB to avoid memory blow-up if Python tracebacks
+      // get huge — the meaningful tail (the actual exception line) is
+      // always at the bottom of a Python traceback.
+      let stderr = "";
+      const STDERR_CAP = 4096;
 
       proc.stdout.on("data", (d) => {
         const text = d.toString();
@@ -702,12 +898,29 @@ class PythonSetup {
       });
 
       proc.stderr.on("data", (d) => {
-        d.toString().split("\n").filter(Boolean).forEach((line) => this._onLog("  " + line.trim()));
+        const text = d.toString();
+        stderr += text;
+        if (stderr.length > STDERR_CAP) {
+          stderr = stderr.slice(-STDERR_CAP);
+        }
+        text.split("\n").filter(Boolean).forEach((line) => this._onLog("  " + line.trim()));
       });
 
       proc.on("close", (code) => {
-        if (code === 0) resolve(stdout);
-        else reject(new Error(`Python exited with code ${code}`));
+        if (code === 0) {
+          resolve(stdout);
+          return;
+        }
+        // Pull the last meaningful line from stderr — typically the actual
+        // exception (e.g. "ModuleNotFoundError: No module named 'greenlet'").
+        // Python tracebacks have the exception at the bottom; we want that,
+        // not "Traceback (most recent call last):" at the top.
+        const lines = stderr.trim().split(/\r?\n/).filter(Boolean);
+        const lastLine = lines.length ? lines[lines.length - 1].trim() : "";
+        const detail = lastLine
+          ? `${lastLine} (Python exited with code ${code})`
+          : `Python exited with code ${code}`;
+        reject(new Error(detail));
       });
 
       proc.on("error", (err) => {

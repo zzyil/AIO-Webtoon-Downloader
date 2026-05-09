@@ -127,7 +127,7 @@
     .error-box {
       display: none;
       width: 100%;
-      max-width: 380px;
+      max-width: 440px;
       padding: 10px 14px;
       background: rgba(239, 68, 68, 0.08);
       border: 1px solid rgba(239, 68, 68, 0.25);
@@ -136,6 +136,10 @@
       font-size: 11px;
       color: #f87171;
       word-break: break-word;
+      /* Long errors (e.g. multi-line ImportError) used to push the
+         log toggle off-screen; cap height and let the box scroll instead. */
+      max-height: 110px;
+      overflow-y: auto;
     }
     .error-box.visible { display: block; }
 
@@ -181,22 +185,22 @@
 
     .log-panel {
       width: 100%;
-      max-width: 440px;
+      max-width: 460px;
       height: 0;
       background: #13151d;
       border: 1px solid #1e2030;
       border-radius: 6px;
       padding: 0;
       font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
-      font-size: 9px;
+      font-size: 10px;
       line-height: 1.5;
-      color: #71717a;
+      color: #a1a1aa;
       overflow-y: auto;
       transition: height 0.2s ease, padding 0.2s ease;
     }
     .log-panel.visible {
-      height: 110px;
-      padding: 6px 10px;
+      height: 160px;
+      padding: 8px 12px;
     }
 
     /* ── Success state ── */
@@ -290,6 +294,13 @@
       $("errorBox").classList.add("visible");
       $("btnRow").classList.add("visible");
       $("progressFill").classList.remove("working");
+      // Auto-expand the log panel — when something fails the user almost
+      // always wants the full traceback. Saves a click and avoids the
+      // off-screen-toggle bug entirely (toggle is now redundant for errors,
+      // but kept around for users who want to peek at the log mid-install).
+      if (!logsVisible) {
+        toggleLogs();
+      }
     }
 
     function hideError() {

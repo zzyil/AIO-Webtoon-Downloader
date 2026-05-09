@@ -69,6 +69,12 @@ let currentSetup = null;  // The PythonSetup instance (only during first-run)
 let pythonEnvDir = null;     // Where the downloaded Python lives
 let pythonSrcDir = null;     // Where aio-dl.py + sites/ ship (read-only)
 let playwrightDir = null;    // Where Playwright's Chromium is stored
+let vcRuntimeDir = null;     // Where bundled MSVC++ runtime DLLs ship (read-only).
+                             // Setup copies these into the embed Python dir so
+                             // C++ extensions like greenlet (playwright dep) can
+                             // load. Without this, _greenlet.pyd → "DLL load
+                             // failed" because Python embed distro lacks
+                             // MSVCP140.dll. Only relevant in packaged mode.
 
 // The resolved paths used for spawning downloads.
 // In packaged mode these point to the bundled/downloaded Python.
@@ -89,6 +95,11 @@ function computePaths() {
     // Python source: aio-dl.py + sites/ ship inside the installer as
     // "extraResources". They live in the app's resources/ folder (read-only).
     pythonSrcDir = path.join(process.resourcesPath, "python-src");
+
+    // VC++ runtime DLLs (msvcp140, vcruntime140_1, etc.) ship as a separate
+    // extraResources entry — see package.json. Setup copies them next to
+    // python.exe so C++-using extensions (greenlet primarily) can load.
+    vcRuntimeDir = path.join(process.resourcesPath, "vcruntime");
 
     // The embedded Python is inside the python-env folder
     defaultPythonCmd = path.join(pythonEnvDir, "python", "python.exe");
@@ -177,10 +188,13 @@ function sendToUI(channel, data) {
  */
 function runSetupFlow() {
   return new Promise((resolve) => {
-    // Create a small, non-resizable setup window
+    // Create the setup window. Sized to fit the full error+buttons+log-toggle
+    // chain even when an error message is long — at 420px the log toggle was
+    // pushed off-screen on long errors (e.g. the MSVCP140 DLL ImportError),
+    // leaving the user unable to expand the log panel.
     setupWindow = new BrowserWindow({
-      width: 520,
-      height: 420,
+      width: 540,
+      height: 580,
       resizable: false,
       maximizable: false,
       frame: false,  // We draw our own title bar in setup.html
@@ -199,6 +213,18 @@ function runSetupFlow() {
     const startSetup = () => {
       currentSetup = new PythonSetup({
         envDir: pythonEnvDir,
+        // pythonSrcDir is passed so setup.js can (a) add it to ._pth during
+        // _configurePython and (b) run the end-to-end smoke test that imports
+        // `sites` and `aio_search_cli` from the bundle. ensurePythonSrcInPth()
+        // also runs on every launch — this setup-time write just bootstraps
+        // it for the first-run smoke test.
+        pythonSrcDir,
+        // vcRuntimeDir holds the bundled MSVC++ runtime DLLs (msvcp140 etc.).
+        // setup.js copies these next to the embed python.exe so C++-using
+        // extensions (greenlet → playwright path) load successfully. Without
+        // this, _greenlet.pyd fails with "DLL load failed" because Python's
+        // embed distro doesn't ship MSVCP140.dll.
+        vcRuntimeDir,
         requirementsPath: path.join(pythonSrcDir, "requirements.txt"),
 
         // Forward progress to the setup window
@@ -325,7 +351,14 @@ function initDownloader() {
   // Cross-site search subprocess invoker — separate from `downloader` because
   // search is a single blocking request/response (not a long-lived stream
   // with progress events) and lives on different IPC channels.
+  //
+  // Searcher gets the SAME extraEnv as Downloader (PLAYWRIGHT_BROWSERS_PATH
+  // in packaged mode). Without this, search would still run but Playwright-
+  // using handlers (mangafire, violetscans, rizzfables, mangathemesia with
+  // use_playwright=True) would silently fail and drop out of the candidate
+  // list — making search results in installed builds inferior to dev builds.
   searcher = new Searcher({
+    extraEnv,
     onLog: (searchId, line, level) => {
       sendToUI("search-log", { searchId, line, level });
     },
