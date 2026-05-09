@@ -46,6 +46,7 @@ from .rizzfables import RizzFablesSiteHandler
 from .tecnoxmoon import TecnoxmoonSiteHandler
 from .violetscans import VioletScansSiteHandler
 from .boratscans import BoratScansSiteHandler
+from .linewebtoon import LineWebtoonSiteHandler
 
 # MangaThemesia sites - unified handler
 from .mangathemesia import MangaThemesiaSiteHandler
@@ -95,6 +96,7 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     TecnoxmoonSiteHandler(),
     VioletScansSiteHandler(),
     BoratScansSiteHandler(),
+    LineWebtoonSiteHandler(),
 )
 
 # Create MangaThemesia handlers from configuration. Skip entries whose name
