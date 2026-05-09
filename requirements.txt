@@ -6,5 +6,5 @@ pypdf
 requests
 pywidevine
 cryptography
-playwright>=1.40.0  # Required for MangaFire VRF generation
+patchright>=1.40.0  # Drop-in Playwright fork with CDP-leak patches (Cloudflare-stealthier). Drives sites/mangafire_vrf_simple.py and sites/playwright_utils.py.
 rapidfuzz  # Cross-site search title matching (sites/search_orchestrator.py)

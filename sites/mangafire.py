@@ -153,6 +153,24 @@ class MangaFireSiteHandler(BaseSiteHandler):
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         _mf_throttle('request')
+
+        # If the caller passed a /read/<slug>... URL (chapter reader URL,
+        # possibly truncated to just /read/<slug>), rewrite it to the series
+        # URL (/manga/<slug>) BEFORE the HTTP fetch. The chapter reader page
+        # doesn't render h1[itemprop=name] so title extraction would return
+        # "Unknown Title" — which then propagates to the aio-dl.py header
+        # printout (the UI's queue-text source), file naming, multi-source
+        # search, etc. _extract_id_from_url's path.split('.')[-1] gives the
+        # same hid for both URL forms, so the manga_id stays consistent.
+        # Mirror of the same rewrite in mangafire_vrf_simple.capture_series_meta.
+        _read_url_match = re.match(
+            r"^https?://(?:www\.)?mangafire\.to/read/([^/?#]+)",
+            url,
+            re.IGNORECASE,
+        )
+        if _read_url_match:
+            url = f"https://mangafire.to/manga/{_read_url_match.group(1)}"
+
         response = make_request(url, scraper)
 
         # MangaFire sometimes returns JSON-wrapped HTML
@@ -428,8 +446,10 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 # 1) VRF
                 stage = "vrf"
                 if chapter_url:
-                    print(f"[*] Capturing chapter VRF via navigation: {chapter_url}")
-                    # ensure_vrf logs its own per-attempt reasons.
+                    # The actual capture path (in-page fetch vs navigation) is
+                    # decided inside ensure_vrf and logged with its own per-
+                    # attempt diagnostic lines — don't pre-claim "navigation".
+                    print(f"[*] Capturing chapter VRF for: {chapter_url}")
                     vrf = vrf_gen.ensure_vrf(ajax_path, page_url=chapter_url, init_url=chapter_url)
                 else:
                     vrf = vrf_gen.ensure_vrf(ajax_path)

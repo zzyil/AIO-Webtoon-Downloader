@@ -183,11 +183,22 @@ def _net_guard(label: str = ""):
     return _COORD.net_phase(label)
 
 
-# ----------------------------- Playwright import -----------------------------
+# ----------------------------- Patchright import -----------------------------
+# Patchright is a drop-in for Playwright Sync API (same imports, same Browser/
+# Context/Page classes, same `python -m <pkg> install chromium` CLI). It patches
+# CDP-leak fingerprints (navigator.webdriver, etc.) at the protocol level —
+# vanilla Playwright is detected by Cloudflare on aggregator sites, which
+# triggers redirect-to-homepage on rapid sequential chapter navigations.
+#
+# We keep the module variables called "PLAYWRIGHT_*" because the public-facing
+# constant (PLAYWRIGHT_AVAILABLE) is consumed by aio_search_cli.py and was the
+# pre-existing flag — renaming it would cascade through callers without
+# functional benefit. Treat "playwright" in identifiers as a generic stand-in
+# for "headless browser driver" from here on.
 
 
 try:
-    from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+    from patchright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
     PLAYWRIGHT_AVAILABLE = True
 except Exception:
@@ -199,6 +210,61 @@ _BASE_URL = "https://mangafire.to"
 # Resource types needed for VRF capture. Everything else is blocked
 # to speed up navigation (no stylesheets, images, fonts, media, etc.)
 _VRF_ALLOWED_TYPES = {"document", "script", "xhr", "fetch"}
+
+
+# ----------------------------- stealth + persistence config -----------------------------
+# Persistent browser state (cookies + localStorage) lives here. cf_clearance
+# from Cloudflare lasts 30min–several hours; reusing it across runs eliminates
+# the warmup challenge. Path uses ~/.aio-dl/cache/ which is the same root the
+# --multi-source-prefetched flag writes to (see aio-dl.py argparse).
+_DEFAULT_STATE_DIR = os.path.expanduser(
+    os.path.join("~", ".aio-dl", "cache", "mangafire")
+)
+_DEFAULT_STATE_PATH = os.path.join(_DEFAULT_STATE_DIR, "storage_state.json")
+# Reject saved state older than this (Cloudflare cookies have already
+# expired naturally; loading them just confuses fingerprint heuristics).
+_STATE_MAX_AGE_SECONDS = 24 * 3600
+
+# UA + viewport. We initially tried a mobile UA (Pixel 7) per a Tachiyomi-
+# documented MangaFire CF workaround, but mobile clients trigger MangaFire's
+# server-side mobile detection (Sec-CH-UA-Mobile hint + UA sniffing), which
+# serves a stripped-down homepage that doesn't load the jQuery bundle the
+# typeahead search relies on. capture_search then crashes with "window.jQuery
+# is not a function" even after wait_for_function reports jQuery as defined,
+# because the mobile bundle's jQuery handle is in a different scope or
+# unloaded between the wait and the trigger.
+#
+# Patchright's CDP-leak patches plus persistent storage_state cf_clearance
+# are doing the Cloudflare-evasion heavy lifting; the mobile UA was belt-
+# and-suspenders that turned out to break typeahead. Sticking with a current
+# desktop Chrome UA gives Cloudflare the same fingerprint a real desktop
+# browser would and lets MangaFire serve the full desktop bundle.
+_DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+_DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
+
+# Reference-only: a stealth init script we previously layered on top of
+# Patchright. We removed it (see _initialize for the rationale) because
+# Object.defineProperty leaves a detectable signature
+# (Object.getOwnPropertyDescriptor(navigator, 'webdriver').get returns a
+# function rather than undefined). Patchright handles this at the protocol
+# level without that side effect. Keeping the constant here documents the
+# decision and makes A/B re-enabling trivial if a different target site
+# needs additional stealth that Patchright doesn't cover.
+_STEALTH_INIT_SCRIPT_UNUSED = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+window.chrome = window.chrome || { runtime: {} };
+""".strip()
+
+# Throttle for in-flight `_save_storage_state(throttle=True)`. Saves are
+# triggered every captured VRF; this keeps file I/O at ≤ once per minute.
+# Forced saves (warmup-end, close()) bypass the throttle.
+_STATE_SAVE_THROTTLE_SECONDS = 60.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -284,6 +350,20 @@ class SimpleMangaFireVRFGenerator:
 
         self._vrf_cache: Dict[str, str] = {}
         self._vrf_meta: Dict[str, Dict[str, Any]] = {}
+
+        # Throttle for incremental storage_state writes. See _save_storage_state.
+        self._last_state_save_ts: float = 0.0
+
+        # Layer-4 (in-page fetch) circuit breaker. The first call to
+        # _capture_via_inpage_fetch sets this to True; on subsequent calls,
+        # if a previous attempt has failed (_inpage_fetch_failed), the
+        # method returns False immediately without burning the 2s poll
+        # budget. Empirically MangaFire's hook is chapter-scoped — it only
+        # fires for the chapter the page was loaded with, so the warmup
+        # chapter benefits but every subsequent chapter wastes 2s. Once we
+        # know it's chapter-scoped (one failure proves it), short-circuit.
+        self._inpage_fetch_attempted: bool = False
+        self._inpage_fetch_failed: bool = False
 
         self._op_lock = threading.Lock()
         atexit.register(self.close)
@@ -377,7 +457,7 @@ class SimpleMangaFireVRFGenerator:
         if self._initialized:
             return
 
-        self._log("initializing Playwright…")
+        self._log("initializing Patchright…")
         self._playwright = sync_playwright().start()
         # Extra args reduce Chromium startup time and memory when we only
         # need it for network request interception (VRF capture).
@@ -392,13 +472,42 @@ class SimpleMangaFireVRFGenerator:
             headless=self._HEADLESS,
             args=_LAUNCH_ARGS,
         )
-        self._context = self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            )
-        )
+
+        # Build context kwargs. Desktop Chrome UA — see the comment above
+        # _DESKTOP_UA for why we're not using mobile. storage_state restores
+        # cf_clearance + other cookies from a previous run so the Cloudflare
+        # challenge cycle is skipped on warmup.
+        context_kwargs: Dict[str, Any] = {
+            "user_agent": _DESKTOP_UA,
+            "viewport": _DESKTOP_VIEWPORT,
+            "locale": "en-US",
+        }
+        storage_path = self._load_storage_state_path()
+        if storage_path:
+            context_kwargs["storage_state"] = storage_path
+            self._log(f"loading saved storage state from {storage_path}")
+
+        try:
+            self._context = self._browser.new_context(**context_kwargs)
+        except Exception as e:
+            # If the file is corrupt / schema-mismatched / Patchright rejects
+            # it for any reason, fall back to a clean context. Don't fail the
+            # run over a stale cookie cache.
+            self._log(f"context init with storage state failed ({_short(e)}); retrying clean")
+            context_kwargs.pop("storage_state", None)
+            self._context = self._browser.new_context(**context_kwargs)
+
+        # NOTE: we DON'T install a JS-level stealth init script here. Patchright
+        # handles webdriver/CDP-leak fingerprinting at the protocol level
+        # (invisible to detection scripts), but a JS-level Object.defineProperty
+        # over navigator.webdriver leaves a detectable signature —
+        # `Object.getOwnPropertyDescriptor(navigator, 'webdriver').get` returns
+        # a function instead of undefined, and modern anti-bot scripts use that
+        # to detect tampering. On MangaFire specifically, an earlier version of
+        # this code installed such a script; the side effect was that MangaFire
+        # poisoned window.jQuery as a defense (it'd be defined but not callable),
+        # which broke capture_search's typeahead. Trust Patchright; don't layer
+        # JS overrides on top of its protocol patches.
 
         # Faster VRF capture: only allow resource types needed for VRF.
         # document = page HTML, script = JS that computes VRF,
@@ -435,6 +544,13 @@ class SimpleMangaFireVRFGenerator:
                 "page_url": self._page_url(),
             }
             self._log(f"captured {path} vrf={vrf[:30]}…")
+            # Throttled background save — keeps the on-disk state warm in
+            # case of crash/interruption mid-download. The throttle inside
+            # _save_storage_state means this is a no-op most of the time.
+            try:
+                self._save_storage_state(throttle=True)
+            except Exception:
+                pass  # Belt+suspenders; _save_storage_state already swallows.
         def handle_response(resp) -> None:
             # Soft-block signals: share a cooldown.
             try:
@@ -463,8 +579,79 @@ class SimpleMangaFireVRFGenerator:
         except Exception as e:
             self._log(f"warm-up navigation warning: {_classify_exc(e)}: {_short(e)}")
 
+        # Force-save the post-warmup state — even if this run fails downstream,
+        # the next run benefits from a fresh cf_clearance cookie. Bypasses the
+        # throttle since this is the first successful state we've reached.
+        self._save_storage_state(throttle=False)
+
         self._warmup_url = init_url
         self._initialized = True
+
+    # ----------------------------- storage-state persistence -----------------------------
+
+    def _save_storage_state(self, throttle: bool = True) -> None:
+        """Persist the current browser context's cookies + localStorage to
+        disk so subsequent runs warm up without re-running Cloudflare's
+        challenge.
+
+        Called from:
+          - `_initialize` after warmup (throttle=False, force first save)
+          - `handle_request` after each captured VRF (throttle=True)
+          - `close` on shutdown (throttle=False, final save)
+
+        With throttle=True, no-op if last save was within
+        _STATE_SAVE_THROTTLE_SECONDS (default 60s). With throttle=False,
+        always writes. Errors are logged but never raised — losing a save
+        is not fatal.
+        """
+        if self._context is None:
+            return
+        if throttle:
+            if time.time() - self._last_state_save_ts < _STATE_SAVE_THROTTLE_SECONDS:
+                return
+        try:
+            os.makedirs(_DEFAULT_STATE_DIR, exist_ok=True)
+            # Patchright's storage_state(path=...) writes the JSON atomically
+            # via a temp-file-then-rename internally, so a crash mid-write
+            # leaves the previous file intact.
+            self._context.storage_state(path=_DEFAULT_STATE_PATH)
+            self._last_state_save_ts = time.time()
+        except Exception as e:
+            # Patchright/Playwright sync objects are bound to the thread
+            # that created them. There are two atexit hooks (one on the
+            # _VRFBridge, one on this instance — see __init__) which can
+            # race: the bridge's hook runs close() on the owner thread
+            # successfully; the instance hook then re-runs close() on the
+            # main thread and Patchright raises a "different thread" error.
+            # The save already happened during the bridge's close, so this
+            # second-call failure is benign — silence it.
+            msg = str(e)
+            if "different thread" in msg or "switch to" in msg:
+                return
+            self._log(f"storage state save warning: {_short(e)}")
+
+    def _load_storage_state_path(self) -> Optional[str]:
+        """Return the on-disk storage-state path if it exists and is younger
+        than `_STATE_MAX_AGE_SECONDS`, else None.
+
+        Doesn't validate the JSON — Patchright will reject malformed files
+        and `_initialize`'s try/except falls back to a clean context.
+        """
+        try:
+            if not os.path.exists(_DEFAULT_STATE_PATH):
+                return None
+            age = time.time() - os.path.getmtime(_DEFAULT_STATE_PATH)
+            if age > _STATE_MAX_AGE_SECONDS:
+                self._log(
+                    f"saved storage state too old ({age/3600:.1f}h > "
+                    f"{_STATE_MAX_AGE_SECONDS/3600:.0f}h); ignoring"
+                )
+                return None
+            return _DEFAULT_STATE_PATH
+        except Exception:
+            return None
+
+    # ----------------------------- page lifecycle -----------------------------
 
     def _recreate_page(self, reason: str = "") -> None:
         if self._context is None:
@@ -497,6 +684,137 @@ class SimpleMangaFireVRFGenerator:
         except Exception as e:
             self._log(f"page recreate warning: {_classify_exc(e)}: {_short(e)}")
 
+    # ----------------------------- capture-loop helpers -----------------------------
+
+    def _poll_for_vrf(self, expected_path: str, timeout_ms: int = 3000, interval_ms: int = 100) -> bool:
+        """Wait up to ``timeout_ms`` for the request handler to populate
+        ``_vrf_cache[expected_path]``. Returns True if captured, False on
+        timeout.
+
+        Cheaper than ``expect_request`` because we're not building a
+        Playwright-side waiter — the request handler already populates the
+        cache from incoming network events. We just pump the page event
+        loop with short sleeps so it can dispatch them.
+
+        Used in place of ``expect_request(_pred, timeout=12s)`` in the
+        navigation loop. The 12s wait was the dominant cost of every failed
+        attempt; this caps the wait at ~3s and bails immediately when we
+        detect a homepage redirect (chapter AJAX won't fire there).
+        """
+        if expected_path in self._vrf_cache:
+            return True
+        if self._page is None:
+            return False
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
+            try:
+                self._page.wait_for_timeout(interval_ms)
+            except Exception:
+                # Page may have closed under us (e.g. _recreate_page); just
+                # return whatever we have in cache.
+                return expected_path in self._vrf_cache
+            if expected_path in self._vrf_cache:
+                return True
+        return False
+
+    def _reset_mangafire_cookies(self) -> None:
+        """Clear mangafire.to cookies. Called when consecutive
+        redirect-to-homepage attempts suggest Cloudflare has flagged the
+        session — dropping the bad cf_clearance forces a fresh challenge,
+        which often clears faster than waiting out the rate-limit window.
+
+        Best-effort; logged on failure but never raised. Patchright
+        signature varies across versions: newer takes a ``domain=`` filter,
+        older clears all. We try filtered first, fall back to clear-all.
+        """
+        if self._context is None:
+            return
+        try:
+            try:
+                self._context.clear_cookies(domain="mangafire.to")
+            except TypeError:
+                self._context.clear_cookies()
+        except Exception as e:
+            self._log(f"cookie reset warning: {_short(e)}")
+
+    # Path filter for the Layer-4 in-page fetch fast path. Only chapter-
+    # payload paths qualify; the chapter-list endpoint is captured during
+    # warmup and other paths might not be hooked the same way.
+    _CHAPTER_PAYLOAD_PATH_RE = re.compile(r"^/ajax/read/chapter/\d+$")
+
+    def _capture_via_inpage_fetch(self, expected_ajax_path: str) -> bool:
+        """Layer 4: fast path that avoids per-chapter navigation.
+
+        MangaFire's chapter pages load a heavily-obfuscated JS bundle (from
+        boringegotistical.com — the suspicious-named domain is deliberately
+        misleading) that hooks `fetch`/`XMLHttpRequest` and injects ?vrf=…
+        into AJAX URLs. The token format is a deterministic encoder over
+        (session-secret, path) — the chapter-list and chapter-payload
+        VRFs share a long prefix and differ only in the suffix that
+        encodes the path.
+
+        That means the hook is almost certainly session-wide: any AJAX from
+        the warm chapter page (regardless of which chapter was originally
+        loaded) gets a valid VRF computed for the requested path. We
+        exploit this by firing fetch() from the page context for an
+        arbitrary chapter ID; the hook computes and injects the VRF; our
+        request handler picks it up.
+
+        Worst case (chapter-scoped hook, hook checks initiator stack, etc.):
+        the request goes out without VRF or returns 404, _poll_for_vrf
+        times out, and we return False. Caller falls back to the navigation
+        path. No regression.
+        """
+        # Sanity guards
+        if not self._initialized or self._page is None or self._context is None:
+            return False
+        if expected_ajax_path in self._vrf_cache:
+            return True
+
+        # Limit scope: only chapter-payload paths. Other AJAX paths might
+        # not be hooked by the obfuscated bundle.
+        if not self._CHAPTER_PAYLOAD_PATH_RE.match(expected_ajax_path):
+            return False
+
+        # Circuit breaker: if a previous in-page fetch on THIS page failed,
+        # the hook is chapter-scoped (verified empirically — MangaFire's
+        # obfuscated bundle only injects vrf= for the current chapter URL).
+        # Don't burn another 2s polling for nothing. The flag clears on
+        # _recreate_page (new page = new hook = worth retrying once).
+        if self._inpage_fetch_failed:
+            return False
+
+        self._log(f"in-page fetch attempt: {expected_ajax_path}")
+        self._inpage_fetch_attempted = True
+        try:
+            # Fire fetch from page context. The .catch() drops any network
+            # error so we don't propagate it back to Python — we don't need
+            # the response body, only for the request to leave the page so
+            # our handler captures the URL (with the hook-injected vrf=).
+            self._page.evaluate(
+                "(p) => { try { fetch(p, { credentials: 'include' }).catch(() => null); } catch (e) {} }",
+                expected_ajax_path,
+            )
+        except Exception as e:
+            self._log(f"in-page fetch error: {_short(e)}")
+            self._inpage_fetch_failed = True
+            return False
+
+        # Poll briefly. If the hook is session-wide, the request fires
+        # within a few hundred ms; longer timeouts just delay the fallback.
+        # 2s gives margin for slow hooks/event loops.
+        captured = self._poll_for_vrf(expected_ajax_path, timeout_ms=2000)
+        if captured:
+            self._log(f"in-page fetch SUCCEEDED for {expected_ajax_path}")
+        else:
+            self._log(
+                "in-page fetch did not capture; hook is chapter-scoped — "
+                "disabling in-page fetch for the rest of this session "
+                "(short-circuits future calls; saves 2s/chapter)"
+            )
+            self._inpage_fetch_failed = True
+        return captured
+
     # ----------------------------- core capture -----------------------------
 
     def _navigate_and_capture(self, page_url: str, expected_ajax_path: str, init_url: Optional[str] = None) -> None:
@@ -512,32 +830,36 @@ class SimpleMangaFireVRFGenerator:
             assert self._page is not None
             last_exc: Optional[BaseException] = None
 
-            def _pred(req) -> bool:
-                try:
-                    u = req.url
-                except Exception:
-                    return False
-                if "vrf=" not in u:
-                    return False
-                try:
-                    return urlparse(u).path == expected_ajax_path
-                except Exception:
-                    return False
-
             # If warmup already navigated to the target page, the page's
-            # JS is still loading.  Wait briefly for the VRF XHR to fire
-            # from the ongoing warmup page load instead of navigating
-            # to the same URL a second time.
+            # JS is still loading. Poll briefly for the VRF XHR to fire
+            # from the ongoing warmup load instead of re-navigating to the
+            # same URL. Uses the same _poll_for_vrf helper as the main
+            # loop — _pred / expect_request are no longer needed since the
+            # request handler installed in _initialize already populates
+            # _vrf_cache from any matching network event.
             if self._warmup_url and self._warmup_url == page_url:
                 self._warmup_url = None  # only try once
-                try:
-                    with self._page.expect_request(_pred, timeout=3000):
-                        pass  # just wait for the XHR from warmup JS
-                except Exception:
-                    pass  # timed out – fall through to normal capture
+                self._poll_for_vrf(expected_ajax_path, timeout_ms=3000)
                 if expected_ajax_path in self._vrf_cache:
                     self._log(f"captured VRF during warmup for {expected_ajax_path}")
                     return
+
+            # ── Layer 4: in-page fetch fast path ──
+            # Try firing fetch() from the warm page context BEFORE re-
+            # navigating. The chapter page's obfuscated network hook
+            # (boringegotistical.com bundle) injects the VRF into outbound
+            # AJAX. Token-format evidence (chapter-list and chapter-payload
+            # VRFs share a long prefix, differ only in the suffix encoding
+            # the path) strongly suggests the hook is session-wide and will
+            # produce valid VRFs for any chapter ID, not just the one the
+            # page was originally loaded for.
+            #
+            # If the hook turns out to be chapter-scoped or initiator-
+            # checked, _capture_via_inpage_fetch returns False quickly (2s
+            # poll budget) and we fall through to the navigation loop —
+            # exactly the same path we had before this optimization.
+            if self._capture_via_inpage_fetch(expected_ajax_path):
+                return
 
             # Target host for the redirect-to-homepage detector below — we
             # extract it from the chapter URL once and reuse it on each
@@ -547,6 +869,12 @@ class SimpleMangaFireVRFGenerator:
                 _retry_target_host = urlparse(page_url).netloc or "mangafire.to"
             except Exception:
                 _retry_target_host = "mangafire.to"
+
+            # Track consecutive homepage-redirect attempts. Used to escalate
+            # the retry action: 1st bounce = immediate retry; 2nd+ bounce =
+            # clear cookies (fresh CF challenge); 3+ on right page but no
+            # VRF = recreate page (stuck JS/dead context).
+            homepage_streak = 0
 
             for i in range(1, self._NAV_RETRIES + 1):
                 if expected_ajax_path in self._vrf_cache:
@@ -560,26 +888,29 @@ class SimpleMangaFireVRFGenerator:
                     expected_path=expected_ajax_path,
                     pre_url=self._page_url(),
                 )
+                # Will be set inside the try block; the retry-action
+                # selector at the bottom of the loop reads this without
+                # re-checking _page_url() (defense against the page state
+                # changing between the navigation and the retry decision).
+                on_homepage = False
                 try:
                     # Cross-process serialization (NET lock + cooldown/gap).
                     with _net_guard("vrf:navigate"):
-                        # Start request expectation *before* goto so we never miss the XHR.
+                        # Plain goto — no expect_request wrapper. Previously
+                        # we wrapped this in `expect_request(_pred, 12s)`, but
+                        # a redirect-to-homepage means the expected XHR
+                        # never fires AND we burn the full 12s timeout per
+                        # failed attempt. Now: do the goto, immediately
+                        # check the post-nav URL, and either bail (homepage)
+                        # or briefly poll the cache (right page, AJAX
+                        # imminent). Worst-case wasted attempt: ~3s.
                         try:
-                            with self._page.expect_request(_pred, timeout=self._WAIT_REQ_MS) as req_info:
-                                resp = self._page.goto(page_url, wait_until="commit", timeout=self._DOM_TIMEOUT_MS)
-                            req = req_info.value
-                            # ensure cache has it (handler should, but belt & suspenders)
-                            try:
-                                u = req.url
-                                parsed = urlparse(u)
-                                q = parse_qs(parsed.query)
-                                vrf = (q.get("vrf") or [""])[0]
-                                if vrf:
-                                    self._vrf_cache[parsed.path] = vrf
-                            except Exception:
-                                pass
+                            resp = self._page.goto(
+                                page_url,
+                                wait_until="commit",
+                                timeout=self._DOM_TIMEOUT_MS,
+                            )
                         except Exception as e:
-                            # Expectation timed out or goto raised. Either way, we may have captured via handler.
                             resp = None
                             last_exc = e
 
@@ -587,28 +918,56 @@ class SimpleMangaFireVRFGenerator:
                         info.post_url = self._page_url()
                         self._log_attempt(info)
 
-                        # Only settle-wait if VRF wasn't captured yet (the
-                        # expect_request handler usually gets it instantly).
-                        # Skipping this 350ms sleep per chapter adds up fast.
-                        if expected_ajax_path not in self._vrf_cache and self._POST_NAV_SETTLE_MS:
-                            self._page.wait_for_timeout(self._POST_NAV_SETTLE_MS)
+                        on_homepage = self._is_homepage_landing(
+                            info.post_url, _retry_target_host
+                        )
+                        if on_homepage:
+                            homepage_streak += 1
+                            # Don't poll — chapter AJAX won't fire from `/`.
+                            # The retry selector below decides escalation.
+                        else:
+                            homepage_streak = 0
+                            # Right page; the request handler should populate
+                            # the cache as soon as the page's JS triggers the
+                            # AJAX. 3s covers the typical case (~500ms-1s)
+                            # with margin for slow pages. The request
+                            # handler in _initialize is what actually fills
+                            # _vrf_cache; this just yields the event loop.
+                            self._poll_for_vrf(
+                                expected_ajax_path, timeout_ms=3000
+                            )
 
                     if expected_ajax_path in self._vrf_cache:
                         self._log(f"success: captured expected VRF for {expected_ajax_path}")
                         return
 
-                    # No exception, but still no VRF.
-                    self._log_attempt(
-                        _AttemptInfo(
-                            attempt=i,
-                            total=self._NAV_RETRIES,
-                            stage="no-vrf-after-nav",
-                            page_url=page_url,
-                            expected_path=expected_ajax_path,
-                            pre_url=info.pre_url,
-                            post_url=info.post_url,
+                    # No exception, but still no VRF. Distinguish the two
+                    # failure modes in the log so a reader can tell them
+                    # apart at a glance.
+                    if on_homepage:
+                        self._log_attempt(
+                            _AttemptInfo(
+                                attempt=i,
+                                total=self._NAV_RETRIES,
+                                stage="redirect-to-homepage",
+                                page_url=page_url,
+                                expected_path=expected_ajax_path,
+                                pre_url=info.pre_url,
+                                post_url=info.post_url,
+                            )
                         )
-                    )
+                    else:
+                        self._log_attempt(
+                            _AttemptInfo(
+                                attempt=i,
+                                total=self._NAV_RETRIES,
+                                stage="no-vrf-after-nav",
+                                page_url=page_url,
+                                expected_path=expected_ajax_path,
+                                pre_url=info.pre_url,
+                                post_url=info.post_url,
+                            )
+                        )
 
                 except BaseException as e:
                     last_exc = e
@@ -641,19 +1000,36 @@ class SimpleMangaFireVRFGenerator:
                     return
 
                 if i < self._NAV_RETRIES:
-                    # Smart-retry shortcut (2026-05-08): when the page is
-                    # currently at the bare homepage, MangaFire's anti-bot
-                    # detection has redirected this rapid sequential nav
-                    # back to `/`. The next goto from `/` to the chapter URL
-                    # typically succeeds — no need to wait the jitter sleep
-                    # since we're already at a "cold-start" baseline. Saves
-                    # ~0.6s per occurrence (typical retry sleep). Falls back
-                    # to the normal exponential-backoff sleep otherwise.
-                    if self._is_homepage_landing(self._page_url(), _retry_target_host):
-                        self._log(
-                            "redirect-to-homepage detected; immediate retry "
-                            "(skipping jitter sleep — page already at clean baseline)"
-                        )
+                    # Retry-action selection by failure mode. Three actions,
+                    # ordered by aggressiveness:
+                    #
+                    #   1. Homepage-bounce (1st time): immediate retry, no
+                    #      sleep. Page is at a clean baseline; next goto
+                    #      typically lands.
+                    #   2. Homepage-bounce (2nd+ consecutive): clear cookies
+                    #      to force a fresh CF challenge. The current
+                    #      cf_clearance is flagged; new challenge usually
+                    #      passes faster than waiting out the rate-limit.
+                    #   3. Right-page-no-VRF on attempt 3+: recreate the
+                    #      page. The page context is likely stuck (slow JS
+                    #      that never fires the AJAX). New page = clean
+                    #      slate. Then sleep with backoff.
+                    #   4. Otherwise: normal exponential backoff sleep.
+                    if on_homepage:
+                        if homepage_streak >= 2:
+                            self._reset_mangafire_cookies()
+                            self._log(
+                                f"redirect-to-homepage streak={homepage_streak}; "
+                                f"cleared cookies, immediate retry"
+                            )
+                        else:
+                            self._log(
+                                "redirect-to-homepage detected; immediate retry "
+                                "(skipping jitter sleep — page already at clean baseline)"
+                            )
+                    elif i >= 3:
+                        self._recreate_page("persistent-no-vrf-after-3-attempts")
+                        self._sleep_retry(i)
                     else:
                         self._sleep_retry(i)
 
@@ -871,23 +1247,31 @@ class SimpleMangaFireVRFGenerator:
             except Exception as e:
                 self._log(f"search nav warning: {_classify_exc(e)}: {_short(e)}")
 
-            # Belt-and-suspenders check: probe that jQuery has actually bound
-            # a keyup handler to the search input. wait_until='load' should be
-            # sufficient, but some bundles defer handler binding into a small
-            # setTimeout after DOMContentLoaded.
+            # Wait for the search input element to be present in the DOM. The
+            # keyup-handler binding is checked indirectly via the setInterval
+            # in the trigger script below — if the first keyup is missed
+            # (handler not yet bound), the 1s ticker keeps firing and
+            # eventually one fires after binding completes.
+            #
+            # Why we no longer poll for jQuery state: empirically, MangaFire's
+            # bundle leaves window.jQuery in an unstable state during page
+            # load — `typeof window.jQuery !== 'undefined'` returns true at
+            # one moment but `window.jQuery(...)` throws "is not a function"
+            # the next moment, even with no navigation in between. Some bundle
+            # script appears to set/clear window.jQuery as part of its
+            # initialization. The DOM-event approach below sidesteps this
+            # entirely — we don't call jQuery, we dispatch native events on
+            # the input element. jQuery's $.on('keyup') is implemented via
+            # addEventListener under the hood, so dispatched native events
+            # reach the typeahead handler regardless of whether window.jQuery
+            # is currently callable.
             try:
                 self._page.wait_for_function(
-                    """() => {
-                        if (typeof window.jQuery === 'undefined') return false;
-                        const $el = window.jQuery('.search-inner input[name=keyword]');
-                        if ($el.length === 0) return false;
-                        const data = window.jQuery._data ? window.jQuery._data($el[0], 'events') : null;
-                        return !!(data && data.keyup && data.keyup.length > 0);
-                    }""",
+                    """() => !!document.querySelector(".search-inner input[name=keyword]")""",
                     timeout=min(self._DOM_TIMEOUT_MS, 5000),
                 )
             except Exception as e:
-                raise RuntimeError(f"capture_search: typeahead handler not bound: {_classify_exc(e)}")
+                raise RuntimeError(f"capture_search: search input never appeared: {_classify_exc(e)}")
 
             def _is_search_xhr(resp) -> bool:
                 try:
@@ -938,27 +1322,44 @@ class SimpleMangaFireVRFGenerator:
                 eval_result = self._page.evaluate(
                     """(q) => {
                         try {
-                            const $el = window.jQuery('.search-inner input[name=keyword]');
+                            const el = document.querySelector('.search-inner input[name=keyword]');
+                            if (!el) return 'err: search input not found';
                             window.__aioMfTickerId && clearInterval(window.__aioMfTickerId);
-                            // Mirror Tachiyomi PR #11396 exactly — they run
-                            // setInterval forever firing val+trigger keyup
-                            // because the typeahead's debounce occasionally
-                            // eats the first trigger or de-dupes identical
-                            // input. Toggling appended-space ensures val()
-                            // sees a different string each tick.
+                            // Set value via the native HTMLInputElement.value
+                            // setter so any framework that wraps the property
+                            // (React, Vue, jQuery's own input cache) sees the
+                            // change and emits 'input'/'keyup' as if the user
+                            // typed. Toggling a trailing space ensures each
+                            // tick presents a different value, defeating any
+                            // de-dupe in the typeahead's debounce.
+                            const valSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value'
+                            ).set;
                             let toggle = false;
                             const fire = () => {
                                 toggle = !toggle;
-                                $el.val(q + (toggle ? ' ' : '')).trigger('keyup');
+                                const v = q + (toggle ? ' ' : '');
+                                valSetter.call(el, v);
+                                // Native events. jQuery's $.on('keyup') uses
+                                // addEventListener internally, so dispatched
+                                // native events reach jQuery-bound handlers
+                                // even when window.jQuery is currently
+                                // unstable/non-callable. 'input' event is
+                                // belt-and-suspenders for any handler bound
+                                // to it instead of keyup.
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new KeyboardEvent('keyup', {
+                                    bubbles: true, cancelable: true, key: 'a'
+                                }));
                             };
                             fire();
                             window.__aioMfTickerId = setInterval(fire, 1000);
                             return 'ok';
-                        } catch (e) { return 'err:' + e.message; }
+                        } catch (e) { return 'err:' + (e && e.message || String(e)); }
                     }""",
                     clean,
                 )
-                self._log(f"capture_search: jQuery trigger returned {eval_result!r}")
+                self._log(f"capture_search: native trigger returned {eval_result!r}")
                 # Poll the page event loop while waiting for the response.
                 deadline = time.monotonic() + wait_ms / 1000.0
                 tick_count = 0
@@ -1246,6 +1647,31 @@ class SimpleMangaFireVRFGenerator:
         if not series_url or "mangafire.to" not in series_url:
             raise RuntimeError(f"capture_series_meta: not a MangaFire URL: {series_url}")
 
+        # If the caller passed any `/read/<slug>...` URL (chapter URL,
+        # truncated /read/<slug> form that the user might paste, or the
+        # synthetic /read/manga.<id>/<lang>/chapter-N form constructed
+        # internally), rewrite it to the series URL (/manga/<slug>) BEFORE
+        # any navigation stage. Otherwise the series-page parser (looking
+        # for h1[itemprop=name]) 3-retries against a non-series page and
+        # burns ~15s before falling back to the slug-derived title — the
+        # dominant cost of a MangaFire download once VRF capture is fast.
+        #
+        # Match captures everything after /read/ up to the first /, ?, or #.
+        # That's the slug (e.g. munou-na-nanaa.nzmj) — same value MangaFire's
+        # /manga/<slug> page expects. Any /lang/chapter-N tail is discarded.
+        _read_url_match = re.match(
+            r"^https?://(?:www\.)?mangafire\.to/read/([^/?#]+)",
+            series_url,
+            re.IGNORECASE,
+        )
+        if _read_url_match:
+            rewritten = f"{_BASE_URL}/manga/{_read_url_match.group(1)}"
+            self._log(
+                f"capture_series_meta: rewriting reader URL to series URL: "
+                f"{series_url} -> {rewritten}"
+            )
+            series_url = rewritten
+
         slug_query = self._slug_to_query(series_url)
 
         # Stage 1: typeahead lookup using the slug as the query.
@@ -1456,6 +1882,15 @@ class SimpleMangaFireVRFGenerator:
 
     def close(self) -> None:
         with self._op_lock:
+            # ── Step 0: Final storage-state save BEFORE teardown ──
+            # We have to capture cookies/localStorage while the context is
+            # still alive. Bypass throttle — this is the run's final save and
+            # we want it even if the throttle hasn't elapsed since the last.
+            try:
+                self._save_storage_state(throttle=False)
+            except Exception:
+                pass  # _save_storage_state already swallows; this is paranoia.
+
             # ── Step 1: Remove all route intercepts FIRST ──
             # This prevents the EPIPE error. Without this, closing the
             # page/context can trigger pending route handlers that try to

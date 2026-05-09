@@ -1,6 +1,10 @@
 import time
+# Drop-in import of Patchright (Playwright fork with CDP-leak patches). Same
+# API; the swap is transparent to call sites in this file. See
+# mangafire_vrf_simple.py for the rationale on keeping PLAYWRIGHT_AVAILABLE as
+# the public flag name.
 try:
-    from playwright.sync_api import sync_playwright
+    from patchright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
