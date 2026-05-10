@@ -48,9 +48,13 @@ jobs:
         working-directory: UI-source
 
     steps:
-      - uses: actions/checkout@v4
+      # Action runtimes pinned to majors that ship with Node 24 (see test.yml
+      # for the deprecation context). node-version: 20 below is the *Node we
+      # build Electron against*, separate from the action runtime — Electron
+      # 40 only requires Node 20, no need to bump the build target.
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -73,7 +77,7 @@ jobs:
           fi
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.os }}-build
           # electron-builder writes per-format artifacts plus blockmap and
@@ -93,13 +97,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # download-artifact@v8 errors on hash mismatch by default (was warning
+      # in v7). That's the secure default we want — a hash mismatch indicates
+      # a corrupted upload-or-transfer and shipping it would be worse than
+      # failing loud. No code changes needed for the upgrade in our usage.
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
+      # gh-release v3 is the Node 24 line; same API as v2.
       - name: Create draft GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: artifacts/**/*

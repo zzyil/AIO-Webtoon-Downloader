@@ -29,9 +29,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # v5/v6 of these actions run on Node 24. v4 runs on Node 20, which
+      # GitHub deprecated for runners in Sep 2026 — pinning to a major that
+      # ships with Node 24 silences the deprecation annotation now and
+      # avoids a flag-day break later.
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
