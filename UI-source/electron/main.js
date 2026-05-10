@@ -108,8 +108,15 @@ function computePaths() {
     // python.exe so C++-using extensions (greenlet primarily) can load.
     vcRuntimeDir = path.join(process.resourcesPath, "vcruntime");
 
-    // The embedded Python is inside the python-env folder
-    defaultPythonCmd = path.join(pythonEnvDir, "python", "python.exe");
+    // The embedded Python is inside the python-env folder. Layout differs:
+    //   Windows (python.org embed):  <env>/python/python.exe
+    //   Unix (python-build-standalone install_only): <env>/python/bin/python3
+    // setup.js's pythonExe getter follows the same convention.
+    if (process.platform === "win32") {
+      defaultPythonCmd = path.join(pythonEnvDir, "python", "python.exe");
+    } else {
+      defaultPythonCmd = path.join(pythonEnvDir, "python", "bin", "python3");
+    }
 
     // aio-dl.py is shipped with the app (not in the env folder)
     defaultScriptPath = path.join(pythonSrcDir, "aio-dl.py");
@@ -124,7 +131,7 @@ function computePaths() {
 /**
  * Ensure the python-src directory is in the embedded Python's ._pth file.
  *
- * WHY THIS IS NEEDED:
+ * WHY THIS IS NEEDED (Windows embed only):
  *   The embeddable Python ships with a ._pth file (e.g. python313._pth)
  *   that completely controls sys.path. When this file exists, Python
  *   IGNORES the PYTHONPATH environment variable entirely. The cwd is
@@ -136,8 +143,15 @@ function computePaths() {
  * This runs on every startup (not just first-run setup) because the app
  * install path can change on updates and the ._pth file persists in the
  * separate python-env folder.
+ *
+ * NO-OP ON UNIX:
+ *   python-build-standalone uses a normal site-packages layout with no
+ *   ._pth file — standard CPython sys.path discovery applies, which
+ *   respects PYTHONPATH. We set PYTHONPATH=pythonSrcDir at spawn time
+ *   in initDownloader() and the _checkSeriesUpdates IPC handler instead.
  */
 function ensurePythonSrcInPth() {
+  if (process.platform !== "win32") return;
   if (!IS_PACKAGED || !pythonSrcDir) return;
 
   const pythonDir = path.join(pythonEnvDir, "python");
@@ -331,14 +345,21 @@ function applyTheme() {
 
 function initDownloader() {
   // Build the extra environment variables for the Python process.
-  // In packaged mode, we set PLAYWRIGHT_BROWSERS_PATH so the
-  // bundled Playwright can find its Chromium installation.
-  // (Note: PYTHONPATH is NOT used here — the embedded Python's ._pth
-  // file ignores it. Instead, ensurePythonSrcInPth() adds the python-src
-  // path directly to the ._pth file on startup.)
+  //
+  // PLAYWRIGHT_BROWSERS_PATH (all platforms in packaged mode): points
+  // patchright at the bundled Chromium that setup.js downloaded, so
+  // VRF/Playwright handlers don't try to re-download into a system path.
+  //
+  // PYTHONPATH (packaged Unix only): puts resources/python-src/ on
+  // sys.path so aio-dl.py can `import sites` and `import aio_search_cli`.
+  // On Windows the embed Python ignores PYTHONPATH entirely and we use
+  // ensurePythonSrcInPth() to write the same path into ._pth instead.
   const extraEnv = {};
   if (IS_PACKAGED && playwrightDir && fs.existsSync(playwrightDir)) {
     extraEnv.PLAYWRIGHT_BROWSERS_PATH = playwrightDir;
+  }
+  if (IS_PACKAGED && process.platform !== "win32" && pythonSrcDir) {
+    extraEnv.PYTHONPATH = pythonSrcDir;
   }
 
   downloader = new Downloader({
@@ -513,7 +534,7 @@ function setupIPC() {
     return history.getAll();
   });
 
-  // ── Open a folder in Windows Explorer ──
+  // ── Reveal a folder in the OS file manager (Explorer / Finder / Files) ──
   ipcMain.handle("open-folder", async (_event, folderPath) => {
     shell.openPath(folderPath);
     return { ok: true };
@@ -698,10 +719,16 @@ function setupIPC() {
         }
         args.push(meta.url);
 
-        // Build env — Playwright path for packaged mode
+        // Build env — Playwright path for packaged mode, plus PYTHONPATH
+        // on Unix (mirrors initDownloader; needed because the bundled
+        // python-src lives under resources/ and won't be on sys.path
+        // otherwise on standard CPython). Windows uses ._pth instead.
         const extraEnv = { PYTHONUNBUFFERED: "1" };
         if (IS_PACKAGED && playwrightDir) {
           extraEnv.PLAYWRIGHT_BROWSERS_PATH = playwrightDir;
+        }
+        if (IS_PACKAGED && process.platform !== "win32" && pythonSrcDir) {
+          extraEnv.PYTHONPATH = pythonSrcDir;
         }
 
         const proc = spawn(pythonCmd, args, {

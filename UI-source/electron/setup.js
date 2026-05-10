@@ -39,13 +39,65 @@ const os = require("os");
 const { spawn } = require("child_process");
 
 // ── CONFIGURABLE ──
-const PYTHON_VERSION = "3.13.2";
+// Windows uses python.org's official "embeddable" CPython distro. macOS/Linux
+// use astral-sh/python-build-standalone (PBS) — relocatable CPython with a
+// normal site-packages layout. The two flavors don't share a release cadence,
+// so patch versions diverge: keep them tracked separately.
+const WIN_PYTHON_VERSION = "3.13.2";   // python.org embed-amd64
+const PBS_PYTHON_VERSION = "3.13.13";  // python-build-standalone latest 3.13.x
+const PBS_RELEASE        = "20260508"; // tag at github.com/astral-sh/python-build-standalone
 
-// ── COMPUTED (don't change these) ──
-const PYTHON_ZIP_NAME = `python-${PYTHON_VERSION}-embed-amd64.zip`;
-const PYTHON_URL = `https://www.python.org/ftp/python/${PYTHON_VERSION}/${PYTHON_ZIP_NAME}`;
+// Surfaced for the "Downloading Python X" log line and the .setup-complete
+// marker. Picks the version we'll actually install on this host. main.js
+// destructures this for back-compat (currently unused there).
+const PYTHON_VERSION = process.platform === "win32" ? WIN_PYTHON_VERSION : PBS_PYTHON_VERSION;
+
 const GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py";
 const TOTAL_STEPS = 6;
+
+/**
+ * Resolve the Python download for this host: { url, archiveName, archiveType }.
+ *
+ * Windows: python.org embeddable zip — keep the existing 3.13.2 codepath
+ * because the embed flow has shipped working installers (delicate fixes for
+ * MSVCP140.dll and ._pth live in _configurePython). Don't disturb it.
+ *
+ * macOS/Linux: PBS install_only tarballs. Normal lib/python3.13/site-packages
+ * layout, so pip works without ._pth surgery.
+ *
+ * archiveType drives _extractPython's tool choice: tar (universal) vs the
+ * Windows-only PowerShell fallback.
+ */
+function getPythonAsset() {
+  if (process.platform === "win32") {
+    const name = `python-${WIN_PYTHON_VERSION}-embed-amd64.zip`;
+    return {
+      url: `https://www.python.org/ftp/python/${WIN_PYTHON_VERSION}/${name}`,
+      archiveName: name,
+      archiveType: "zip",
+    };
+  }
+  // PBS install_only URL pattern:
+  //   https://github.com/astral-sh/python-build-standalone/releases/download/
+  //     <release>/cpython-<version>+<release>-<triple>-install_only.tar.gz
+  const tripleMap = {
+    "darwin:x64":   "x86_64-apple-darwin",
+    "darwin:arm64": "aarch64-apple-darwin",
+    "linux:x64":    "x86_64-unknown-linux-gnu",
+    "linux:arm64":  "aarch64-unknown-linux-gnu",
+  };
+  const key = `${process.platform}:${process.arch}`;
+  const triple = tripleMap[key];
+  if (!triple) {
+    throw new Error(`Unsupported platform/arch combination: ${key}`);
+  }
+  const name = `cpython-${PBS_PYTHON_VERSION}+${PBS_RELEASE}-${triple}-install_only.tar.gz`;
+  return {
+    url: `https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/${name}`,
+    archiveName: name,
+    archiveType: "tar.gz",
+  };
+}
 
 // Every package the runtime imports — verified after pip install completes.
 // Each entry is [label, exact_import_statement]. We use the EXACT statement
@@ -85,6 +137,9 @@ const REQUIRED_IMPORTS = [
 // ZIP files always start with these 4 bytes ("PK\x03\x04").
 const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
 
+// gzip-compressed files (.tar.gz) start with these 2 bytes (RFC 1952 §2.3.1).
+const GZIP_MAGIC = Buffer.from([0x1f, 0x8b]);
+
 class PythonSetup {
   /**
    * @param {object} opts
@@ -121,9 +176,19 @@ class PythonSetup {
     this._onError = onError || (() => {});
   }
 
-  /** Full path to the embedded python.exe */
+  /**
+   * Full path to the embedded Python interpreter.
+   *   Windows (embed):    <pythonDir>/python.exe
+   *   Unix (PBS install): <pythonDir>/bin/python3
+   * The PBS install_only layout puts the binary one level deep; the rest of
+   * setup (and main.js's defaultPythonCmd) follow this getter so the right
+   * path falls out automatically.
+   */
   get pythonExe() {
-    return path.join(this._pythonDir, "python.exe");
+    if (process.platform === "win32") {
+      return path.join(this._pythonDir, "python.exe");
+    }
+    return path.join(this._pythonDir, "bin", "python3");
   }
 
   /** Full path to the Playwright browsers folder */
@@ -177,30 +242,36 @@ class PythonSetup {
   // ═══════════════════════════════════════════
 
   async _downloadPython() {
-    const zipPath = path.join(this._tempDir, PYTHON_ZIP_NAME);
+    // Resolve URL / asset name per host. Stash type+path on the instance so
+    // _extractPython can choose the right tool without re-resolving.
+    const asset = getPythonAsset();
+    const archivePath = path.join(this._tempDir, asset.archiveName);
+    this._archivePath = archivePath;
+    this._archiveType = asset.archiveType;
 
-    // If a cached download exists AND is a valid ZIP, reuse it.
-    if (fs.existsSync(zipPath) && this._isValidZip(zipPath)) {
+    // If a cached download exists AND validates, reuse it.
+    if (fs.existsSync(archivePath) && this._isValidArchive(archivePath, asset.archiveType)) {
       this._onLog("Using cached download (verified valid)");
       return;
     }
 
     // Delete any corrupt/partial cached file.
-    try { fs.unlinkSync(zipPath); } catch {}
+    try { fs.unlinkSync(archivePath); } catch {}
 
-    this._onLog("Downloading from python.org…");
-    await this._downloadFile(PYTHON_URL, zipPath);
+    this._onLog(`Downloading ${asset.archiveName}…`);
+    this._onLog(`  source: ${asset.url}`);
+    await this._downloadFile(asset.url, archivePath);
 
-    // Verify the download is a real ZIP file.
-    if (!this._isValidZip(zipPath)) {
-      try { fs.unlinkSync(zipPath); } catch {}
+    // Verify the download is a real archive of the expected type.
+    if (!this._isValidArchive(archivePath, asset.archiveType)) {
+      try { fs.unlinkSync(archivePath); } catch {}
       throw new Error(
-        "Downloaded file is corrupt (not a valid ZIP). " +
+        `Downloaded file is corrupt (not a valid ${asset.archiveType}). ` +
         "This usually means the download was interrupted. Click Retry."
       );
     }
 
-    const sizeMB = (fs.statSync(zipPath).size / 1_048_576).toFixed(1);
+    const sizeMB = (fs.statSync(archivePath).size / 1_048_576).toFixed(1);
     this._onLog(`Downloaded: ${sizeMB} MB ✓`);
   }
 
@@ -209,18 +280,18 @@ class PythonSetup {
   // ═══════════════════════════════════════════
 
   async _extractPython() {
-    // If python.exe already exists, skip extraction.
+    // If the interpreter is already present, skip extraction.
     if (fs.existsSync(this.pythonExe)) {
-      this._onLog("python.exe already exists, skipping extraction");
+      this._onLog(`${path.basename(this.pythonExe)} already exists, skipping extraction`);
       return;
     }
 
-    const zipPath = path.join(this._tempDir, PYTHON_ZIP_NAME);
+    const archivePath = this._archivePath;
+    const archiveType = this._archiveType;
 
-    // Make sure the ZIP is there and valid.
-    if (!fs.existsSync(zipPath) || !this._isValidZip(zipPath)) {
+    if (!archivePath || !fs.existsSync(archivePath) || !this._isValidArchive(archivePath, archiveType)) {
       throw new Error(
-        "Python ZIP not found or corrupt. Click Retry to re-download."
+        "Python archive not found or corrupt. Click Retry to re-download."
       );
     }
 
@@ -231,33 +302,35 @@ class PythonSetup {
     }
     fs.mkdirSync(this._pythonDir, { recursive: true });
 
-    // ── Try tar.exe first (built into Windows 10 1803+) ──
-    // tar is far more reliable than PowerShell Expand-Archive
-    // for this specific ZIP format.
+    // ── Primary: tar ──
+    // tar handles BOTH .zip and .tar.gz, and is universally available:
+    //   - Windows 10 1803+ ships tar.exe (April 2018)
+    //   - macOS / Linux always have it
+    // Auto-detects compression (-xf does the right thing for .tar.gz too).
     let extracted = false;
 
     try {
       this._onLog("Extracting with tar…");
-      await this._runCommand("tar", [
-        "-xf", zipPath,
-        "-C", this._pythonDir,
-      ]);
+      await this._runCommand("tar", ["-xf", archivePath, "-C", this._pythonDir]);
       extracted = true;
     } catch (tarErr) {
       this._onLog(`tar failed: ${tarErr.message}`);
-      this._onLog("Falling back to PowerShell…");
     }
 
-    // ── Fallback: PowerShell Expand-Archive ──
-    if (!extracted) {
-      // Clean the directory before retrying with a different tool.
+    // ── Fallback: PowerShell Expand-Archive (Windows + .zip only) ──
+    // PowerShell's Expand-Archive only handles .zip, and powershell.exe
+    // doesn't exist on Unix — so this branch is gated to that combination.
+    // On Unix the tar primary should always succeed; if it doesn't, the
+    // verify step below throws and the user retries.
+    if (!extracted && archiveType === "zip" && process.platform === "win32") {
+      this._onLog("Falling back to PowerShell…");
       fs.rmSync(this._pythonDir, { recursive: true, force: true });
       fs.mkdirSync(this._pythonDir, { recursive: true });
 
       try {
         await this._runCommand("powershell.exe", [
           "-NoProfile", "-NonInteractive", "-Command",
-          `Expand-Archive -Path '${zipPath}' -DestinationPath '${this._pythonDir}' -Force`,
+          `Expand-Archive -Path '${archivePath}' -DestinationPath '${this._pythonDir}' -Force`,
         ]);
         extracted = true;
       } catch (psErr) {
@@ -266,16 +339,19 @@ class PythonSetup {
     }
 
     // ── Verify extraction succeeded ──
+    // Two layouts reach this point:
+    //   - Windows embed zip: flat — python.exe at <pythonDir>/python.exe
+    //   - PBS install_only:  nested — binary at <pythonDir>/python/bin/python3
+    // _fixNestedExtraction handles the nested case by moving sub-folder
+    // contents up one level. After that, this.pythonExe should resolve.
     if (!extracted || !fs.existsSync(this.pythonExe)) {
-      // Sometimes the ZIP extracts into a sub-folder.  Check for that.
       const moved = this._fixNestedExtraction();
       if (!moved) {
-        // Last resort: delete everything so Retry starts clean.
         try { fs.rmSync(this._pythonDir, { recursive: true, force: true }); } catch {}
-        try { fs.unlinkSync(zipPath); } catch {}
+        try { fs.unlinkSync(archivePath); } catch {}
         throw new Error(
-          "Extraction failed — python.exe not found after extracting. " +
-          "The ZIP may have been corrupt. Click Retry to re-download."
+          `Extraction failed — ${path.basename(this.pythonExe)} not found after extracting. ` +
+          "The archive may have been corrupt. Click Retry to re-download."
         );
       }
     }
@@ -288,6 +364,24 @@ class PythonSetup {
   // ═══════════════════════════════════════════
 
   async _configurePython() {
+    // ── Unix fast-path ──
+    // PBS install_only ships a normal lib/python3.13/site-packages tree, so
+    // pip writes there by default — no ._pth surgery, no VC++ DLLs needed.
+    // The pythonSrcDir gets onto sys.path via PYTHONPATH at spawn time
+    // (set in main.js initDownloader / _checkSeriesUpdates / Searcher),
+    // which the standard CPython interpreter respects (unlike Windows embed).
+    // We DO still verify the interpreter starts so Step 4+ get a clean baseline.
+    if (process.platform !== "win32") {
+      try {
+        const ver = await this._runPython(["--version"]);
+        this._onLog(`Verified: ${ver.trim()} ✓`);
+      } catch (err) {
+        throw new Error(`Python installed but won't start: ${err.message}`);
+      }
+      return;
+    }
+
+    // ── Windows-embed-only path below ──
     // ── First: copy bundled VC++ runtime DLLs next to python.exe ──
     //
     // The Python embed distro ships vcruntime140.dll + vcruntime140_1.dll but
@@ -544,13 +638,19 @@ class PythonSetup {
     // already ensured by adding it to ._pth.
     if (this._pythonSrcDir) {
       this._onLog("Verifying bundled scripts load…");
+      // On Windows the python-src dir is on sys.path via the ._pth rewrite
+      // we did in _configurePython. On Unix, embed-style ._pth doesn't exist
+      // (PBS uses standard sys.path), so pass PYTHONPATH explicitly. main.js
+      // does the same at spawn time for downloads/searches; this is the
+      // setup-time bootstrap so the smoke test below sees the bundle.
+      const smokeEnv = process.platform === "win32" ? {} : { PYTHONPATH: this._pythonSrcDir };
       try {
         await this._runPython([
           "-c",
           "import sites; import aio_search_cli; " +
           "n = sum(1 for _ in sites.iter_search_capable_handlers()); " +
           "print(f'bundle OK: {n} search-capable handlers registered')",
-        ]);
+        ], smokeEnv);
       } catch (err) {
         throw new Error(
           "The bundled aio-dl.py / sites / aio_search_cli failed to load. " +
@@ -635,11 +735,19 @@ class PythonSetup {
         { PLAYWRIGHT_BROWSERS_PATH: this._playwrightDir }
       );
     } catch (err) {
+      // Platform-specific advice on what to check next. On Windows the
+      // common cause is antivirus quarantining chrome.exe; on macOS the
+      // bundled headless_shell may need Gatekeeper allowance; on Linux
+      // missing system libraries (libnss3, libgbm, libasound2) are typical.
+      const advice = process.platform === "win32"
+        ? "Check your antivirus quarantine for any blocked chrome.exe under " + this._playwrightDir
+        : process.platform === "darwin"
+          ? "Try opening the bundled Chromium binary once via Finder → right-click → Open to clear Gatekeeper. Path: " + this._playwrightDir
+          : "Make sure system libraries are installed: libnss3, libgbm1, libasound2 (apt) or equivalents. Path: " + this._playwrightDir;
       throw new Error(
         "Chromium installed but failed to launch. The download may be corrupt " +
-        "or your antivirus may have quarantined the binary. Try Retry — if " +
-        "that doesn't help, check your antivirus quarantine for any blocked " +
-        `chrome.exe under ${this._playwrightDir}. Detail: ${err.message}`
+        "or a system protection mechanism may be blocking the binary. Try Retry — " +
+        `if that doesn't help: ${advice}. Detail: ${err.message}`
       );
     }
 
@@ -694,31 +802,64 @@ class PythonSetup {
   }
 
   /**
-   * Some ZIP tools extract into a nested sub-folder instead of flat.
-   * e.g. pythonDir/python-3.13.2-embed-amd64/python.exe
-   * This checks for that case and moves files up if needed.
+   * Cheap header check for gzip-compressed files (.tar.gz). We only check
+   * the gzip magic bytes — verifying the embedded tar payload would mean
+   * decompressing the whole thing, which is what tar -xf does anyway.
+   * If the file is gzip-truncated, tar fails loudly during extraction and
+   * the user retries.
+   */
+  _isValidTarGz(filePath) {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.size < 32) return false;
+      const fd = fs.openSync(filePath, "r");
+      const header = Buffer.alloc(2);
+      fs.readSync(fd, header, 0, 2, 0);
+      fs.closeSync(fd);
+      return header.equals(GZIP_MAGIC);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Dispatch validator based on the archive type returned by getPythonAsset. */
+  _isValidArchive(filePath, type) {
+    if (type === "zip") return this._isValidZip(filePath);
+    if (type === "tar.gz") return this._isValidTarGz(filePath);
+    return false;
+  }
+
+  /**
+   * Some archives extract into a nested sub-folder instead of flat:
+   *   - Some ZIP tools wrap into pythonDir/python-3.13.2-embed-amd64/python.exe
+   *   - PBS install_only tarballs always nest: pythonDir/python/bin/python3
+   * This finds that case and moves the sub-folder's contents up one level
+   * so this.pythonExe resolves cleanly.
+   *
+   * The target relative path differs by platform — on Windows we look for
+   * a sub-folder containing python.exe, on Unix bin/python3.
    */
   _fixNestedExtraction() {
     try {
+      const targetRel = process.platform === "win32"
+        ? "python.exe"
+        : path.join("bin", "python3");
+      const targetLabel = path.basename(this.pythonExe);
       const entries = fs.readdirSync(this._pythonDir);
-      // Look for a single sub-directory that contains python.exe.
       for (const entry of entries) {
         const sub = path.join(this._pythonDir, entry);
-        if (fs.statSync(sub).isDirectory()) {
-          const subExe = path.join(sub, "python.exe");
-          if (fs.existsSync(subExe)) {
-            this._onLog(`Found python.exe in sub-folder "${entry}", moving up…`);
-            // Move all files from the sub-folder to pythonDir.
-            for (const file of fs.readdirSync(sub)) {
-              const src = path.join(sub, file);
-              const dest = path.join(this._pythonDir, file);
-              fs.renameSync(src, dest);
-            }
-            // Remove the now-empty sub-folder.
-            fs.rmdirSync(sub);
-            return true;
-          }
+        if (!fs.statSync(sub).isDirectory()) continue;
+        const subExe = path.join(sub, targetRel);
+        if (!fs.existsSync(subExe)) continue;
+
+        this._onLog(`Found ${targetLabel} in sub-folder "${entry}", moving up…`);
+        for (const file of fs.readdirSync(sub)) {
+          const src = path.join(sub, file);
+          const dest = path.join(this._pythonDir, file);
+          fs.renameSync(src, dest);
         }
+        fs.rmdirSync(sub);
+        return true;
       }
     } catch {}
     return false;
@@ -864,11 +1005,11 @@ class PythonSetup {
    */
   _runPython(args, extraEnv = {}) {
     return new Promise((resolve, reject) => {
-      // Verify python.exe exists before trying to spawn it.
+      // Verify the interpreter binary exists before trying to spawn it.
       // This gives a clear error instead of cryptic "spawn ENOENT".
       if (!fs.existsSync(this.pythonExe)) {
         return reject(new Error(
-          `python.exe not found at: ${this.pythonExe}\n` +
+          `Python interpreter not found at: ${this.pythonExe}\n` +
           "The Python extraction may have failed. Click Retry."
         ));
       }

@@ -171,11 +171,43 @@ python3 aio-dl.py --help
 cd UI-source
 npm install
 npm run electron:dev       # development mode (hot reload)
-# OR
-npm run electron:build     # produce a Windows NSIS installer under release/
+# OR — produce a per-OS installer under release/:
+npm run dist:win           # Windows  → AIO Downloader Setup *.exe (NSIS)
+npm run dist:mac           # macOS    → AIO Downloader-*-{x64,arm64}.dmg
+npm run dist:linux         # Linux    → AIO-Downloader-*.AppImage
 ```
 
-The `prepare-src.js` step (run automatically by `electron:build`) bundles the Python backend into the installer as `extraResources`. The installed app spawns `aio-dl.py` as a subprocess; no separate Python install is needed for end users.
+`dist:mac` requires a macOS host (DMG creation needs `hdiutil`). `dist:linux` and `dist:win` can run anywhere. The repo's `.github/workflows/release.yml` runs all three in parallel on tag push and produces a draft GitHub Release.
+
+The `prepare-src.js` step (run automatically) bundles the Python backend into the installer as `extraResources`. The installed app spawns `aio-dl.py` as a subprocess; no separate Python install is needed for end users.
+
+#### First-run cost on Unix
+
+The setup wizard downloads ~30 MB of relocatable Python from [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) into the platform's user-data folder, then ~150 MB of Chromium for Patchright:
+
+| OS      | python-env location                                            |
+| ------- | -------------------------------------------------------------- |
+| Windows | `%APPDATA%\aio-downloader-ui\python-env\`                      |
+| macOS   | `~/Library/Application Support/aio-downloader-ui/python-env/`  |
+| Linux   | `~/.config/aio-downloader-ui/python-env/`                      |
+
+Total first-run cost: ~200 MB and a few minutes. Subsequent launches skip the wizard.
+
+#### Running an unsigned macOS build
+
+The macOS DMGs are not notarized (no Apple Developer cert). On first launch Gatekeeper blocks the app with *"AIO Downloader cannot be opened because the developer cannot be verified"*. To allow it once:
+
+1. Open `Applications` in Finder, right-click `AIO Downloader.app` → **Open** → **Open** (one-time bypass), **or**
+2. *System Settings* → *Privacy & Security* → scroll to "AIO Downloader was blocked" → **Open Anyway**.
+
+#### Running the Linux AppImage
+
+```bash
+chmod +x AIO-Downloader-*.AppImage
+./AIO-Downloader-*.AppImage
+```
+
+Minimal distros without FUSE need it once: `sudo apt install libfuse2` (Ubuntu 22.04+) or the equivalent for your distro.
 
 ---
 
@@ -277,7 +309,7 @@ Under `UI-source/` is a full Electron + React + Vite + Tailwind desktop applicat
 - **Library** — manage downloaded books on disk; rename, re-process, delete.
 - **Settings** — Python interpreter selection, default paths, group preferences, theme.
 
-**Build artifacts**: `npm run electron:build` produces a Windows NSIS installer under `UI-source/release/`. macOS and Linux builds are possible by adding the corresponding `electron-builder` targets to `package.json`.
+**Build artifacts**: `npm run dist:win` / `dist:mac` / `dist:linux` produce per-OS installers under `UI-source/release/` (Windows NSIS `.exe`, macOS `.dmg` for x64+arm64, Linux `.AppImage`). See *Installation → Desktop UI* above for first-run setup details and the macOS Gatekeeper bypass for unsigned builds. CI builds all three on every tag via `.github/workflows/release.yml`.
 
 **Architecture note**: each Electron bridge module (`electron/downloader.js`, `electron/searcher.js`, `electron/library.js`, `electron/history.js`) is a thin wrapper around `child_process.spawn(python, ['aio-dl.py', ...])` with stdout/stderr parsers that turn `aio-dl.py`'s log lines into structured IPC events for the React renderer. If you change a CLI flag, the bridge usually needs a matching update — see `useDownloader.js:buildCliArgs`.
 

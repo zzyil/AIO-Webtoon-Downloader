@@ -1,0 +1,106 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Release workflow — build the AIO Downloader Electron app on three OSes.
+#
+# Triggers:
+#   - push of any tag matching v*  (cuts a draft GitHub Release)
+#   - manual workflow_dispatch     (smoke-test changes without tagging)
+#
+# Jobs:
+#   build   — matrix over windows-latest / macos-latest / ubuntu-latest.
+#             Each runner does its own `npm ci` and runs the right
+#             `dist:<os>` script. macOS DMGs cannot be cross-built from
+#             Windows or Linux (Apple's hdiutil is required), which is
+#             why the matrix exists.
+#   release — only on tag push. Downloads the per-OS artifacts and
+#             attaches them to a draft release. Manual smoke-test runs
+#             stop after `build` and just upload artifacts.
+#
+# Notes:
+#   - All builds are unsigned (no Apple Developer cert, no Authenticode).
+#     The corresponding macOS Gatekeeper-bypass instructions live in the
+#     top-level README.
+#   - prepare-src.js's default already resolves to the repo root from the
+#     script's location, but we set AIO_SOURCE_DIR explicitly anyway —
+#     the env var is the documented contract and it survives any future
+#     refactor of the script's path resolution.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed by softprops/action-gh-release to create the draft
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        working-directory: UI-source
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: UI-source/package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build installer
+        env:
+          AIO_SOURCE_DIR: ${{ github.workspace }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            npm run dist:win
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            npm run dist:mac
+          else
+            npm run dist:linux
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-build
+          # electron-builder writes per-format artifacts plus blockmap and
+          # latest*.yml metadata. We capture the user-facing installers
+          # only — blockmaps are auto-update bookkeeping we don't ship.
+          path: |
+            UI-source/release/*.exe
+            UI-source/release/*.dmg
+            UI-source/release/*.zip
+            UI-source/release/*.AppImage
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: artifacts/**/*
+          generate_release_notes: true

@@ -1,6 +1,6 @@
 {
   "name": "aio-downloader-ui",
-  "version": "1.0.0",
+  "version": "1.6.0",
   "description": "Desktop UI for AIO Manga/Webtoon Downloader",
   "main": "electron/main.js",
   "scripts": {
@@ -8,7 +8,10 @@
     "build": "vite build",
     "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
     "electron:build": "node scripts/prepare-src.js && vite build && electron-builder",
-    "electron:preview": "vite build && cross-env NODE_ENV=production electron ."
+    "electron:preview": "vite build && cross-env NODE_ENV=production electron .",
+    "dist:win":   "node scripts/prepare-src.js && vite build && electron-builder --win",
+    "dist:mac":   "node scripts/prepare-src.js && vite build && electron-builder --mac",
+    "dist:linux": "node scripts/prepare-src.js && vite build && electron-builder --linux"
   },
   "build": {
     "appId": "com.aio.downloader",
@@ -25,22 +28,45 @@
           "**/*",
           "!**/__pycache__/**"
         ]
-      },
-      {
-        "from": "build-resources/vcruntime",
-        "to": "vcruntime",
-        "filter": ["*.dll"]
       }
     ],
     "win": {
       "target": "nsis",
-      "signAndEditExecutable": false
+      "signAndEditExecutable": false,
+      "extraResources": [
+        {
+          "from": "build-resources/vcruntime",
+          "to": "vcruntime",
+          "filter": ["*.dll"]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "perMachine": false,
       "deleteAppDataOnUninstall": true
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["x64", "arm64"] },
+        { "target": "zip", "arch": ["x64", "arm64"] }
+      ],
+      "category": "public.app-category.utilities",
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "entitlements": "build-resources/entitlements.mac.plist",
+      "entitlementsInherit": "build-resources/entitlements.mac.plist"
+    },
+    "dmg": {
+      "writeUpdateInfo": false
+    },
+    "linux": {
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] }
+      ],
+      "category": "Network"
     },
     "directories": {
       "output": "release"

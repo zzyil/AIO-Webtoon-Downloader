@@ -18,15 +18,15 @@
 
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 
 // ── CONFIGURABLE: Where your AIO source files are ──
-// Change this if your AIO downloader is in a different location.
-// You can also set the AIO_SOURCE_DIR environment variable instead.
-const DEFAULT_AIO_SOURCE = path.join(
-  os.homedir(),
-  "OneDrive", "Belgeler", "AIO-Webtoon-Downloader"
-);
+// Default: the repo root, computed from this script's location.
+//   UI-source/scripts/prepare-src.js → UI-source/scripts/ → UI-source/ → repo root
+// This works in CI (GitHub Actions checks out the repo into the workspace
+// root and runs `npm run electron:build` from UI-source/) and on any
+// contributor's clone, regardless of where they put it. Override via the
+// AIO_SOURCE_DIR environment variable when the source lives elsewhere.
+const DEFAULT_AIO_SOURCE = path.resolve(__dirname, "..", "..");
 
 const AIO_SOURCE = process.env.AIO_SOURCE_DIR || DEFAULT_AIO_SOURCE;
 

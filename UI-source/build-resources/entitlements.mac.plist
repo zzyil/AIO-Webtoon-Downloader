@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minimum entitlements for ad-hoc-signed (unsigned) macOS builds.
+
+  We don't ship with a Developer ID certificate, but electron-builder still
+  performs an ad-hoc codesign so the .app bundle loads on Apple Silicon
+  (arm64 macOS refuses to execute unsigned code, even locally). That ad-hoc
+  signature attaches THIS entitlements file to the bundle.
+
+  Why each entitlement is needed:
+
+  - allow-jit / allow-unsigned-executable-memory:
+    Electron's V8 engine generates JIT-compiled code at runtime. Without
+    these, the renderer process would crash with EXC_BAD_ACCESS the first
+    time JS hits a hot path.
+
+  - disable-library-validation:
+    We bundle our own Python interpreter (python-build-standalone) in
+    Resources/python-env/, plus the Chromium binary that patchright
+    downloads on first run. Both load .dylib / .so files that are NOT
+    signed by Apple's Developer ID. Library validation would reject them
+    and block startup. This entitlement turns that check off.
+
+  - allow-dyld-environment-variables:
+    The bundled Python uses DYLD_FALLBACK_LIBRARY_PATH internally (for
+    its own lib/ folder) and patchright sets DYLD_LIBRARY_PATH when
+    launching Chromium. macOS strips these vars from signed processes
+    by default; this lets them through.
+
+  This file is referenced by the `mac.entitlements` and
+  `mac.entitlementsInherit` fields in package.json's `build` section.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+</dict>
+</plist>
