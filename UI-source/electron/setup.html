@@ -260,7 +260,10 @@
     // ── State ──
     let logsVisible = false;
     let currentStep = 0;
-    let totalSteps = 7;
+    // Keep this in sync with TOTAL_STEPS in setup.js. The first onSetupStep
+    // event overwrites it (line 327 in this file) anyway, but the placeholder
+    // value is briefly visible during the IPC round-trip so it should match.
+    let totalSteps = 6;
 
     // ════════════════════════════════════════════
     // UI HELPERS

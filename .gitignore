@@ -41,3 +41,15 @@ _webp_test/
 UI-binary/
 python3
 exclude.txt
+
+# Electron build outputs — installers and per-OS staging dirs.
+# These are produced by `npm run dist:*` and should never be tracked
+# (a single .exe/.dmg can be hundreds of MB).
+UI-source/release/
+UI-source/dist/
+
+# MCP / dev probes / scratch artifacts left behind by interactive sessions.
+.playwright-mcp/
+search_out.json
+settings-full.png
+probe_*.py

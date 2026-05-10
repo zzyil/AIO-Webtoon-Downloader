@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Pytest workflow — run the Python test suite on every push and PR.
+#
+# Until this existed, tests/ was effectively dark code: a regression in
+# chapter_merger / search_orchestrator / mangadex_handler would only surface
+# when a release was tagged (release.yml is the only other workflow). This
+# workflow gives PRs a green/red signal before merge.
+#
+# Linux-only is intentional — the tests don't touch platform-specific paths
+# (Patchright/Playwright is mocked) and the runtime aio-dl.py imports are
+# pure Python. Adding macOS/Windows would triple CI minutes for no signal.
+#
+# Cross-file: pytest.ini sets testpaths=tests. tests/conftest.py inserts the
+# project root onto sys.path so `from sites.chapter_merger import ...` works
+# without an editable install.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # requirements-dev.txt pulls in requirements.txt via a -r line, so
+          # one install command covers both runtime and test deps.
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest

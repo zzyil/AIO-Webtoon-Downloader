@@ -960,8 +960,15 @@ class PythonSetup {
   /**
    * Run a command (like tar.exe) and return stdout.
    * Logs all output in real time.
+   *
+   * Watchdog: kills the spawned process if it doesn't exit within
+   * `timeoutMs` (default 5min). Without it, a stuck tar.exe (corrupt
+   * archive, AV scanner deadlock) freezes setup forever — only the
+   * download path had a timeout previously, the extraction path didn't.
+   * 5min is comfortably above the worst observed extraction (Python
+   * embed zip ~30 MB on slow disks finishes in <60s).
    */
-  _runCommand(command, args) {
+  _runCommand(command, args, timeoutMs = 5 * 60_000) {
     return new Promise((resolve, reject) => {
       const proc = spawn(command, args, {
         windowsHide: true,
@@ -970,6 +977,15 @@ class PythonSetup {
 
       let stdout = "";
       let stderr = "";
+      let timedOut = false;
+
+      // Watchdog: SIGKILL on Windows maps to TerminateProcess, which is
+      // what we want — tar.exe doesn't respond gracefully when wedged.
+      const watchdog = setTimeout(() => {
+        timedOut = true;
+        this._onLog(`Watchdog: ${command} exceeded ${Math.round(timeoutMs / 1000)}s — terminating`);
+        try { proc.kill("SIGKILL"); } catch {}
+      }, timeoutMs);
 
       proc.stdout.on("data", (d) => {
         const text = d.toString();
@@ -984,11 +1000,17 @@ class PythonSetup {
       });
 
       proc.on("close", (code) => {
+        clearTimeout(watchdog);
+        if (timedOut) {
+          reject(new Error(`${command} timed out after ${Math.round(timeoutMs / 1000)}s and was terminated`));
+          return;
+        }
         if (code === 0) resolve(stdout);
         else reject(new Error(`${command} exited with code ${code}: ${stderr.slice(0, 200)}`));
       });
 
       proc.on("error", (err) => {
+        clearTimeout(watchdog);
         reject(new Error(`Failed to start ${command}: ${err.message}`));
       });
     });

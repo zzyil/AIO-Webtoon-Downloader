@@ -206,7 +206,13 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             bg_container = soup.select_one(".thumb, .summary_image")
             if bg_container:
                 style = bg_container.get("style") or ""
-                match = re.search(r"url\\(['\"]?(.*?)['\"]?\\)", style)
+                # Single-escape parens are correct here: in a raw string,
+                # `\\(` is two characters (backslash + paren) and the regex
+                # looks for a literal backslash, which never appears in
+                # `style="background-image: url(...)"`. The previous
+                # double-escape made cover-from-style detection always fail
+                # silently — handlers fell through to the WP REST API path.
+                match = re.search(r"url\(['\"]?(.*?)['\"]?\)", style)
                 if match:
                     cover = match.group(1)
         

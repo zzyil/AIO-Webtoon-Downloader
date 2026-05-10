@@ -552,6 +552,14 @@ class Downloader {
       // Running counter: how many "Chapter N" lines we've seen so far
       processedChapters: 0,
     };
+    // Promise that resolves when this child process finally exits — both
+    // the close and error handlers below resolve it. Used by cancelAll() so
+    // the main process can wait for orphaned children to actually die before
+    // app.quit() rather than fire-and-forget taskkill (which is async on
+    // Windows; Python often outlives Electron by 1-3 seconds without a wait).
+    let _resolveClose;
+    entry.closePromise = new Promise((resolve) => { _resolveClose = resolve; });
+    entry._resolveClose = _resolveClose;
     this._processes.set(downloadId, entry);
 
     // Buffer for incomplete lines (stdout comes in chunks, not always full lines)
@@ -679,6 +687,8 @@ class Downloader {
         ...entry.progress,
       };
       this._onComplete(downloadId, result);
+      // Unblock cancelAll() awaiters now that the child is really gone.
+      entry._resolveClose();
     });
 
     // Handle spawn errors (e.g. python not found)
@@ -698,15 +708,25 @@ class Downloader {
         error: err.message,
         duration: Date.now() - entry.startTime,
       });
+      // Spawn errored before any close event will fire — resolve here too,
+      // otherwise cancelAll() would wait the full 5s timeout for a child
+      // that never actually started.
+      entry._resolveClose();
     });
   }
 
   /**
    * Kill a running download process.
+   *
+   * Returns a Promise that resolves when the underlying child has actually
+   * exited (close event fired). Callers that don't care can fire-and-forget
+   * — the IPC handler in main.js does this. Callers that DO care, like
+   * cancelAll() during app shutdown, await it so the process tree is gone
+   * before the next step (app.quit) runs.
    */
   cancel(downloadId) {
     const entry = this._processes.get(downloadId);
-    if (!entry) return;
+    if (!entry) return Promise.resolve();
 
     this._onLog(downloadId, "Cancelling download...", "warning");
 
@@ -723,15 +743,29 @@ class Downloader {
     } catch (err) {
       // Process might have already exited
     }
+    return entry.closePromise;
   }
 
   /**
    * Kill all running downloads (called when the app quits).
+   *
+   * Awaits the process trees actually dying, with a 5s upper bound so a
+   * stuck taskkill (e.g. an AV scanner blocking) doesn't trap quit forever.
+   * Without the wait, the previous fire-and-forget loop let Python children
+   * outlive Electron, which kept tmp_<hid>/ lockfiles held briefly across
+   * an immediate relaunch.
    */
   cancelAll() {
+    const pending = [];
     for (const id of this._processes.keys()) {
-      this.cancel(id);
+      pending.push(this.cancel(id));
     }
+    if (pending.length === 0) return Promise.resolve();
+    const QUIT_TIMEOUT_MS = 5000;
+    return Promise.race([
+      Promise.all(pending),
+      new Promise((resolve) => setTimeout(resolve, QUIT_TIMEOUT_MS)),
+    ]);
   }
 
   /**

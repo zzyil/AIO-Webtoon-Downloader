@@ -1010,7 +1010,12 @@ app.whenReady().then(async () => {
   createWindow();
 });
 
-app.on("window-all-closed", () => {
-  if (downloader) downloader.cancelAll();
+app.on("window-all-closed", async () => {
+  // Wait for in-flight downloads to actually die before quitting. Without
+  // the await, fire-and-forget taskkill on Windows lets Python children
+  // outlive Electron — if the user immediately relaunches, the orphan
+  // children may still hold tmp_<hid>/ lockfiles (resume detection bug).
+  // cancelAll() bounds itself at 5s so a stuck child can't trap quit.
+  if (downloader) await downloader.cancelAll();
   app.quit();
 });

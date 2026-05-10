@@ -812,7 +812,8 @@ def _chapter_cancelled() -> bool:
 
 
 def _try_download_url(
-    url, pth, name, scraper, max_retries, retry_delay, timeout=30
+    url, pth, name, scraper, max_retries, retry_delay, timeout=30,
+    stop_event: Optional[threading.Event] = None,
 ) -> Tuple[bool, Optional[requests.exceptions.RequestException], Optional[str]]:
     """Attempts to download a single URL with retries. Returns
     (success, last_error, content_type). content_type is the response's
@@ -832,6 +833,12 @@ def _try_download_url(
       - per-chapter watchdog timer fired (_CHAPTER_CANCEL.is_set())
       - this host has accumulated >= _CHAPTER_HOST_POISON distinct fully-failed URLs
         within the current chapter
+      - stop_event was set by the caller (parallel-variant winner notifies losers
+        to abort their in-flight downloads — see dl_image's parallel block).
+
+    `stop_event` is also polled inside the chunk read loop so a worker mid-
+    download can stop within ~one chunk (~131 KB) of another variant winning,
+    instead of finishing its full body and getting cleaned up afterward.
     """
     host = urlparse(url).netloc
     last_error: Optional[requests.exceptions.RequestException] = None
@@ -841,6 +848,9 @@ def _try_download_url(
     for attempt in range(max_retries):
         # Fast-fail: chapter deadline passed, give up everything in flight.
         if _chapter_cancelled():
+            return False, last_error, None
+        # Fast-fail: another parallel variant already succeeded.
+        if stop_event is not None and stop_event.is_set():
             return False, last_error, None
         # Fast-fail: this host has shown N fully-failed URLs already this
         # chapter. No point grinding through more retries; the chapter is
@@ -861,6 +871,17 @@ def _try_download_url(
                 content_type = r.headers.get("Content-Type")
                 with open(pth, "wb") as fh:
                     for chunk in r.iter_content(131072):
+                        # Mid-download abort path. requests honors r.close()
+                        # by terminating the underlying socket — the iter_content
+                        # generator raises StopIteration on next pull, but we
+                        # break out first so callers see a clean (False, ...)
+                        # result instead of an exception.
+                        if stop_event is not None and stop_event.is_set():
+                            try:
+                                r.close()
+                            except Exception:
+                                pass
+                            return False, last_error, None
                         if chunk:
                             fh.write(chunk)
 
@@ -1089,10 +1110,18 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
     # Track all temp files created for cleanup
     temp_files_created = []
     temp_files_lock = threading.Lock()
-    
+
     # Track which thread succeeded (if any)
     success_lock = threading.Lock()
     successful_temp_file = [None]  # Use list to allow modification in nested function
+
+    # Parallel-variant early-stop signal. Set by the first worker that crosses
+    # the success line below; polled by every other worker's _try_download_url
+    # call inside its chunk-read loop. Without this, future.cancel() in the
+    # orchestrator below is a no-op for already-running tasks and the losing
+    # workers all complete their full downloads — the temp files get deleted
+    # anyway, but the bandwidth is wasted (8x redundancy on a slow CDN).
+    stop_event = threading.Event()
 
     def try_variant(attempt_url, thread_id):
         """Helper function for parallel execution - each thread uses its own temp file"""
@@ -1100,6 +1129,8 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
         # or the target host is poisoned. _try_download_url itself also checks
         # this, but bailing out before tempfile creation saves needless I/O.
         if _chapter_cancelled():
+            return None
+        if stop_event.is_set():
             return None
         if _poison_threshold > 0 and _host_fail_count(urlparse(attempt_url).netloc) >= _poison_threshold:
             return None
@@ -1124,6 +1155,7 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
                 parallel_retries,
                 retry_delay,
                 timeout,
+                stop_event=stop_event,
             )
             if success:
                 # Successfully downloaded to temp file
@@ -1134,8 +1166,13 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
                         # We're the first successful download. Phase A: also
                         # capture this thread's response Content-Type so the
                         # post-loop sniff has a reliable fallback when magic
-                        # bytes are ambiguous.
+                        # bytes are ambiguous. Setting the stop_event under
+                        # success_lock guarantees only one worker ever signals,
+                        # and that the signal is visible before the lock release
+                        # so any worker that just finished a chunk reads `set`
+                        # on its next loop iteration.
                         successful_temp_file[0] = (temp_path, attempt_url, ct)
+                        stop_event.set()
                         return attempt_url
 
                 # Another thread already succeeded, this will be cleaned up later
@@ -1150,20 +1187,25 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
     # Use ThreadPoolExecutor to try all remaining variants in parallel
     # Limit workers to avoid overwhelming the server
     max_workers = min(len(remaining_urls), 5)
-    
+
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all variant attempts with thread IDs
             future_to_url = {
-                executor.submit(try_variant, url, i): url 
+                executor.submit(try_variant, url, i): url
                 for i, url in enumerate(remaining_urls)
             }
-            
+
             # Wait for first successful result
             for future in as_completed(future_to_url):
                 result = future.result()
                 if result:
-                    # Cancel remaining futures since we found a successful download
+                    # Belt-and-suspenders: the winning try_variant has already
+                    # set stop_event under success_lock, but set again here so
+                    # we don't depend on that ordering. future.cancel() only
+                    # works for queued (not-yet-started) tasks; running ones
+                    # rely on stop_event polling inside _try_download_url.
+                    stop_event.set()
                     for f in future_to_url:
                         f.cancel()
                     break
@@ -2635,17 +2677,36 @@ a:hover, a:active { text-decoration: underline; }
                 comp = zipfile.ZIP_STORED if ext in _STORED_EXTS else zipfile.ZIP_DEFLATED
                 zf.write(file_path, arcname, compress_type=comp)
 
-    # Clean up temp directory with retry logic for file handle issues
-    try:
-        shutil.rmtree(temp_dir)
-    except OSError:
-        # If rmtree fails, try again with ignore_errors after brief delay
-        import time
-        time.sleep(0.1)  # Brief delay to allow file handles to close
+    # Clean up temp directory with retry logic for file handle issues.
+    # On Windows, AV scanners (Defender, etc.) often hold a read handle to
+    # files we just wrote for 500ms-2s after the writer closes. The previous
+    # 100ms single retry was below that window — leftovers like
+    # `temp_epub_<hid>/` would silently accumulate across runs (search the
+    # `.gitignore` for the matching pattern). Backoff covers the AV window
+    # in the common case; if all retries still fail we surface a warning so
+    # the user knows there's stray cleanup to do, instead of failing silent.
+    _cleanup_attempts = (0.0, 0.25, 0.5, 1.0)
+    for _delay in _cleanup_attempts:
+        if _delay:
+            time.sleep(_delay)
         try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass  # Ignore cleanup errors - EPUB file was successfully created
+            shutil.rmtree(temp_dir)
+        except FileNotFoundError:
+            break  # already gone — success
+        except OSError:
+            continue
+        else:
+            break
+    else:
+        # All retries exhausted. Try ignore_errors as a final attempt and log
+        # whatever's left so the user can clear it manually.
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        if os.path.exists(temp_dir):
+            log_verbose(
+                f"  Warning: could not remove EPUB temp dir {temp_dir!r} "
+                f"after {len(_cleanup_attempts)} retries — leftover files "
+                f"need manual cleanup. EPUB itself was saved successfully."
+            )
 
     print(f"EPUB saved \u2192 {os.path.basename(out_path)}")
 
