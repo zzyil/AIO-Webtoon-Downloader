@@ -7,6 +7,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 import glob
+import hashlib
 import io
 import json
 import math
@@ -2785,73 +2786,207 @@ def rm_tree(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def get_processing_params(args, calculated_width, calculated_aspect_ratio):
-    """Creates a dictionary of parameters that affect image processing.
-    
-    These are used to check if a resumed download is compatible — if any of
-    these changed, the tmp directory is cleaned and a fresh start happens.
-    Only include params that affect the actual image data on disk.
+# ──────────────────────────────────────────────────────────────────
+# Resume parameter persistence
+# ──────────────────────────────────────────────────────────────────
+# Single source of truth for what gets written to tmp_<hid>/run_params.json
+# and what determines whether a tmp folder is resume-compatible.
+#
+# Mental model:
+# - Every argparse dest auto-saves to run_params.json by default,
+#   EXCEPT those listed in _RESUME_TRANSIENT_DESTS (mode flags,
+#   one-shot inputs, orchestrator-only knobs). New flags are
+#   preserved across resume without any list-maintenance.
+# - The _RESUME_GATING_DESTS subset (image-affecting params) is
+#   hashed via gating_hash(); the hash is saved alongside the dict.
+#   A resume is allowed iff the saved hash matches the current
+#   run's hash — meaning the on-disk images are compatible with
+#   the current invocation's image-pipeline parameters.
+# - Restored values are setattr'd onto args; cached tunables are
+#   then re-seeded via _apply_runtime_tunables(args) so the
+#   runtime honors the JSON values (not argparse defaults).
+# - _validate_resume_categories runs once at startup to catch
+#   typos in the dest sets and category overlaps.
+#
+# Cross-file: read by main()'s resume-check + save block (search
+# `current_params = get_resumable_params`) and the
+# --restore-parameters block (search `if args.restore_parameters:`).
+# UI-source/electron/downloader.js builds the resume CLI as just
+# ["--restore-parameters", "--format", fmt, "--verbose", url] — so
+# every per-download setting must come from the JSON, not the CLI.
+
+# Dests that GATE resume compatibility. If any of these changes
+# between the original run and the current invocation, the on-disk
+# images are invalidated and the tmp folder is wiped. These are all
+# the params that affect the actual image data: dimensions, quality,
+# chapter selection, group filter, processing on/off.
+#
+# width/aspect_ratio are saved as their RESOLVED (post-format-default)
+# values, not raw args.width / args.aspect_ratio (which may be None).
+# The resolution happens at line ~4280 in main() before save.
+_RESUME_GATING_DESTS = frozenset({
+    "width", "aspect_ratio",
+    "quality", "scaling", "chapters", "group",
+    "mix_by_upvote", "no_partials", "no_processing",
+})
+
+# Dests that must NEVER be persisted to run_params.json. Every other
+# dest is saved by default — adding a flag here is the explicit
+# opt-out. Categorize by why it's transient.
+#
+# Adding a new CLI flag? You do NOT need to update this set for it
+# to be saved/restored on --restore-parameters. Only add a dest
+# here if the flag is one-shot (mode/search/orchestrator) or
+# explicitly re-applied from the new CLI invocation on resume.
+_RESUME_TRANSIENT_DESTS = frozenset({
+    # Provided per-invocation; URL also lives in run_meta.json.
+    "comic_url",
+    # Format/epub_layout are intentionally re-overrideable on resume —
+    # the restore block captures the new --format / --epub-layout from
+    # the resume CLI and re-applies them after the setattr loop. Saving
+    # them would be moot.
+    "format", "epub_layout",
+    # The resume flag itself.
+    "restore_parameters",
+    # Logging level — per-invocation choice.
+    "verbose", "debug",
+    # Search-only mode (mutually exclusive with the download path that
+    # calls save; the save site is unreachable in search mode). Listed
+    # for completeness so the validator passes.
+    "search", "auto_pick", "search_language", "search_parallelism",
+    "search_timeout", "search_min_match", "search_json", "seeded_only",
+    # One-shot mode/input flags.
+    "multi_source_prefetched", "list_chapters", "build_final_file",
+    "prompt_urls",
+    # Multi-URL orchestrator — children get these re-passed by the
+    # parent via child_base; not meaningful for the single-URL resume
+    # path. net_min_gap is also orchestrator-gated (only consumed when
+    # AIO_COORD_ENABLED is set, which the Electron UI never sets).
+    "jobs", "coord_dir", "net_min_gap",
+    "job_stall_timeout", "job_hard_timeout", "job_retries",
+    "job_spawn_gap",
+})
+
+
+def get_resumable_params(args, parser, calculated_width, calculated_aspect_ratio):
+    """Auto-derives the dict of CLI flags to persist for resume.
+
+    Walks the argparse parser and returns every dest NOT in
+    _RESUME_TRANSIENT_DESTS. width/aspect_ratio are overridden with
+    the resolved (post-format-default) values rather than raw args.*
+    (which may be None when the user didn't pass --width).
+
+    The returned dict's _RESUME_GATING_DESTS subset is what
+    gating_hash() consumes for resume-compatibility checking; the
+    rest of the dict is restored on --restore-parameters but does
+    not affect resume invalidation.
     """
-    return {
-        "width": calculated_width,
-        "aspect_ratio": calculated_aspect_ratio,
-        "quality": args.quality,
-        "scaling": args.scaling,
-        "chapters": args.chapters,
-        "group": args.group,
-        "mix_by_upvote": args.mix_by_upvote,
-        "no_partials": args.no_partials,
-        "no_processing": args.no_processing,
+    skip = _RESUME_TRANSIENT_DESTS | {"help"}
+    out = {
+        action.dest: getattr(args, action.dest)
+        for action in parser._actions
+        if action.dest not in skip and hasattr(args, action.dest)
     }
+    # Override raw width/aspect_ratio with resolved values so the
+    # gating-hash compare is stable: a fresh-run "width=None →
+    # format-default 2000" matches a resumed-run "width=2000 (from
+    # JSON) → still 2000" cleanly.
+    out["width"] = calculated_width
+    out["aspect_ratio"] = calculated_aspect_ratio
+    return out
 
 
-def get_behavior_params(args):
-    """Creates a dictionary of all non-processing parameters.
+def gating_hash(params):
+    """Stable hash of the resume-gating subset of params.
 
-    These don't affect image data so changing them shouldn't force a
-    re-download. They're saved to run_params.json so --restore-parameters
-    can restore the full set of flags (keep_chapters, no_final_file, etc.).
+    Two runs with the same gating_hash are guaranteed to produce
+    byte-equivalent on-disk images (same resize, same quality, same
+    chapter/group filter, same processing-on-or-off). Mismatch =
+    saved tmp folder incompatible with the current invocation, must
+    be wiped before fresh download.
 
-    Cross-file: must include every CLI flag the user might want preserved
-    on resume. Adding a new flag elsewhere in the codebase? Audit this
-    list — restore-parameters silently drops any field absent from here.
+    sha256 over a sorted-key JSON dump for stability across Python
+    versions and dict-insertion-order changes. List fields (just
+    `group` today) are order-sensitive — matches the previous
+    field-by-field compare semantics (priority order matters).
     """
-    return {
-        "keep_chapters": args.keep_chapters,
-        "no_final_file": args.no_final_file,
-        "keep_images": args.keep_images,
-        "no_cleanup": args.no_cleanup,
-        "split": args.split,
-        "language": args.language,
-        "site": args.site,
-        "cookies": args.cookies,
-        "image_workers": args.image_workers,
-        "http_timeout": args.http_timeout,
-        "http_max_retries": args.http_max_retries,
-        "http_backoff_base": args.http_backoff_base,
-        "http_backoff_cap": args.http_backoff_cap,
-        "no_retry_missed_chapters": args.no_retry_missed_chapters,
-        "missed_retries": args.missed_retries,
-        # Multi-source fallback (added 2026-05-07). When the user resumes
-        # via --restore-parameters from a tmp_<hid>/ folder, these come
-        # back so the downloader continues with the same multi-source
-        # behavior the original run had — without forcing the user to
-        # re-toggle in the UI on every resume.
-        "multi_source": args.multi_source,
-        "multi_source_quality_min": args.multi_source_quality_min,
-        # Chapter-collapse toggle (2026-05-08). Affects whether split-cluster
-        # chapters (e.g. 1.1/1.2/1.3/1.4 with no integer 1) merge into one
-        # combined output, whether redundant duplicate uploads are dropped,
-        # and the search-display "X main / Y entries" diagnostic counts. Must
-        # be persisted so a resumed run doesn't surprise-switch behavior.
-        # See sites/chapter_merger.py:group_chapters_for_download for rules.
-        "collapse_splits": args.collapse_splits,
-        # Inter-chapter image-download prefetch worker count (Phase G7, 2026-05-08).
-        # See _start_image_prefetch for the orchestration. Persisted so a
-        # resumed run preserves the user's bandwidth-budget choice. Sentinel
-        # -1 = match args.image_workers; 0 = off; N>0 = explicit count.
-        "prefetch_image_workers": getattr(args, "prefetch_image_workers", -1),
-    }
+    gating = {k: params.get(k) for k in sorted(_RESUME_GATING_DESTS)}
+    blob = json.dumps(gating, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _validate_resume_categories(parser):
+    """Startup sanity check: dests in the category sets must exist
+    in the parser, and the two sets must not overlap.
+
+    Catches typos (renaming an add_argument's dest without updating
+    the set) and accidental overlap (a dest classified as both
+    gating and transient is incoherent — gating params must persist
+    to compute the hash, transient ones must not).
+
+    Does NOT enforce that every dest is categorized — by design,
+    every uncategorized dest is auto-saved as a non-gating param.
+    That is the robustness goal: new flags can't be silently
+    dropped, only intentionally opted out.
+    """
+    all_dests = {a.dest for a in parser._actions if a.dest != "help"}
+    typos_g = _RESUME_GATING_DESTS - all_dests
+    typos_t = _RESUME_TRANSIENT_DESTS - all_dests
+    overlap = _RESUME_GATING_DESTS & _RESUME_TRANSIENT_DESTS
+    errors = []
+    if typos_g:
+        errors.append(
+            f"_RESUME_GATING_DESTS contains dests not in parser: {sorted(typos_g)}"
+        )
+    if typos_t:
+        errors.append(
+            f"_RESUME_TRANSIENT_DESTS contains dests not in parser: {sorted(typos_t)}"
+        )
+    if overlap:
+        errors.append(
+            f"dests classified as both gating and transient: {sorted(overlap)}"
+        )
+    if errors:
+        raise RuntimeError(
+            "Resume category inconsistency (fix _RESUME_*_DESTS in aio-dl.py):\n  "
+            + "\n  ".join(errors)
+        )
+
+
+def _apply_runtime_tunables(args):
+    """Snapshot per-process tunables from args into module globals.
+
+    Called twice in main():
+      - Once after parse_args (initial seed from argparse defaults / CLI args)
+      - Again from inside the --restore-parameters block (re-seed
+        after JSON values have been setattr'd onto args)
+
+    Globals here are read at runtime by make_request, dl_image,
+    _process_chapter (watchdog), _process_chapter_strict (inline retry),
+    and _vrf_prefetch_worker_loop (batch sizing). Without the second
+    call after restore, these caches still hold the argparse defaults
+    from the resume invocation's CLI (which only re-passes
+    --restore-parameters --format … --verbose <url>) — so the user's
+    original tunables are silently ignored at runtime even when they
+    were correctly saved into run_params.json.
+
+    Cross-file: when adding a new tunable that's snapshotted into a
+    module global (rather than read directly from args at runtime),
+    add it here. get_resumable_params auto-includes the dest in
+    run_params.json by default; this function is what makes the
+    restored value actually take effect at runtime.
+    """
+    globals()["_HTTP_TIMEOUT"] = float(getattr(args, "http_timeout", 30.0))
+    globals()["_HTTP_MAX_RETRIES"] = int(getattr(args, "http_max_retries", 6))
+    globals()["_HTTP_BACKOFF_BASE"] = float(getattr(args, "http_backoff_base", 1.0))
+    globals()["_HTTP_BACKOFF_CAP"] = float(getattr(args, "http_backoff_cap", 45.0))
+    globals()["_CHAPTER_DEADLINE"] = float(getattr(args, "chapter_deadline_seconds", 90.0))
+    globals()["_CHAPTER_HOST_POISON"] = int(getattr(args, "chapter_host_poison_threshold", 5))
+    globals()["_INLINE_CHAPTER_RETRIES"] = int(getattr(args, "inline_chapter_retries", 2))
+    globals()["_INLINE_CHAPTER_BACKOFF"] = float(getattr(args, "inline_chapter_backoff", 30.0))
+    _vrf_async_batch_state["parallel_count"] = max(
+        1, int(getattr(args, "mangafire_vrf_parallel", 1) or 1)
+    )
 
 
 # -----------------------------------------------------------
@@ -3826,6 +3961,7 @@ def main():
         "when no transform was requested.",
     )
     args = p.parse_args()
+    _validate_resume_categories(p)  # fail-fast on dest typos / category overlap
     # -----------------------------
     # Argument sanity checks / modes
     # -----------------------------
@@ -3863,26 +3999,11 @@ def main():
         if (not getattr(args, "prompt_urls", False)) and (not args.comic_url):
             p.error("You must provide at least one URL (or use --prompt-urls).")
 
-    # Apply tunables to module globals (used by make_request / dl_image)
-    globals()["_HTTP_TIMEOUT"] = float(getattr(args, "http_timeout", 30.0))
-    globals()["_HTTP_MAX_RETRIES"] = int(getattr(args, "http_max_retries", 6))
-    globals()["_HTTP_BACKOFF_BASE"] = float(getattr(args, "http_backoff_base", 1.0))
-    globals()["_HTTP_BACKOFF_CAP"] = float(getattr(args, "http_backoff_cap", 45.0))
-    # Per-chapter strict-mode tunables — read inside _try_download_url, dl_image,
-    # _process_chapter (watchdog), and _process_chapter_strict (inline retry).
-    # The script is "all or nothing" per chapter: any missing page triggers an
-    # inline retry; after _INLINE_CHAPTER_RETRIES exhausted, the run aborts.
-    globals()["_CHAPTER_DEADLINE"] = float(getattr(args, "chapter_deadline_seconds", 90.0))
-    globals()["_CHAPTER_HOST_POISON"] = int(getattr(args, "chapter_host_poison_threshold", 5))
-    globals()["_INLINE_CHAPTER_RETRIES"] = int(getattr(args, "inline_chapter_retries", 2))
-    globals()["_INLINE_CHAPTER_BACKOFF"] = float(getattr(args, "inline_chapter_backoff", 30.0))
-
-    # Wire --mangafire-vrf-parallel into the prefetch worker so it knows
-    # whether to batch jobs (parallel >= 2) or process them one-by-one
-    # (parallel == 1, current behavior). Read at queue-drain time.
-    _vrf_async_batch_state["parallel_count"] = max(
-        1, int(getattr(args, "mangafire_vrf_parallel", 1) or 1)
-    )
+    # Seed module globals from args. Called again from inside the
+    # --restore-parameters block (after setattr loop) so resumed runs
+    # honor the user's saved tunables instead of the argparse defaults
+    # the resume-CLI invocation would otherwise leave in place.
+    _apply_runtime_tunables(args)
 
     # Coordinator setup (cross-process NET/CPU pipelining)
     coord_dir = os.getenv("AIO_COORD_DIR", "").strip() or getattr(args, "coord_dir", "")
@@ -4213,15 +4334,34 @@ def main():
 
         try:
             with open(params_path, "r") as f:
-                restored_params = json.load(f)
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                raise TypeError("run_params.json must be a JSON object")
+            # New schema: {"gating_hash": ..., "params": {...}}.
+            # Legacy schema (pre-rewrite): flat dict at top level.
+            # See gating_hash() / get_resumable_params() in this file.
+            if "gating_hash" in saved:
+                restored_params = saved.get("params") or {}
+            else:
+                restored_params = saved
 
             # Update the args namespace with the restored parameters
             for key, value in restored_params.items():
                 setattr(args, key, value)
 
-            # Crucially, apply the new format settings
+            # Crucially, apply the new format settings — these are
+            # intentionally re-overrideable on resume.
             args.format = new_format
             args.epub_layout = new_epub_layout
+
+            # Re-seed module globals from the restored args. The initial
+            # apply (right after parse_args) used argparse defaults for
+            # any flag the user didn't pass on the resume CLI; now that
+            # the JSON values have been setattr'd onto args, re-snapshot
+            # so runtime-cached tunables (_HTTP_TIMEOUT, _CHAPTER_DEADLINE,
+            # _vrf_async_batch_state, etc.) honor the user's original
+            # choices instead of the argparse defaults.
+            _apply_runtime_tunables(args)
 
             print("  Successfully restored parameters. The following settings will be used:")
             log_verbose(f"    - Chapters: {args.chapters}")
@@ -4646,26 +4786,27 @@ def main():
 
     resume_mode = False
     params_path = os.path.join(main_tmp_dir, "run_params.json")
-    current_processing = get_processing_params(args, width, aspect_ratio_str)
-    current_behavior = get_behavior_params(args)
-    # The full params dict: processing params + behavior params.
-    # Processing params are used for the resume match check (if they differ,
-    # the images on disk are incompatible and we must start fresh).
-    # Behavior params are saved alongside so --restore-parameters can
-    # restore the full set of flags (keep_chapters, no_final_file, etc.).
-    current_params = {**current_processing, **current_behavior}
+    current_params = get_resumable_params(args, p, width, aspect_ratio_str)
+    current_hash = gating_hash(current_params)
 
     if os.path.isdir(main_tmp_dir):
         print("Temporary directory found. Checking for resume compatibility...")
         if os.path.exists(params_path):
             try:
                 with open(params_path, "r") as f:
-                    old_params = json.load(f)
-                # Only compare processing-relevant keys for resume compatibility.
-                # Behavior params (keep_chapters, no_final_file, etc.) can change
-                # without invalidating the downloaded images.
-                old_processing = {k: old_params.get(k) for k in current_processing}
-                if old_processing == current_processing:
+                    old_data = json.load(f)
+                if not isinstance(old_data, dict):
+                    raise TypeError("not a JSON object")
+                # New schema: {"gating_hash": ..., "params": {...}}.
+                # Legacy schema (pre-rewrite): flat dict at top level —
+                # recompute the hash from its gating-subset fields so a
+                # tmp folder created by old code is still resumable as
+                # long as the gating params haven't changed.
+                if "gating_hash" in old_data:
+                    old_hash = old_data["gating_hash"]
+                else:
+                    old_hash = gating_hash(old_data)
+                if old_hash == current_hash:
                     print("  Parameters match. Resuming download.")
                     resume_mode = True
                 else:
@@ -4686,8 +4827,14 @@ def main():
 
     if not resume_mode:
         os.makedirs(main_tmp_dir, exist_ok=True)
+        # Wrapped schema. Legacy flat-dict format is detected on read above;
+        # any tmp folder created from this point forward uses the wrapped
+        # {"gating_hash", "params"} structure.
         with open(params_path, "w") as f:
-            json.dump(current_params, f, indent=4)
+            json.dump(
+                {"gating_hash": current_hash, "params": current_params},
+                f, indent=4,
+            )
 
     # Save UI metadata (URL, format, title) separately from processing params.
     # This file is read by the Electron UI to auto-fill the URL when resuming,
