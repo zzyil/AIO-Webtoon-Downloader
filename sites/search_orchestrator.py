@@ -148,6 +148,11 @@ class SourceEntry:
     actual_chapter_count: Optional[int] = None
     dmca_likely: bool = False
     raw_score: float = 0.0
+    # True when the handler is the publisher's own platform (e.g. linewebtoon
+    # = webtoons.com), not an aggregator re-hosting other publishers' content.
+    # Populated in search_all from handler.OFFICIAL_PUBLISHER. Consumed by
+    # _cmp as the top tiebreaker within a SeriesCandidate, above quality.
+    is_official: bool = False
 
 
 @dataclass
@@ -174,6 +179,7 @@ class SeriesCandidate:
                     "chapter_count_hint": s.chapter_count_hint,
                     "actual_chapter_count": s.actual_chapter_count,
                     "dmca_likely": s.dmca_likely,
+                    "is_official": s.is_official,
                 }
                 for s in self.sources
             ],
@@ -884,6 +890,17 @@ def search_all(
     if not handlers and not seed_hits:
         return []
 
+    # Lowercase names of handlers flagged as publisher-owned platforms (vs
+    # aggregators). Read off the class attribute once here so the per-source
+    # loop below can populate SourceEntry.is_official with a cheap set lookup
+    # instead of re-traversing the handler registry per candidate. Empty set
+    # is the safe degenerate — falls back to the pre-fix behavior of quality-
+    # only tiebreaking. See BaseSiteHandler.OFFICIAL_PUBLISHER for the flag.
+    official_sites: set = {
+        h.name.lower() for h in handlers
+        if getattr(h, "OFFICIAL_PUBLISHER", False)
+    }
+
     # Names of sites already represented by a seed hit (URL-mode --search).
     # Defined here (before the eligibility loop uses it) so seed_hits can
     # short-circuit re-querying those handlers.
@@ -1090,6 +1107,7 @@ def search_all(
                     actual_chapter_count=hit.actual_chapter_count,
                     dmca_likely=hit.dmca_likely,
                     raw_score=hit.raw_score,
+                    is_official=site.lower() in official_sites,
                 )
             )
 
@@ -1122,12 +1140,24 @@ def search_all(
         #      quality. Fixes the canonical Witch Hat Atelier case where
         #      MangaDex's higher seed_quality (0.92) was beating MangaFire
         #      (0.85) even though MangaDex was DMCA-hollowed.
-        #   2. Title match within TIEBREAKER_WINDOW (0.10) → image-quality
+        #   2. Official publisher wins. When one source is the publisher's own
+        #      platform (e.g. linewebtoon = webtoons.com, the literal LINE
+        #      publisher) and the other is an aggregator re-hosting that
+        #      same content (toonily, asura, etc.), the publisher wins
+        #      regardless of title_match spread or measured image quality.
+        #      Both sources have already been merged by union-find as the
+        #      same series, so we trust the canonical bytes from the
+        #      publisher. Fixes the webtoons.com vs toonily case where
+        #      vertical-scroll PNG at 720-800px scored below toonily's
+        #      upscaled JPEG on the probe's res_score formula (which
+        #      treats 800-2400px as the credit band) despite the PNG
+        #      being lossless and the JPEG being generation-loss.
+        #   3. Title match within TIEBREAKER_WINDOW (0.10) → image-quality
         #      decides. Use img_quality_score when measured (Phase 2 cover
         #      probe); fall back to seed_quality when probe failed or hasn't
         #      run yet. Per the plan, ANY measurement replaces the seed —
         #      cover-bytes are deterministic, not noisy estimates.
-        #   3. Otherwise title_match wins.
+        #   4. Otherwise title_match wins.
         # Pairwise comparator gives deterministic behavior at window boundaries.
         def _quality_for(s: SourceEntry) -> float:
             # `is not None` (not `> 0`): a measured 0.0 is meaningful — it's
@@ -1139,6 +1169,8 @@ def search_all(
         def _cmp(a: SourceEntry, b: SourceEntry) -> int:
             if a.dmca_likely != b.dmca_likely:
                 return 1 if a.dmca_likely else -1
+            if a.is_official != b.is_official:
+                return -1 if a.is_official else 1
             if abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW:
                 qa, qb = _quality_for(a), _quality_for(b)
                 if qa != qb:

@@ -137,3 +137,128 @@ def test_search_all_handles_blocked_handlers():
             assert result == []
             # Handler was filtered — search() should NOT have been invoked.
             scraper_factory.assert_not_called()
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Official-publisher tiebreaker (2026-05-12).
+# Within a SeriesCandidate, sources where the handler sets
+# OFFICIAL_PUBLISHER=True must rank above aggregator sources regardless
+# of measured img_quality_score. Closes the webtoons.com vs toonily case
+# where the official publisher served PNGs at 720-800px (below the probe's
+# 800px res_score floor) and was losing to toonily's upscaled JPEG.
+# ────────────────────────────────────────────────────────────────────────
+
+def _sort_sources(sources):
+    """Apply the same comparator logic the orchestrator uses internally,
+    so we test the wire-level behavior without needing to spin up a full
+    search_all + scraper_factory.
+    """
+    from functools import cmp_to_key
+    from sites.search_orchestrator import TIEBREAKER_WINDOW
+
+    def quality_for(s):
+        return s.img_quality_score if s.img_quality_score is not None else s.seed_quality
+
+    def cmp(a, b):
+        if a.dmca_likely != b.dmca_likely:
+            return 1 if a.dmca_likely else -1
+        if a.is_official != b.is_official:
+            return -1 if a.is_official else 1
+        if abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW:
+            qa, qb = quality_for(a), quality_for(b)
+            if qa != qb:
+                return -1 if qa > qb else 1
+            return 0
+        return -1 if a.title_match > b.title_match else 1
+
+    return sorted(sources, key=cmp_to_key(cmp))
+
+
+def _make_source(site, *, is_official=False, title_match=1.0,
+                 seed_quality=0.5, img_quality_score=None,
+                 dmca_likely=False):
+    from sites.search_orchestrator import SourceEntry
+    return SourceEntry(
+        site=site, url=f"https://{site}/x", title="x", cover=None,
+        title_match=title_match, seed_quality=seed_quality,
+        img_quality_score=img_quality_score, dmca_likely=dmca_likely,
+        is_official=is_official,
+    )
+
+
+def test_official_publisher_beats_aggregator_despite_lower_img_quality():
+    """The bug: linewebtoon (official, PNG @ 800px → res_score=0 → composite
+    ~0.51) was being outranked by toonily (aggregator, upscaled JPEG →
+    composite ~0.60). After the fix, official wins regardless of quality."""
+    linewebtoon = _make_source("linewebtoon", is_official=True,
+                               seed_quality=0.92, img_quality_score=0.51)
+    toonily = _make_source("toonily", is_official=False,
+                           seed_quality=0.55, img_quality_score=0.60)
+    result = _sort_sources([toonily, linewebtoon])
+    assert result[0].site == "linewebtoon"
+    assert result[1].site == "toonily"
+
+
+def test_official_publisher_beats_aggregator_outside_tiebreaker_window():
+    """Even when title_match deltas are large, official wins within a
+    candidate — the union-find merge already established same-series
+    membership, so the publisher is canonical regardless of title spread.
+    Verifies the official check happens BEFORE the TIEBREAKER_WINDOW
+    branch."""
+    linewebtoon = _make_source("linewebtoon", is_official=True,
+                               title_match=0.85, seed_quality=0.92)
+    toonily = _make_source("toonily", is_official=False,
+                           title_match=1.00, seed_quality=0.55)
+    # delta = 0.15, outside TIEBREAKER_WINDOW of 0.10.
+    result = _sort_sources([toonily, linewebtoon])
+    assert result[0].site == "linewebtoon"
+
+
+def test_dmca_likely_still_beats_official():
+    """DMCA-likely sources go to the back even when they're the official
+    publisher. The DMCA flag means most chapters are inaccessible — a
+    canonical-but-empty source is worse than a complete aggregator."""
+    official_dmca = _make_source("linewebtoon", is_official=True,
+                                 dmca_likely=True, seed_quality=0.92)
+    clean_agg = _make_source("toonily", is_official=False,
+                             dmca_likely=False, seed_quality=0.55)
+    result = _sort_sources([official_dmca, clean_agg])
+    assert result[0].site == "toonily"
+    assert result[1].site == "linewebtoon"
+
+
+def test_two_aggregators_still_decided_by_quality():
+    """When neither source is official, the existing img_quality_score-or-
+    seed_quality tiebreaker takes over inside the title-match window."""
+    mangadex = _make_source("mangadex", is_official=False,
+                            title_match=1.0, seed_quality=0.93)
+    toonily = _make_source("toonily", is_official=False,
+                           title_match=1.0, seed_quality=0.55)
+    result = _sort_sources([toonily, mangadex])
+    assert result[0].site == "mangadex"
+
+
+def test_two_officials_still_decided_by_quality():
+    """Hypothetical: two official-publisher sources for the same series
+    (would only happen if voyceme + linewebtoon both republished it).
+    Quality decides among officials as well — the flag is a class tier,
+    not a free pass."""
+    off_hi = _make_source("a", is_official=True, seed_quality=0.92)
+    off_lo = _make_source("b", is_official=True, seed_quality=0.55)
+    result = _sort_sources([off_lo, off_hi])
+    assert result[0].site == "a"
+
+
+def test_linewebtoon_handler_carries_official_publisher_flag():
+    """Wire-level: the linewebtoon handler class actually sets the flag.
+    Regression guard for accidental class-attribute removal during a
+    handler refactor."""
+    from sites.linewebtoon import LineWebtoonSiteHandler
+    assert getattr(LineWebtoonSiteHandler, "OFFICIAL_PUBLISHER", False) is True
+
+
+def test_base_handler_defaults_official_publisher_to_false():
+    """Aggregators that don't override the flag must default to False;
+    otherwise every handler in the registry would be marked official."""
+    from sites.base import BaseSiteHandler
+    assert getattr(BaseSiteHandler, "OFFICIAL_PUBLISHER", None) is False

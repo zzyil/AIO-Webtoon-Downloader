@@ -128,6 +128,15 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
 
     name = "linewebtoon"
     domains = ("webtoons.com",)
+    # webtoons.com IS the publisher (LINE Webtoon) — opt into the
+    # orchestrator's "official wins the tiebreaker" rule so aggregators
+    # re-hosting these series (toonily, etc.) rank below us within a
+    # SeriesCandidate. Without this, aggregators that upscale our PNGs
+    # to higher-res JPEG were winning the image-quality probe despite
+    # being generation-loss copies. See BaseSiteHandler.OFFICIAL_PUBLISHER
+    # for the full rationale and search_orchestrator.py:_cmp for the
+    # consuming sort.
+    OFFICIAL_PUBLISHER = True
 
     def __init__(self) -> None:
         super().__init__()

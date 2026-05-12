@@ -114,6 +114,28 @@ class BaseSiteHandler:
     # only mangafire flips this; new VRF/expensive handlers should opt in.
     EXPENSIVE_PROBE: bool = False
 
+    # When True, the search orchestrator treats this handler as the canonical
+    # source for any series it returns — winning the per-candidate tiebreaker
+    # over non-official aggregators WITHIN the same SeriesCandidate (post
+    # union-find merge) regardless of measured image quality or title-match
+    # spread. Set on handlers operating the publisher's own platform where
+    # the canonical bytes originate; do NOT set on aggregators that re-host
+    # other publishers' content (toonily, asura, mangafire, etc.).
+    #
+    # Why this matters: the image-quality probe scores resolution + format
+    # + decode quality. Webtoons.com serves vertical-scroll PNGs at the
+    # intentional 720–800px width — below the probe's res_score 800px floor,
+    # so res_score contributes 0/1.0 to the composite. Aggregators that
+    # upscale to 1500–2000px JPEG get a HIGHER res_score even though their
+    # content is generation-loss from the official PNGs. Without this flag
+    # the probe was confidently choosing toonily over webtoons.com despite
+    # the latter being the literal publisher. Cross-file:
+    # sites/search_orchestrator.py:SourceEntry.is_official + _cmp consume
+    # this flag; grep OFFICIAL_PUBLISHER for the consumer side.
+    #
+    # Current opt-ins (lowercase handler names): linewebtoon.
+    OFFICIAL_PUBLISHER: bool = False
+
     def matches(self, url: str) -> bool:
         netloc = urlparse(url).netloc.lower()
         return any(domain in netloc for domain in self.domains)
