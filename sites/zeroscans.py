@@ -9,15 +9,23 @@ from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 class ZeroScansSiteHandler(BaseSiteHandler):
     name = "zeroscans"
-    domains = ("zscans.com", "www.zscans.com")
-    
-    API_BASE = "https://zscans.com/swordflake"
+    # 2026-05-13: zscans.com returns Cloudflare 525 (origin SSL handshake
+    # failed). The original zeroscans.com domain still serves the same
+    # /swordflake API; zeroscans.us is the .us-TLD mirror — also alive.
+    # Keep all three so existing bookmarks across any TLD route here.
+    domains = (
+        "zeroscans.com", "www.zeroscans.com",
+        "zeroscans.us", "www.zeroscans.us",
+        "zscans.com", "www.zscans.com",
+    )
+
+    API_BASE = "https://zeroscans.com/swordflake"
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.update(
             {
-                "Referer": "https://zscans.com/",
-                "Origin": "https://zscans.com",
+                "Referer": "https://zeroscans.com/",
+                "Origin": "https://zeroscans.com",
             }
         )
 
@@ -31,7 +39,7 @@ class ZeroScansSiteHandler(BaseSiteHandler):
     def fetch_comic_context(
         self, url: str, scraper, make_request
     ) -> SiteComicContext:
-        # URL: https://zscans.com/comics/{slug}
+        # URL: https://zeroscans.com/comics/{slug}
         parsed = urlparse(url)
         path_parts = [p for p in parsed.path.split("/") if p]
         
@@ -49,7 +57,7 @@ class ZeroScansSiteHandler(BaseSiteHandler):
         # Kotlin: comicList.first { comic -> comic.slug == mangaSlug }
         # It fetches ALL comics to find one. That's heavy but that's what the extension does.
         # Let's try to see if there is a better way or just do that.
-        # API: https://zscans.com/swordflake/comics
+        # API: https://zeroscans.com/swordflake/comics
         
         comics_data = self._fetch_json(f"{self.API_BASE}/comics", scraper)
         all_comics = comics_data.get("data", {}).get("comics", [])
@@ -115,7 +123,7 @@ class ZeroScansSiteHandler(BaseSiteHandler):
             # Re-fetch if missing (shouldn't happen)
             return []
             
-        # API: https://zscans.com/swordflake/comic/{id}/chapters?sort=desc&page={page}
+        # API: https://zeroscans.com/swordflake/comic/{id}/chapters?sort=desc&page={page}
         chapters = []
         page = 1
         has_more = True
@@ -133,7 +141,7 @@ class ZeroScansSiteHandler(BaseSiteHandler):
                 created_at = chap.get("created_at")
                 
                 # Virtual URL: /comics/{slug}/{id}
-                chap_url = f"https://zscans.com/comics/{slug}/{chap_id}"
+                chap_url = f"https://zeroscans.com/comics/{slug}/{chap_id}"
                 
                 chapters.append({
                     "hid": str(chap_id),
@@ -152,7 +160,7 @@ class ZeroScansSiteHandler(BaseSiteHandler):
         return chapters
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
-        # API: https://zscans.com/swordflake/comic/{slug}/chapters/{id}
+        # API: https://zeroscans.com/swordflake/comic/{slug}/chapters/{id}
         # Wait, Kotlin says: GET("$baseUrl/$API_PATH/comic/$mangaSlug/chapters/$chapterId")
         # So it uses SLUG here, not ID?
         # Let's check `pageListRequest` in Kotlin.
@@ -163,7 +171,7 @@ class ZeroScansSiteHandler(BaseSiteHandler):
         
         # We need the slug. It's in the virtual URL we constructed or context.
         # But `get_chapter_images` only gets `chapter` dict.
-        # We can extract it from the URL we built: https://zscans.com/comics/{slug}/{id}
+        # We can extract it from the URL we built: https://zeroscans.com/comics/{slug}/{id}
         
         url = chapter.get("url")
         parsed = urlparse(url)
@@ -250,7 +258,7 @@ class ZeroScansSiteHandler(BaseSiteHandler):
             if not slug:
                 continue
             cover_v = (c.get("cover") or {}).get("vertical")
-            url = f"https://zscans.com/comics/{slug}"
+            url = f"https://zeroscans.com/comics/{slug}"
             # Position-based raw_score, scaled by relevance so substring
             # matches outrank token-overlap ones.
             raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
