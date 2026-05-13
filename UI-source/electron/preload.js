@@ -26,6 +26,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getHistory: () => ipcRenderer.invoke("get-history"),
   getSettings: () => ipcRenderer.invoke("get-settings"),
   saveSettings: (s) => ipcRenderer.invoke("save-settings", s),
+  // Display-only read of the currently-resolved python / script / workingDir
+  // paths. Renderer uses these for placeholder hints in SettingsTab so the
+  // user can see what's auto-resolved without the values being persisted
+  // back via saveSettings. See main.js's get-resolved-paths handler for
+  // the round-trip-bug rationale.
+  getResolvedPaths: () => ipcRenderer.invoke("get-resolved-paths"),
   getTheme: () => ipcRenderer.invoke("get-theme"),
 
   // ── OS dialogs ──

@@ -64,9 +64,28 @@
     },
     "linux": {
       "target": [
-        { "target": "AppImage", "arch": ["x64"] }
+        { "target": "AppImage", "arch": ["x64"] },
+        { "target": "deb", "arch": ["x64"] }
       ],
-      "category": "Network"
+      "category": "Network",
+      "synopsis": "Multi-site manga/webtoon downloader with PDF/EPUB/CBZ output",
+      "description": "Desktop app for downloading manga, webtoons, and comics from 50+ sites with cross-site search and quality ranking. Builds PDF, EPUB, or CBZ output (with optional Mihon/Komikku-compatible per-chapter CBZs). Bundles Python + Patchright Chromium for VRF-gated sources. Resume-safe by default; configurable per-host concurrency throttling on CDN errors."
+    },
+    "deb": {
+      "//": "Explicit dependency list — electron-builder's default `auto` mode misses Patchright/Chromium's transitive system libs, which then surface as 'failed to launch chromium' on Ubuntu Server / minimal Debian images. Pinned to package names that exist on Debian 11/12 and Ubuntu 20.04/22.04/24.04. libasound2|libasound2t64 alternation handles the Ubuntu 24.04 / Mint 22 t64 transition (libasound2 was renamed to libasound2t64 for the time_t ABI break — dpkg respects the pipe alternation).",
+      "depends": [
+        "libnss3",
+        "libgbm1",
+        "libasound2 | libasound2t64",
+        "libatspi2.0-0",
+        "libdrm2",
+        "libxcb-dri3-0",
+        "libxss1",
+        "libxtst6",
+        "libgtk-3-0",
+        "libnotify4",
+        "xdg-utils"
+      ]
     },
     "directories": {
       "output": "release"

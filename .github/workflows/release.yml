@@ -83,11 +83,14 @@ jobs:
           # electron-builder writes per-format artifacts plus blockmap and
           # latest*.yml metadata. We capture the user-facing installers
           # only — blockmaps are auto-update bookkeeping we don't ship.
+          # The Linux job emits BOTH .AppImage and .deb (added 2026-05-13
+          # alongside AppImage — see UI-source/package.json:build.linux.target).
           path: |
             UI-source/release/*.exe
             UI-source/release/*.dmg
             UI-source/release/*.zip
             UI-source/release/*.AppImage
+            UI-source/release/*.deb
           if-no-files-found: ignore
           retention-days: 14
 

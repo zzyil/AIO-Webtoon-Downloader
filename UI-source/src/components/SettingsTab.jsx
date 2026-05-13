@@ -52,8 +52,22 @@ const DEFAULT_SEARCH_OPTS = {
 // On Reset (handleReset below), dev-mode reverts to these blanks so the
 // user can re-pick their workingDir; packaged-mode preserves the existing
 // value via the prev.isPackaged guard.
+// All three path fields START EMPTY. The empty string is the user's
+// "no override — use the runtime-resolved default" sentinel. Every
+// consumer (main.js spawn sites) does `settings.X || defaultX`, so
+// empty falls through to the runtime default cleanly.
+//
+// This is part of the 2026-05-13 round-trip fix: AppImage / macOS
+// Gatekeeper App Translocation / DMG-direct runs all produce volatile
+// auto-computed paths that change between launches. If we initialized
+// these to non-empty values (or hydrated them from settings.json with
+// the old computed defaults baked in), Save would persist the volatile
+// path back to disk and the next launch would ENOENT. Keeping initial
+// state empty + filtering the hydration spread + reading resolved
+// paths separately via getResolvedPaths() ensures the saved settings
+// dict only carries user-typed overrides.
 const DEV_DEFAULTS = {
-  pythonCmd: "python",
+  pythonCmd: "",
   scriptPath: "",
   workingDir: "",
 };
@@ -191,6 +205,33 @@ export default function SettingsTab({ settings, onSave }) {
     searchOpts: { ...DEFAULT_SEARCH_OPTS },
   });
 
+  // Display-only resolved paths (what main.js would use as defaults when
+  // local.pythonCmd / .scriptPath / .workingDir are empty). Shown as
+  // placeholders/hints in the path input fields below. NOT persisted —
+  // fetched once via the dedicated read-only IPC so the volatile auto-
+  // resolved values (AppImage /tmp/.mount_*, macOS App Translocation,
+  // DMG-direct) never enter the saveSettings round-trip.
+  const [resolved, setResolved] = useState({
+    pythonCmd: "",
+    scriptPath: "",
+    workingDir: "",
+  });
+
+  // Fetch resolved paths from main.js once on mount. The handler is a
+  // pure read of the computePaths() globals — no side effects, runs in
+  // microseconds. We don't refresh on every settings change because
+  // those globals don't move at runtime.
+  useEffect(() => {
+    let cancelled = false;
+    const api = typeof window !== "undefined" && window.electronAPI;
+    if (api && typeof api.getResolvedPaths === "function") {
+      api.getResolvedPaths()
+        .then((r) => { if (!cancelled && r) setResolved(r); })
+        .catch(() => { /* main.js missing handler → keep empty placeholders */ });
+    }
+    return () => { cancelled = true; };
+  }, []);
+
   // Load settings when they arrive from Electron
   useEffect(() => {
     if (settings) {
@@ -210,6 +251,34 @@ export default function SettingsTab({ settings, onSave }) {
       }
       // Drop the legacy key so it doesn't get written back on save.
       delete migrated.mangafireImageConcurrency;
+
+      // Volatile-path filter on hydration — mirrors the write-side
+      // filter in history.js:saveSettings. Existing users may have
+      // pre-2026-05-13 settings.json files carrying stale AppImage /
+      // macOS Gatekeeper-translocation paths that were auto-computed
+      // and round-tripped before the fix. Without this filter, the
+      // stale path would hydrate into local.scriptPath, the input
+      // would show the broken path as the value (not a placeholder),
+      // and even though saveSettings would reject the bad write, the
+      // existing on-disk value would never get cleared. Stripping
+      // volatile values here lets the input fall back to the resolved
+      // placeholder so users see what's actually going to run.
+      // Non-volatile customizations (e.g. a custom `python3.13` venv
+      // path the user typed deliberately) pass through unchanged.
+      const VOLATILE_PATH_PATTERNS = [
+        /^\/tmp\/\.mount_/,
+        /\/AppTranslocation\/[0-9A-F-]+\//,
+        /\/Volumes\/[^/]+\.app\//,
+      ];
+      for (const k of ["pythonCmd", "scriptPath", "workingDir"]) {
+        const v = migrated[k];
+        if (typeof v === "string" && v) {
+          const normalized = v.replace(/\\/g, "/");
+          if (VOLATILE_PATH_PATTERNS.some((re) => re.test(normalized))) {
+            delete migrated[k];
+          }
+        }
+      }
 
       setLocal((prev) => ({
         ...prev,
@@ -240,10 +309,15 @@ export default function SettingsTab({ settings, onSave }) {
 
   const handleReset = () => {
     setLocal((prev) => ({
-      // Keep isPackaged from the current state (it's set by main.js)
-      pythonCmd: prev.isPackaged ? prev.pythonCmd : DEV_DEFAULTS.pythonCmd,
-      scriptPath: prev.isPackaged ? prev.scriptPath : DEV_DEFAULTS.scriptPath,
-      workingDir: prev.isPackaged ? prev.workingDir : DEV_DEFAULTS.workingDir,
+      // Keep isPackaged from the current state (it's set by main.js).
+      // Path fields reset to empty in BOTH packaged and dev modes —
+      // empty == "use the runtime-resolved default" per the post-2026-05-13
+      // round-trip-prevention design. The placeholder shown in the UI
+      // (sourced from getResolvedPaths) tells the user what's actually
+      // going to run; the empty string is just the absence of an override.
+      pythonCmd: "",
+      scriptPath: "",
+      workingDir: "",
       isPackaged: prev.isPackaged,
       verboseAlways: true,
       collapseSplits: true,
@@ -340,6 +414,7 @@ export default function SettingsTab({ settings, onSave }) {
                 <Input
                   value={local.workingDir}
                   onChange={(e) => set("workingDir", e.target.value)}
+                  placeholder={resolved.workingDir || ""}
                   className="flex-1 font-mono text-xs"
                 />
                 <Button variant="outline" size="sm" onClick={browseWorkingDir}>
@@ -347,7 +422,10 @@ export default function SettingsTab({ settings, onSave }) {
                 </Button>
               </div>
               <p className="text-[10px] text-muted-foreground mt-1">
-                The "mangas" folder will be created inside this directory.
+                {local.workingDir
+                  ? <>The "mangas" folder will be created inside this directory.</>
+                  : <>Using auto-resolved default. Leave blank to keep it; type a path to override.</>
+                }
               </p>
             </div>
             {/* Reinstall button — re-downloads Python from scratch */}
@@ -382,11 +460,14 @@ export default function SettingsTab({ settings, onSave }) {
               <Input
                 value={local.pythonCmd}
                 onChange={(e) => set("pythonCmd", e.target.value)}
-                placeholder="python"
+                placeholder={resolved.pythonCmd || "python"}
                 className="mt-1 font-mono text-sm"
               />
               <p className="text-[10px] text-muted-foreground mt-1">
-                Usually just "python". Change if you use a virtualenv or custom path.
+                {local.pythonCmd
+                  ? <>Custom override. Clear to fall back to auto-resolved <span className="font-mono">{resolved.pythonCmd || "python"}</span>.</>
+                  : <>Using auto-resolved <span className="font-mono">{resolved.pythonCmd || "python"}</span>. Type to override (e.g. <span className="font-mono">python3.13</span> for a specific venv).</>
+                }
               </p>
             </div>
 
@@ -396,12 +477,19 @@ export default function SettingsTab({ settings, onSave }) {
                 <Input
                   value={local.scriptPath}
                   onChange={(e) => set("scriptPath", e.target.value)}
+                  placeholder={resolved.scriptPath || ""}
                   className="flex-1 font-mono text-xs"
                 />
                 <Button variant="outline" size="sm" onClick={browseScript}>
                   <FileText className="w-3.5 h-3.5" />
                 </Button>
               </div>
+              <p className="text-[10px] text-muted-foreground mt-1">
+                {local.scriptPath
+                  ? <>Custom override. Clear to fall back to the auto-resolved path shown as placeholder.</>
+                  : <>Using auto-resolved default. Leave blank or type a path to override.</>
+                }
+              </p>
             </div>
 
             <div>
@@ -410,6 +498,7 @@ export default function SettingsTab({ settings, onSave }) {
                 <Input
                   value={local.workingDir}
                   onChange={(e) => set("workingDir", e.target.value)}
+                  placeholder={resolved.workingDir || ""}
                   className="flex-1 font-mono text-xs"
                 />
                 <Button variant="outline" size="sm" onClick={browseWorkingDir}>
@@ -417,7 +506,10 @@ export default function SettingsTab({ settings, onSave }) {
                 </Button>
               </div>
               <p className="text-[10px] text-muted-foreground mt-1">
-                Where aio-dl.py runs. The "mangas" output folder will be created here.
+                {local.workingDir
+                  ? <>Custom override. The "mangas" output folder will be created here. Clear to fall back to the auto-resolved path.</>
+                  : <>Using auto-resolved default. Leave blank or type a path to override.</>
+                }
               </p>
             </div>
           </div>
