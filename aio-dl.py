@@ -5,6 +5,7 @@
 # -----------------------------------------------------------
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 import base64
 import glob
 import hashlib
@@ -590,6 +591,17 @@ _HOST_FAIL_COUNT: Dict[str, int] = {}
 _HOST_FAIL_URLS: Dict[str, set] = {}
 _HOST_FAIL_LOCK = threading.Lock()
 
+# Phase D (2026-05-13): per-host concurrency cap that dials DOWN on
+# confirmed CDN failures during a run. Distinct from _HOST_FAIL_COUNT
+# (per-chapter, drives the chapter-skip threshold) — this lives across
+# the whole run so a CDN that 520s on chapter 5 stays capped through
+# chapter 50. Reset only by _reset_host_concurrency_caps at run start.
+# Floor is 1; we never reduce below "one request at a time" because
+# concurrency reduction is a coarse control and the polite-delay
+# machinery handles fine-grained request pacing separately.
+_HOST_CONCURRENCY_CAP: Dict[str, int] = {}
+_HOST_CAP_LOCK = threading.Lock()
+
 # Set by the per-chapter watchdog Timer in _process_chapter when the chapter's
 # wall-clock deadline expires. dl_image / _try_download_url check this and
 # return early so the chapter aborts within seconds of the deadline.
@@ -773,6 +785,13 @@ def _record_failure(host: str, url: str, cls: str) -> None:
     Cls is the classification of the *last* failure; we only count network
     failures (origin_error / rate_limit / retryable) — permanent 4xx errors
     don't indicate the host is broken.
+
+    Phase D (2026-05-13): also feeds _record_host_failure_for_backoff,
+    which dials down the per-host concurrency cap on rate_limit/retryable
+    failures. The backoff cap is per-run (not per-chapter like the URL
+    counter here) and is independent of the chapter-poison threshold —
+    it makes the in-flight fetch lighter BEFORE the threshold trips a
+    chapter abort.
     """
     if not host or cls == "permanent":
         return
@@ -781,6 +800,10 @@ def _record_failure(host: str, url: str, cls: str) -> None:
         if url not in seen:
             seen.add(url)
             _HOST_FAIL_COUNT[host] = _HOST_FAIL_COUNT.get(host, 0) + 1
+    # Dial down concurrency for subsequent fetches against this host.
+    # Outside the _HOST_FAIL_LOCK because _record_host_failure_for_backoff
+    # uses its own _HOST_CAP_LOCK — separate locks prevent contention.
+    _record_host_failure_for_backoff(host, cls)
 
 
 def _host_fail_count(host: str) -> int:
@@ -797,6 +820,74 @@ def _reset_host_failures_for_chapter() -> None:
     with _HOST_FAIL_LOCK:
         _HOST_FAIL_COUNT.clear()
         _HOST_FAIL_URLS.clear()
+
+
+def _record_host_failure_for_backoff(host: str, cls: str) -> None:
+    """Reduce _HOST_CONCURRENCY_CAP[host] in response to a confirmed failure.
+
+    Called from _record_failure right after the URL bookkeeping. Floor is 1.
+    Class behavior:
+      - rate_limit:   cap //= 2  (aggressive — server is mad at request rate)
+      - retryable:    cap -= 1   (we got unlucky; light decrement)
+      - origin_error: no-op      (CF 520-527 — upstream sickness; concurrency
+                                  reduction doesn't help and may slow recovery
+                                  when origin comes back)
+      - permanent:    no-op      (4xx — already filtered by _record_failure)
+
+    Cross-process backoff (sibling worker processes via _COORD) is NOT
+    triggered from here — that path goes through _record_rate_limit which
+    is hit by the in-band retry logic. The concurrency cap is purely
+    local to this process.
+
+    No-op for empty host (defensive — _record_failure already guards but
+    we re-check for cheap insurance)."""
+    if cls in ("permanent", "origin_error"):
+        return
+    if not host:
+        return
+    with _HOST_CAP_LOCK:
+        # Default base is 8 (matches --image-concurrency default). First
+        # failure for this host: start from 8, then reduce per the class.
+        # If user passed --image-concurrency 4 and we've already capped to
+        # 3 from prior failures, _effective_concurrency picks min(4, 3) = 3.
+        current = _HOST_CONCURRENCY_CAP.get(host, 8)
+        if cls == "rate_limit":
+            new_cap = max(1, current // 2)
+        elif cls == "retryable":
+            new_cap = max(1, current - 1)
+        else:
+            return
+        if new_cap < current:
+            _HOST_CONCURRENCY_CAP[host] = new_cap
+            log_verbose(
+                f"  [Backoff] Reducing {host} concurrency: {current} -> "
+                f"{new_cap} (reason={cls})"
+            )
+
+
+def _effective_concurrency(host: str, base: int) -> int:
+    """Return min(base, _HOST_CONCURRENCY_CAP[host]) when capped; else base.
+
+    When the cap hasn't been touched (healthy CDN), returns base unchanged
+    — zero overhead. Callers must invoke this immediately before
+    constructing an asyncio.Semaphore or ThreadPoolExecutor. The host
+    is derived from download_tasks[0][1]'s netloc (single-host-per-chapter
+    assumption — true in 99%+ cases). Empty host returns base unchanged."""
+    if not host:
+        return base
+    with _HOST_CAP_LOCK:
+        cap = _HOST_CONCURRENCY_CAP.get(host)
+    return min(base, cap) if cap is not None else base
+
+
+def _reset_host_concurrency_caps() -> None:
+    """Clear per-run concurrency caps. Called by _apply_runtime_tunables at
+    run start so each run begins with fresh CDN trust. The polite-delay
+    decay (_cool_polite_delay) handles fine-grained request-pacing recovery
+    within a run; concurrency stays capped for the rest of the run once
+    reduced, intentionally — a CDN that 520s once is likely to 520 again."""
+    with _HOST_CAP_LOCK:
+        _HOST_CONCURRENCY_CAP.clear()
 
 
 def _chapter_cancelled() -> bool:
@@ -2416,6 +2507,11 @@ def _komikku_status_to_digit(status_str: Optional[str]) -> str:
         return "5"
     if s in ("hiatus", "on hiatus", "on_hiatus", "onhiatus", "paused"):
         return "6"
+    # MangaPark `uploadStatus` returns "pending" for scheduled-but-not-yet-
+    # started series. Explicit Unknown — don't let a future refactor lump it
+    # in with "ongoing" by accident.
+    if s == "pending":
+        return "0"
     return "0"
 
 
@@ -3446,6 +3542,26 @@ def _apply_runtime_tunables(args):
     _vrf_async_batch_state["parallel_count"] = max(
         1, int(getattr(args, "mangafire_vrf_parallel", 1) or 1)
     )
+    # --no-fast-download: force-disable curl_cffi fast path globally. Read
+    # by both the main-path SUPPORTS_FAST_DOWNLOAD gate AND the prefetch
+    # worker's SUPPORTS_FAST_DOWNLOAD gate. Module-global so the prefetch
+    # worker (which doesn't have args in scope as a closure capture) can
+    # read it without parameter threading.
+    globals()["_NO_FAST_DOWNLOAD"] = bool(getattr(args, "no_fast_download", False))
+    # --image-prefetch-parallel: how many concurrent image-prefetch worker
+    # threads. Same module-global pattern as _vrf_async_batch_state since
+    # the workers are spawned by _ensure_image_prefetch_workers without
+    # args in scope. Re-applied on --restore-parameters via the second
+    # call to _apply_runtime_tunables.
+    globals()["_image_prefetch_parallel"] = max(
+        1, int(getattr(args, "image_prefetch_parallel", 2) or 2)
+    )
+    # Phase D (2026-05-13): clear per-run concurrency caps so each run
+    # starts with fresh CDN trust. NOTE: This is called twice in main()
+    # (once after parse_args, once on --restore-parameters); the second
+    # call also resets caps, which is correct — resume = fresh run on
+    # the CDN's side too.
+    _reset_host_concurrency_caps()
 
 
 # -----------------------------------------------------------
@@ -3751,11 +3867,262 @@ def _start_vrf_prefetch(next_chapter: Optional[Dict], handler) -> None:
 # concurrent burst hurts more than the overlap helps; set to a smaller
 # positive number to keep prefetch on but with a lighter footprint.
 #
-# Single in-flight prefetch — main consumes (joins) before firing the next
-# one, so `_image_prefetch_thread` only ever holds one outstanding task.
-_image_prefetch_lock = threading.Lock()
-_image_prefetch_thread: Optional[threading.Thread] = None
-_image_prefetch_target_chap: Optional[str] = None
+# Phase B (2026-05-13): replaced single-in-flight thread with a
+# queue+worker-pool pattern mirroring _vrf_prefetch_*. Multiple chapters
+# can now download in parallel (controlled by --image-prefetch-parallel),
+# and the queue depth (--image-prefetch-depth) lets us push ahead
+# multiple chapters at the chain-fire site. Preserves the filesystem-
+# mediated coordination contract: .download_prefetched marker on full
+# success, rm_tree(target_tdir) on partial failure.
+
+
+@dataclass
+class _ImgPrefetchJob:
+    """One queued image-prefetch task. Carries everything the worker needs
+    to download a chapter's images independently — no shared in-memory
+    state with main beyond the per-chapter Event used for consume-wait."""
+    next_chapter: Dict[str, Any]
+    target_tdir: str
+    scraper: Any
+    handler: Any
+    image_workers: int
+    fast_concurrency: int
+    chap_label: str
+
+
+# Bounded so a runaway depth value can't OOM the process. depth check at
+# the fire site keeps this far below the cap in normal operation; the cap
+# is purely defensive.
+_image_prefetch_queue: "_stdlib_queue.Queue[Optional[_ImgPrefetchJob]]" = (
+    _stdlib_queue.Queue(maxsize=16)
+)
+_image_prefetch_workers: List[threading.Thread] = []
+_image_prefetch_seen: set = set()                       # dedupe: chap_label
+_image_prefetch_done: Dict[str, threading.Event] = {}   # chap_label -> Event
+_image_prefetch_lock = threading.Lock()                 # guards _seen/_done/_workers
+# Set by _apply_runtime_tunables from --image-prefetch-parallel (default 2).
+_image_prefetch_parallel: int = 2
+
+
+def _image_prefetch_worker_loop() -> None:
+    """Dequeue prefetch jobs forever. Daemon thread; exits with the
+    process. Each iteration runs the same body the old _worker closure
+    did, with one diff at the end: setting _image_prefetch_done[chap].set()
+    so _consume_image_prefetch can unblock.
+
+    Multiple workers may run this loop concurrently (one Python thread
+    each). The queue handles synchronization; each chapter is processed
+    by exactly one worker."""
+    while True:
+        job = _image_prefetch_queue.get()
+        if job is None:  # Shutdown sentinel
+            return
+        try:
+            _run_image_prefetch_job(job)
+        finally:
+            # Always signal completion (success or failure) so the main
+            # thread's _consume_image_prefetch doesn't deadlock.
+            evt = _image_prefetch_done.get(job.chap_label)
+            if evt is not None:
+                evt.set()
+            _image_prefetch_queue.task_done()
+
+
+def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
+    """The body of one prefetch job. Lifted verbatim from the old
+    inline _worker closure in _start_image_prefetch (pre-2026-05-13)
+    so the success/failure marker contract is unchanged.
+
+    On full success: writes .download_prefetched marker into target_tdir.
+    On partial failure: wipes target_tdir entirely so main's foreground
+    download starts from a clean slate (no half-populated state)."""
+    next_chapter = job.next_chapter
+    target_tdir = job.target_tdir
+    scraper = job.scraper
+    handler = job.handler
+    image_workers = job.image_workers
+    fast_concurrency = job.fast_concurrency
+    chap_label = job.chap_label
+    try:
+        # ── Phase 1: media_entries (URL list) ──
+        merged_parts = next_chapter.get("_merged_parts")
+        if merged_parts:
+            media_entries: List[Any] = []
+            for part in merged_parts:
+                try:
+                    part_entries = handler.get_chapter_images(
+                        part, scraper, make_request
+                    ) or []
+                    media_entries.extend(part_entries)
+                except Exception as exc:
+                    log_verbose(
+                        f"  [Img Prefetch] Ch {chap_label} part fetch failed: {exc}"
+                    )
+                    return
+        else:
+            try:
+                media_entries = handler.get_chapter_images(
+                    next_chapter, scraper, make_request
+                ) or []
+            except Exception as exc:
+                log_verbose(
+                    f"  [Img Prefetch] Ch {chap_label} get_chapter_images failed: {exc}"
+                )
+                return
+
+        if not media_entries:
+            return
+
+        os.makedirs(target_tdir, exist_ok=True)
+
+        # ── Classify entries (mirrors main's Phase 1 logic) ──
+        download_tasks: List[Tuple[int, str, str, str]] = []
+        page_counter = 1
+        for entry in media_entries:
+            if isinstance(entry, dict):
+                entry_type = entry.get("type")
+                if entry_type == "text":
+                    # Text blocks are re-extracted by main's own Phase 1;
+                    # the prefetch only persists image bytes.
+                    continue
+                if entry_type == "binary_image":
+                    blob = entry.get("data")
+                    if not blob:
+                        continue
+                    explicit_ext = entry.get("extension")
+                    if explicit_ext:
+                        ext = (
+                            explicit_ext
+                            if explicit_ext.startswith(".")
+                            else "." + explicit_ext
+                        )
+                    else:
+                        ext = _sniff_image_extension(
+                            blob[:32]
+                            if isinstance(blob, (bytes, bytearray))
+                            else b"",
+                            entry.get("content_type"),
+                        )
+                    custom_name = entry.get("name")
+                    filename = (
+                        custom_name
+                        if custom_name
+                        else f"{chap_label}_{page_counter:04d}{ext}"
+                    )
+                    pth = os.path.join(target_tdir, filename)
+                    try:
+                        with open(pth, "wb") as fh:
+                            fh.write(blob)
+                    except OSError:
+                        pass
+                    page_counter += 1
+                    continue
+            full_url = entry if isinstance(entry, str) else entry.get("url")
+            if not full_url:
+                continue
+            # Filename uses ".jpg" placeholder; dl_image's Phase A sniff
+            # gives the file its real extension after bytes land.
+            filename = f"{chap_label}_{page_counter:04d}.jpg"
+            download_tasks.append((page_counter, full_url, target_tdir, filename))
+            page_counter += 1
+
+        if not download_tasks:
+            # Pure binary_image chapter — write marker so main skips
+            # Phase 2 anyway (there'd be nothing to download).
+            _write_prefetched_marker(target_tdir)
+            return
+
+        # ── Phase 2: parallel download ──
+        # curl_cffi async path runs concurrently inside this daemon
+        # thread (asyncio.run() spins up its own event loop here).
+        # Handlers without SUPPORTS_FAST_DOWNLOAD (or globally disabled
+        # via --no-fast-download) fall through to ThreadPoolExecutor.
+        failed = 0
+        if (
+            getattr(handler, "SUPPORTS_FAST_DOWNLOAD", False)
+            and not globals().get("_NO_FAST_DOWNLOAD", False)
+        ):
+            fast_conc = max(1, int(fast_concurrency))
+            # Phase D: apply per-host concurrency cap on prefetch too —
+            # if the foreground path dialed concurrency down for this
+            # CDN, prefetch should respect the same limit.
+            fast_conc = _effective_concurrency(
+                urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                fast_conc,
+            )
+            fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
+            # No host-poison feedback here: prefetch is best-effort. If
+            # it fails, the partial-failure branch below wipes tdir and
+            # main's foreground download retries with full instrumentation.
+            fast_results = handler.fast_download_images(
+                download_tasks,
+                concurrency=fast_conc,
+                timeout=fast_timeout,
+                # Forward cookies (e.g. age-gate cookies for LineWebtoon)
+                # so prefetch can fetch the same content the foreground
+                # path would. Base impl filters to host-relevant cookies.
+                scraper=scraper,
+            )
+            failed = sum(1 for _, p in fast_results if not p)
+        else:
+            workers = max(1, min(image_workers, len(download_tasks)))
+            # Phase D: cap prefetch ThreadPool concurrency too.
+            workers = max(1, _effective_concurrency(
+                urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                workers,
+            ))
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=f"img-prefetch-{chap_label}"
+            ) as pool:
+                futures = [
+                    pool.submit(dl_image, url, folder, name, scraper, True)
+                    for _, url, folder, name in download_tasks
+                ]
+                for fut in as_completed(futures):
+                    try:
+                        if not fut.result():
+                            failed += 1
+                    except Exception:
+                        failed += 1
+
+        if failed == 0:
+            _write_prefetched_marker(target_tdir)
+            log_verbose(
+                f"  [Img Prefetch] Ch {chap_label} ready ({len(download_tasks)} imgs)"
+            )
+        else:
+            # Partial failure → wipe so main starts fresh. Don't leave a
+            # half-populated tdir that main's marker check would skip into.
+            log_verbose(
+                f"  [Img Prefetch] Ch {chap_label} partial fail "
+                f"({failed}/{len(download_tasks)}) — discarding"
+            )
+            try:
+                rm_tree(target_tdir)
+            except Exception:
+                pass
+    except Exception as exc:
+        log_verbose(f"  [Img Prefetch] Ch {chap_label} unexpected error: {exc}")
+
+
+def _ensure_image_prefetch_workers() -> None:
+    """Lazy-spawn up to _image_prefetch_parallel daemon worker threads.
+    Mirrors _ensure_vrf_prefetch_worker but with N workers instead of 1.
+    Called from _start_image_prefetch on first enqueue; idempotent on
+    subsequent calls (re-checks alive count and tops up if any died)."""
+    with _image_prefetch_lock:
+        # Filter alive workers; replace died ones up to the target count.
+        alive = [t for t in _image_prefetch_workers if t.is_alive()]
+        _image_prefetch_workers[:] = alive
+        target = max(1, int(globals().get("_image_prefetch_parallel", 2)))
+        while len(_image_prefetch_workers) < target:
+            t = threading.Thread(
+                target=_image_prefetch_worker_loop,
+                daemon=True,
+                name=f"Img-Prefetch-Worker-{len(_image_prefetch_workers) + 1}",
+            )
+            t.start()
+            _image_prefetch_workers.append(t)
 
 
 def _start_image_prefetch(
@@ -3766,182 +4133,105 @@ def _start_image_prefetch(
     image_workers: int,
     fast_concurrency: int = 8,
 ) -> None:
-    """Fire-and-forget background download for next_chapter's images. On
-    success, writes target_tdir/.download_prefetched so the main thread's
-    next iteration can detect and skip its own Phase 2 download.
+    """Enqueue an image-prefetch job for next_chapter. Signature preserved
+    from pre-Phase-B for callsite back-compat; internals are now queue+pool.
 
     Honors split-cluster collapse: if next_chapter carries `_merged_parts`
     (set by group_chapters_for_download for rule-5 clusters), the worker
     fetches each part's media_entries and concatenates them in order —
     matching what _process_chapter_impl would have done synchronously.
 
-    `fast_concurrency` is honored only when handler.SUPPORTS_FAST_DOWNLOAD
-    is True (MangaFire) — it bounds the curl_cffi async semaphore. Other
-    handlers use image_workers via the ThreadPoolExecutor path.
-    """
-    global _image_prefetch_thread, _image_prefetch_target_chap
+    `fast_concurrency` bounds the curl_cffi async semaphore when the
+    handler has SUPPORTS_FAST_DOWNLOAD=True. Other handlers (or runs with
+    --no-fast-download) use image_workers via ThreadPoolExecutor.
 
+    Dedupe: if a job for chap_label is already in flight or queued, skip
+    re-enqueue. _consume_image_prefetch joins the existing job's done event.
+    """
     if next_chapter is None:
         return
     chap_label = str(next_chapter.get("chap", "?"))
     if not chap_label or chap_label == "?":
         return
 
-    def _worker() -> None:
-        try:
-            # ── Phase 1: media_entries (URL list) ──
-            merged_parts = next_chapter.get("_merged_parts")
-            if merged_parts:
-                media_entries: List[Any] = []
-                for part in merged_parts:
-                    try:
-                        part_entries = handler.get_chapter_images(
-                            part, scraper, make_request
-                        ) or []
-                        media_entries.extend(part_entries)
-                    except Exception as exc:
-                        log_verbose(
-                            f"  [Img Prefetch] Ch {chap_label} part fetch failed: {exc}"
-                        )
-                        return
-            else:
-                try:
-                    media_entries = handler.get_chapter_images(
-                        next_chapter, scraper, make_request
-                    ) or []
-                except Exception as exc:
-                    log_verbose(
-                        f"  [Img Prefetch] Ch {chap_label} get_chapter_images failed: {exc}"
-                    )
-                    return
-
-            if not media_entries:
-                return
-
-            os.makedirs(target_tdir, exist_ok=True)
-
-            # ── Classify entries (mirrors main's Phase 1 logic) ──
-            download_tasks: List[Tuple[int, str, str, str]] = []
-            page_counter = 1
-            for entry in media_entries:
-                if isinstance(entry, dict):
-                    entry_type = entry.get("type")
-                    if entry_type == "text":
-                        # Text blocks are re-extracted by main's own Phase 1;
-                        # the prefetch only persists image bytes.
-                        continue
-                    if entry_type == "binary_image":
-                        blob = entry.get("data")
-                        if not blob:
-                            continue
-                        explicit_ext = entry.get("extension")
-                        if explicit_ext:
-                            ext = (
-                                explicit_ext
-                                if explicit_ext.startswith(".")
-                                else "." + explicit_ext
-                            )
-                        else:
-                            ext = _sniff_image_extension(
-                                blob[:32]
-                                if isinstance(blob, (bytes, bytearray))
-                                else b"",
-                                entry.get("content_type"),
-                            )
-                        custom_name = entry.get("name")
-                        filename = (
-                            custom_name
-                            if custom_name
-                            else f"{chap_label}_{page_counter:04d}{ext}"
-                        )
-                        pth = os.path.join(target_tdir, filename)
-                        try:
-                            with open(pth, "wb") as fh:
-                                fh.write(blob)
-                        except OSError:
-                            pass
-                        page_counter += 1
-                        continue
-                full_url = entry if isinstance(entry, str) else entry.get("url")
-                if not full_url:
-                    continue
-                # Filename uses ".jpg" placeholder; dl_image's Phase A sniff
-                # gives the file its real extension after bytes land.
-                filename = f"{chap_label}_{page_counter:04d}.jpg"
-                download_tasks.append((page_counter, full_url, target_tdir, filename))
-                page_counter += 1
-
-            if not download_tasks:
-                # Pure binary_image chapter — write marker so main skips
-                # Phase 2 anyway (there'd be nothing to download).
-                _write_prefetched_marker(target_tdir)
-                return
-
-            # ── Phase 2: parallel download ──
-            # MangaFire's curl_cffi async path runs concurrently inside this
-            # daemon thread (asyncio.run() spins up its own event loop here).
-            # Other handlers fall through to the ThreadPoolExecutor path.
-            failed = 0
-            if getattr(handler, "SUPPORTS_FAST_DOWNLOAD", False):
-                fast_conc = max(1, int(fast_concurrency))
-                fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
-                # No host-poison feedback here: prefetch is best-effort. If
-                # it fails, the partial-failure branch below wipes tdir and
-                # main's foreground download retries with full instrumentation.
-                fast_results = handler.fast_download_images(
-                    download_tasks,
-                    concurrency=fast_conc,
-                    timeout=fast_timeout,
-                )
-                failed = sum(1 for _, p in fast_results if not p)
-            else:
-                workers = max(1, min(image_workers, len(download_tasks)))
-                with ThreadPoolExecutor(
-                    max_workers=workers, thread_name_prefix=f"img-prefetch-{chap_label}"
-                ) as pool:
-                    futures = [
-                        pool.submit(dl_image, url, folder, name, scraper, True)
-                        for _, url, folder, name in download_tasks
-                    ]
-                    for fut in as_completed(futures):
-                        try:
-                            if not fut.result():
-                                failed += 1
-                        except Exception:
-                            failed += 1
-
-            if failed == 0:
-                _write_prefetched_marker(target_tdir)
-                log_verbose(
-                    f"  [Img Prefetch] Ch {chap_label} ready ({len(download_tasks)} imgs)"
-                )
-            else:
-                # Partial failure → wipe so main starts fresh. Don't leave a
-                # half-populated tdir that main's marker check would skip into.
-                log_verbose(
-                    f"  [Img Prefetch] Ch {chap_label} partial fail "
-                    f"({failed}/{len(download_tasks)}) — discarding"
-                )
-                try:
-                    rm_tree(target_tdir)
-                except Exception:
-                    pass
-        except Exception as exc:
-            log_verbose(f"  [Img Prefetch] Ch {chap_label} unexpected error: {exc}")
-
     with _image_prefetch_lock:
-        # If a prior prefetch is somehow still in flight (chapter loop should
-        # have consumed it), let it finish before firing the next one. Keeps
-        # us bounded at one outstanding background task at any time.
-        if _image_prefetch_thread is not None and _image_prefetch_thread.is_alive():
-            log_verbose("  [Img Prefetch] Waiting for prior prefetch to finish")
-            _image_prefetch_thread.join(timeout=120)
-        _image_prefetch_target_chap = chap_label
-        t = threading.Thread(
-            target=_worker, daemon=True, name=f"Img-Prefetch-{chap_label}"
+        if chap_label in _image_prefetch_seen:
+            # Already queued or in-flight for this chapter — second enqueue
+            # is a no-op. The existing job's Event will fire normally on
+            # completion; _consume_image_prefetch joins that Event.
+            return
+        _image_prefetch_seen.add(chap_label)
+        _image_prefetch_done[chap_label] = threading.Event()
+
+    job = _ImgPrefetchJob(
+        next_chapter=next_chapter,
+        target_tdir=target_tdir,
+        scraper=scraper,
+        handler=handler,
+        image_workers=image_workers,
+        fast_concurrency=fast_concurrency,
+        chap_label=chap_label,
+    )
+    try:
+        _image_prefetch_queue.put(job, block=False)
+    except _stdlib_queue.Full:
+        # Queue is at maxsize (defensive cap, depth check usually keeps
+        # us well below). Drop the job — main's foreground download
+        # handles the chapter normally. Clear the seen/done state so a
+        # future enqueue attempt isn't blocked.
+        log_verbose(
+            f"  [Img Prefetch] Queue full, dropping Ch {chap_label} "
+            f"(main will download normally)"
         )
-        _image_prefetch_thread = t
-        t.start()
+        with _image_prefetch_lock:
+            _image_prefetch_seen.discard(chap_label)
+            _image_prefetch_done.pop(chap_label, None)
+        return
+    _ensure_image_prefetch_workers()
+
+
+def _start_image_prefetch_chain(
+    upcoming: List[Dict[str, Any]],
+    main_tmp_dir: str,
+    scraper,
+    handler,
+    image_workers: int,
+    fast_concurrency: int,
+    depth: int,
+    no_processing: bool,
+) -> None:
+    """Push the next `depth` chapters' image-prefetch jobs onto the queue.
+    No-op when depth <= 0 (user opted out). Mirror of
+    _start_vrf_prefetch_chain for the image-download side.
+
+    Skips chapters whose tdir already has a success marker (processed-
+    complete or download-complete depending on --no-processing) — same
+    cache check the single-shot fire site used to do at line ~6253.
+
+    The dedupe in _start_image_prefetch handles overlapping windows
+    (e.g. chain fired at ch 10 queues 11+12; ch 11's chain fires 12+13
+    and 12 is already in the queue from ch 10's chain — skipped)."""
+    if depth <= 0 or not upcoming:
+        return
+    pushed = 0
+    for ch in upcoming[:depth]:
+        chap = ch.get("chap")
+        if chap is None:
+            continue
+        target_tdir = os.path.join(main_tmp_dir, f"ch_{chap}")
+        marker_name = ".download_complete" if no_processing else ".processed_complete"
+        if os.path.exists(os.path.join(target_tdir, marker_name)):
+            # Already fully processed (resume case); no point prefetching
+            # bytes whose ch_dir is already marker-complete.
+            continue
+        _start_image_prefetch(
+            ch, target_tdir, scraper, handler, image_workers, fast_concurrency
+        )
+        pushed += 1
+    if pushed > 0:
+        log_verbose(
+            f"  [Img Prefetch] chain pushed {pushed}/{len(upcoming[:depth])} chapter(s)"
+        )
 
 
 def _write_prefetched_marker(tdir: str) -> None:
@@ -3956,23 +4246,33 @@ def _write_prefetched_marker(tdir: str) -> None:
 
 
 def _consume_image_prefetch(chap_label: str) -> None:
-    """Block until any in-flight prefetch for chap_label finishes, then
-    clear the module-level slot. Idempotent — call at the start of each
+    """Block until the prefetch for chap_label finishes (or no prefetch was
+    queued for this chapter). Idempotent — call at the start of each
     chapter's processing. The prefetch's outputs are picked up via the
-    .download_prefetched marker (filesystem-mediated, not in-memory)."""
-    global _image_prefetch_thread, _image_prefetch_target_chap
+    .download_prefetched marker (filesystem-mediated, not in-memory).
+
+    With the queue+pool refactor, the chapter may be IN-FLIGHT (a worker
+    is processing it) or QUEUED (waiting for a worker). The per-chap Event
+    handles both cases: it gets set when the worker finishes processing,
+    regardless of which worker took the job."""
+    chap_label = str(chap_label)
     with _image_prefetch_lock:
-        thread = _image_prefetch_thread
-        target = _image_prefetch_target_chap
-    if thread is None or target != str(chap_label):
+        evt = _image_prefetch_done.get(chap_label)
+    if evt is None:
+        # No prefetch was queued for this chapter — nothing to consume.
         return
-    if thread.is_alive():
+    if not evt.is_set():
         log_verbose(f"  Waiting for image prefetch of Ch {chap_label}...")
-        thread.join(timeout=300)
+        # 300s timeout matches pre-Phase-B behavior. If a queue backlog
+        # pushes us beyond this, foreground download falls through and
+        # main re-does the work — same recovery semantics as a single-
+        # thread prefetch hanging.
+        evt.wait(timeout=300.0)
     with _image_prefetch_lock:
-        if _image_prefetch_target_chap == str(chap_label):
-            _image_prefetch_thread = None
-            _image_prefetch_target_chap = None
+        # Clean up per-chap state. Keep _image_prefetch_seen entry so a
+        # second enqueue for the same chapter (e.g. inline retry) is
+        # a no-op — main's foreground download path handles retries.
+        _image_prefetch_done.pop(chap_label, None)
 
 
 def main():
@@ -4058,19 +4358,61 @@ def main():
              "Set to 1 to download images one at a time (old behaviour).",
     )
 
-    # MangaFire-specific speed knobs (2026-05-09). Other handlers ignore these.
-    # See sites/mangafire.py:fast_download_images and sites/mangafire_vrf_async_batch.py.
+    # ── Fast-download knobs (2026-05-13: generalized from MangaFire-only) ──
+    # These apply to any handler with SUPPORTS_FAST_DOWNLOAD=True (currently
+    # mangafire and linewebtoon; see sites/base.py:fast_download_images for
+    # the implementation and sites/*.py for opt-ins). Resume-transient — see
+    # _RESUME_TRANSIENT_DESTS for why these don't invalidate on-disk images.
     p.add_argument(
-        "--mangafire-image-concurrency",
+        "--image-concurrency",
         type=int,
         default=8,
-        help="Concurrent in-flight image fetches for MangaFire's curl_cffi async "
-             "downloader (default: 8). MangaFire only — other handlers use "
-             "--image-workers. Bench (83-page chapter, single network): 8 hits "
-             "~5 MB/s near network ceiling; >12 is diminishing returns. Drop "
-             "to 3 or 4 if CF starts rate-limiting (rare on the cookieless edge "
-             "cache, but defensive).",
+        help="Concurrent in-flight image fetches for handlers with fast "
+             "download support (curl_cffi async + HTTP/2; default: 8). "
+             "Bench (MangaFire 83-page chapter): 8 hits ~5 MB/s near network "
+             "ceiling; >12 is diminishing returns. Auto-dials down on CDN "
+             "errors via per-host concurrency cap (independent of "
+             "--chapter-host-poison-threshold which is the hard chapter "
+             "abort). Drop to 3 or 4 if a CDN starts rate-limiting (rare on "
+             "cookieless edge caches, but defensive).",
     )
+    p.add_argument(
+        "--image-prefetch-depth",
+        type=int,
+        default=2,
+        help="How many chapters ahead to keep queued for image prefetch "
+             "(default: 2). Set to 0 to disable image prefetch entirely. "
+             "Higher depths help when main-loop processing is FAST relative "
+             "to network download (e.g. CBZ fast-path on LINE Webtoon) — "
+             "more chapters in the queue mean less waiting between chapters. "
+             "Doesn't help when processing is the bottleneck (PDF assembly, "
+             "WebP recompression with high effort settings).",
+    )
+    p.add_argument(
+        "--image-prefetch-parallel",
+        type=int,
+        default=2,
+        help="Concurrent prefetch worker threads (default: 2). Each worker "
+             "processes one chapter at a time from the queue; parallel=2 "
+             "means up to 2 chapters in flight simultaneously while the main "
+             "thread processes a third. parallel=1 is the legacy single-in-"
+             "flight behavior. Higher values = more concurrent host "
+             "connections (parallel × image-concurrency). Webtoons.com and "
+             "MangaFire's edge cache tolerate 2 well in practice.",
+    )
+    p.add_argument(
+        "--no-fast-download",
+        action="store_true",
+        help="Force-disable the curl_cffi fast download path on all handlers; "
+             "use the legacy ThreadPoolExecutor + dl_image cloudscraper path. "
+             "Escape hatch for curl_cffi version regressions or weird CDN-vs-"
+             "impersonation issues. Equivalent to setting "
+             "SUPPORTS_FAST_DOWNLOAD=False per-handler, but global.",
+    )
+
+    # MangaFire-specific VRF capture knobs (2026-05-09). VRF is MangaFire's
+    # proprietary token-capture problem; no other handler has it. Kept under
+    # the --mangafire- namespace because the flags don't apply to anyone else.
     p.add_argument(
         "--mangafire-vrf-prefetch-depth",
         type=int,
@@ -5973,16 +6315,27 @@ def main():
                             None,
                         )
                         downloaded_images.append((task_page_idx, match))
-                elif getattr(handler, "SUPPORTS_FAST_DOWNLOAD", False):
-                    # MangaFire's curl_cffi async path: HTTP/2 multiplex over
-                    # one keep-alive AsyncSession. Bench (83-page chapter):
+                elif (
+                    getattr(handler, "SUPPORTS_FAST_DOWNLOAD", False)
+                    and not getattr(args, "no_fast_download", False)
+                ):
+                    # curl_cffi async path: HTTP/2 multiplex over one
+                    # keep-alive AsyncSession. Bench (83-page chapter):
                     # ~1.7x faster than the ThreadPoolExecutor cloudscraper
                     # path. Cancellation + host-poison are bridged via
                     # callbacks so the handler stays decoupled from this
                     # module's globals. fast_download_images returns the
                     # same (page_idx, path_or_None) shape as dl_image.
                     fast_conc = max(
-                        1, int(getattr(args, "mangafire_image_concurrency", 8))
+                        1, int(getattr(args, "image_concurrency", 8))
+                    )
+                    # Phase D: apply per-host concurrency cap. If a prior
+                    # rate_limit / retryable failure dialed the cap down
+                    # for this CDN, _effective_concurrency clamps to the
+                    # cap. Healthy CDNs see the user-configured value.
+                    fast_conc = _effective_concurrency(
+                        urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                        fast_conc,
                     )
                     fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
                     log_verbose(
@@ -5999,13 +6352,28 @@ def main():
                         # context out here; the host-poison threshold treats
                         # any non-permanent failure the same).
                         record_host_failure=lambda h, u: _record_failure(h, u, "retryable"),
+                        # Forward cookies from the cloudscraper session so
+                        # handlers whose image CDN gates on session cookies
+                        # (e.g. age-gated content) ride them. Base impl
+                        # filters to host-relevant cookies; no-op for
+                        # cookieless edge-cache CDNs (MangaFire, normal
+                        # webtoons series).
+                        scraper=scraper,
                     )
                     downloaded_images.extend(fast_results)
                 elif image_workers > 1 and len(download_tasks) > 1:
+                    # Phase D: apply per-host concurrency cap. ThreadPool
+                    # max_workers can't be changed after creation, so we
+                    # compute the effective worker count up front.
+                    pool_workers = min(image_workers, len(download_tasks))
+                    pool_workers = max(1, _effective_concurrency(
+                        urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                        pool_workers,
+                    ))
                     log_verbose(
-                        f"  Downloading {len(download_tasks)} image(s) with {min(image_workers, len(download_tasks))} parallel workers..."
+                        f"  Downloading {len(download_tasks)} image(s) with {pool_workers} parallel workers..."
                     )
-                    with ThreadPoolExecutor(max_workers=min(image_workers, len(download_tasks))) as img_pool:
+                    with ThreadPoolExecutor(max_workers=pool_workers) as img_pool:
                         future_to_page = {
                             img_pool.submit(
                                 dl_image,
@@ -6209,30 +6577,38 @@ def main():
             _t0_proc = time.monotonic()
             os.makedirs(processed_tdir, exist_ok=True)
 
-            # Phase G7 (2026-05-08): kick off image prefetch for next_chapter
-            # NOW — after this chapter's downloads + validation succeeded,
-            # before the CPU-bound processing/encoding begins. While the
-            # main thread is decoding/scaling/saving this chapter's images,
-            # the prefetch worker downloads next_chapter's images in
-            # parallel. _process_chapter_impl's next iteration consumes
-            # the prefetch via the .download_prefetched marker.
+            # Phase G7 (2026-05-08; Phase B chain 2026-05-13): kick off
+            # image prefetch chain for upcoming chapters NOW — after this
+            # chapter's downloads + validation succeeded, before the CPU-
+            # bound processing/encoding begins. While the main thread is
+            # decoding/scaling/saving this chapter's images, prefetch
+            # workers download the next `image_prefetch_depth` chapters'
+            # images in parallel (up to `image_prefetch_parallel` workers).
+            # _process_chapter_impl's next iteration consumes the prefetch
+            # via the .download_prefetched marker.
             #
-            # Worker count: --prefetch-image-workers (default -1 = match
-            # --image-workers). 0 disables. Positive N = exact count
-            # regardless of main pool size, useful when the user wants
-            # fewer concurrent connections during prefetch than during
-            # the in-band download (e.g. main=12 prefetch=4 to avoid
-            # CDN-throttle compounding without giving up the overlap).
+            # Worker count knobs:
+            #   --prefetch-image-workers: parallelism WITHIN one chapter
+            #     prefetch (default -1 = match --image-workers). 0
+            #     disables prefetch entirely.
+            #   --image-prefetch-depth: how many chapters ahead to queue
+            #     (default 2).
+            #   --image-prefetch-parallel: concurrent prefetch worker
+            #     threads (default 2). _ensure_image_prefetch_workers
+            #     spawns up to this many daemons.
+            #
+            # Chain dedupe: when ch N fires the chain it queues N+1, N+2;
+            # when ch N+1 fires it tries to queue N+2 (already in queue,
+            # dedup'd) + N+3 (new). _start_image_prefetch's _seen set
+            # handles this.
             #
             # Skipped on:
             #   - prefetch_image_workers <= 0 (user opt-out)
+            #   - image_prefetch_depth <= 0 (chain disabled)
             #   - force_redownload=True (inline retry — don't fire side
             #     work that the retry path will also fire)
-            #   - next_chapter is None (last chapter in the run)
-            #   - next_chapter is already fully processed (resume case;
-            #     prefetching a cached chapter would just download bytes
-            #     into a tdir whose `.processed_complete` marker already
-            #     short-circuits the next iteration)
+            #   - is_alt_source=True (multi-source fallback active)
+            #   - all upcoming chapters already cached
             prefetch_workers_raw = getattr(args, "prefetch_image_workers", -1)
             if prefetch_workers_raw is None:
                 prefetch_workers_raw = -1
@@ -6240,27 +6616,32 @@ def main():
                 effective_prefetch_workers = image_workers
             else:
                 effective_prefetch_workers = int(prefetch_workers_raw)
+            depth = max(0, int(getattr(args, "image_prefetch_depth", 2) or 0))
             if (
                 effective_prefetch_workers > 0
-                and next_chapter is not None
+                and depth > 0
                 and not force_redownload
                 and not is_alt_source
             ):
-                next_n = next_chapter.get("chap")
-                if next_n is not None:
-                    next_tdir = os.path.join(main_tmp_dir, f"ch_{next_n}")
-                    next_marker_name = (
-                        ".download_complete" if args.no_processing else ".processed_complete"
+                # Prefer the windowed upcoming_chapters list (same shape
+                # passed to the VRF chain), falling back to [next_chapter]
+                # when the chapter loop didn't propagate a window.
+                chain_upcoming: List[Dict[str, Any]] = (
+                    list(upcoming_chapters)
+                    if upcoming_chapters
+                    else ([next_chapter] if next_chapter is not None else [])
+                )
+                if chain_upcoming:
+                    _start_image_prefetch_chain(
+                        chain_upcoming,
+                        main_tmp_dir,
+                        scraper,
+                        handler,
+                        effective_prefetch_workers,
+                        fast_concurrency=int(getattr(args, "image_concurrency", 8) or 8),
+                        depth=depth,
+                        no_processing=bool(args.no_processing),
                     )
-                    next_already_cached = os.path.exists(
-                        os.path.join(next_tdir, next_marker_name)
-                    )
-                    if not next_already_cached:
-                        _start_image_prefetch(
-                            next_chapter, next_tdir, scraper, handler,
-                            effective_prefetch_workers,
-                            fast_concurrency=int(getattr(args, "mangafire_image_concurrency", 8) or 8),
-                        )
 
             chapter_content = []
 

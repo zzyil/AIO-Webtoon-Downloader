@@ -398,20 +398,29 @@ export function useDownloader() {
         ...(s?.prefetchImageWorkers != null && s.prefetchImageWorkers !== -1
           ? { prefetchImageWorkers: s.prefetchImageWorkers }
           : {}),
-        // ── MangaFire-only speed knobs (added 2026-05-09) ──
+        // ── Fast-download knobs (added 2026-05-09; generalized 2026-05-13) ──
         // Same "skip if at default" pattern as prefetchImageWorkers above:
         // when the setting matches the Python-side default, leave it out of
         // the spawn so older saved settings dicts that don't have the field
-        // still produce identical CLI invocations. Python defaults: 8, 4, 1.
-        ...(s?.mangafireImageConcurrency != null && s.mangafireImageConcurrency !== 8
-          ? { mangafireImageConcurrency: s.mangafireImageConcurrency }
+        // still produce identical CLI invocations. Python defaults:
+        //   imageConcurrency=8, imagePrefetchDepth=2, imagePrefetchParallel=2.
+        // MangaFire VRF capture knobs (--mangafire-vrf-prefetch-depth,
+        // --mangafire-vrf-parallel) were dropped from the UI on 2026-05-13
+        // — argparse defaults serve everyone now; advanced users pass the
+        // CLI flags directly. Migration note: settings dicts persisted
+        // before 2026-05-13 carry `mangafireImageConcurrency` instead of
+        // `imageConcurrency`. The SettingsTab loader migrates them at read
+        // time, so by the time we get here `s.imageConcurrency` is live.
+        ...(s?.imageConcurrency != null && s.imageConcurrency !== 8
+          ? { imageConcurrency: s.imageConcurrency }
           : {}),
-        ...(s?.mangafireVrfPrefetchDepth != null && s.mangafireVrfPrefetchDepth !== 4
-          ? { mangafireVrfPrefetchDepth: s.mangafireVrfPrefetchDepth }
+        ...(s?.imagePrefetchDepth != null && s.imagePrefetchDepth !== 2
+          ? { imagePrefetchDepth: s.imagePrefetchDepth }
           : {}),
-        ...(s?.mangafireVrfParallel != null && s.mangafireVrfParallel !== 1
-          ? { mangafireVrfParallel: s.mangafireVrfParallel }
+        ...(s?.imagePrefetchParallel != null && s.imagePrefetchParallel !== 2
+          ? { imagePrefetchParallel: s.imagePrefetchParallel }
           : {}),
+        ...(s?.noFastDownload === true ? { noFastDownload: true } : {}),
         ...args,
       };
 

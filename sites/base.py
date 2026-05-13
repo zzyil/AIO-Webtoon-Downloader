@@ -1,11 +1,30 @@
 from __future__ import annotations
 
+import os
 import statistics
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
+
+from ._image_io import finalize_pending_image
+
+# curl_cffi powers the fast image-download path used by handlers that opt into
+# SUPPORTS_FAST_DOWNLOAD. HTTP/2 multiplex over a single keep-alive
+# AsyncSession + Chrome-impersonate TLS fingerprint. Pinned to >=0.7.0 in
+# requirements.txt for the AsyncSession API. ImportError fallback flips the
+# module-level capability flag to False so opt-in handlers degrade to
+# SUPPORTS_FAST_DOWNLOAD=False and the chapter loop reverts to its existing
+# ThreadPoolExecutor + cloudscraper path. Cross-file: re-exported from
+# sites/mangafire.py for back-compat with anything that grepped for the
+# symbol there before this refactor.
+try:
+    from curl_cffi.requests import AsyncSession as _CurlCffiAsyncSession
+    _CURL_CFFI_AVAILABLE = True
+except Exception:  # ImportError or any sub-dep failure
+    _CurlCffiAsyncSession = None  # type: ignore[assignment]
+    _CURL_CFFI_AVAILABLE = False
 
 
 class IncompleteChapterError(Exception):
@@ -135,6 +154,256 @@ class BaseSiteHandler:
     #
     # Current opt-ins (lowercase handler names): linewebtoon.
     OFFICIAL_PUBLISHER: bool = False
+
+    # When True, the chapter loop and the inter-chapter image prefetch route
+    # this handler's image fetches through fast_download_images (curl_cffi
+    # async + HTTP/2 multiplex over one keep-alive TLS session) instead of
+    # the legacy dl_image + cloudscraper ThreadPoolExecutor path. Bench
+    # (MangaFire, 83-page chapter, 2026-05-09): cloudscraper 3-thread =
+    # 10.20s; curl_cffi async @ conc=8 = 6.04s. The win is HTTP/2 multiplex
+    # eliminating per-page TLS handshake. Auto-disabled when curl_cffi
+    # failed to import (falls back to the cloudscraper path).
+    #
+    # Opt in by setting True (typically `_CURL_CFFI_AVAILABLE`); subclasses
+    # also override the FAST_DL_* attributes below if they need a custom
+    # Referer / UA / TLS impersonate profile / extra headers. The base
+    # fast_download_images method handles the rest.
+    #
+    # Don't opt in handlers whose image CDN requires a non-Chrome UA (e.g.
+    # MangaDex's API ToS-mandated UA at sites/mangadex.py:configure_session) —
+    # the curl_cffi `impersonate=` parameter overrides UA at the JA3/JA4
+    # level too, and the API may reject the impersonated traffic outright.
+    SUPPORTS_FAST_DOWNLOAD: bool = False
+
+    # curl_cffi TLS-impersonate profile passed to AsyncSession(impersonate=).
+    # "chrome120" gives a Chrome 120-equivalent JA3/JA4 + h2 settings frame.
+    # Override only if the CDN requires a different fingerprint (very rare —
+    # Cloudflare-fronted CDNs largely accept any modern Chrome profile).
+    FAST_DL_IMPERSONATE: str = "chrome120"
+
+    # User-Agent header sent with every fast-download request. None = let
+    # curl_cffi fill the UA from the impersonate profile (Chrome's default
+    # for that version). Override when consistency with the cloudscraper
+    # session matters (MangaFire pins Chrome/122 because Cloudflare may
+    # cookie-validate against the UA fingerprint of the cf_clearance cookie
+    # captured by Patchright; mismatched UA invalidates the cookie).
+    FAST_DL_USER_AGENT: Optional[str] = None
+
+    # Static Referer URL (typically the site's homepage with trailing slash).
+    # Empty string = no Referer header. Most aggregators serve images from
+    # a separate CDN host and check Referer for anti-hotlink protection;
+    # send the site's homepage URL to satisfy that check. Per-URL Referer
+    # logic is rare; subclasses needing it override _fast_dl_build_headers
+    # rather than this attribute.
+    FAST_DL_REFERER_FROM: str = ""
+
+    # Extra headers to send on every fast-download request (e.g.
+    # X-Requested-With, custom auth tokens, locale hints). Built into the
+    # request before Referer/User-Agent so those two attributes can override
+    # entries here if both are set.
+    FAST_DL_EXTRA_HEADERS: Dict[str, str] = {}
+
+    def _fast_dl_build_headers(self, host: str) -> Dict[str, str]:
+        """Build the headers dict sent with every fast-download request.
+
+        Default implementation reads the FAST_DL_* class attributes. The
+        `host` argument is provided so subclasses can override and inject
+        per-host headers (rare); the default ignores it and emits a static
+        dict driven entirely by the class config.
+
+        Order: extra headers first, then Referer, then User-Agent — the last
+        two override extras if a key collision happens (unlikely; called out
+        for predictability).
+        """
+        headers: Dict[str, str] = dict(self.FAST_DL_EXTRA_HEADERS)
+        if self.FAST_DL_REFERER_FROM:
+            headers["Referer"] = self.FAST_DL_REFERER_FROM
+        if self.FAST_DL_USER_AGENT:
+            headers["User-Agent"] = self.FAST_DL_USER_AGENT
+        return headers
+
+    def fast_download_images(
+        self,
+        download_tasks: List[Tuple[int, str, str, str]],
+        *,
+        concurrency: int = 8,
+        timeout: float = 30.0,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+        record_host_failure: Optional[Callable[[str, str], None]] = None,
+        scraper: Any = None,
+    ) -> List[Tuple[int, Optional[str]]]:
+        """Bulk-download chapter images via curl_cffi async + HTTP/2.
+
+        Lifted from the original sites/mangafire.py implementation
+        (2026-05-13 generalization) with three substitutions to make it
+        handler-agnostic: headers come from _fast_dl_build_headers,
+        impersonate comes from FAST_DL_IMPERSONATE, and an optional
+        `scraper` kwarg lets callers forward cookies from the cloudscraper
+        session to the curl_cffi session (handler-relevant for sites that
+        gate their image CDN on session cookies).
+
+        Args:
+          download_tasks: list of (page_index, url, folder, filename) tuples,
+                          same shape aio-dl.py constructs in Phase 1. The
+                          filename is a base placeholder like "5_0001.jpg";
+                          finalize_pending_image rewrites the extension based
+                          on actual bytes.
+          concurrency:    asyncio.Semaphore bound. 8 is the bench-stable
+                          default. Past ~12 is diminishing returns on most
+                          home networks (network-bandwidth-limited).
+          timeout:        Per-request socket timeout. 30s matches aio-dl.py's
+                          default _HTTP_TIMEOUT.
+          is_cancelled:   Optional callback. When True, every in-flight fetch
+                          checks before sending the next request and bails.
+          record_host_failure: Optional callback fired when a URL hard-fails.
+                          Updates aio-dl.py's _HOST_FAIL_COUNT so the chapter
+                          watchdog can poison-detect a flaky CDN.
+          scraper:        Optional cloudscraper session. When supplied, the
+                          curl_cffi AsyncSession is constructed with cookies
+                          forwarded from the scraper that match the host of
+                          the first download URL (single-host-per-chapter
+                          assumption — true in 99%+ cases). Lets handlers
+                          like LineWebtoon ride along their .webtoons.com
+                          age-gate cookies even though the curl_cffi session
+                          is a separate TLS session from cloudscraper's.
+
+        Returns: list of (page_index, path_or_None), ordered by page_index.
+        path_or_None matches dl_image's contract — None signals failure.
+
+        Subclass override pattern: most handlers won't need to override this
+        method — set the FAST_DL_* class attributes instead. Subclasses
+        that DO override should mirror the cancellation + record_host_failure
+        callback shape so the existing aio-dl.py wiring continues to work.
+        """
+        if not _CURL_CFFI_AVAILABLE:
+            raise RuntimeError(
+                "fast_download_images called without curl_cffi installed. "
+                "Caller should check SUPPORTS_FAST_DOWNLOAD before invoking."
+            )
+        if not download_tasks:
+            return []
+
+        import asyncio
+
+        # Build cookies dict for the URL host. Filter scraper cookies to only
+        # include those whose domain matches the target host (or which have
+        # no domain at all — those ride along on every same-host request).
+        # When scraper is None or has no relevant cookies, dict ends up empty.
+        cookies: Optional[Dict[str, str]] = None
+        if scraper is not None:
+            try:
+                first_host = urlparse(download_tasks[0][1]).netloc
+                relevant: Dict[str, str] = {}
+                for c in scraper.cookies:
+                    cookie_domain = (c.domain or "").lstrip(".")
+                    # No domain set → ride along on same-host. Domain set →
+                    # match if the request host endswith the cookie domain.
+                    if not cookie_domain or first_host.endswith(cookie_domain):
+                        relevant[c.name] = c.value
+                if relevant:
+                    cookies = relevant
+            except Exception:
+                # Cookie extraction is best-effort; swallow and continue
+                # with no cookies rather than failing the whole download.
+                cookies = None
+
+        # Headers built once per chapter — host parameter is for subclass
+        # hooks; default implementation ignores it.
+        first_host_for_headers = urlparse(download_tasks[0][1]).netloc
+        headers = self._fast_dl_build_headers(first_host_for_headers)
+
+        async def _fetch_one(
+            session, sema, page_idx: int, url: str, folder: str, filename: str
+        ) -> Tuple[int, Optional[str]]:
+            base, _ = os.path.splitext(filename)
+            if not base:
+                base = filename
+            pending_path = os.path.join(folder, f".pending_{base}")
+            host = urlparse(url).netloc
+
+            # Two attempts: original + one retry on transient failure. No
+            # variant cascade — alternates rarely exist on image CDNs and
+            # subclasses can override fast_download_images entirely if they
+            # need one. (MangaFire confirmed: alternative path segments
+            # /o/, /full/, /orig/ and extensions .png, .webp all 404.)
+            for attempt in range(2):
+                if is_cancelled is not None and is_cancelled():
+                    return page_idx, None
+                async with sema:
+                    # Re-check after sema acquire — coroutines that were
+                    # queued before cancel was set should still bail here
+                    # rather than firing a GET they were already cancelled
+                    # for. (Without this, large queues + late cancel = the
+                    # remaining tail still issues HTTP requests.)
+                    if is_cancelled is not None and is_cancelled():
+                        return page_idx, None
+                    try:
+                        r = await session.get(url, headers=headers, timeout=timeout)
+                    except Exception:
+                        if attempt < 1:
+                            await asyncio.sleep(1.0)
+                            continue
+                        if record_host_failure is not None:
+                            try:
+                                record_host_failure(host, url)
+                            except Exception:
+                                pass
+                        return page_idx, None
+                if r.status_code != 200 or not r.content or len(r.content) < 256:
+                    if attempt < 1:
+                        await asyncio.sleep(1.0)
+                        continue
+                    if record_host_failure is not None:
+                        try:
+                            record_host_failure(host, url)
+                        except Exception:
+                            pass
+                    return page_idx, None
+                # Bytes look real — write pending file then atomic-rename.
+                # finalize_pending_image runs sync; safe inside the coroutine
+                # because file I/O is the same cost either way.
+                try:
+                    os.makedirs(folder, exist_ok=True)
+                    with open(pending_path, "wb") as fh:
+                        fh.write(r.content)
+                except OSError:
+                    return page_idx, None
+                content_type = ""
+                try:
+                    content_type = r.headers.get("Content-Type", "") or ""
+                except Exception:
+                    content_type = ""
+                final = finalize_pending_image(
+                    pending_path, folder, base, content_type
+                )
+                return page_idx, final
+            return page_idx, None
+
+        async def _run() -> List[Tuple[int, Optional[str]]]:
+            sema = asyncio.Semaphore(max(1, int(concurrency)))
+            # Single AsyncSession across all pages of this chapter so HTTP/2
+            # multiplex + connection keepalive amortize TLS handshake cost.
+            # impersonate sets the JA3/JA4 + h2 settings frame to match a
+            # real browser — should not strictly be needed for cookieless
+            # edge-cached image CDNs, but defensive (and free).
+            session_kwargs: Dict[str, Any] = {"impersonate": self.FAST_DL_IMPERSONATE}
+            if cookies:
+                session_kwargs["cookies"] = cookies
+            async with _CurlCffiAsyncSession(**session_kwargs) as s:
+                tasks = [
+                    _fetch_one(s, sema, p_idx, url, folder, name)
+                    for p_idx, url, folder, name in download_tasks
+                ]
+                return await asyncio.gather(*tasks)
+
+        # Run in this thread's own event loop. asyncio.run constructs a fresh
+        # loop, so works whether called from main thread or from a daemon
+        # prefetch thread (each has no running loop).
+        results = asyncio.run(_run())
+        # Preserve original submission order (page_idx ascending). gather()
+        # already returns in input order, but sorting is cheap insurance.
+        results.sort(key=lambda t: t[0])
+        return results
 
     def matches(self, url: str) -> bool:
         netloc = urlparse(url).netloc.lower()

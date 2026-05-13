@@ -68,6 +68,7 @@ from .base import (
     IncompleteChapterError,
     SearchHit,
     SiteComicContext,
+    _CURL_CFFI_AVAILABLE,
 )
 
 
@@ -137,6 +138,21 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
     # for the full rationale and search_orchestrator.py:_cmp for the
     # consuming sort.
     OFFICIAL_PUBLISHER = True
+
+    # Opt into the curl_cffi fast image-download path (HTTP/2 multiplex over
+    # one keep-alive TLS session). Webtoons.com chapters are 25-60 PNG pages
+    # at ~2-3 MB each; the per-page TLS handshake dominates the legacy
+    # ThreadPoolExecutor path's wall-clock. curl_cffi cuts a typical chapter
+    # from ~25s → ~10-15s. The image CDN (typically swebtoon-phinf.pstatic.net)
+    # is on a different host than the .webtoons.com cookies — so cookie
+    # forwarding from the cloudscraper session is a no-op for normal series
+    # (cookies don't ride to a different domain). Anti-hotlink Referer is
+    # the only required header; static webtoons.com homepage URL satisfies it.
+    SUPPORTS_FAST_DOWNLOAD = _CURL_CFFI_AVAILABLE
+    FAST_DL_REFERER_FROM = "https://www.webtoons.com/"
+    # FAST_DL_USER_AGENT not set — let curl_cffi's chrome120 default fill it.
+    # The cloudscraper session's _DEFAULT_UA pins Chrome/120 too, so the two
+    # sessions stay roughly in sync without us hard-coding it twice.
 
     def __init__(self) -> None:
         super().__init__()

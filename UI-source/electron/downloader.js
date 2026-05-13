@@ -106,12 +106,19 @@ function buildCliArgs(args) {
     multiSourceQualityMin: "--multi-source-quality-min",
     multiSourcePrefetched: "--multi-source-prefetched",
     prefetchImageWorkers: "--prefetch-image-workers",
-    // MangaFire-only speed knobs (2026-05-09). Settings injects each only
-    // when not at default (see useDownloader.js:queueDownload), so non-
-    // MangaFire downloads or default-config runs don't carry these flags.
-    mangafireImageConcurrency: "--mangafire-image-concurrency",
-    mangafireVrfPrefetchDepth: "--mangafire-vrf-prefetch-depth",
-    mangafireVrfParallel: "--mangafire-vrf-parallel",
+    // Fast-download knobs (2026-05-13: generalized from MangaFire-only).
+    // Apply to any handler with SUPPORTS_FAST_DOWNLOAD=True
+    // (currently mangafire and linewebtoon; see sites/base.py for the
+    // implementation and aio-dl.py's argparse for full help text).
+    imageConcurrency: "--image-concurrency",
+    imagePrefetchDepth: "--image-prefetch-depth",
+    imagePrefetchParallel: "--image-prefetch-parallel",
+    // MangaFire VRF capture flags (--mangafire-vrf-prefetch-depth and
+    // --mangafire-vrf-parallel) intentionally NOT in flagMap. They were
+    // removed from the Settings UI on 2026-05-13 — argparse defaults
+    // are good for most users; advanced users pass them on the CLI
+    // directly. Keeping them out of flagMap means useDownloader.js
+    // can't accidentally emit them when settings dicts are spread.
     missedRetries: "--missed-retries",
     missedLog: "--missed-log",
     jobStallTimeout: "--job-stall-timeout",
@@ -159,6 +166,12 @@ function buildCliArgs(args) {
     // <Komikku-SAF>/local/ themselves). Search/library-initiated downloads
     // pick this up via App.jsx's settings.defaults spread.
     komikku: "--komikku",
+    // Escape hatch for curl_cffi fast download path (2026-05-13). When the
+    // user toggles this on in Settings, all handlers fall back to the
+    // legacy ThreadPoolExecutor + dl_image cloudscraper path regardless
+    // of their per-handler SUPPORTS_FAST_DOWNLOAD flag. Useful for
+    // curl_cffi version bugs or CDN-vs-impersonation issues.
+    noFastDownload: "--no-fast-download",
   };
 
   // Add valued arguments
