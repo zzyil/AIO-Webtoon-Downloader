@@ -1,6 +1,6 @@
 {
   "name": "aio-downloader-ui",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Desktop UI for AIO Manga/Webtoon Downloader",
   "main": "electron/main.js",
   "scripts": {
