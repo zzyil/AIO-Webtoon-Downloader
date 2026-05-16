@@ -9,3 +9,11 @@ cryptography
 patchright>=1.40.0  # Drop-in Playwright fork with CDP-leak patches (Cloudflare-stealthier). Drives sites/mangafire_vrf_simple.py and sites/playwright_utils.py.
 rapidfuzz  # Cross-site search title matching (sites/search_orchestrator.py)
 curl_cffi>=0.7.0  # MangaFire fast image-download path (HTTP/2 + Chrome120 TLS fingerprint, async). See sites/mangafire.py:fast_download_images.
+# Phase H (2026-05-16) — pyvips powers the lossy-WebP save fast path in
+# aio-dl.py:save_final_images. ~2x faster than PIL.Image.save at the same
+# libwebp settings on 1500x3750 stitched LineWebtoon pages (bench/results.csv:
+# pyvips-webp-q85-e2=2.75s vs pil-webp-q85-m2=4.24s on 94 pages parallel x6).
+# Optional: the code falls back to PIL when these can't load. pyvips-binary
+# bundles the libvips DLLs on Windows so users don't need a separate install.
+pyvips>=2.2.0
+pyvips-binary>=8.18.0

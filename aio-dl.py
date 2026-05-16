@@ -385,6 +385,23 @@ from PIL import Image, ImageDraw, ImageFont
 # MangaFire often has high-resolution pages that exceed the default limit
 Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels (default is ~89 megapixels)
 
+# pyvips powers the lossy-WebP save fast path inside save_final_images. libvips
+# streams rows directly from a PIL.Image.tobytes() buffer through libwebp,
+# skipping the PIL→libwebp glue layer that costs ~2x on 1500x3750 stitched
+# LineWebtoon pages. Bench numbers on the 12-core test box:
+#   pil-webp-q85-m2   : 4.24 s / 94 pages parallel x6
+#   pyvips-webp-q85-e2: 2.75 s / 94 pages parallel x6   ← 54% faster, same output bytes
+# (see bench/results.csv 2026-05-15). If pyvips or its libvips DLL bundle
+# can't load (older Windows w/o pyvips-binary wheel, ARM Linux without libvips,
+# etc.) we silently fall back to PIL — output bytes are byte-identical-size
+# and SSIM-identical because both call the same libwebp under the hood.
+try:
+    import pyvips  # type: ignore
+    _HAS_PYVIPS = True
+except Exception:  # pragma: no cover
+    pyvips = None  # type: ignore
+    _HAS_PYVIPS = False
+
 _VERBOSE = False  # Global flag for standard verbose output
 _DEBUG = False  # Global flag for debug-level output
 
@@ -2134,6 +2151,8 @@ def save_final_images(
     quality: int,
     output_format: str = "auto",
     source_paths: Optional[List[Optional[str]]] = None,
+    *,
+    webp_source_is_lossy: bool = False,
 ) -> List[str]:
     """Saves a list of final PIL images to disk with format-aware encoding.
 
@@ -2144,14 +2163,30 @@ def save_final_images(
     matches (and preserves the quality of) the source:
 
       - "auto": decide per-image from source_paths[i].format. WebP source
-        → WebP lossless output (zero generation loss vs decoded WebP);
-        JPEG source → JPEG at ``quality`` (typically q≥95 from caller);
-        PNG/GIF/other or unknown → PNG (lossless). Falls back to PNG
-        when source_paths isn't provided or doesn't line up 1:1.
-      - "webp_lossless": every output is WebP-lossless at method=4
-        (used by ``auto`` for WebP-source legacy re-encode).
+        → WebP-lossless **by default** (preserves natively-WebP sites like
+        Atsumaru), or WebP lossy q85 when the caller sets
+        ``webp_source_is_lossy=True`` (Phase H, see below); JPEG source →
+        JPEG at ``quality`` (typically q≥95 from caller); PNG/GIF/other or
+        unknown → PNG (lossless). Falls back to PNG when source_paths isn't
+        provided or doesn't line up 1:1.
+      - "webp_lossless": every output is WebP-lossless at method=4. The
+        auto-mode default for WebP source when ``webp_source_is_lossy=False``.
+        Callers can also pick this explicitly.
+      - "webp_q85": every output is lossy WebP q85 method=2. The auto-mode
+        choice for WebP source when ``webp_source_is_lossy=True``. Also
+        usable as an explicit output_format. Routed through pyvips when
+        available (~2x faster than PIL at the same settings); falls back
+        to PIL when pyvips can't load.
       - "jpeg": legacy behavior, every output is JPEG at ``quality``.
       - "png": every output is PNG (lossless).
+
+    The ``webp_source_is_lossy`` keyword-only hint tells auto-mode that any
+    WebP source it probes is already a lossy q85 from our own
+    --webtoon-recompress step (LineWebtoon-specific, see
+    recompress_chapter_images_to_webp at ~line 2300). Default False so
+    sites that ship native WebP (Atsumaru, etc.) get lossless preserve
+    behavior unchanged. Cross-file: set at the CBZ caller around
+    ~line 6890 to ``args.webtoon_recompress and handler.name == 'linewebtoon'``.
 
     Phase G2 (2026-05-08): WebP-lossless encodes go through a
     ThreadPoolExecutor (cap 4 workers). libwebp releases the GIL during
@@ -2169,6 +2204,30 @@ def save_final_images(
     during JPEG encoding, so the same 4-worker pool drops that to ~3-4s.
     User report 2026-05-08: WebP CBZs already-fast (pooled), JPEG CBZs
     15s vs PDF 1s — fix bridges the gap.
+
+    Phase H (2026-05-16): user reported 65 m 20 s Processing for 6
+    chapters with --webtoon-recompress on. Code trace pinpointed this
+    function: the pre-Phase-H auto-mode mapped WEBP source →
+    webp_lossless (method=4, lossless=True, quality=100), which encodes
+    each 1500×3750 stitched page in ~2-3s at ~2.85 MB per page. With
+    --webtoon-recompress the source WebPs are already lossy q85, so the
+    lossless wrapper was wasting both wall time AND disk (the resulting
+    CBZ is ~262 MB / chapter instead of ~30 MB at matched q85). Bench
+    on 94 Eleceed Ch.380 pages at 6 parallel workers:
+        pil-webp-lossless-m4 (BASELINE):  67.6 s   261.8 MB  SSIM 1.0
+        pyvips-webp-q85-e2 (Phase H):      2.75 s   30.0 MB  SSIM 0.99415
+            → 25x faster, 8.7x smaller, q85 indistinguishable on phone.
+    The pyvips path is preferred when available; PIL fallback at q85 m2
+    is still 16x over baseline. See bench/webtoon_encode_bench.py +
+    bench/results.csv.
+
+    SCOPING (2026-05-16 follow-up, per user): the q85 mapping fires ONLY
+    when ``webp_source_is_lossy=True`` is passed. Sites that ship native
+    lossless or near-lossless WebP (Atsumaru is the canonical case;
+    MangaDex and others also serve WebP) keep the original
+    "WEBP → webp_lossless" mapping so their CBZs aren't silently
+    re-encoded at q85. The flag is set at the LineWebtoon + recompress
+    call site (search for ``_webp_source_is_lossy`` in this file).
 
     The PDF path passes ``output_format="jpeg"`` and ``quality=100`` to
     keep the existing PDF re-encode contract unchanged.
@@ -2197,7 +2256,15 @@ def save_final_images(
                 except Exception:
                     src_fmt = None
             if src_fmt == "WEBP":
-                fmt = "webp_lossless"
+                # Phase H (2026-05-16, scoped follow-up): pick lossy q85 only
+                # when the caller signals the source is already lossy (i.e.,
+                # came from our own --webtoon-recompress step on LineWebtoon).
+                # Default stays "webp_lossless" so natively-WebP sites like
+                # Atsumaru, MangaDex, etc. don't get silently degraded —
+                # their WebPs are at the publisher's chosen quality and
+                # losslessly preserving them is the right call. The hint is
+                # plumbed in at the CBZ caller (~line 6890).
+                fmt = "webp_q85" if webp_source_is_lossy else "webp_lossless"
             elif src_fmt == "JPEG":
                 fmt = "jpeg"
             else:
@@ -2209,6 +2276,16 @@ def save_final_images(
             save_kwargs: Dict[str, Any] = dict(
                 format="WebP", lossless=True, method=4, quality=100
             )
+        elif fmt == "webp_q85":
+            ext = ".webp"
+            # Phase H: lossy WebP q85, libwebp method/effort=2. Sweet spot
+            # from bench/results.csv 2026-05-15 — 16x faster than the old
+            # lossless path on PIL alone, 25x with pyvips. SSIM 0.99415 vs
+            # lossless reference, indistinguishable on phone-screen viewing
+            # per existing --webtoon-recompress quality contract.
+            # _save_one dispatches to pyvips when available; the kwargs
+            # below are also valid for PIL.Image.save when pyvips isn't.
+            save_kwargs = dict(format="WebP", quality=85, method=2)
         elif fmt == "jpeg":
             ext = ".jpg"
             save_kwargs = dict(format="JPEG", optimize=True, quality=quality)
@@ -2226,12 +2303,38 @@ def save_final_images(
     def _save_one(entry):
         idx, src_img, dst, fmt_local, save_kw = entry
         # WebP lossless does not accept RGBA in some PIL builds; convert
-        # to a clean RGB/L mode before save. Same for JPEG.
-        if fmt_local.startswith("webp_lossless") and src_img.mode not in ("RGB", "L"):
+        # to a clean RGB/L mode before save. Same for JPEG and the new
+        # Phase H webp_q85 path (which also routes through libwebp).
+        if fmt_local.startswith("webp") and src_img.mode not in ("RGB", "L"):
             src_img = src_img.convert("RGB")
         elif fmt_local == "jpeg" and src_img.mode not in ("RGB", "L"):
             src_img = src_img.convert("RGB")
-        src_img.save(dst, **save_kw)
+
+        # Phase H (2026-05-16): the lossy webp_q85 path prefers pyvips when
+        # the optional dep loaded at import time. libvips streams rows of
+        # the PIL buffer through libwebp without building an intermediate
+        # RGB array, ~2x faster than PIL.Image.save at the same q/method
+        # settings on 1500x3750 stitched LineWebtoon pages (bench/results.csv
+        # 2026-05-15: pil-webp-q85-m2=4.24s vs pyvips-webp-q85-e2=2.75s on
+        # 94 pages parallel x6). Output bytes are size-identical and SSIM-
+        # identical because both call the same libwebp encoder. Fallback
+        # is the legacy PIL path so users on platforms without a pyvips
+        # wheel (uncommon: pyvips-binary wheels cover win/mac/linux x86_64
+        # and arm64) still get the 16x A1 win.
+        if fmt_local == "webp_q85" and _HAS_PYVIPS:
+            # PIL.Image.tobytes("raw","RGB") returns row-major R0G0B0R1G1B1...
+            # which is exactly what pyvips.Image.new_from_memory wants for
+            # bands=3 format="uchar". No numpy import needed on the hot path.
+            w, h = src_img.size
+            buf = src_img.tobytes()
+            v = pyvips.Image.new_from_memory(buf, w, h, 3, "uchar")
+            v.webpsave(
+                str(dst),
+                Q=save_kw["quality"],
+                effort=save_kw["method"],
+            )
+        else:
+            src_img.save(dst, **save_kw)
         log_debug(f"    Saved -> {os.path.basename(dst)}")
         return idx, dst
 
@@ -2260,7 +2363,7 @@ def save_final_images(
         # Thread-name prefix reflects the dominant format in the plan so log
         # output stays readable; doesn't change behavior.
         prefix = "webp-encode" if any(
-            entry[3].startswith("webp_lossless") for entry in plan
+            entry[3].startswith("webp") for entry in plan
         ) else "img-encode"
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix=prefix
@@ -2280,68 +2383,76 @@ def save_final_images(
 # -----------------------------------------------------------
 # WebP recompression (LINE Webtoon, opt-in via --webtoon-recompress)
 # -----------------------------------------------------------
+
 def recompress_chapter_images_to_webp(
     raw_paths: List[str],
     quality: int,
     method: int,
 ) -> List[str]:
-    """Re-encode lossless PNG source images to lossy WebP at the given quality
-    and encoder method, replacing files in place.
+    """Re-encode source images to lossy WebP at the given quality and
+    encoder method, replacing files in place.
 
     Used by the LINE Webtoon pipeline (handler.name == 'linewebtoon') to
-    convert webtoons.com's CDN-served lossless PNG (~2-3 MB/page) to
-    storage-optimized WebP (~80-130 KB/page) before the CBZ fast-path or
-    EPUB packager consumes raw_paths.
+    convert webtoons.com's CDN-served archival images (~200-700 KB/page
+    JPEG at q98-99, or historically multi-MB lossless PNG) to storage-
+    optimized WebP (~80-130 KB/page) before the CBZ fast-path or EPUB
+    packager consumes raw_paths.
 
     Per-file behavior:
-      - .png sources: decoded via PIL, saved as WebP with quality + method,
-        original then removed. Returns the new .webp path in the same slot
-        of the output list.
-      - .jpg / .jpeg / .webp / .avif / .gif / .heic sources: skipped.
-        webtoons.com only serves JPEG for low-popularity series (Eleceed Ch
-        1-56 was JPEG, Ch 57+ flipped to lossless PNG once the series got
-        popular). Those JPEGs are already small (~50-350 KB total) AND lossy
-        — re-encoding them to WebP would be generation-loss for tiny savings.
-        The actual ~45 GB-per-series problem is the PNG chapters; we target
-        those specifically. Same skip reasoning for other already-lossy
-        formats. Returns the original path unchanged.
-      - Decode failures (corrupt files, DecompressionBomb): logged via
-        log_verbose, original path kept. Caller still packages the chapter
-        with that page's original bytes.
+      - Already .webp: passthrough (already in target format). Skipping
+        avoids generation loss from decode → re-encode. webtoons.com
+        doesn't serve .webp today, but the check is cheap and future-
+        proofs the path.
+      - Anything else PIL can decode (.png, .jpg/.jpeg, .gif, .avif via
+        plugin, etc.): decoded, saved as WebP at quality + method, then
+        the original is os.remove'd. Returns the new .webp path in the
+        same slot of the output list.
+      - Decode failures (corrupt files, UnidentifiedImageError,
+        DecompressionBomb): logged via log_verbose, original path kept.
+        Caller still packages the chapter with that page's original
+        bytes.
+
+    Eligibility design (2026-05-16): the older `_is_recompress_eligible`
+    predicate gated JPEG re-encoding behind an estimated-quality + BPP
+    threshold, intended to skip already-small dialogue panels. That
+    skip created a downstream bug: when 5+/83 pages in a chapter stayed
+    .jpg (some panels below BPP threshold), the slow-path 1:N
+    `all(.webp)` check at save_final_images failed and the final output
+    fell back to lossless PNG, producing 130 MB CBZs on Eleceed Ch 25+.
+    The user's call: "compress everything." Simplicity wins; tiny JPEGs
+    re-encode to similar-sized WebPs with negligible generation loss
+    (q98 JPEG → q85 WebP on already-tiny content), and the all-WebP
+    invariant downstream is preserved.
 
     Concurrency: cpu // 2 workers, matching save_final_images (lines
-    2166-2168). libwebp releases the GIL during native encode so per-image
+    ~2360). libwebp releases the GIL during native encode so per-image
     saves run in parallel.
 
-    Atomicity: <base>.webp is written first; only on success do we os.remove
-    the original. A crash mid-conversion can leave .webp next to the old
-    ext — the next inline retry wipes the chapter dir
+    Atomicity: <base>.webp is written first; only on success do we
+    os.remove the original. A crash mid-conversion can leave .webp next
+    to the old ext — the next inline retry wipes the chapter dir
     (_process_chapter_strict ~line 5518) so leftover state is self-healing.
 
-    Cross-file: read by _process_chapter_impl ~line 5559 (between the
-    --keep-images copytree and the processed_tdir setup); the result becomes
-    raw_image_paths for the rest of the chapter pipeline. CBZ fast-path
-    (~line 5632) and EPUB chapter_content build (~line 5836) honor per-file
-    extensions via os.path.splitext, so .webp arcnames flow through. Resume
-    gating: webtoon_recompress / _quality / _method are in
+    Cross-file: read by _process_chapter_impl ~line 6800 (between the
+    --keep-images copytree and the processed_tdir setup); the result
+    becomes raw_image_paths for the rest of the chapter pipeline. CBZ
+    fast-path (~line 6900) and EPUB chapter_content build honor per-file
+    extensions via os.path.splitext, so .webp arcnames flow through.
+    Resume gating: webtoon_recompress / _quality / _method are in
     _RESUME_GATING_DESTS — changing any invalidates the on-disk images.
     """
     if not raw_paths:
         return list(raw_paths)
 
-    # Source extensions that benefit from WebP re-encode. PNG only because
-    # webtoons.com's JPEG-served chapters are already small AND already lossy
-    # (the CDN flips low-popularity series to JPEG q90); recompressing them
-    # would be generation-loss for ~50KB of savings per page. The real
-    # storage win is the PNG chapters (~2-3 MB → ~80-130 KB at q85).
-    _ELIGIBLE = {".png"}
-
     def _convert_one(entry: Tuple[int, str]) -> Tuple[int, str]:
         idx, src = entry
-        ext = os.path.splitext(src)[1].lower()
-        if ext not in _ELIGIBLE:
+        # Already in target format: leave alone to avoid generation loss
+        # from a decode → re-encode round trip. webtoons.com doesn't serve
+        # .webp today, but other sites (Atsumaru, MangaDex) do — relevant
+        # if --webtoon-recompress is ever applied outside LineWebtoon.
+        if os.path.splitext(src)[1].lower() == ".webp":
             log_debug(
-                f"    Recompress skip (already {ext}): {os.path.basename(src)}"
+                f"    Recompress skip (already .webp): {os.path.basename(src)}"
             )
             return idx, src
 
@@ -3405,12 +3516,25 @@ _RESUME_TRANSIENT_DESTS = frozenset({
     "restore_parameters",
     # Logging level — per-invocation choice.
     "verbose", "debug",
-    # Search-only mode (mutually exclusive with the download path that
-    # calls save; the save site is unreachable in search mode). Listed
-    # for completeness so the validator passes.
-    "search", "auto_pick", "search_language", "search_parallelism",
-    "search_timeout", "search_min_match", "search_json", "seeded_only",
-    # One-shot mode/input flags.
+    # Pure --search mode flags. The original run resolved a query to a
+    # URL via search; the resume CLI passes that URL directly, so
+    # re-entering search mode would be both wrong and a validation
+    # error (URL + --search are mutually exclusive). search_json is
+    # output-mode plumbing for --search alone.
+    #
+    # NOTE: seeded_only / search_language / search_parallelism /
+    # search_timeout / search_min_match are NOT here — they ALSO drive
+    # find_alternatives_for_direct_url during a regular --multi-source
+    # download (aio_search_cli.py ~line 654), so they must persist on
+    # resume. Classifying them as transient hid the user's
+    # --seeded-only preference on resume and triggered an unfiltered
+    # 297-site search instead of the seeded ~26-site subset.
+    "search", "auto_pick", "search_json",
+    # One-shot mode/input flags. multi_source_prefetched is a
+    # path to a per-spawn cache JSON (UI writes a fresh file before
+    # each search-initiated download); on resume we want the alts
+    # rediscovered against current site state, so this stays
+    # transient and the multi-source path re-runs the lookup.
     "multi_source_prefetched", "list_chapters", "build_final_file",
     "prompt_urls",
     # Multi-URL orchestrator — children get these re-passed by the
@@ -3448,6 +3572,16 @@ def get_resumable_params(args, parser, calculated_width, calculated_aspect_ratio
     # JSON) → still 2000" cleanly.
     out["width"] = calculated_width
     out["aspect_ratio"] = calculated_aspect_ratio
+    # Persist the user-intent flags so --restore-parameters preserves them.
+    # Without these the resume invocation (which doesn't re-pass --width)
+    # would set args.width via setattr from `out["width"]` above, then a
+    # subsequent `args._user_set_width = args.width is not None` would
+    # falsely flip to True, defeating the CBZ fast-path. Cross-file: the
+    # original computation lives near parse_args() (grep '_user_set_width ='),
+    # and the fast-path read site is aio-dl.py:cbz_fast_path (~line 6900).
+    out["_user_set_width"] = bool(getattr(args, "_user_set_width", False))
+    out["_user_set_aspect_ratio"] = bool(getattr(args, "_user_set_aspect_ratio", False))
+    out["_user_set_quality"] = bool(getattr(args, "_user_set_quality", False))
     return out
 
 
@@ -4836,6 +4970,43 @@ def main():
     )
     args = p.parse_args()
     _validate_resume_categories(p)  # fail-fast on dest typos / category overlap
+
+    # Phase B (2026-05-07) / Phase H follow-up (2026-05-16): snapshot which CLI
+    # flags the user explicitly set on THIS invocation, BEFORE any later
+    # mutations (--restore-parameters setattr loop, format-defaulting,
+    # --komikku coercion) overwrite args.* with derived values. The CBZ
+    # fast-path at ~line 6900 reads these booleans to detect "user wants the
+    # wire bytes verbatim" vs "user asked for a transform." `--width` /
+    # `--aspect-ratio` argparse-default to None so `is None` is the user-set
+    # test; `--quality` defaults to 85 so we sniff sys.argv for it instead.
+    #
+    # Phase G4 (2026-05-08): --quality 100 means "highest quality, no
+    # tradeoffs" — exactly what the fast-path provides. Treating it as a
+    # transform-request would force CBZ into the legacy decode/recombine/
+    # re-encode path, defeating the byte-preservation. The UI's Settings
+    # quality slider defaults to 100, so without this guard EVERY
+    # UI-spawned CBZ download fell into legacy. Only quality < 100 now
+    # signals "user wants smaller/lossy."
+    #
+    # Position note (2026-05-16): this block USED to live after the
+    # --restore-parameters setattr loop, which broke resume — restore
+    # loaded calculated `width=1500` from JSON, then this assignment
+    # flipped `_user_set_width` to True and disabled the fast-path for
+    # every chapter on resume (Ch 25+ in Eleceed bulk download came out
+    # as 130 MB lossless-PNG CBZs). Moved here so the user's CURRENT CLI
+    # is captured first; the restore loop overrides from JSON when the
+    # saved run actually had the flag set (get_resumable_params now
+    # persists `_user_set_*` keys for this purpose).
+    args._user_set_width = args.width is not None
+    args._user_set_aspect_ratio = args.aspect_ratio is not None
+    args._user_set_quality = (
+        any(
+            a == "--quality" or a.startswith("--quality=")
+            for a in sys.argv[1:]
+        )
+        and args.quality < 100
+    )
+
     # -----------------------------
     # Argument sanity checks / modes
     # -----------------------------
@@ -5323,17 +5494,20 @@ def main():
             # choices instead of the argparse defaults.
             _apply_runtime_tunables(args)
 
+            # Auto-derived: walk the restored params so newly-persisted
+            # flags appear automatically. Underscore-prefixed entries
+            # (`_user_set_*`) are internal fast-path sentinels — they
+            # describe what the original CLI did, not user-meaningful
+            # settings — so suppress them from the listing. Sorted for
+            # determinism. See get_resumable_params() for what lands
+            # in this dict; the print here is purely UX, not state.
             print("  Successfully restored parameters. The following settings will be used:")
-            log_verbose(f"    - Chapters: {args.chapters}")
-            log_verbose(f"    - Group(s): {args.group}")
-            log_verbose(f"    - Width: {args.width}")
-            log_verbose(f"    - Aspect Ratio: {args.aspect_ratio}")
-            log_verbose(f"    - Scaling: {args.scaling}%")
-            log_verbose(f"    - Quality: {args.quality}")
-            log_verbose(f"    - Keep Chapters: {args.keep_chapters}")
-            log_verbose(f"    - No Final File: {args.no_final_file}")
-            log_verbose(f"    - Language: {args.language}")
-            log_verbose(f"    - Site: {args.site}")
+            for _rk in sorted(restored_params.keys()):
+                if _rk.startswith("_"):
+                    continue
+                _rv = restored_params[_rk]
+                _rl = _rk.replace("_", " ").title()
+                log_verbose(f"    - {_rl}: {_rv}")
             print(f"  New output format will be: {args.format.upper()}")
 
         except (json.JSONDecodeError, TypeError) as e:
@@ -5353,30 +5527,11 @@ def main():
             except ValueError as e:
                 sys.exit(e)
 
-    # Phase B (2026-05-07): snapshot which CLI flags the user explicitly set
-    # BEFORE format-defaulting fills in `width` / `aspect_ratio` from the
-    # format-specific defaults below. The CBZ fast-path uses these booleans
-    # to detect "user wants the wire bytes verbatim" vs "user asked for a
-    # transform." `--width` / `--aspect-ratio` argparse-default to None so
-    # `is None` is the user-set test; `--quality` defaults to 85 so we sniff
-    # sys.argv for it instead.
-    args._user_set_width = args.width is not None
-    args._user_set_aspect_ratio = args.aspect_ratio is not None
-    # Phase G4 (2026-05-08): --quality 100 means "highest quality, no
-    # tradeoffs" — exactly what the fast-path provides. Treating it as a
-    # transform-request would force CBZ into the legacy decode/recombine/
-    # re-encode path, defeating the byte-preservation. The UI's Settings
-    # quality slider defaults to 100, so without this guard EVERY
-    # UI-spawned CBZ download fell into legacy. Only quality < 100 now
-    # signals "user wants smaller/lossy."
-    args._user_set_quality = (
-        any(
-            a == "--quality" or a.startswith("--quality=")
-            for a in sys.argv[1:]
-        )
-        and args.quality < 100
-    )
-
+    # Note: _user_set_width / _user_set_aspect_ratio / _user_set_quality
+    # are computed earlier (right after parse_args) so they capture the
+    # CURRENT invocation's CLI flags before --restore-parameters loads
+    # calculated values from run_params.json. See the block tagged
+    # "Position note (2026-05-16)" near parse_args for the full rationale.
     width = args.width
     aspect_ratio_str = args.aspect_ratio
 
@@ -6771,25 +6926,72 @@ def main():
                     # Phase C: pick output format. PDF's _build_images_pdf
                     # consumes JPEG-quality re-encodes, so PDF stays "jpeg".
                     # CBZ asks for "auto" which maps each output to its
-                    # source format (WebP→WebP-lossless, JPEG→JPEG q=95,
-                    # else PNG). When recombination drew from multiple
-                    # inputs (1:N mapping), source_paths is None and "auto"
-                    # falls to PNG — but if every source was WebP we can
-                    # safely keep the lossless promise via webp_lossless.
+                    # source format (WebP→WebP-lossless or webp_q85 per
+                    # Phase H scoping below, JPEG→JPEG q=95, else PNG).
+                    # When recombination drew from multiple inputs (1:N
+                    # mapping), source_paths is None and "auto" falls to
+                    # PNG — but if every source was WebP we route to
+                    # webp_lossless/webp_q85 explicitly based on the same
+                    # Phase H scoping signal.
+                    #
+                    # Phase H (2026-05-16): _webp_source_is_lossy is True
+                    # iff we know the WebP sources are already lossy q85
+                    # from our own recompress step on LineWebtoon. This
+                    # avoids wrapping recompressed q85 in a ~10x bigger
+                    # lossless WebP. It's gated on handler.name +
+                    # args.webtoon_recompress so natively-WebP sites
+                    # (Atsumaru, MangaDex, etc.) keep the lossless preserve
+                    # behavior — re-encoding their publisher-chosen quality
+                    # at q85 would be generation-loss for those archives.
+                    _webp_source_is_lossy = (
+                        getattr(args, "webtoon_recompress", False)
+                        and handler.name == "linewebtoon"
+                    )
                     if args.format == "pdf":
                         _output_format = "jpeg"
                         _src_paths_for_save = None
                     elif args.format == "cbz":
                         if len(images_to_save) == len(raw_image_paths):
+                            # 1:1 mapping: source paths line up per output
+                            # page, so save_final_images' auto-mode can
+                            # probe each one individually.
                             _output_format = "auto"
                             _src_paths_for_save = list(raw_image_paths)
+                        elif _webp_source_is_lossy:
+                            # 1:N mapping AND --webtoon-recompress is on
+                            # for the active LineWebtoon handler. Match
+                            # the user's intent (lossy q85 WebP) regardless
+                            # of the source extension mix. This catches the
+                            # case where some pages stayed .jpg as small
+                            # passthrough (pre-2026-05-16 the JPEG
+                            # eligibility predicate would skip near-empty
+                            # panels; even after dropping it, a corrupt
+                            # page can still fall back to .jpg). Without
+                            # this branch the next `all(.webp)` check
+                            # would fail and the chapter would silently
+                            # fall through to lossless PNG — producing
+                            # 130 MB CBZs on Eleceed Ch 25+.
+                            _output_format = "webp_q85"
+                            _src_paths_for_save = None
                         elif raw_image_paths and all(
                             os.path.splitext(p)[1].lower() == ".webp"
                             for p in raw_image_paths
                         ):
+                            # 1:N mapping with publisher-supplied lossless
+                            # WebP (Atsumaru, MangaDex, etc.). Source
+                            # paths can't be matched per-page so auto-mode
+                            # probing would fall to PNG; pick the lossless
+                            # WebP variant explicitly so the publisher's
+                            # chosen quality is preserved.
                             _output_format = "webp_lossless"
                             _src_paths_for_save = None
                         else:
+                            # 1:N mapping with mixed / non-WebP sources
+                            # AND no --webtoon-recompress intent. Falls
+                            # through to save_final_images' auto-without-
+                            # source-paths default (lossless PNG). This is
+                            # the legacy behavior for sites that don't ship
+                            # uniform-format images.
                             _output_format = "auto"
                             _src_paths_for_save = None
                     else:
@@ -6832,6 +7034,7 @@ def main():
                             _save_quality,
                             output_format=_output_format,
                             source_paths=_src_paths_for_save,
+                            webp_source_is_lossy=_webp_source_is_lossy,
                         )
 
             if args.format == "cbz":
