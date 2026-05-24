@@ -7,29 +7,186 @@ from urllib.parse import urlparse
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
+# Auto-domain selection (2026-05-24): the swordflake API has historically
+# been served from zeroscans.com but the .us-TLD mirror and the zscans.com
+# mirror have been brought up at various points when CF was breaking the
+# primary. Rather than hard-coding `https://zeroscans.com/swordflake`,
+# this handler now:
+#   1. Anchors the API domain on the user's input URL when one is provided
+#      (fetch_comic_context, get_chapter_images) so the same TLD the user
+#      typed is what we query.
+#   2. Probes the `domains` tuple in order on the first API call (search)
+#      when there's no URL context, caching the first working domain.
+#   3. Auto-bounces to the next mirror on connection errors or 5xx (e.g.
+#      zeroscans.com → CF 525 → fail over to zeroscans.us). 4xx errors
+#      bubble up unchanged — those are legit client errors and trying
+#      mirrors won't help.
+# Resolves zzyil's PR-31 review feedback "can you modify sites/zeroscans.py
+# to determine the current API domain automatically instead of hardcoding
+# it?".
+
+
 class ZeroScansSiteHandler(BaseSiteHandler):
     name = "zeroscans"
-    # 2026-05-13: zscans.com returns Cloudflare 525 (origin SSL handshake
-    # failed). The original zeroscans.com domain still serves the same
-    # /swordflake API; zeroscans.us is the .us-TLD mirror — also alive.
-    # Keep all three so existing bookmarks across any TLD route here.
+    # Domain preference order. First entry is the historical primary; the
+    # .us TLD is the .us-mirror; zscans.com was a 2026 alt that has shown
+    # CF 525 issues. Probe order matches this tuple, with www-prefix
+    # variants deduped down to their apex form so we don't double-probe.
     domains = (
         "zeroscans.com", "www.zeroscans.com",
         "zeroscans.us", "www.zeroscans.us",
         "zscans.com", "www.zscans.com",
     )
 
-    API_BASE = "https://zeroscans.com/swordflake"
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # Cached working domain. None until set by:
+        #   - _set_active_domain_from_url(url) when we have an explicit URL
+        #     (fetch_comic_context, get_chapter_images)
+        #   - First successful _api_request call (search probe path)
+        # _candidate_domains() falls back to iterating the `domains` tuple
+        # when this is None.
+        self._active_domain: Optional[str] = None
+
+    # -- API base helpers --------------------------------------------
+    @classmethod
+    def _default_domain(cls) -> str:
+        """Apex form of the first domain in the tuple. Used by
+        configure_session (which has no URL context) for the initial
+        Referer/Origin until _api_request refreshes them to the active
+        domain post-probe."""
+        d = cls.domains[0]
+        return d[4:] if d.startswith("www.") else d
+
+    def _candidate_domains(self) -> List[str]:
+        """Domains to try, in preference order. The active domain (if
+        known) comes first; the rest of the `domains` tuple follows, with
+        www-prefix deduplication so we don't double-probe `foo.com` AND
+        `www.foo.com` against the same origin."""
+        ordered: List[str] = []
+        seen: set = set()
+        if self._active_domain and self._active_domain not in seen:
+            ordered.append(self._active_domain)
+            seen.add(self._active_domain)
+        for d in self.domains:
+            apex = d[4:] if d.startswith("www.") else d
+            if apex not in seen:
+                ordered.append(apex)
+                seen.add(apex)
+        return ordered
+
+    def _set_active_domain_from_url(self, url: str) -> None:
+        """Anchor the API domain on the user-supplied URL's hostname so
+        we query the same TLD the user typed. Unknown hostnames are
+        accepted as-is (defensive — they might be a new mirror we haven't
+        catalogued yet, in which case the user knows better than us)."""
+        try:
+            netloc = (urlparse(url).netloc or "").lower()
+            if netloc.startswith("www."):
+                netloc = netloc[4:]
+            if netloc:
+                self._active_domain = netloc
+        except Exception:
+            # Malformed URL — silently keep whatever _active_domain was;
+            # _candidate_domains will iterate from the default if it's None.
+            pass
+
+    def _api_request(
+        self,
+        path: str,
+        scraper,
+        make_request=None,
+    ) -> Dict:
+        """Fetch https://<domain>/swordflake<path> from the first reachable
+        mirror.
+
+        Iterates _candidate_domains() and per-domain handles:
+          - 2xx     → cache the domain in self._active_domain, refresh the
+                      session's Referer/Origin to match, return parsed JSON.
+          - 5xx     → try next mirror (origin sick on this one).
+          - 4xx     → re-raise immediately (legit client error like 404
+                      "comic not found"; mirror-bouncing wouldn't help).
+          - network → connection refused / DNS / SSL / timeout / JSON
+                      parse fail → try next mirror.
+
+        `make_request`, when provided, plugs into aio-dl.py's retry +
+        per-host backoff + coordinator infrastructure — preferred for
+        request paths that benefit from those. Plain scraper.get is used
+        when make_request is None (the historic _fetch_json behavior).
+
+        Within-domain retries are NOT done here: when make_request is
+        used, it does its own retry+backoff first, so by the time we
+        bounce mirrors we've already exhausted the within-domain budget.
+        """
+        last_exc: Optional[Exception] = None
+        path = path if path.startswith("/") else "/" + path
+        for domain in self._candidate_domains():
+            url = f"https://{domain}/swordflake{path}"
+            try:
+                if make_request is not None:
+                    r = make_request(url, scraper)
+                else:
+                    r = scraper.get(url)
+                status = getattr(r, "status_code", 0)
+                if status >= 500:
+                    # Server-side issue (CF 5xx, origin handshake fail,
+                    # maintenance HTML) — bounce to next mirror without
+                    # raising. Record for the final error message.
+                    last_exc = RuntimeError(f"{domain} returned {status}")
+                    continue
+                # 2xx/3xx: trust it. raise_for_status() turns lingering 4xx
+                # into HTTPError which bubbles up unchanged (per docstring).
+                r.raise_for_status()
+                # Success: cache the working domain and re-sync session
+                # headers so subsequent unrelated GETs from the scraper
+                # (e.g. cover fetches that don't go through _api_request)
+                # still ride a consistent Referer/Origin.
+                self._active_domain = domain
+                scraper.headers.update({
+                    "Referer": f"https://{domain}/",
+                    "Origin": f"https://{domain}",
+                })
+                return r.json()
+            except Exception as exc:
+                # Connection error, SSL / DNS failure, JSON parse, HTTPError
+                # on 4xx (status was < 500 so we didn't `continue` above —
+                # this means raise_for_status raised on 4xx; we re-raise to
+                # let the caller distinguish client error from mirror
+                # outage). Plain ConnectionError / Timeout flows through
+                # here naturally too.
+                #
+                # NOTE: an HTTPError raised here on 4xx will be re-thrown
+                # below because we exhaust the loop with last_exc still
+                # populated. That's correct for `comic not found` but does
+                # mean we waste one extra mirror probe on a 4xx response.
+                # Acceptable cost — mirror bouncing on 4xx is incorrect
+                # anyway and the redundant probes will mostly hit
+                # connection-cached sockets.
+                last_exc = exc
+                continue
+        candidates = ", ".join(self._candidate_domains())
+        raise RuntimeError(
+            f"ZeroScans API unreachable on any of [{candidates}]: "
+            f"{type(last_exc).__name__ if last_exc else 'unknown'}: "
+            f"{last_exc or 'no response'}"
+        )
 
     def configure_session(self, scraper, args) -> None:
+        # Use the active domain when we already have one (e.g. a previous
+        # call set it via _set_active_domain_from_url); otherwise fall back
+        # to the default. _api_request will refresh these on its first
+        # successful call to whichever mirror responds — see the headers
+        # update inside _api_request's 2xx branch.
+        domain = self._active_domain or self._default_domain()
         scraper.headers.update(
             {
-                "Referer": "https://zeroscans.com/",
-                "Origin": "https://zeroscans.com",
+                "Referer": f"https://{domain}/",
+                "Origin": f"https://{domain}",
             }
         )
 
-    # -- Helpers -----------------------------------------------------
+    # -- Legacy helper (kept for any external callers; new code uses
+    #    _api_request which has mirror failover) ----------------------
     def _fetch_json(self, url: str, scraper) -> Dict:
         response = scraper.get(url)
         response.raise_for_status()
@@ -39,37 +196,44 @@ class ZeroScansSiteHandler(BaseSiteHandler):
     def fetch_comic_context(
         self, url: str, scraper, make_request
     ) -> SiteComicContext:
-        # URL: https://zeroscans.com/comics/{slug}
+        # URL: https://<domain>/comics/{slug}
+        # Anchor the API domain on the user's URL FIRST so the catalog
+        # fetch below goes to the same TLD they typed. Without this
+        # anchoring, a user who passed `zeroscans.us/comics/foo` would
+        # still hit zeroscans.com on the catalog fetch (and fail if .com
+        # is the one that's down — which is exactly when the .us-typed
+        # URL is useful).
+        self._set_active_domain_from_url(url)
+
         parsed = urlparse(url)
         path_parts = [p for p in parsed.path.split("/") if p]
-        
+
         slug = None
         if len(path_parts) >= 2 and path_parts[0] == "comics":
             slug = path_parts[1]
         else:
             # Fallback: try to extract from end
             slug = path_parts[-1]
-            
+
         if not slug:
             raise RuntimeError(f"Could not extract slug from URL: {url}")
-            
+
         # We need to find the comic in the full list because the API doesn't seem to have a direct details endpoint by slug?
         # Kotlin: comicList.first { comic -> comic.slug == mangaSlug }
         # It fetches ALL comics to find one. That's heavy but that's what the extension does.
         # Let's try to see if there is a better way or just do that.
-        # API: https://zeroscans.com/swordflake/comics
-        
-        comics_data = self._fetch_json(f"{self.API_BASE}/comics", scraper)
+        # API: GET /swordflake/comics on the active domain
+        comics_data = self._api_request("/comics", scraper, make_request)
         all_comics = comics_data.get("data", {}).get("comics", [])
-        
+
         comic_data = next((c for c in all_comics if c.get("slug") == slug), None)
-        
+
         if not comic_data:
             raise RuntimeError(f"Comic not found: {slug}")
-            
+
         title = comic_data.get("name")
         comic_id = comic_data.get("id")
-        
+
         comic = {
             "hid": slug,
             "title": title,
@@ -118,31 +282,45 @@ class ZeroScansSiteHandler(BaseSiteHandler):
     ) -> List[Dict]:
         comic_id = context.comic.get("_comic_id")
         slug = context.identifier
-        
+
         if not comic_id:
             # Re-fetch if missing (shouldn't happen)
             return []
-            
-        # API: https://zeroscans.com/swordflake/comic/{id}/chapters?sort=desc&page={page}
+
+        # API: GET /swordflake/comic/{id}/chapters?sort=desc&page={page} on
+        # the active domain (set by fetch_comic_context above; this is
+        # always called after fetch_comic_context within a single download).
         chapters = []
         page = 1
         has_more = True
-        
+
+        # Cache the active domain for the virtual chapter URL builder
+        # below. Always set by fetch_comic_context, but fall back to the
+        # default for defensiveness in case a caller invoked get_chapters
+        # without fetch_comic_context (unusual but not impossible).
+        active_domain = self._active_domain or self._default_domain()
+
         while has_more:
-            url = f"{self.API_BASE}/comic/{comic_id}/chapters?sort=desc&page={page}"
-            data = self._fetch_json(url, scraper)
-            
+            data = self._api_request(
+                f"/comic/{comic_id}/chapters?sort=desc&page={page}",
+                scraper,
+                make_request,
+            )
+
             chap_data = data.get("data", {})
             current_chaps = chap_data.get("data", [])
-            
+
             for chap in current_chaps:
                 chap_id = chap.get("id")
                 name = chap.get("name") # "123"
                 created_at = chap.get("created_at")
-                
-                # Virtual URL: /comics/{slug}/{id}
-                chap_url = f"https://zeroscans.com/comics/{slug}/{chap_id}"
-                
+
+                # Virtual URL: https://<active>/comics/{slug}/{id}
+                # We stamp the active domain in so that on resume (via
+                # `--restore-parameters URL`) the chapter URLs still
+                # match the run's active mirror.
+                chap_url = f"https://{active_domain}/comics/{slug}/{chap_id}"
+
                 chapters.append({
                     "hid": str(chap_id),
                     "chap": str(name),
@@ -151,41 +329,46 @@ class ZeroScansSiteHandler(BaseSiteHandler):
                     "uploaded": created_at,
                     "_chapter_id": chap_id,
                 })
-                
+
             current_page = chap_data.get("current_page")
             last_page = chap_data.get("last_page")
             has_more = current_page < last_page
             page += 1
-            
+
         return chapters
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
-        # API: https://zeroscans.com/swordflake/comic/{slug}/chapters/{id}
-        # Wait, Kotlin says: GET("$baseUrl/$API_PATH/comic/$mangaSlug/chapters/$chapterId")
-        # So it uses SLUG here, not ID?
-        # Let's check `pageListRequest` in Kotlin.
+        # API: GET /swordflake/comic/{slug}/chapters/{id} on the active
+        # domain.
+        # Kotlin: GET("$baseUrl/$API_PATH/comic/$mangaSlug/chapters/$chapterId")
         # val mangaSlug = chapterUrlPaths[1]
         # val chapterId = chapterUrlPaths[2]
-        # return GET("$baseUrl/$API_PATH/comic/$mangaSlug/chapters/$chapterId")
-        # Yes, it uses slug and chapter ID.
-        
-        # We need the slug. It's in the virtual URL we constructed or context.
-        # But `get_chapter_images` only gets `chapter` dict.
-        # We can extract it from the URL we built: https://zeroscans.com/comics/{slug}/{id}
-        
+        # So we extract slug + id from the virtual URL stamped by
+        # get_chapters above.
+
         url = chapter.get("url")
         parsed = urlparse(url)
         path_parts = [p for p in parsed.path.split("/") if p]
         # parts: comics, slug, id
-        
+
         if len(path_parts) < 3:
-             raise RuntimeError(f"Invalid chapter URL: {url}")
-             
+            raise RuntimeError(f"Invalid chapter URL: {url}")
+
         slug = path_parts[1]
         chap_id = path_parts[2]
-        
-        api_url = f"{self.API_BASE}/comic/{slug}/chapters/{chap_id}"
-        data = self._fetch_json(api_url, scraper)
+
+        # Re-anchor the active domain from this chapter URL. Important on
+        # resume / per-chapter fallback paths where get_chapter_images may
+        # be called without a fresh fetch_comic_context (e.g. multi-source
+        # download where this handler is the alt source and was never
+        # warmed up).
+        self._set_active_domain_from_url(url)
+
+        data = self._api_request(
+            f"/comic/{slug}/chapters/{chap_id}",
+            scraper,
+            make_request,
+        )
 
         chap_detail = data.get("data", {}).get("chapter", {})
 
@@ -216,17 +399,25 @@ class ZeroScansSiteHandler(BaseSiteHandler):
         clean = (query or "").strip()
         if not clean:
             return []
-        # Use make_request so retries/cooldowns flow through. Let HTTP errors
-        # propagate (e.g., the site returns 525 when CF can't reach origin —
-        # that's a probe-failure-cache signal, not silent empty results).
-        response = make_request(f"{self.API_BASE}/comics", scraper)
+        # Use _api_request so we get mirror failover. There's no URL
+        # anchor on a search call (we don't know which TLD the user
+        # prefers until they pick a result), so this is the path that
+        # actually exercises the domains-tuple probe.
         try:
-            data = response.json()
-        except (ValueError, json.JSONDecodeError):
+            data = self._api_request("/comics", scraper, make_request)
+        except (RuntimeError, ValueError, json.JSONDecodeError):
+            # All mirrors failed OR JSON came back invalid. Empty result
+            # set so the orchestrator drops this source and moves on; the
+            # explicit error message in _api_request gets surfaced to the
+            # log by make_request's higher-level handling.
             return []
         all_comics = data.get("data", {}).get("comics") or []
         if not isinstance(all_comics, list):
             return []
+
+        # Cache the active domain for the result URL builder below. Set
+        # by _api_request's success path; fall back to default for safety.
+        active_domain = self._active_domain or self._default_domain()
 
         ql = clean.lower()
         # Score by token overlap so multi-word queries match meaningfully.
@@ -258,7 +449,7 @@ class ZeroScansSiteHandler(BaseSiteHandler):
             if not slug:
                 continue
             cover_v = (c.get("cover") or {}).get("vertical")
-            url = f"https://zeroscans.com/comics/{slug}"
+            url = f"https://{active_domain}/comics/{slug}"
             # Position-based raw_score, scaled by relevance so substring
             # matches outrank token-overlap ones.
             raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
