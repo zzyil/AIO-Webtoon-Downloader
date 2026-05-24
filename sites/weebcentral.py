@@ -167,6 +167,15 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         title = title or self._extract_slug(url)
 
         authors = self._extract_list_values(hero or soup, ["author"])
+        # WeebCentral's series template MAY expose a separate "Artist(s)"
+        # row in the .post_content_item list. When present, surface it for
+        # Komikku's details.json. When absent (the dominant case — WeebCentral
+        # typically conflates author + artist into the Author row), `artists`
+        # stays empty and the field is documented as a per-site limitation.
+        # See dry_run_komikku_findings.md §A.
+        artists = self._extract_list_values(
+            hero or soup, ["artist", "illustrator"]
+        )
         tags = self._extract_list_values(hero or soup, ["tag", "type"])
         status_values = self._extract_list_values(hero or soup, ["status"])
         alt_values = self._extract_list_values(
@@ -187,6 +196,8 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         }
         if authors:
             comic["authors"] = authors
+        if artists:
+            comic["artists"] = artists
         if tags:
             comic["genres"] = tags
         if status_values:

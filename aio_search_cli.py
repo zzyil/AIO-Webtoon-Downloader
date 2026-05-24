@@ -37,7 +37,7 @@ except Exception:  # pragma: no cover
 
 import requests
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _CFTimeout
 from urllib.parse import urlparse
 
 from sites import get_handler_by_name
@@ -230,6 +230,27 @@ def _fetch_chapters_for_winner(
         or "en"
     )
 
+    # Fast-fail make_request for the discovery work in this function.
+    # The default aio-dl.py make_request retries up to 6× with exponential
+    # backoff capped at 45s per attempt (≈4.5 min worst case) — appropriate
+    # for a user-initiated chapter download where giving up loses real
+    # work, but a deadlock for best-effort cross-source alignment where a
+    # dead host (comix.to has gone dark, asuracomic.net is 525, etc.)
+    # blocks the entire alignment phase for minutes.
+    #
+    # Historical incident: with comix.to dead, the main-thread comix
+    # prefetch loop below would call `fetch_comic_context` with the
+    # full-retry make_request → 4-6 minutes of HTTP retries on the main
+    # thread, blocking even the ThreadPoolExecutor timeout from firing.
+    #
+    # Same fast-fail policy is used by `search_all` upstream of us, so
+    # this is internally consistent with the rest of the search pipeline.
+    discovery_timeout = float(
+        getattr(args, "search_timeout", DEFAULT_PER_SITE_TIMEOUT_S)
+        or DEFAULT_PER_SITE_TIMEOUT_S
+    )
+    discovery_mr = _search_make_request_factory(timeout=discovery_timeout, attempts=2)
+
     def _fetch_one(source) -> dict:
         handler = get_handler_by_name(source.site)
         if handler is None:
@@ -243,7 +264,7 @@ def _fetch_chapters_for_winner(
         except Exception:
             pass
         try:
-            ctx = handler.fetch_comic_context(source.url, scraper, make_request)
+            ctx = handler.fetch_comic_context(source.url, scraper, discovery_mr)
         except Exception as exc:
             if on_status:
                 on_status(f"  {source.site}: fetch_comic_context failed ({type(exc).__name__})")
@@ -252,7 +273,7 @@ def _fetch_chapters_for_winner(
                 "chapters": [], "scraper": scraper, "handler": handler, "context": None,
             }
         try:
-            chapters = handler.get_chapters(ctx, scraper, language, make_request)
+            chapters = handler.get_chapters(ctx, scraper, language, discovery_mr)
         except Exception as exc:
             if on_status:
                 on_status(f"  {source.site}: get_chapters failed ({type(exc).__name__})")
@@ -267,20 +288,114 @@ def _fetch_chapters_for_winner(
             "chapters": chapters, "scraper": scraper, "handler": handler, "context": ctx,
         }
 
+    # Main-thread pre-warm. Handlers with NEEDS_MAIN_THREAD_PREFETCH = True
+    # (currently only comix, whose Patchright-based chapter-listing token
+    # capture can't drive its sync API from a worker thread) get a chance to
+    # populate caches the ThreadPoolExecutor workers below will then read.
+    # Sequential by design — workers can't safely race the Patchright launch.
+    # Skipped for the no-op default so non-comix candidates pay nothing here.
+    #
+    # Per-prefetch HTTP budget is bounded by discovery_mr's fast-fail
+    # (attempts=2 × timeout) ≈ 40s worst case for the HTTP portion. The
+    # Patchright portion has its own 30s page.goto timeout + 5s XHR
+    # polling loop, so total main-thread block per source is ~40s worst
+    # case on a dead host — down from the original ~4.5min on the
+    # full-retry make_request that the historical incident used.
+    for src in candidate.sources:
+        handler = get_handler_by_name(src.site)
+        if handler is None:
+            continue
+        if not getattr(handler, "NEEDS_MAIN_THREAD_PREFETCH", False):
+            continue
+        warm_scraper = _build_scraper(args)
+        try:
+            handler.configure_session(warm_scraper, args)
+        except Exception:
+            pass
+
+        # NOTE: comix's _get_api_token has an `if not self._is_main_thread():
+        # return None` guard — it MUST run on the main thread to drive
+        # Patchright's sync API. Python can't interrupt a synchronous call
+        # from another thread, so we can't externally bound this. We rely
+        # on discovery_mr to fail fast on the HTTP portion (instead of the
+        # original full-retry make_request that pinned the main thread on
+        # dead hosts for ~4.5 minutes).
+        try:
+            handler.prepare_chapter_fetch(src.url, warm_scraper, args, discovery_mr)
+        except Exception:
+            # Best-effort; worker's get_chapters will still try and may
+            # surface its own failure via on_status.
+            pass
+
     workers = max(1, min(parallelism, len(candidate.sources)))
     results: list = [None] * len(candidate.sources)
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ms-chap") as pool:
+
+    # Global timeout for the parallel chapter-list fetch. Without it,
+    # `as_completed(futures)` blocks forever if any single worker hangs
+    # in `fetch_comic_context` or `get_chapters` — and the `with` block's
+    # __exit__ then calls `shutdown(wait=True)` which compounds the hang
+    # by blocking on every still-running worker.
+    #
+    # Why this matters: handlers like MangaFire perform a Playwright VRF
+    # capture inside get_chapters that serializes through a single global
+    # Patchright instance. When the winner has multiple MangaFire variants
+    # (e.g. "Toradora" matches /6oz, /6369, /ow6z — three different series
+    # pages, all on mangafire), the Patchright lock funnels them. One
+    # genuinely-stuck VRF capture is enough to block every queued task
+    # behind it. Other handlers can fail similarly when their CDN is poison
+    # or a captcha challenge is mid-flight.
+    #
+    # Budget rationale: 8 sources × ~10s typical per chapter-list fetch
+    # ≈ 80s; we round to 90s for buffer. T3 ran with a 60s budget too, so
+    # this is internally consistent.
+    #
+    # Bail behavior: on timeout, fill placeholder entries for sources that
+    # didn't return, log a warning via on_status, then `shutdown(wait=False)`
+    # so we return without blocking on the hung workers. The workers stay
+    # alive in the background until they finish OR the aio-dl.py process
+    # exits — Python will reap them at interpreter shutdown.
+    WINNER_FETCH_TIMEOUT_S = 90.0
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ms-chap")
+    try:
         futures = {pool.submit(_fetch_one, src): idx for idx, src in enumerate(candidate.sources)}
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            try:
-                results[idx] = fut.result(timeout=60.0)
-            except Exception:
-                src = candidate.sources[idx]
-                results[idx] = {
-                    "site": src.site, "url": src.url, "chapters": [],
-                    "scraper": None, "handler": None, "context": None,
-                }
+        try:
+            for fut in as_completed(futures, timeout=WINNER_FETCH_TIMEOUT_S):
+                idx = futures[fut]
+                try:
+                    results[idx] = fut.result(timeout=5.0)
+                except Exception:
+                    src = candidate.sources[idx]
+                    results[idx] = {
+                        "site": src.site, "url": src.url, "chapters": [],
+                        "scraper": None, "handler": None, "context": None,
+                    }
+        except _CFTimeout:
+            stuck_sites = [
+                candidate.sources[idx].site
+                for fut, idx in futures.items()
+                if not fut.done()
+            ]
+            if on_status:
+                on_status(
+                    f"  [!] Chapter-list fetch budget "
+                    f"({WINNER_FETCH_TIMEOUT_S:.0f}s) exhausted; using partial "
+                    f"results. Stuck sites: {', '.join(stuck_sites) or '(none)'}"
+                )
+    finally:
+        # shutdown(wait=False) lets us return immediately. The running
+        # workers can't be killed (Python doesn't support thread cancellation),
+        # but they'll be cleaned up when the process exits.
+        pool.shutdown(wait=False)
+
+    # Backfill placeholders for any sources whose worker timed out and so
+    # never reached the results[idx] assignment.
+    for idx, r in enumerate(results):
+        if r is None:
+            src = candidate.sources[idx]
+            results[idx] = {
+                "site": src.site, "url": src.url, "chapters": [],
+                "scraper": None, "handler": None, "context": None,
+            }
     return [r for r in results if r is not None]
 
 
@@ -320,6 +435,15 @@ def run_search_mode(
     query = (getattr(args, "search", "") or "").strip()
     if not query:
         sys.exit("--search requires a non-empty title.")
+
+    # Set the ML-rating gate BEFORE the orchestrator imports torch-backed
+    # modules. When False (the default), all torch/pyiqa/torchmetrics
+    # imports stay deferred — search startup never loads torch. This
+    # avoids the Python 3.13 + Windows WMI hang that bricked --search
+    # before the 2026-05-20 lazy-import refactor. set_ml_rating_enabled
+    # is idempotent so direct-URL multi-source paths can also call it.
+    from sites.search_orchestrator import set_ml_rating_enabled
+    set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
 
     # URL-mode: if the user supplied a MangaFire URL instead of a title text,
     # scrape the series page once via Playwright and turn it into a seed hit.
@@ -709,6 +833,12 @@ def find_alternatives_for_direct_url(
 
     if on_status:
         on_status(f"[*] Multi-source: searching for alternatives to '{title}'...")
+
+    # Direct-URL multi-source enters here, separate from run_search_mode. Set
+    # the ML-rating gate here too so the orchestrator's lazy torch checks see
+    # the right state. Idempotent — calling twice in the same process is fine.
+    from sites.search_orchestrator import set_ml_rating_enabled
+    set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
 
     # Step 2: search.
     timeout = float(getattr(args, "search_timeout", DEFAULT_PER_SITE_TIMEOUT_S) or DEFAULT_PER_SITE_TIMEOUT_S)

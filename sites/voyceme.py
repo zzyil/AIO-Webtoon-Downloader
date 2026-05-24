@@ -14,7 +14,14 @@ class VoyceMeSiteHandler(BaseSiteHandler):
     GRAPHQL_URL = "https://graphql.voyce.me/v1/graphql"
     STATIC_URL = "https://dlkfxmdtxtzpb.cloudfront.net/"
 
-    # Queries extracted from VoyceMeQueries.kt
+    # Queries extracted from VoyceMeQueries.kt.
+    #
+    # NOTE: the `voyce_series` Hasura schema exposes `author` (singular,
+    # with a `username` field) but no separate `artist` relationship.
+    # Komikku's details.json `artist` field will stay empty for voyceme
+    # series — that's a site-side schema limitation, not a parser bug.
+    # The displayed author covers both creator roles by site convention.
+    # See dry_run_komikku_findings.md §C.
     DETAILS_QUERY = """
         query($slug: String!) {
             voyce_series(

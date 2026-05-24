@@ -101,7 +101,19 @@ class MadaraSiteHandler(BaseSiteHandler):
             label = heading.get_text(strip=True).lower()
             if any(lbl in label for lbl in lowered):
                 people = re.split(r"[,/]", content.get_text(" ", strip=True))
-                values.extend([p.strip() for p in people if p.strip()])
+                for p in people:
+                    p = p.strip()
+                    if not p:
+                        continue
+                    # Reject pure-digit values. Some Madara child sites stuff
+                    # release years into mislabeled rows (manhuaplus.com's
+                    # "i-am-the-fated-villain" series renders an "Artist" row
+                    # whose value is "2021" — a year, not a person). Real
+                    # author/artist names contain letters. Documented in
+                    # dry_run_komikku_findings.md §A.
+                    if p.isdigit():
+                        continue
+                    values.append(p)
         return values
 
     def _extract_alt_titles(self, soup: BeautifulSoup) -> List[str]:

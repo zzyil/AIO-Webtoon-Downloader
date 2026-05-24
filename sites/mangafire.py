@@ -259,6 +259,32 @@ class MangaFireSiteHandler(BaseSiteHandler):
             if author_name:
                 authors.append(author_name)
 
+        # Artists — MangaFire's series page exposes a separate "Artist" field
+        # via the same schema.org itemprop pattern as authors. Without this
+        # extraction Komikku's details.json `artist` field stayed empty even
+        # though MangaFire ships the data. See dry_run_komikku_findings.md §A.
+        # Fallback selectors cover layouts where the itemprop attribute was
+        # dropped: `.meta` block typically renders rows as `<div>Label:
+        # <a>Value</a></div>` so we also try an Artist-label-prefixed anchor
+        # walk.
+        artists: List[str] = []
+        for artist_link in soup.select(".meta a[itemprop='artist']"):
+            artist_name = artist_link.get_text(strip=True)
+            if artist_name:
+                artists.append(artist_name)
+        if not artists:
+            # Fallback: scan `.meta div` rows for a label starting with "Artist"
+            # and pull anchor text from inside. Mirrors the existing genre
+            # row walk a few lines below.
+            for div in soup.select(".meta div"):
+                span = div.select_one("span")
+                if span and "Artist" in span.get_text():
+                    for anchor in div.select("a[href]"):
+                        text = anchor.get_text(strip=True)
+                        if text:
+                            artists.append(text)
+                    break
+
         genres: List[str] = []
         for div in soup.select(".meta div"):
             span = div.select_one("span")
@@ -294,6 +320,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
             "desc": desc,
             "cover": cover,
             "authors": authors,
+            "artists": artists,
             "genres": genres,
             "status": status,
             "url": url,

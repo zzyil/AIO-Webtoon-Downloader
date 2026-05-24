@@ -476,6 +476,29 @@ def make_request(url: str, scraper):
                         f"Origin error ({r.status_code})", response=r
                     )
 
+                if cls == "retryable":
+                    # 5xx server errors (500/502/503/504) and 408 timeouts. The
+                    # response body is always an error page or maintenance HTML
+                    # — never useful payload — so the body-size threshold below
+                    # is a trap: a 503 with a >100-char MangaDex maintenance
+                    # page slipped through as a "successful" response and
+                    # fetch_comic_context's .json() blew up with the cryptic
+                    # "Expecting value: line 1 column 1 (char 0)" the user
+                    # reported on 2026-05-16 (the chapter-5 follow-up where
+                    # the API was 503'ing). Raise here so the outer retry
+                    # loop engages with exponential backoff — same response
+                    # class as origin_error, just a different status band.
+                    # Symmetric with the origin_error branch above.
+                    raise requests.exceptions.HTTPError(
+                        f"Retryable server error ({r.status_code})", response=r
+                    )
+
+                # cls == "permanent" (4xx with no rate-limit keyword). Some APIs
+                # return structured 4xx with JSON bodies the caller wants to
+                # inspect (MangaDex's API does this for client-side validation
+                # errors), so when the body has content we surface the response
+                # rather than raising. Tiny-body 4xx fails fast — there's
+                # nothing to inspect.
                 if not r.text or len(r.text) < 100:
                     r.raise_for_status()
                 log_verbose(
@@ -4669,6 +4692,26 @@ def main():
              "that aren't in the curated list.",
     )
     p.add_argument(
+        "--enable-ml-rating",
+        action="store_true",
+        default=os.environ.get("AIO_ENABLE_ML_RATING", "").lower() in (
+            "1", "true", "yes", "on",
+        ),
+        help="Enable ML-based image quality scoring (torch + pyiqa + "
+             "torchmetrics). Off by default. When enabled, the search "
+             "ranker uses T2 (CLIP-IQA + NIQE) and T3 (paired DISTS) on "
+             "top of T1 (pixel-level numpy/PIL scoring), giving ~3-8%% "
+             "more accurate rankings on borderline matches. Cost: torch "
+             "import adds ~2-5 s of process startup, model weights are "
+             "~150 MB on first-use download, and per-source probe gains "
+             "~2-5 s. The default-off rationale (2026-05-20): torch's "
+             "Windows import path calls platform.machine() which Python "
+             "3.13 implements via WMI — that can stall indefinitely on "
+             "hosts with a degraded WMI service, hanging --search forever. "
+             "Honors AIO_ENABLE_ML_RATING=1 env var so power users can "
+             "set the preference once.",
+    )
+    p.add_argument(
         "--prefetch-image-workers",
         type=int,
         default=-1,
@@ -5006,6 +5049,32 @@ def main():
         )
         and args.quality < 100
     )
+
+    # Generic CLI-user-set snapshot. Mirrors the _user_set_* booleans
+    # above but covers EVERY argparse dest, not just the three with
+    # fast-path heuristics. Consumed by the --restore-parameters loop
+    # (~line 5523) so freshly-typed CLI overrides survive resume —
+    # without this, `--restore-parameters --width 3000 URL` would have
+    # the setattr loop silently restore the saved run's width=2000 and
+    # the user got no log indication their override was discarded.
+    # Built from p._actions's option_strings against sys.argv: each
+    # `--flag` (or its `--flag=value` shorthand) maps back to its dest
+    # via the same dest argparse uses for setattr. Positional args
+    # (option_strings == []) are skipped because they are always
+    # re-provided on the resume CLI and never appear in run_params.json
+    # anyway.
+    _user_set_dests: set = set()
+    _opt_to_dest: Dict[str, str] = {}
+    for _action in p._actions:
+        for _opt in _action.option_strings:
+            _opt_to_dest[_opt] = _action.dest
+    for _tok in sys.argv[1:]:
+        if not _tok.startswith("-"):
+            continue
+        _name = _tok.split("=", 1)[0]
+        if _name in _opt_to_dest:
+            _user_set_dests.add(_opt_to_dest[_name])
+    args._user_set_dests = _user_set_dests
 
     # -----------------------------
     # Argument sanity checks / modes
@@ -5476,12 +5545,48 @@ def main():
             else:
                 restored_params = saved
 
-            # Update the args namespace with the restored parameters
+            # Update the args namespace with the restored parameters,
+            # with two exclusions that preserve the user's CURRENT CLI:
+            #
+            #   1. Dests the user explicitly set on the resume CLI
+            #      (tracked at parse_args time via args._user_set_dests).
+            #      `--restore-parameters --width 3000 URL` should keep
+            #      width=3000; the previous unconditional setattr loop
+            #      silently restored the saved run's width and left
+            #      no log indication the override was discarded.
+            #
+            #   2. `_user_set_*` sentinels themselves. get_resumable_params
+            #      persists these alongside real values, but they describe
+            #      THIS invocation's CLI intent (computed earlier from
+            #      sys.argv) and must not be clobbered by the saved run's
+            #      values. The fast-path heuristic at ~line 6892 reads
+            #      _user_set_width/_user_set_aspect_ratio to decide whether
+            #      to engage the CBZ wire-bytes path; flipping it from True
+            #      to False mid-resume defeats the user's width override.
+            _user_set_dests_resume: set = getattr(args, "_user_set_dests", set())
+            _skipped_for_cli_override: List[str] = []
             for key, value in restored_params.items():
+                if key.startswith("_user_set_"):
+                    continue
+                if key in _user_set_dests_resume:
+                    _skipped_for_cli_override.append(key)
+                    continue
                 setattr(args, key, value)
+            if _skipped_for_cli_override:
+                _override_summary = ", ".join(
+                    f"--{k.replace('_', '-')}={getattr(args, k, None)!r}"
+                    for k in sorted(_skipped_for_cli_override)
+                )
+                print(
+                    f"  [resume] Keeping fresh CLI override(s) over saved "
+                    f"values: {_override_summary}"
+                )
 
             # Crucially, apply the new format settings — these are
-            # intentionally re-overrideable on resume.
+            # intentionally re-overrideable on resume. Redundant when the
+            # user passed --format/--epub-layout on the resume CLI (the
+            # _user_set_dests filter above would already have skipped them)
+            # but harmless: the same value gets assigned to the same dest.
             args.format = new_format
             args.epub_layout = new_epub_layout
 
@@ -6346,6 +6451,32 @@ def main():
                         pages_ok=ice.pages_ok,
                         pages_total=ice.pages_total,
                     ) from ice
+                except Exception as exc:
+                    # Handler raised an arbitrary exception (e.g. requests.HTTPError
+                    # from MangaDex's /at-home/server returning a transient 500
+                    # after retries are exhausted, RuntimeError from a malformed
+                    # API payload, the many `raise RuntimeError("...")` paths in
+                    # the *scans Madara-style handlers, etc.). Convert to
+                    # ChapterSkippedError so the strict wrapper's multi-source
+                    # fallback + inline-retry path picks it up. Without this,
+                    # the exception bypasses _process_chapter_strict (which only
+                    # catches ChapterSkippedError) and the chapter loop's bare
+                    # `except Exception` at the bottom of main() silently
+                    # records the chapter as missed via _record_missed — user
+                    # observes "Chapter N (group)" with no follow-up line,
+                    # indistinguishable from a frozen download. The merged-parts
+                    # branch above (~30 lines up) already has this conversion;
+                    # this branch was the asymmetry letting the silent skip
+                    # through. Symptom that drove this fix: Shuumatsu no
+                    # Valkyrie Ch 5 on MangaDex 2026-05-16, /at-home/server 500.
+                    if os.path.isdir(tdir):
+                        rm_tree(tdir)
+                    raise ChapterSkippedError(
+                        reason=f"get_chapter_images_failed:{type(exc).__name__}",
+                        host="",
+                        pages_ok=0,
+                        pages_total=0,
+                    ) from exc
             _timing["vrf"] += time.monotonic() - _t0_vrf
 
             # --- VRF pipelining: enqueue the next `depth` chapters' VRF
@@ -7562,6 +7693,24 @@ def main():
                 )
             break
         except Exception as e:
+            # Defense-in-depth: print so the user actually sees the failure
+            # in the live log. Phase 1 (get_chapter_images) exceptions are
+            # converted to ChapterSkippedError at the call site so they engage
+            # multi-source fallback + inline-retry inside _process_chapter_strict
+            # — they won't reach here. This branch catches the residual cases:
+            # Phase 3 build errors (CBZ assembly, PDF encode), unexpected
+            # exceptions inside the handler that slipped past the per-phase
+            # try/except blocks, or a future code path that raises before
+            # being wrapped. Recording the entry without surfacing it was the
+            # bug that masked Shuumatsu no Valkyrie Ch 5 in the user's
+            # 2026-05-16 run; printing here means future regressions of the
+            # same shape are visible immediately rather than only via
+            # missed_chapters.json after the run ends.
+            print(
+                f"  [!] Chapter {ch.get('chap', '?')} hit an unexpected error: "
+                f"{type(e).__name__}: {str(e)[:200]}. "
+                f"Recorded as missed; the run will continue."
+            )
             _record_missed(ch, grp_name, 'exception', repr(e), insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
             continue
 

@@ -61,24 +61,43 @@ class RizzComicSiteHandler(MangaThemesiaSiteHandler):
         result = super()._probe_chapter_aggregate(
             hit, scraper, make_request, max_samples=max_samples,
         )
-        if result is not None:
-            # Successful aggregate (5/5 OR 0/5) — pass through. The 0/5
-            # case already returns (0.0, samples=0/5) per the parent's v3
-            # contract; we don't need to override that.
-            return result
-        # Parent returned None — hard failure before even the fetch loop
-        # could run (no chapter list / unreachable series page / parse
-        # error). Without this override the orchestrator would fall back
-        # to cover and the 3023px rizzcomic cover would score ~0.85,
-        # camouflaging the broken-CDN reality. Force-record 0.0.
-        return 0.0, {
-            "width": 0,
-            "height": 0,
-            "format": "FAILED",
-            "size_bytes": 0,
-            "samples_attempted": 0,
-            "samples_succeeded": 0,
-        }
+        if result is None:
+            # Parent returned None — hard failure before even the fetch loop
+            # could run (no chapter list / unreachable series page / parse
+            # error). Without this override the orchestrator would fall back
+            # to cover and the 3023px rizzcomic cover would score ~0.85,
+            # camouflaging the broken-CDN reality. Force-record 0.0.
+            return 0.0, {
+                "width": 0,
+                "height": 0,
+                "format": "FAILED",
+                "size_bytes": 0,
+                "samples_attempted": 0,
+                "samples_succeeded": 0,
+                "cdn_reliability": 0.0,
+            }
+
+        # v5 throttle-probe-tail check (added 2026-05-17): when the breadth
+        # phase happened to hit a healthy cache shard for every sampled
+        # chapter, the breadth score can look fine (e.g. 0.7+) even though
+        # the throttle-tail's 3 sequential follow-up fetches all failed —
+        # i.e. the CDN serves first-page-per-chapter fine but throttles on
+        # any subsequent request. That's the rizzchoros.cloud signature.
+        # The base aggregate doesn't fold cdn_reliability into the score
+        # (deliberately — a sleeping CDN that revives mid-probe shouldn't
+        # crater a quality source). For rizzcomic specifically we cap the
+        # composite at 0.1 when cdn_reliability==0 so the broken-CDN signal
+        # dominates the orchestrator's per-chapter ranking even when the
+        # breadth phase looked good.
+        score, metadata = result
+        cdn_reliability = metadata.get("cdn_reliability") if isinstance(metadata, dict) else None
+        if cdn_reliability == 0.0 and score > 0.1:
+            score = 0.1
+            # Make the bottom-out visible in metadata for UI / debug.
+            metadata = dict(metadata)
+            metadata["outlier"] = "throttle_detected"
+            result = (score, metadata)
+        return result
 
     def _probe_cover_image(self, hit, scraper, make_request) -> Optional[bytes]:
         # Cover never used for rizzcomic — see class docstring. The

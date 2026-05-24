@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import atexit
+import builtins as _builtins
+import concurrent.futures as _futures
 import json
+import queue
 import re
+import sys
+import threading
 from typing import Dict, List, Optional, Any
 from urllib.parse import parse_qsl, quote_plus, urlparse
 
@@ -10,9 +16,51 @@ from bs4 import BeautifulSoup
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
+# All bare print() calls in this module emit to stderr by default. Why: this
+# handler's Patchright bridge logs [!] diagnostic messages when chapter-API
+# capture fails, and when invoked from the orchestrator's search-time probe
+# path (sites/search_orchestrator.py:_probe_one) those lines would land on
+# stdout — which carries the JSON --search output for piped consumers. The
+# UI's searcher.js rejects non-JSON stdout with "Search produced non-JSON
+# stdout" so any leak hard-breaks the search results panel. This shim keeps
+# stdout clean without touching every print site. Explicit file= overrides
+# still work (e.g., pass file=sys.stdout to opt out). Same idiom as
+# sites/mangafire.py:_stderr_print.
+def _stderr_print(*args, **kwargs):
+    kwargs.setdefault("file", sys.stderr)
+    return _builtins.print(*args, **kwargs)
+
+
+print = _stderr_print  # noqa: A001 — intentional shadow of builtins.print
+
+
 class ComixSiteHandler(BaseSiteHandler):
     name = "comix"
     domains = ("comix.to", "www.comix.to")
+
+    # comix.to API endpoints are token-gated with per-URL HMAC signatures
+    # (`_=<sig>` param) we can't reproduce in Python. The only tractable
+    # path is letting Patchright navigate the page and either capturing the
+    # outgoing request URL (for listing — replayed with cloudscraper) or
+    # reading the response body (for chapter detail — we steal the JSON
+    # directly).
+    #
+    # Patchright's sync API requires that every call run on the same thread
+    # that started the browser, AND that thread must own an asyncio loop.
+    # Probe-phase workers (sites/search_orchestrator.py:4346-4354) and
+    # aio-dl.py's image-prefetch threads can't satisfy either. So we route
+    # all Patchright work through _COMIX_BROWSER_BRIDGE (defined at the
+    # bottom of this file), which serializes calls onto a single dedicated
+    # worker thread, one process-wide. Block-on-future semantics make the
+    # bridge fully synchronous from any caller's perspective.
+    #
+    # Cross-file: identical idiom to sites/mangafire_vrf_simple.py:_VRFBridge.
+    #
+    # Token cache memoizes successful list-API sig captures by title-url
+    # across the bridge's lifetime AND across multiple handler instances.
+    # Tokens are URL-bound (not session-bound) so one capture per title
+    # covers paginated chapter-list fetches.
+    _ChaptersTokenCache: Dict[str, str] = {}
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.update({
@@ -20,218 +68,36 @@ class ComixSiteHandler(BaseSiteHandler):
             "Origin": "https://comix.to",
         })
 
-    # ------------------------------------------------------------------ browser
-    # As of 2026-05-13 comix.to API endpoints are token-gated with per-URL
-    # HMAC signatures (`_=<sig>` param). Each unique API URL needs its OWN
-    # capture — signatures don't transfer across URLs or sessions. The only
-    # tractable path is letting Patchright navigate the page and either
-    # capturing the outgoing request URL (for listing — we can replay with
-    # cloudscraper) or reading the response body (for chapter detail —
-    # we steal the JSON directly instead of replaying).
-    #
-    # Persistent browser instance kept alive for the handler lifetime so we
-    # amortize the ~3-5s Patchright launch across N chapters. atexit hook
-    # ensures cleanup at process exit. Sequential use only — the chapter
-    # loop in aio-dl.py invokes get_chapter_images serially per handler.
-    # Cross-file: same Patchright pattern used by sites/mangafire_vrf_simple.py
-    # and sites/playwright_utils.py.
-    _ChaptersTokenCache: Dict[str, str] = {}
-
-    def __init__(self):
-        super().__init__()
-        # (pw_manager, browser, page) tuple or None when not yet started /
-        # cleaned up. Started lazily by _ensure_browser on first need.
-        self._browser_ctx: Optional[tuple] = None
-
-    def _ensure_browser(self):
-        """Start (once) and return the (pw, browser, page) tuple. Returns
-        None if Patchright/Playwright unavailable, launch failed, or we're
-        running in a non-main thread (Patchright's sync API requires an
-        asyncio event loop, which background worker threads don't have).
-
-        aio-dl.py's image-prefetch chain spawns background threads that
-        call get_chapter_images for upcoming chapters in parallel — those
-        threads silently degrade here. The main download thread still gets
-        the real Patchright capture for the chapter it's actively downloading.
-        Net effect: prefetch becomes a no-op (no speedup, no crash), and
-        the sequential per-chapter capture still works.
-        """
-        if self._browser_ctx is not None:
-            return self._browser_ctx
-        # Reject non-main-thread callers up front — Patchright sync API
-        # would raise "no running event loop" inside thread workers and
-        # the resulting traceback floods the log.
-        import threading
-        if threading.current_thread() is not threading.main_thread():
-            return None
-        try:
-            from patchright.sync_api import sync_playwright  # type: ignore
-        except ImportError:
-            try:
-                from playwright.sync_api import sync_playwright  # type: ignore
-            except ImportError:
-                print("[!] Comix: patchright/playwright not installed; API capture unavailable.")
-                return None
-        try:
-            pw = sync_playwright().start()
-        except Exception as e:
-            print(f"[!] Comix Playwright start failed: {e}")
-            return None
-        try:
-            browser = pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
-            )
-            page = browser.new_page()
-        except Exception as e:
-            print(f"[!] Comix Playwright launch failed: {e}")
-            try:
-                pw.stop()
-            except Exception:
-                pass
-            return None
-        self._browser_ctx = (pw, browser, page)
-        import atexit
-        atexit.register(self._close_browser)
-        return self._browser_ctx
-
-    def _close_browser(self):
-        ctx = self._browser_ctx
-        self._browser_ctx = None
-        if not ctx:
-            return
-        pw, browser, _ = ctx
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            pw.stop()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _is_main_thread() -> bool:
-        import threading
-        return threading.current_thread() is threading.main_thread()
-
     def _get_api_token(self, url: str) -> Optional[str]:
-        """Capture the `_=<sig>&time=<ts>` query string for the chapter
-        listing API (`/api/v1/manga/{hid}/chapters`) by navigating to the
-        title URL and watching for the outgoing listing request.
+        """Return the `_=<sig>&time=<ts>` query string for the chapter
+        listing API (`/api/v1/manga/{hid}/chapters`).
 
-        Caches per (title url) for the handler lifetime — list-API tokens
-        are URL-bound, not chapter-id-bound, so one capture per title is
-        enough for paginated chapter-list fetches.
+        Cached per (title url) on the class; first miss drives the bridge,
+        which navigates Patchright to the title URL and intercepts the
+        outgoing /chapters?_=… request. Returns the bare query string
+        (no leading `?`) or None on failure.
 
-        Returns the bare query string (no leading `?`) or None on failure.
+        Cross-file: actual Patchright work lives in
+        `_ComixBrowserSession.get_api_token` at the bottom of this file.
         """
         cached = ComixSiteHandler._ChaptersTokenCache.get(url)
         if cached:
             return cached
-        # Patchright sync API requires the asyncio loop of the main thread;
-        # background prefetch threads have no loop and any call raises
-        # "no running event loop". Cached token wins (returned above);
-        # otherwise we can't capture a fresh one here.
-        if not self._is_main_thread():
-            return None
-        ctx = self._ensure_browser()
-        if not ctx:
-            return None
-        _, _, page = ctx
-        token_query: Optional[str] = None
-
-        def handle_req(request):
-            nonlocal token_query
-            if token_query:
-                return
-            u = request.url
-            # Title page only fires the /chapters listing call (not /chapters/{id}).
-            if "/chapters?" in u and "_=" in u:
-                parts = u.split("?", 1)
-                if len(parts) > 1:
-                    token_query = parts[1]
-
-        page.on("request", handle_req)
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            # Poll up to ~5s for the listing XHR to fire.
-            for _ in range(50):
-                if token_query:
-                    break
-                page.wait_for_timeout(100)
-        except Exception as e:
-            print(f"[!] Comix token capture navigation failed: {e}")
-            try:
-                page.remove_listener("request", handle_req)
-            except Exception:
-                pass
-            return None
-        try:
-            page.remove_listener("request", handle_req)
-        except Exception:
-            pass
-
+        token_query = _COMIX_BROWSER_BRIDGE.get_api_token(url)
         if token_query:
             ComixSiteHandler._ChaptersTokenCache[url] = token_query
         return token_query
 
     def _fetch_chapter_api_via_browser(self, chapter_url: str, chap_id) -> Optional[Dict]:
-        """Steal the chapter-detail API response body by navigating to the
-        chapter URL in Patchright. The site's JS fires /api/v1/chapters/{id}
-        with a per-URL `_=<sig>` we can't reproduce — but we can read the
-        response Patchright already received.
+        """Steal the chapter-detail API response body via Patchright.
 
-        Returns the parsed response dict (with `result.pages`) or None.
+        Returns the parsed `/api/v1/chapters/{chap_id}` response dict (with
+        `result.pages`) or None on failure.
+
+        Cross-file: actual Patchright work lives in
+        `_ComixBrowserSession.fetch_chapter_api` at the bottom of this file.
         """
-        # Non-main threads can't drive Patchright's sync API (no event loop).
-        # Background prefetch threads land here silently — main-thread
-        # sequential fetch still works.
-        if not self._is_main_thread():
-            return None
-        ctx = self._ensure_browser()
-        if not ctx:
-            return None
-        _, _, page = ctx
-        captured: Dict[str, Optional[Dict]] = {"data": None}
-        target_path = f"/api/v1/chapters/{chap_id}"
-        seen_responses: List[str] = []
-
-        def handle_response(response):
-            if captured["data"] is not None:
-                return
-            try:
-                u = response.url
-                if "/api/v1/" in u:
-                    seen_responses.append(f"{response.status} {u[:120]}")
-                if target_path in u and response.status == 200:
-                    captured["data"] = response.json()
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
-        try:
-            page.goto(chapter_url, wait_until="domcontentloaded", timeout=30000)
-            # Poll up to ~10s for the chapter-detail XHR to land. SPA loads
-            # the viewer JS first, then fires the API call ~1-2s later.
-            for _ in range(100):
-                if captured["data"]:
-                    break
-                page.wait_for_timeout(100)
-        except Exception as e:
-            print(f"[!] Comix chapter browser fetch failed for {chap_id}: {type(e).__name__}: {e}", flush=True)
-        finally:
-            try:
-                page.remove_listener("response", handle_response)
-            except Exception:
-                pass
-
-        if not captured["data"]:
-            # Diagnostic: surface what API responses we DID see so the user
-            # can tell if the site changed structure vs. our listener missed.
-            tail = seen_responses[-6:] if seen_responses else ["(none)"]
-            print(f"[!] Comix: no chapter-API response captured for {chap_id}. Seen API responses (tail): {tail}", flush=True)
-        return captured["data"]
+        return _COMIX_BROWSER_BRIDGE.fetch_chapter_api(chapter_url, chap_id)
 
     def _extract_next_data(self, html: str) -> List[Any]:
         """Extracts data pushed to self.__next_f."""
@@ -466,7 +332,17 @@ class ComixSiteHandler(BaseSiteHandler):
             if desc_meta and desc_meta.get("content"):
                 manga_data["desc"] = desc_meta["content"].strip()
 
-        if url and not manga_data.get("url"):
+        # comix.to API returns relative paths (e.g. "/title/pvry-one-piece")
+        # in manga_data["url"]. _get_api_token → page.goto in get_chapters
+        # requires an absolute URL or Patchright raises "Cannot navigate to
+        # invalid URL", which short-circuits the token capture and causes the
+        # downstream /chapters API to 403. Normalize here so every caller of
+        # context.comic["url"] sees a usable absolute URL. Fall back to the
+        # caller-supplied url only when the API didn't populate the field.
+        api_url_value = manga_data.get("url")
+        if isinstance(api_url_value, str) and api_url_value.startswith("/"):
+            manga_data["url"] = "https://comix.to" + api_url_value
+        elif url and not api_url_value:
             manga_data["url"] = url
 
         list_mappings = {
@@ -567,23 +443,58 @@ class ComixSiteHandler(BaseSiteHandler):
                 # Filter by language if needed, though the API seems to return 'en' mostly
                 if language and item.get("language") != language:
                     continue
-                    
+
                 chap_num = item.get("number")
                 # v1 uses `id`; v2 used `chapter_id`. Try v1 first.
                 chap_id = item.get("id") or item.get("chapter_id")
                 title = item.get("name") or f"Chapter {chap_num}"
-                
+
+                # Normalize chap_num to a parseable numeric string.
+                # The API USUALLY returns int/float (e.g. 47, 47.5), but
+                # has been observed returning None / "" / non-numeric
+                # strings for special chapters (oneshots, side stories,
+                # season-break placeholders). aio-dl.py:5885 calls
+                # float(chap) for chapter bucketing and ValueErrors on
+                # "None" / non-numeric text → the chapter gets skipped
+                # with "Skipping chapter with invalid number: None" and
+                # the user sees zero comix chapters downloaded.
+                # Resolution order:
+                #   1. item["number"] when numeric → "%g" coerce ("47", "47.5").
+                #   2. item["number"] as a string with embedded digits
+                #      → regex-extract.
+                #   3. item["name"] / title → regex-extract.
+                # Skip the chapter entirely when no numeric token is
+                # available — surfacing a non-numeric `chap` would just
+                # trigger the same skip downstream with a misleading
+                # "Skipping chapter with invalid number" log line.
+                chap_str: Optional[str] = None
+                if isinstance(chap_num, (int, float)):
+                    chap_str = f"{chap_num:g}"
+                else:
+                    for source_text in (
+                        chap_num if isinstance(chap_num, str) else None,
+                        title,
+                    ):
+                        if not source_text:
+                            continue
+                        m = re.search(r"(\d+(?:\.\d+)?)", str(source_text))
+                        if m:
+                            chap_str = m.group(1)
+                            break
+                if chap_str is None:
+                    continue
+
                 # Construct URL
                 # Format: https://comix.to/title/{hash_id}-{slug}/{chapter_id}-chapter-{number}
                 slug = context.comic.get("slug")
-                
+
                 # If we don't have the slug from API, try to get it from the context URL
                 if not slug and context.comic.get("url"):
                      path = urlparse(context.comic["url"]).path
                      parts = path.split('/')
                      if len(parts) >= 3:
                          # This is likely the full slug (hash_id-slug)
-                         slug = parts[2] 
+                         slug = parts[2]
                          # If we use this, we don't need to prepend hash_id again if it's already there
                          if slug.startswith(f"{hash_id}-"):
                              pass
@@ -593,20 +504,27 @@ class ComixSiteHandler(BaseSiteHandler):
 
                 if not slug:
                     slug = "unknown"
-                
+
                 # Ensure slug starts with hash_id
                 if not slug.startswith(f"{hash_id}-"):
                     slug = f"{hash_id}-{slug}"
 
-                chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{chap_num}"
-                
+                # URL still uses the API's raw `number` value (which is
+                # what comix.to's chapter-page URL expects); chap_str is
+                # only for our internal bucketing/sorting. Falls back to
+                # chap_str when the API field was unparseable so the URL
+                # at least targets the right chapter number rather than
+                # the literal string "None".
+                url_chap_part = chap_num if chap_num not in (None, "") else chap_str
+                chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{url_chap_part}"
+
                 # v1 uses `group`; v2 used `scanlation_group`. Try both.
                 group_info = item.get("group") or item.get("scanlation_group") or {}
                 group_name = group_info.get("name") if group_info else None
 
                 chapters.append({
                     "url": chap_url,
-                    "chap": str(chap_num),
+                    "chap": chap_str,
                     "title": title,
                     "id": chap_id,
                     "group": group_name,
@@ -782,3 +700,356 @@ class ComixSiteHandler(BaseSiteHandler):
                 )
             )
         return hits
+
+
+# ---------------------------------------------------------------------------
+# Patchright bridge
+# ---------------------------------------------------------------------------
+# Patchright's sync API has two hard constraints: (1) every call must run on
+# the same thread that called sync_playwright().start(), and (2) that thread
+# must own an asyncio event loop. Probe-phase workers in
+# sites/search_orchestrator.py and image-prefetch threads in aio-dl.py
+# satisfy neither. To make Patchright safely callable from any thread, we
+# serialize all Patchright work onto a single dedicated worker thread (one
+# process-wide) — the daemon `comix-pw` thread started by
+# _ensure_comix_worker(). Callers from any thread submit a (future, fn,
+# args, kwargs) tuple to _COMIX_REQUEST_QUEUE and block on the future's
+# result with a wall-clock timeout (_COMIX_DEFAULT_TIMEOUT_S, 60 s).
+# Synchronous from the caller's perspective.
+#
+# Mirrors sites/mangadex.py:_report_worker / _enqueue_report (same daemon
+# +queue pattern) and sites/mangafire_vrf_simple.py:1965-2106 (the prior
+# pattern this module used to follow before the v8 rewrite). Keep the
+# three structurally similar so the pattern stays recognizable across
+# the codebase.
+
+
+class _ComixBrowserSession:
+    """Patchright lifecycle owner. Every method runs on the daemon
+    `comix-pw` worker (see _comix_worker_loop) so sync_playwright's
+    same-thread contract is upheld.
+
+    Bodies are lifted verbatim from the prior in-class implementation,
+    with the main-thread guard removed (this dedicated thread IS now the
+    only valid caller).
+    """
+
+    def __init__(self):
+        self._pw = None
+        self._browser = None
+        self._page = None
+
+    def _start(self) -> bool:
+        """Lazy-launch Patchright on first use. Returns True if the browser
+        is ready, False if Patchright/Playwright unavailable or launch failed.
+        Subsequent calls are cheap (already-started fast path)."""
+        if self._page is not None:
+            return True
+        try:
+            from patchright.sync_api import sync_playwright  # type: ignore
+        except ImportError:
+            try:
+                from playwright.sync_api import sync_playwright  # type: ignore
+            except ImportError:
+                print("[!] Comix: patchright/playwright not installed; API capture unavailable.")
+                return False
+        try:
+            self._pw = sync_playwright().start()
+        except Exception as e:
+            print(f"[!] Comix Playwright start failed: {e}")
+            return False
+        try:
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            self._page = self._browser.new_page()
+        except Exception as e:
+            print(f"[!] Comix Playwright launch failed: {e}")
+            self._cleanup()
+            return False
+        return True
+
+    def _cleanup(self):
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        except Exception:
+            pass
+        self._browser = None
+        try:
+            if self._pw is not None:
+                self._pw.stop()
+        except Exception:
+            pass
+        self._pw = None
+        self._page = None
+
+    def get_api_token(self, url: str) -> Optional[str]:
+        if not self._start():
+            return None
+        page = self._page
+        token_query: Optional[str] = None
+
+        def handle_req(request):
+            nonlocal token_query
+            if token_query:
+                return
+            u = request.url
+            # Title page only fires the /chapters listing call (not /chapters/{id}).
+            if "/chapters?" in u and "_=" in u:
+                parts = u.split("?", 1)
+                if len(parts) > 1:
+                    token_query = parts[1]
+
+        page.on("request", handle_req)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Poll up to ~5s for the listing XHR to fire.
+            for _ in range(50):
+                if token_query:
+                    break
+                page.wait_for_timeout(100)
+        except Exception as e:
+            print(f"[!] Comix token capture navigation failed: {e}")
+            try:
+                page.remove_listener("request", handle_req)
+            except Exception:
+                pass
+            return None
+        try:
+            page.remove_listener("request", handle_req)
+        except Exception:
+            pass
+        return token_query
+
+    def fetch_chapter_api(self, chapter_url: str, chap_id) -> Optional[Dict]:
+        if not self._start():
+            return None
+        page = self._page
+        captured: Dict[str, Optional[Dict]] = {"data": None}
+        target_path = f"/api/v1/chapters/{chap_id}"
+        seen_responses: List[str] = []
+
+        def handle_response(response):
+            if captured["data"] is not None:
+                return
+            try:
+                u = response.url
+                if "/api/v1/" in u:
+                    seen_responses.append(f"{response.status} {u[:120]}")
+                if target_path in u and response.status == 200:
+                    captured["data"] = response.json()
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+        try:
+            page.goto(chapter_url, wait_until="domcontentloaded", timeout=30000)
+            # Poll up to ~10s for the chapter-detail XHR to land. SPA loads
+            # the viewer JS first, then fires the API call ~1-2s later.
+            for _ in range(100):
+                if captured["data"]:
+                    break
+                page.wait_for_timeout(100)
+        except Exception as e:
+            print(f"[!] Comix chapter browser fetch failed for {chap_id}: {type(e).__name__}: {e}", flush=True)
+        finally:
+            try:
+                page.remove_listener("response", handle_response)
+            except Exception:
+                pass
+
+        if not captured["data"]:
+            # Diagnostic: surface what API responses we DID see so the user
+            # can tell if the site changed structure vs. our listener missed.
+            tail = seen_responses[-6:] if seen_responses else ["(none)"]
+            print(f"[!] Comix: no chapter-API response captured for {chap_id}. Seen API responses (tail): {tail}", flush=True)
+        return captured["data"]
+
+    def close(self):
+        self._cleanup()
+
+
+# v8 bridge rewrite (2026-05-24): replaced module-level ThreadPoolExecutor
+# with a daemon thread + queue.Queue, mirroring sites/mangadex.py's report
+# pipeline. The TPE approach had two latent failure modes that the
+# code review surfaced:
+#
+#   1. INTERPRETER HANG AT EXIT. concurrent.futures._python_exit
+#      registers with `threading._register_atexit` and runs BEFORE the
+#      atexit module's hooks. It calls join() on every TPE worker
+#      unconditionally — even after shutdown(wait=False, cancel_futures=True).
+#      If Patchright nav was wedged on a Cloudflare turnstile spin at
+#      Ctrl-C, the comix-pw worker stayed blocked in page.goto and
+#      the user's process hung for up to 30s waiting for the goto's
+#      own timeout. Same anti-pattern that sites/mangadex.py's daemon
+#      rewrite explicitly addressed earlier in the same diff
+#      (mangadex.py:41-58 comment).
+#   2. CALLER DEADLOCK ON HUNG NAV. `fut.result()` had no timeout, so
+#      any single hung Patchright op deadlocked every concurrent caller
+#      submitting through the same single-worker executor (and there
+#      IS only one worker — max_workers=1). The probe phase has 6 parallel
+#      probe-pool workers all routing through this bridge; one comix
+#      candidate getting stuck would freeze all six.
+#
+# Daemon thread + queue resolves both: daemons are skipped by _python_exit
+# (clean Ctrl-C semantics), and the worker dequeues one job at a time so
+# we can attach an explicit per-call timeout on fut.result() without
+# changing the single-thread-owns-the-browser invariant. Bridge public
+# API (_COMIX_BROWSER_BRIDGE) is unchanged so existing call sites in
+# this file don't move.
+_COMIX_REQUEST_QUEUE: queue.Queue = queue.Queue()
+_COMIX_WORKER_STARTED = False
+_COMIX_WORKER_LOCK = threading.Lock()
+_COMIX_BROWSER: Optional[_ComixBrowserSession] = None  # owned by the worker thread
+_COMIX_SHUTDOWN_SENTINEL = object()
+# Per-call wall-clock cap on Patchright work. Real-world page.goto
+# timeouts inside _ComixBrowserSession sit at 30s; the bridge cap is
+# the sum of those plus a small slack so a legitimate slow nav still
+# completes but a stuck one surfaces as TimeoutError rather than
+# deadlocking the caller. Search-phase callers should also have their
+# own outer deadline (PROBE_PHASE_DEADLINE_S in search_orchestrator);
+# this is the inner guard.
+_COMIX_DEFAULT_TIMEOUT_S = 60.0
+
+
+def _comix_worker_loop() -> None:
+    """Daemon thread that owns the single Patchright browser instance.
+
+    Pulls (future, fn_name, args, kwargs) tuples and sets the future's
+    result/exception. Exits cleanly on the shutdown sentinel. Lazy-inits
+    the session singleton on the first non-sentinel job so import-time
+    cost stays at zero for non-comix runs (sites/__init__.py imports
+    this module eagerly so every aio-dl process touches these globals,
+    but no Patchright launch happens until a user actually hits comix).
+    """
+    global _COMIX_BROWSER
+    while True:
+        item = _COMIX_REQUEST_QUEUE.get()
+        if item is _COMIX_SHUTDOWN_SENTINEL:
+            try:
+                if _COMIX_BROWSER is not None:
+                    try:
+                        _COMIX_BROWSER.close()
+                    except Exception:
+                        pass
+                    _COMIX_BROWSER = None
+            finally:
+                return
+        try:
+            fut, fn_name, args, kwargs = item
+        except (TypeError, ValueError):
+            # Malformed enqueue — skip without dying. Belt-and-suspenders
+            # against future maintainers putting unexpected sentinels on
+            # the queue (matches the mangadex worker's None-safe pattern).
+            continue
+        # Caller's fut.result(timeout=...) may have already given up and
+        # the future could be cancelled; honor the cancel without doing
+        # the work (avoids redundant Patchright nav for callers who
+        # already moved on).
+        if fut.cancelled():
+            continue
+        try:
+            if _COMIX_BROWSER is None:
+                _COMIX_BROWSER = _ComixBrowserSession()
+            fn = getattr(_COMIX_BROWSER, fn_name)
+            result = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 — propagate to caller
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+
+def _ensure_comix_worker() -> None:
+    """Lazy-start the single Patchright worker daemon. Double-checked
+    locking so concurrent first-callers don't race to spawn duplicates.
+    """
+    global _COMIX_WORKER_STARTED
+    if _COMIX_WORKER_STARTED:
+        return
+    with _COMIX_WORKER_LOCK:
+        if _COMIX_WORKER_STARTED:
+            return
+        threading.Thread(
+            target=_comix_worker_loop,
+            name="comix-pw",
+            daemon=True,
+        ).start()
+        _COMIX_WORKER_STARTED = True
+
+
+def _comix_call(fn_name: str, *args, _timeout_s: float = _COMIX_DEFAULT_TIMEOUT_S, **kwargs):
+    """Submit a session method call onto the daemon worker and block on
+    its result, bounded by ``_timeout_s`` (default 60 s). Synchronous
+    from the caller's perspective — same contract as the previous
+    ThreadPoolExecutor-based implementation, but with an explicit
+    wall-clock cap so a hung Patchright nav surfaces as TimeoutError
+    instead of an indefinite deadlock.
+
+    Per-call timeout can be overridden via the keyword `_timeout_s`
+    (kw-only so it doesn't collide with method args). Cancellation
+    after timeout sets the future cancelled; the worker honors the
+    cancel and skips the underlying call if it hadn't started yet.
+    """
+    _ensure_comix_worker()
+    fut: _futures.Future = _futures.Future()
+    _COMIX_REQUEST_QUEUE.put((fut, fn_name, args, kwargs))
+    try:
+        return fut.result(timeout=_timeout_s)
+    except _futures.TimeoutError:
+        # Best-effort cancel so the worker can skip the call if it
+        # hasn't started. If the worker is already executing this
+        # future, set_running_or_notify_cancel returns False internally
+        # and the underlying Patchright op continues (no thread
+        # cancellation in Python) — but at least subsequent callers
+        # aren't blocked behind a future we've stopped waiting for.
+        fut.cancel()
+        raise
+
+
+class _ComixBrowserBridge:
+    """Thread-safe facade over _ComixBrowserSession. Every method routes
+    through _comix_call so the underlying Patchright calls always run
+    on the daemon worker thread that owns the browser instance.
+
+    Cross-file: mirrors sites/mangafire_vrf_simple.py:_VRFBridge in
+    spirit; the v8 rewrite swaps the executor for daemon+queue (see
+    block-comment near _COMIX_REQUEST_QUEUE for rationale).
+    """
+
+    def get_api_token(self, url: str) -> Optional[str]:
+        return _comix_call("get_api_token", url)
+
+    def fetch_chapter_api(self, chapter_url: str, chap_id) -> Optional[Dict]:
+        return _comix_call("fetch_chapter_api", chapter_url, chap_id)
+
+    def close(self) -> None:
+        try:
+            _comix_call("close", _timeout_s=5.0)
+        except Exception:
+            pass
+
+
+_COMIX_BROWSER_BRIDGE = _ComixBrowserBridge()
+
+
+def _shutdown_comix_bridge():
+    """At-exit best-effort cleanup. Daemon worker dies with the
+    interpreter regardless (the whole reason for the daemon+queue
+    rewrite), so the goal here is just to close the Patchright session
+    cleanly when there's time. We enqueue the shutdown sentinel and
+    rely on the daemon to drain — no join, no wait."""
+    if not _COMIX_WORKER_STARTED:
+        return
+    try:
+        _COMIX_REQUEST_QUEUE.put_nowait(_COMIX_SHUTDOWN_SENTINEL)
+    except queue.Full:
+        # The unbounded queue can't actually go full here; the except
+        # is defensive belt-and-suspenders in case the queue is ever
+        # given a maxsize. Silent drop matches the rest of the bridge's
+        # at-exit semantics.
+        pass
+
+
+atexit.register(_shutdown_comix_bridge)

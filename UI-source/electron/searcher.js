@@ -75,6 +75,13 @@ function buildSearchArgs(query, opts = {}) {
   // default ON" so older saved searchOpts dicts without the field don't
   // accidentally disable collapse.
   if (opts.collapseSplits === false) args.push("--no-collapse-splits");
+  // enableMlRating defaults FALSE (production default; matches argparse).
+  // Only emit the flag when explicitly enabled. Wiring this through so
+  // users can opt into torch-backed T2/T3 image-quality scoring (CLIP-IQA,
+  // NIQE, paired DISTS). Off by default because torch's Windows import
+  // can stall on WMI degraded states — see search_orchestrator.py's
+  // _ML_RATING_ENABLED docstring for the full rationale.
+  if (opts.enableMlRating) args.push("--enable-ml-rating");
 
   return args;
 }

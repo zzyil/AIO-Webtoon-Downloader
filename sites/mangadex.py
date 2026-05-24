@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import atexit
 import logging
+import queue
+import random
 import re
 import threading
 import time
@@ -25,21 +26,131 @@ from ._publishers import lookup_publisher
 _logger = logging.getLogger(__name__)
 
 
-# Module-level pool for fire-and-forget /api/report POSTs to the MD@H
-# operator network. Without this, the prior code spawned one daemon thread
-# per page per node-attempt; a 200-page chapter through 4 swaps would
-# spawn ~800 threads in <2s, putting unnecessary pressure on Python's
-# thread allocator. A small bounded pool delivers the same end result
+# Module-level fire-and-forget /api/report POSTs to the MD@H operator
+# network. Without batching, the prior code spawned one daemon thread per
+# page per node-attempt; a 200-page chapter through 4 swaps would spawn
+# ~800 threads in <2s, putting unnecessary pressure on Python's thread
+# allocator. A small bounded pool delivers the same end result
 # (eventually fire each report) at a fraction of the overhead.
 #
 # Reports are cosmetic to the user — failure to deliver one doesn't
-# affect the download. Pool sized at 4 because reports complete in
-# ~50-200ms and we never need more concurrency than the image-fetch
-# pool (3 workers); 4 leaves slack for occasional bursts.
-_REPORT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="md-report")
-# Don't wait — outstanding reports are best-effort and the user closing
-# the app shouldn't hang on them.
-atexit.register(_REPORT_POOL.shutdown, wait=False)
+# affect the download. Sized at 4 because reports complete in ~50-200ms
+# on healthy nodes and we never need more concurrency than the
+# image-fetch pool (3 workers); 4 leaves slack for occasional bursts.
+#
+# Daemon Thread + Queue, NOT ThreadPoolExecutor. ThreadPoolExecutor
+# workers register in concurrent.futures.thread._threads_queues and
+# CPython's _python_exit (registered via threading._register_atexit, runs
+# BEFORE the atexit module's hooks at interpreter teardown) joins them
+# unconditionally — even after shutdown(wait=False). When api.mangadex
+# .network is slow or its TLS conn trickles bytes, the requests.post
+# timeout=10 doesn't actually fire (urllib3 resets the read timer per
+# byte), so a stuck SSL recv pins Python at exit for minutes — visible
+# to the user as the search UI hanging "forever" after run_search_mode
+# has already printed its JSON to stdout. Diagnosed via py-spy dump on
+# a real Toradora multi-source hang (2026-05-18): MainThread sat in
+# _python_exit → join() while four md-report_* workers were all blocked
+# in mangadex._post → ssl.recv_into.
+#
+# Daemon threads are skipped by _python_exit and die with the process,
+# which is the correct semantics for fire-and-forget telemetry. Grep
+# target if this ever needs adjusting: _REPORT_QUEUE / _report_worker.
+#
+# v8 hardening (2026-05-24):
+#   - LAZY spawn via _ensure_report_workers() instead of eager import-time
+#     for-loop. sites/__init__.py imports MangaDex eagerly so every
+#     aio-dl run was paying for 4 idle daemons even when no MangaDex
+#     chapter was downloaded. The lazy path defers thread creation
+#     until the first _enqueue_report() call (i.e., the first MD page
+#     fetch in the process), so search-only / non-MD runs don't pay
+#     the cost.
+#   - BOUNDED queue (maxsize=256). The previous queue.Queue() default
+#     of unbounded grew unboundedly during the exact failure mode the
+#     design comment above addresses: TLS recv stalls on api.mangadex
+#     .network mean workers can't drain faster than producers enqueue,
+#     and a 30-minute bulk download could accumulate tens of thousands
+#     of (url, payload) tuples. 256 entries × ~few hundred bytes per
+#     tuple = ~tens of kB ceiling; sustained burst >256/sec drops
+#     newest, which is the right semantics for cosmetic telemetry.
+#   - None-SENTINEL safe worker. The unpack `url, payload = q.get()`
+#     would TypeError on a None enqueue (today nothing enqueues None
+#     but a future shutdown sentinel would crash all 4 workers since
+#     the outer try/except only wraps requests.post, not the unpack).
+#     The worker now checks for None first and exits cleanly.
+_REPORT_QUEUE: queue.Queue = queue.Queue(maxsize=256)
+_REPORT_WORKERS_STARTED = False
+_REPORT_WORKERS_LOCK = threading.Lock()
+
+
+def _report_worker() -> None:
+    """Drain (url, payload) tuples from _REPORT_QUEUE and POST them.
+    Daemon thread target — exits with the interpreter. Errors are
+    swallowed because reports are cosmetic to the user.
+
+    None on the queue is treated as a shutdown sentinel and exits the
+    worker cleanly. Today nothing enqueues None (workers are daemons
+    and die with the interpreter), but the future-proofing matters: if
+    a maintainer ever adds an explicit shutdown via `_REPORT_QUEUE.put(None)`
+    the unpack would otherwise TypeError out and silently kill all 4
+    workers since the outer try/except only wraps the POST itself.
+    """
+    while True:
+        item = _REPORT_QUEUE.get()
+        if item is None:
+            return
+        try:
+            url, payload = item
+        except (TypeError, ValueError):
+            # Malformed enqueue — skip without dying.
+            continue
+        try:
+            requests.post(url, json=payload, timeout=10.0)
+        except Exception:
+            pass
+
+
+def _ensure_report_workers() -> None:
+    """Lazy-start the 4 daemon workers on first enqueue.
+
+    sites/__init__.py eagerly imports MangaDex so this module's globals
+    initialize on every aio-dl run; spawning the daemons at import time
+    paid for 4 threads in every search-only / non-MD process. Lazy
+    initialization defers the cost to the first report.
+
+    Double-checked locking: cheap fast-path read of the started flag
+    without the lock, then re-check after acquiring it so concurrent
+    first-callers don't all spawn redundant worker sets.
+    """
+    global _REPORT_WORKERS_STARTED
+    if _REPORT_WORKERS_STARTED:
+        return
+    with _REPORT_WORKERS_LOCK:
+        if _REPORT_WORKERS_STARTED:
+            return
+        for _i in range(4):
+            threading.Thread(
+                target=_report_worker,
+                name=f"md-report_{_i}",
+                daemon=True,
+            ).start()
+        _REPORT_WORKERS_STARTED = True
+
+
+def _enqueue_report(url: str, payload: dict) -> None:
+    """Best-effort report enqueue. Lazy-starts workers and drops the
+    payload (instead of blocking) when the bounded queue is full —
+    image-fetch threads must NOT stall on cosmetic telemetry. Same
+    contract as the previous unbounded `_REPORT_QUEUE.put()`: the
+    caller doesn't see failures."""
+    _ensure_report_workers()
+    try:
+        _REPORT_QUEUE.put_nowait((url, payload))
+    except queue.Full:
+        # Telemetry is cosmetic; dropping is correct semantics under
+        # back-pressure (the alternative — blocking image fetch — would
+        # make the actual download slower). No log: silent drop matches
+        # the worker's silent POST-failure handling.
+        pass
 
 
 class MangaDexSiteHandler(BaseSiteHandler):
@@ -73,6 +184,20 @@ class MangaDexSiteHandler(BaseSiteHandler):
     # disk cache, and possibly the origin pull. 30s matches dl_image's
     # default and Mihon's setup.
     _IMAGE_TIMEOUT_S = 30.0
+    # /at-home/server retry budget (total attempts, including the first).
+    # The MangaDex assignment server itself — distinct from the MD@H operator
+    # network — is occasionally flaky and will 500 on a chapter UUID one
+    # second and 200 on the next. Without retries here the HTTPError would
+    # propagate out of get_chapter_images, bypass the strict-wrapper multi-
+    # source fallback in aio-dl.py (it only converts IncompleteChapterError),
+    # and get silently absorbed by the chapter loop's bare `except Exception`
+    # so the user sees "Chapter N (group)" with no follow-up line — same
+    # symptom the user reported on Shuumatsu no Valkyrie 2026-05-16.
+    # 3 attempts × bounded exponential backoff (~1s/2s/4s with jitter) caps
+    # the worst-case wall-clock at ~8s before propagating; well under the
+    # 30s downstream node-swap budget, so this layer only spends time when
+    # it has a realistic chance of recovering.
+    _AT_HOME_RETRIES = 3
 
     def configure_session(self, scraper, args) -> None:
         # Per api.mangadex.org/docs/2-limitations: User-Agent is mandatory and
@@ -195,6 +320,15 @@ class MangaDexSiteHandler(BaseSiteHandler):
             "cover": self._cover_url(manga_id, relationships),
             "authors": authors or artists,
             "artists": artists or authors,
+            # NOTE: DMCA-affected titles (e.g. "Na Honjaman Level-Up",
+            # 32d76d19-8a05-4db0-9fc2-e0b0648fe9d0) return an empty
+            # attributes.tags array from MangaDex's API — the takedown
+            # response strips the tag-relationship along with chapter
+            # availability. Detected upstream via the dmca_likely flag
+            # (chapter_count_hint vs actual_chapter_count). For
+            # Komikku-mode details.json, the genre array will be empty
+            # on those titles. Not a parser bug; the data is hollowed at
+            # the source. See dry_run_komikku_findings.md §C.
             "genres": [tag.get("name") for tag in attributes.get("tags", []) if tag.get("name")],
             "_manga_id": manga_id,
         }
@@ -331,16 +465,75 @@ class MangaDexSiteHandler(BaseSiteHandler):
         path (MangaDexHelper.kt:213-254); the ``forcePort443`` query is the
         same flag that Mihon exposes as ``STANDARD_HTTPS_PORT_PREF``.
 
+        Transient-5xx retry policy: the MangaDex assignment server (distinct
+        from the MD@H operator network) is occasionally flaky and will 500
+        on a given chapter UUID one moment and 200 the next. We retry up to
+        ``_AT_HOME_RETRIES`` total attempts with bounded exponential backoff
+        (~1s / 2s / 4s with jitter) on 5xx responses and network exceptions.
+        4xx responses fail fast (a 404 here means the chapter genuinely does
+        not exist at MD@H; retrying is pointless and would burn the API's
+        40 req/min budget per IP). The downstream node-swap loop in
+        get_chapter_images is for a DIFFERENT failure mode — bad bytes from
+        a single MD@H node — so the two retry layers serve disjoint causes
+        and don't compound.
+
         Raises RuntimeError on malformed response. The caller catches and
         wraps that into IncompleteChapterError when no successful baseUrl
-        is ever obtained.
+        is ever obtained. requests.HTTPError on 4xx / final-attempt 5xx
+        propagates; aio-dl.py:_process_chapter_impl's call-site catches it
+        and converts to ChapterSkippedError so multi-source fallback engages.
         """
         url = f"{self._API_BASE}/at-home/server/{chapter_id}?forcePort443=true"
-        resp = scraper.get(
-            url,
-            headers={"Cache-Control": "no-cache, no-store"},
-            timeout=30.0,
-        )
+        last_exc: Optional[Exception] = None
+        resp: Optional[requests.Response] = None
+        for attempt in range(self._AT_HOME_RETRIES):
+            try:
+                resp = scraper.get(
+                    url,
+                    headers={"Cache-Control": "no-cache, no-store"},
+                    timeout=30.0,
+                )
+            except requests.RequestException as exc:
+                # Network error / timeout / SSL error — treat as transient.
+                # We retry up to the budget and propagate the last one on
+                # exhaustion. Re-binding resp to None avoids reusing a
+                # response object from a prior loop iteration.
+                last_exc = exc
+                resp = None
+                if attempt < self._AT_HOME_RETRIES - 1:
+                    wait_s = min(2.0 ** attempt, 5.0) * random.uniform(0.85, 1.15)
+                    _logger.info(
+                        "[mangadex] /at-home/server %s network error on "
+                        "attempt %d/%d (%s); retrying in %.1fs",
+                        chapter_id, attempt + 1, self._AT_HOME_RETRIES, exc, wait_s,
+                    )
+                    time.sleep(wait_s)
+                    continue
+                raise
+            status = getattr(resp, "status_code", None) or 0
+            if status >= 500 and attempt < self._AT_HOME_RETRIES - 1:
+                wait_s = min(2.0 ** attempt, 5.0) * random.uniform(0.85, 1.15)
+                _logger.info(
+                    "[mangadex] /at-home/server %s returned %d on "
+                    "attempt %d/%d; retrying in %.1fs",
+                    chapter_id, status, attempt + 1, self._AT_HOME_RETRIES, wait_s,
+                )
+                time.sleep(wait_s)
+                continue
+            # Success path (2xx) or a non-retryable response (4xx) or a final-
+            # attempt 5xx — break out and let raise_for_status decide below.
+            break
+        if resp is None:
+            # The loop terminates with resp set unless the very last attempt
+            # raised a RequestException without a Response object (which we
+            # re-raised above). Defensive: surfaces the network-exception
+            # path explicitly rather than crashing on a None.raise_for_status.
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError(
+                "MangaDex _fetch_at_home_assignment exhausted retries "
+                "without obtaining a response"
+            )
         resp.raise_for_status()
         try:
             data = resp.json()
@@ -434,10 +627,11 @@ class MangaDexSiteHandler(BaseSiteHandler):
         downloader.py:309-338 comment "domain that is not from
         mangadex.network are not allowed to report").
 
-        Submits to the module-level _REPORT_POOL (4 workers) instead of
-        spawning a fresh thread per page — the prior approach could spawn
-        ~800 threads in <2s on a long chapter through multiple swaps.
-        Errors are swallowed; reporting is cosmetic.
+        Enqueued onto the module-level _REPORT_QUEUE (4 daemon workers)
+        instead of spawning a fresh thread per page — the prior approach
+        could spawn ~800 threads in <2s on a long chapter through multiple
+        swaps. Errors are swallowed by _report_worker; reporting is
+        cosmetic.
         """
         if "mangadex.network" not in url:
             return
@@ -448,20 +642,13 @@ class MangaDexSiteHandler(BaseSiteHandler):
             "duration": int(duration_ms),
             "cached": bool(cached),
         }
-
-        def _post() -> None:
-            try:
-                requests.post(self._REPORT_URL, json=payload, timeout=10.0)
-            except Exception:
-                pass  # Cosmetic; user impact is zero.
-
-        try:
-            _REPORT_POOL.submit(_post)
-        except RuntimeError:
-            # Pool was shut down (atexit ran during interpreter teardown).
-            # Drop the report rather than leaking a fresh thread on the
-            # way down — same end result for the user (no report sent).
-            pass
+        # Best-effort fire-and-forget via _enqueue_report (v8): the
+        # helper lazy-starts the worker daemons on first call and drops
+        # silently when the bounded queue (maxsize=256) is full. Daemon
+        # workers die with the interpreter, so a slow report in flight
+        # at process exit gets dropped (not joined). Grep target:
+        # _enqueue_report / _ensure_report_workers in this file.
+        _enqueue_report(self._REPORT_URL, payload)
 
     def get_chapter_images(
         self,

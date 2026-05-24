@@ -90,7 +90,51 @@ class MangaKatanaSiteHandler(BaseSiteHandler):
         title_node = soup.select_one("h1.heading")
         title = title_node.get_text(strip=True) if title_node else slug
 
-        authors = [a.get_text(strip=True) for a in soup.select(".author a") if a.get_text(strip=True)]
+        # MangaKatana renders series metadata in a few different shapes across
+        # series (status uses `.value.status` below which suggests label/value
+        # rows). `.author a` works on some pages but the 2026-05-19 probe found
+        # it empty on solo-leveling.21708. Layer fallbacks:
+        #   1. canonical `.author a` (works on the bulk of pages),
+        #   2. `a[href*='/authors/']` (the site's catalog-link convention),
+        #   3. label/value row scan in `.d39 li` / `.meta li` blocks.
+        # See dry_run_komikku_findings.md §A.
+        authors = [
+            a.get_text(strip=True)
+            for a in soup.select(".author a")
+            if a.get_text(strip=True)
+        ]
+        if not authors:
+            seen: set = set()
+            for a in soup.select("a[href*='/authors/'], a[href*='/author/']"):
+                text = a.get_text(strip=True)
+                if text and text not in seen:
+                    seen.add(text)
+                    authors.append(text)
+        if not authors:
+            for row in soup.select("ul.d39 li, .d39 li, ul.meta li, .meta li"):
+                label_node = row.select_one(".label, .name")
+                value_node = row.select_one(".value")
+                if not label_node or not value_node:
+                    continue
+                if "author" not in label_node.get_text(strip=True).lower():
+                    continue
+                anchors = [
+                    a.get_text(strip=True)
+                    for a in value_node.select("a")
+                    if a.get_text(strip=True)
+                ]
+                if anchors:
+                    authors = anchors
+                else:
+                    txt = value_node.get_text(" ", strip=True)
+                    if txt:
+                        authors = [
+                            p.strip() for p in re.split(r"[,/;]", txt) if p.strip()
+                        ]
+                break
+        # MangaKatana does NOT expose a separate Artist field on its series
+        # template (verified 2026-05-19 audit). `artists` stays empty by site
+        # limitation; Komikku's details.json artist key reflects "no artist".
         genres = [a.get_text(strip=True) for a in soup.select(".genres a") if a.get_text(strip=True)]
 
         comic: Dict[str, object] = {

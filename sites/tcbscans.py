@@ -10,6 +10,13 @@ from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class TCBScansSiteHandler(BaseSiteHandler):
+    # NOTE: TCBScans's series template exposes only title + description + cover.
+    # No genres/authors/artists/status anywhere on the page. Komikku's
+    # details.json for tcbscans-sourced series will populate `description`
+    # only — the other four fields stay empty (Komikku falls back to
+    # status=0/Unknown). This is a site-side limitation, not a parser bug.
+    # See dry_run_komikku_findings.md §C and bench/probe_komikku_metadata.py's
+    # EXPECTED_MISSING entry (~line 124).
     name = "tcbscans"
     domains = ("tcbonepiecechapters.com", "www.tcbonepiecechapters.com", "tcbscans.com", "www.tcbscans.com")
     _BASE_URL = "https://tcbonepiecechapters.com"

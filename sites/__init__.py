@@ -174,9 +174,14 @@ _REGISTERED_HANDLERS: Iterable[BaseSiteHandler] = tuple(
 
 
 def get_handler_by_name(name: str) -> Optional[BaseSiteHandler]:
+    # Case-insensitive lookup. Some handlers (Toonily, WebtoonXYZ) call their
+    # Madara parent's __init__ with a mixed-case display name, which overwrites
+    # the lowercase class attribute. Before this fix the comparison silently
+    # failed for those two sites — see bench/probe_komikku_metadata.py:54-67
+    # for the workaround that motivated the fix.
     lowered = name.lower()
     for handler in _REGISTERED_HANDLERS:
-        if handler.name == lowered:
+        if handler.name.lower() == lowered:
             return handler
     return None
 

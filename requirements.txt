@@ -1,6 +1,7 @@
 beautifulsoup4
 cloudscraper
 lxml
+numpy>=1.24  # v5 image-quality scoring uses FFT/blockiness/Tenengrad/JPEG-QF LSM in sites/search_orchestrator.py
 Pillow
 pypdf
 requests
@@ -8,6 +9,22 @@ pywidevine
 cryptography
 patchright>=1.40.0  # Drop-in Playwright fork with CDP-leak patches (Cloudflare-stealthier). Drives sites/mangafire_vrf_simple.py and sites/playwright_utils.py.
 rapidfuzz  # Cross-site search title matching (sites/search_orchestrator.py)
+# v5 image-quality scoring: T2 (NIQE always, ARNIQA opt-in via AIO_T2_ARNIQA=1)
+# + T3 (paired DISTS for cross-source ranking). Both bring PyTorch CPU
+# (~700 MB) — gated behind try-import in sites/search_orchestrator.py so the
+# downloader still runs (T1-only) if these fail to install. The T3 paired-
+# comparison alignment step (Phase 4) uses cv2.phaseCorrelate from
+# opencv-python which is a transitive dep of pyiqa, so no separate cv2
+# requirement is needed.
+pyiqa>=0.1.10
+piq>=0.8
+# v6 (2026-05-18): torchmetrics provides CLIP-IQA+ via the HuggingFace
+# CLIP backend (transformers' CLIPModel + CLIPImageProcessor) — sidesteps
+# pyiqa's clip-iqa path which depends on `clip-by-openai` and is broken
+# on Python 3.13 / setuptools 81+ (pkg_resources removal). CLIP-IQA+ runs
+# with manga-tuned prompts as the primary T2 signal for B&W manga
+# content. See sites/search_orchestrator.py:_get_clip_iqa_model.
+torchmetrics>=1.0
 curl_cffi>=0.7.0  # MangaFire fast image-download path (HTTP/2 + Chrome120 TLS fingerprint, async). See sites/mangafire.py:fast_download_images.
 # Phase H (2026-05-16) — pyvips powers the lossy-WebP save fast path in
 # aio-dl.py:save_final_images. ~2x faster than PIL.Image.save at the same
@@ -17,3 +34,9 @@ curl_cffi>=0.7.0  # MangaFire fast image-download path (HTTP/2 + Chrome120 TLS f
 # bundles the libvips DLLs on Windows so users don't need a separate install.
 pyvips>=2.2.0
 pyvips-binary>=8.18.0
+# v5.1 Phase 1 (2026-05-17) — watermark detection via region-based text
+# detection. easyocr uses CRAFT internally; ~200 MB weights download on
+# first use. Optional: search degrades gracefully when missing (no
+# watermark penalty, but T1/T2/T3 still work). See
+# sites/search_orchestrator.py:_detect_watermarks for the integration.
+easyocr>=1.7.2

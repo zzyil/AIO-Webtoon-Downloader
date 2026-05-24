@@ -459,7 +459,13 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
             "_is_canvas": is_canvas,
             "_slug": slug,
         }
-        if artist and artist != author:
+        # Always populate `artists` when we determined an artist, even when
+        # it equals author. Komikku's details.json `artist` field is independent
+        # of `author`; leaving it empty for solo creators (the common
+        # Webtoons.com case — singNsong, lilprincessember, etc.) made the
+        # Komikku Library show no artist at all. `artist = artist or author`
+        # above guarantees a non-empty value when author was found.
+        if artist:
             comic["artists"] = [artist]
 
         return SiteComicContext(

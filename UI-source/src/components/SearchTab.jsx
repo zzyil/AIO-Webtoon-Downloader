@@ -77,6 +77,14 @@ const DEFAULT_OPTS = {
   searchTimeout: 20,
   searchMinMatch: 0.55,
   searchParallelism: 6,
+  // Off by default — torch + pyiqa + torchmetrics import on Windows can
+  // stall on WMI queries (Python 3.13 platform.machine() path), which
+  // historically hung search forever with no output. T2/T3 ML scoring
+  // adds ~3-8% ranking accuracy on borderline matches; users who want
+  // the boost can opt in via the Advanced toggle. See
+  // sites/search_orchestrator.py:_ML_RATING_ENABLED for the full
+  // rationale. Surfaces as --enable-ml-rating in searcher.js.
+  enableMlRating: false,
 };
 
 export default function SearchTab({
@@ -500,6 +508,34 @@ export default function SearchTab({
                 onChange={(e) => set("searchParallelism", parseInt(e.target.value, 10) || 6)}
                 disabled={isRunning}
                 className="w-20 h-8 text-xs"
+              />
+            </div>
+
+            {/* ML quality rating toggle. Off by default because torch's
+                Windows import path can stall on degraded WMI services
+                (Python 3.13 platform.machine() → WMI query) — historically
+                hung search with no output. When on, T2 (CLIP-IQA, NIQE)
+                and T3 (paired DISTS) ML scoring run on top of T1's
+                pixel-level quality metrics for ~3-8% more accurate
+                rankings on borderline matches. Cost: ~150 MB model
+                weights on first download, ~2-5 s per source probe. */}
+            <div className="flex items-start justify-between gap-3 pt-1 border-t border-border/40">
+              <div className="flex-1 min-w-0">
+                <Label htmlFor="opt-ml-rating" className="text-xs font-medium block">
+                  ML quality rating
+                </Label>
+                <p className="text-[10px] text-muted-foreground mt-0.5 leading-relaxed">
+                  GPU/CPU torch models (CLIP-IQA, NIQE, paired DISTS) refine
+                  rankings on borderline matches. <strong>Off by default</strong> —
+                  enable only if you've installed torch and don't see search
+                  hangs. Downloads ~150 MB of model weights on first use.
+                </p>
+              </div>
+              <Switch
+                id="opt-ml-rating"
+                checked={opts.enableMlRating}
+                onCheckedChange={(v) => set("enableMlRating", v)}
+                disabled={isRunning}
               />
             </div>
           </div>

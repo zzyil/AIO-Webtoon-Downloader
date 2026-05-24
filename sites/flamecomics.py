@@ -29,6 +29,23 @@ class FlameComicsSiteHandler(BaseSiteHandler):
         response.encoding = response.encoding or "utf-8"
         return response.text
 
+    @staticmethod
+    def _strip_html(value: Optional[str]) -> Optional[str]:
+        """Strip HTML tags from a Mantine-framework-wrapped string.
+
+        FlameComics's Next.js API returns the description with the Mantine
+        UI wrapper baked in (e.g. `<p class="mantine-focus-auto m_b6d8b162
+        mantine-Text-root">10 years ago...</p>`). Before this strip the raw
+        HTML leaked into Komikku's details.json `description` field. Mirrors
+        the same approach used in sites/dynasty.py:62-67 (`_clean_description`)
+        and sites/mangathemesia.py:591-596 (`_clean_wp_text`). See
+        dry_run_komikku_findings.md §A.
+        """
+        if not value:
+            return None
+        cleaned = BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
+        return cleaned or None
+
     def _fetch_build_id(self, scraper, make_request) -> str:
         """
         Fetches the current build ID from the homepage.
@@ -129,11 +146,19 @@ class FlameComicsSiteHandler(BaseSiteHandler):
         comic = {
             "hid": slug,
             "title": title,
-            "desc": series_data.get("description"),
+            # `description` arrives Mantine-wrapped; strip the HTML so
+            # Komikku's details.json doesn't surface raw `<p class="mantine-x">`
+            # markup. See _strip_html docstring above.
+            "desc": self._strip_html(series_data.get("description")),
             "status": series_data.get("status"),
             "alt_names": series_data.get("altTitles", []),
             "authors": series_data.get("author", []),
             "artists": series_data.get("artist", []),
+            # NOTE: `series_data.get("tags", [])` is server-side empty for at
+            # least some FlameComics series (verified 2026-05-19 dry-run for
+            # Solo Leveling). Accepted as a known limitation per user direction
+            # — Komikku's `genre` array will be empty for affected titles. The
+            # other 4 fields (desc, authors, artists, status) populate normally.
             "genres": [t.get("name") for t in series_data.get("tags", []) if isinstance(t, dict) and t.get("name")],
             "cover": f"https://cdn.flamecomics.xyz/uploads/images/series/{slug}/{series_data.get('cover')}",
             "_series_data": series_data, # Cache for get_chapters

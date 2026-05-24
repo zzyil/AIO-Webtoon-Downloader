@@ -56,12 +56,72 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
     
     def _make_soup(self, html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
-    
+
     def _normalize_url(self, url: str) -> str:
         """Normalize URL if custom normalizer is provided."""
         if self._url_normalizer:
             return self._url_normalizer(url)
         return url
+
+    def _extract_imptdt_values(self, soup: BeautifulSoup, label: str) -> List[str]:
+        """Extract values from a MangaThemesia `.imptdt` label/value row.
+
+        Real MangaThemesia (the WordPress theme this base class is named for)
+        renders series metadata as `<div class="imptdt">Label <i>Value</i></div>`
+        rows — one each for Status, Type, Released, Author, Artist, Serialization,
+        Posted By. The label is plain text at the start; values are wrapped in
+        `<a>` or `<i>` elements (or the bare remainder text when neither).
+
+        This is the canonical extractor. The existing `.author-content`,
+        `.genres-content`, `.post-status` selectors in `fetch_comic_context`
+        below are Madara-theme selectors that happen to also work on a handful
+        of MT sites that mix themes; we keep them as a layered fallback. See
+        sites/tecnoxmoon.py:106-126 for the original implementation this is
+        ported from — that handler had to roll its own enrichment because the
+        base parser didn't read `.imptdt` rows.
+
+        Returns a dedup-preserving list (first occurrence wins). Empty list
+        when no matching row exists.
+        """
+        # Match the label only when followed by `:`, whitespace, or end-of-
+        # string. The previous bare `startswith(label.lower())` accepted
+        # 'Author Note:', 'Authored By:', 'Artist Statement:', 'Status
+        # Update:' — any of which would feed wrong content back through the
+        # `if imptdt_authors: authors = imptdt_authors` assignments below and
+        # silently overwrite the canonical author/artist/status lists parsed
+        # by the Madara-style selectors. The character class `[:\s]` covers
+        # the realistic delimiters MangaThemesia variants render between the
+        # label and its value (`:`, space, NBSP — `\s` covers NBSP per
+        # re.UNICODE which is the default in Py3).
+        label_lower = label.lower()
+        boundary_pattern = re.compile(
+            r"^" + re.escape(label_lower) + r"(?:[:\s]|$)"
+        )
+        for row in soup.select(".imptdt"):
+            text = row.get_text(" ", strip=True)
+            text_lower = text.lower()
+            if not boundary_pattern.match(text_lower):
+                continue
+            values: List[str] = []
+            for node in row.select("a, i"):
+                value = node.get_text(strip=True)
+                if value:
+                    values.append(value)
+            if not values:
+                # Strip the label prefix AND any trailing `:` / whitespace
+                # before re-using the remainder. `len(label)` alone left
+                # entries like ": Real Name" after the boundary-aware match
+                # promoted a `Status:`-prefixed row to a value of `: Real`.
+                remainder = text[len(label):].lstrip(":").strip()
+                if remainder:
+                    values.append(remainder)
+            if values:
+                seen: List[str] = []
+                for val in values:
+                    if val not in seen:
+                        seen.append(val)
+                return seen
+        return []
 
     # ---------------------------------------------------------------- search
     # MangaThemesia framework search: GET /?s=<query> returns the standard
@@ -192,6 +252,15 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         
         desc_node = soup.select_one(".entry-content p, .summary__content p")
         desc = desc_node.get_text(strip=True) if desc_node else None
+        # Real-MangaThemesia desc fallback: itemprop="description" is the
+        # canonical schema.org tag. Sites that strip the `.entry-content`
+        # wrapper but keep the structured-data markup land here.
+        if not desc:
+            itemprop_desc = soup.select_one("[itemprop='description']")
+            if itemprop_desc is not None:
+                text = itemprop_desc.get_text(" ", strip=True)
+                if text:
+                    desc = text
         
         # Cover image
         cover_node = soup.select_one(".thumb img, .summary_image img")
@@ -216,21 +285,49 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
                 if match:
                     cover = match.group(1)
         
-        # Authors
+        # Authors — Madara-style selectors first (a small minority of MT
+        # sites render Madara markup); imptdt rows are the real MangaThemesia
+        # surface and override when present.
         authors = []
         author_nodes = soup.select(".author-content a, .artist-content a")
         for node in author_nodes:
-            authors.append(node.get_text(strip=True))
-            
-        # Genres
+            text = node.get_text(strip=True)
+            if text:
+                authors.append(text)
+        imptdt_authors = self._extract_imptdt_values(soup, "Author")
+        if imptdt_authors:
+            authors = imptdt_authors
+
+        # Artists — real MangaThemesia exposes a separate Artist row. Komikku's
+        # details.json requires the artist field; we now extract it here. Before
+        # this fix the base parser had no `artists` extraction at all (see
+        # dry_run_komikku_findings.md §A — rizzfables/rizzcomic/violetscans).
+        artists: List[str] = []
+        imptdt_artists = self._extract_imptdt_values(soup, "Artist")
+        if imptdt_artists:
+            artists = imptdt_artists
+
+        # Genres — Madara-style fallback first, then the canonical `.mgen a`
+        # used by real MangaThemesia.
         genres = []
         genre_nodes = soup.select(".genres-content a")
         for node in genre_nodes:
-            genres.append(node.get_text(strip=True))
+            text = node.get_text(strip=True)
+            if text:
+                genres.append(text)
+        if not genres:
+            for node in soup.select(".mgen a"):
+                text = node.get_text(strip=True)
+                if text:
+                    genres.append(text)
 
-        # Status
+        # Status — Madara fallback first, then imptdt Status row.
         status_node = soup.select_one(".post-status .summary-content, .status-content")
         status = status_node.get_text(strip=True) if status_node else "Unknown"
+        if not status or status == "Unknown":
+            imptdt_status = self._extract_imptdt_values(soup, "Status")
+            if imptdt_status:
+                status = imptdt_status[0]
 
         # Alt titles — MT skins surface them under `.seriestualt`. Splits on
         # the usual separator zoo; deduped while preserving order. Skip year:
@@ -262,6 +359,11 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             "desc": desc,
             "cover": cover,
             "authors": authors,
+            # `artists` was missing from the base before the 2026-05-19
+            # Komikku-metadata pass. aio-dl.py:6042 joins this list into
+            # details.json's `artist` field; emit it even when empty so the
+            # Komikku writer treats it as "no artist" rather than KeyError.
+            "artists": artists,
             "genres": genres,
             "status": status,
             "url": url,

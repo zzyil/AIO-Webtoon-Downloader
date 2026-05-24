@@ -102,6 +102,12 @@ class DynastySiteHandler(BaseSiteHandler):
             alias_block = f"Aliases:\n{alias_text}"
             description = f"{description}\n\n{alias_block}".strip() if description else alias_block
 
+        # NOTE: Dynasty's /series/<slug>.json API does NOT return a `status`
+        # field — only `tags`, `aliases`, `description`, `name`, `cover`,
+        # `pages`. For Komikku-mode details.json, the status digit will be
+        # "0" (Unknown). Per user direction 2026-05-19 we accept this rather
+        # than HTML-scrape the series page for an extra request. See
+        # dry_run_komikku_findings.md §C.
         comic = {
             "hid": slug,
             "title": title,
