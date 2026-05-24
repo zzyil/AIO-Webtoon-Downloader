@@ -12,18 +12,18 @@
 | [artlapsa.com](https://artlapsa.com) | recent check 11.26.25 ✅ |
 | [aryascans.com/brainrotcomics.com](https://brainrotcomics.com/) | recent check 11.26.25 ✅ |
 | [asmotoon.com](https://asmotoon.com) | recent check 11.26.25 ✅ |
-| [asuracomic.net](https://asuracomic.net) | recent check 11.26.25 ✅ |
+| [asuracomic.net](https://asuracomic.net) | recent check 05.20.26 ✅ |
 | [asurascans.net](https://asurascans.net) | recent check 11.26.25 ✅ |
-| [atsu.moe](https://atsu.moe) | recent check 11.26.25 ✅ |
+| [atsu.moe](https://atsu.moe) | recent check 05.20.26 ✅ |
 | [Azora](https://azoramoon.com) | recent check 11.26.25 ✅ |
-| [Bato](https://bato.to) | recent check 11.25.25 ✅ · See [mirror list](#bato-mirrors) |
+| ~~Bato~~ | shut down January 2026; handler should remain retired ⛓️‍💥 |
 | [BiblioPanda](https://bibliopanda.com) | image selection not working ⛔️ |
 | [BokugenTranslation](https://bokugents.com) | recent check 11.26.25 ✅ |
 | [boratscans.com](https://boratscans.com) | recent check 11.26.25 ✅ |
 | [BorutoExplorer](https://leitor.borutoexplorer.com.br) | image selection not working ⛔️ |
 | [cocomic.co](https://cocomic.co) | currently offline ⛓️‍💥 |
 | [coffeemanga.io](https://coffeemanga.io) | recent check 11.26.25 ✅ · Mirror: [coffeemanga.ink](https://coffeemanga.ink) |
-| [comix.to](https://comix.to) | recent check 11.26.25 ✅  · Supports scanlation group selection |
+| [comix.to](https://comix.to) | recent check 05.20.26 ✅  · Supports scanlation group selection |
 | [culturedworks.com](https://culturedworks.com) | recent check 11.26.25 ✅ |
 | [darkscans.net](https://darkscans.net) | currently offline ⛓️‍💥 |
 | [decadencescans.com](https://reader.decadencescans.com) | only first image downloads due to page style being default ⛔️ |
@@ -32,15 +32,15 @@
 | [Emperor Scan](https://emperorscan.mundoalterno.org) | recent check 11.26.25 ✅ |
 | [erosvoid.xyz](https://erosvoid.xyz) | recent check 11.25.25 ✅ Mirror: [erosxsun.xyz](https://erosxsun.xyz) |
 | [evilflowers.com](https://evilflowers.com) | image selection not working ⛔️ |
-| [fanfox.net](https://fanfox.net) | recent check 11.26.25 ✅ · Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) — both bare and `www.` variants |
+| [fanfox.net](https://fanfox.net) | recent check 05.20.26 ✅ · Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) — both bare and `www.` variants |
 | [firescans.xyz](https://firescans.xyz) | image selection not working ⛔️ |
-| [flamecomics.xyz](https://flamecomics.xyz) | recent check 11.25.25 ✅ |
+| [flamecomics.xyz](https://flamecomics.xyz) | recent check 05.20.26 ✅ |
 | [FlowerMangaDotNet](https://flowermanga.net) | recent check 11.26.25 ✅ |
 | [freecomiconline.me](https://freecomiconline.me) | image selection not working ⛔️ |
 | [freemanga.me](https://freemanga.me) | recent check 11.26.25 ✅ |
 | [freemangatop.com](https://freemangatop.com) | recent check 11.26.25 ✅ |
 | [galaxydegenscans.com](https://gdscans.com) | image selection not working ⛔️ |
-| [galaxymanga.io](https://galaxymanga.io) | recent check 11.26.25 ✅ |
+| [galaxymanga.io](https://galaxymanga.io) | recent check 05.20.26 ✅ |
 | [GarciaManga](https://garciamanga.com) | chapter filter broken ⛔️ |
 | [GhostScan](https://ghostscan.xyz) | chapter filter broken ⛔️ |
 | [gourmetscans.com](https://gourmetsupremacy.com) | temporarily login protected ⛔️ |
@@ -56,8 +56,8 @@
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) |
 | [KamiSamaExplorer](https://leitor.kamisama.com.br) | recent check 11.26.25 ✅ |
 | [Kedito](https://kedi.to) | recent check 11.25.25 ✅ |
-| [kappabeast.com](https://kappabeast.com) | recent check 11.26.25 ✅ |
-| [kingofshojo.com](https://kingofshojo.com) | recent check 11.26.25 ✅ |
+| [kappabeast.com](https://kappabeast.com) | recent check 05.20.26 ✅ · Dedicated Strapi API handler |
+| [kingofshojo.com](https://kingofshojo.com) | recent check 05.20.26 ✅ |
 | [kirascans.com](https://kirascans.com) | recent check 11.26.25 ✅ |
 | [kissmangain.com](https://kissmanga.in) | cloudflare protection currently, not working 💨 |
 | [KlikManga](https://klikmanga.org) | recent check 11.26.25 ✅ |
@@ -66,24 +66,26 @@
 | [lagoonscans.com](https://lagoonscans.com) | chapter filter broken ⛔️ |
 | [lhtranslation.net](https://lhtranslation.net) | chapter filter broken ⛔️ |
 | [likemanga.in](https://likemanga.in) | recent check 11.26.25 ✅ |
+| [manhwaread.com / mgread.io](https://mgread.io) | recent check 05.20.26 ✅ · NSFW content; see [NSFW.MD](NSFW.MD) |
 | [likemanga.ink](https://likemanga.ink) | chapter filter broken ⛔️ |
 | [Manga Crab](https://mangacrab.org) | recent check 11.26.25 ✅ |
 | [Manga3asq](https://3asq.org) | recent check 11.26.25 ✅ |
-| [MangaBin](https://mangabin.com) | image selection not working ⛔️ |
-| [mangabuddy.com](https://mangabuddy.com) | recent check 11.27.25 ✅ · See [MangaBuddy mirrors](#mangabuddy-mirrors) |
+| [mangabin.com](https://mangabin.com) | image selection not working ⛔️ |
+| ~~mangabuddy.com~~ | offline May 2026 ⛓️‍💥 |
 | [mangaclash.com](https://toonclash.com) | cloudflare protection currently, not working 💨 |
-| [mangadex.org](https://mangadex.org) | recent check 11.26.25 ✅ · Supports scanlation group selection |
-| [mangafire.to](https://mangafire.to) | recent check 11.26.25 ✅ · Supports multiple languages |
+| [mangadex.org](https://mangadex.org) | recent check 05.20.26 ✅ · Supports scanlation group selection |
+| [mangafire.to](https://mangafire.to) | recent check 05.20.26 ✅ · Supports multiple languages |
 | [mangafoxfull.com](https://mangafoxfull.com) | currently offline ⛓️‍💥 |
 | [mangagg.com](https://mangagg.com) | chapter filter broken ⛔️ |
+| [mangago.me](https://www.mangago.me) | recent check 05.21.26 ✅ · Supports scanlation group selection |
 | [mangagojo.com](https://mangagojo.com) | recent check 11.26.25 ✅ |
-| [mangahub.io](https://mangahub.io) | recent check 11.26.25 ✅ |
-| [MangaKakalot / Manganato family](https://www.manganato.gg) | recent check 11.26.25 ✅ · See [mirror list](#mangakakalot--manganato-mirrors) |
+| [mangahub.io](https://mangahub.io) | recent check 05.20.26 ✅ |
+| [MangaKakalot / Manganato family](https://www.manganato.gg) | recent check 05.20.26 ✅ · See [mirror list](#mangakakalot--manganato-mirrors) |
 | [MangaLc](https://manga-lc.net) | image selection not working ⛔️ |
 | [mangaleveling.com](https://mangaleveling.com) | currently offline ⛓️‍💥 |
 | [mangaonlineteam.com](https://mangaonlineteam.com) | currently offline ⛓️‍💥 |
 | [mangaowl.io](https://mangaowl.io) | recent check 11.26.25 ✅ |
-| [mangapark.net](https://mangapark.net) | image selection not working ⛔️ |
+| ~~mangapark.net~~ | related Bato-network domains reported shut down; keep retired unless a distinct live target is validated ⛓️‍💥 |
 | [mangapill.com](https://mangapill.com) | chapter filter broken ⛔️ |
 | [mangaread.co](https://mangaread.co) | only first image downloads due to page style being default ⛔️ |
 | [mangaread.org](https://www.mangaread.org) | recent check 11.26.25 ✅ |
@@ -91,7 +93,7 @@
 | [MangaRomance](https://mangaromance19.com) | recent check 11.26.25 ✅ |
 | [MangaSehri](https://manga-sehri.com) | recent check 11.25.25 ✅ |
 | [mangasushi.org](https://mangasushi.org) | recent check 11.26.25 ✅ |
-| [mangataro.org](https://mangataro.org) | recent check 11.26.25 ✅ · Supports scanlation group selection |
+| [mangataro.org](https://mangataro.org) | recent check 05.20.26 ✅ · Supports scanlation group selection |
 | [mangatone.com](https://mangatone.com) | currently offline ⛓️‍💥 |
 | [MangaTRNet](https://mangatr.app) | recent check 11.26.25 ✅ |
 | [MangaTuk](https://mangatuk.com) | recent check 11.26.25 ✅ |
@@ -101,15 +103,15 @@
 | [manhuaaz.com](https://manhuaaz.com) | currently offline ⛓️‍💥 |
 | [manhuaes.com](https://manhuaes.com) | currently offline ⛓️‍💥 |
 | [manhuafast.com](https://manhuafast.com) | recent check 11.25.25 ✅ |
-| [manhuafast.net](https://manhuafast.net) | recent check 11.25.25 ✅ |
+| [manhuafast.net](https://manhuafast.net) | recent check 05.20.26 ✅ |
 | [manhuaga.org](https://manhua-ga.org) | currently offline ⛓️‍💥 |
 | [manhuahot.com](https://manhuahot.com) | recent check 11.26.25 ✅ |
 | [manhuanext.com](https://manhuanext.com) | recent check 11.26.25 ✅ |
-| [manhuaplus.com](https://manhuaplus.com) | recent check 11.25.25 ✅ |
+| [manhuaplus.com](https://manhuaplus.com) | recent check 05.20.26 ✅ |
 | [Manhuarm](https://manhuarmmtl.com) | recent check 11.25.25 ✅ |
 | [manhuascan.us](https://manhuascan.us) | recent check 11.25.25 ✅ |
 | [manhuatop.org](https://manhuatop.org) | recent check 11.26.25 ✅ |
-| [manhuaus.com](https://manhuaus.com) | recent check 11.25.25 ✅ |
+| [manhuaus.com](https://manhuaus.com) | recent check 05.20.26 ✅ |
 | [manhuazonghe.com](https://www.manhuazonghe.com) |  |
 | [manhwamanhua.com](https://manhwamanhua.com) |  |
 | [manhwas.men](https://manhwas.men) | currently offline ⛓️‍💥 |
@@ -130,7 +132,7 @@
 | [plutoscans.com](https://flamescans.lol) | recent check 11.26.25 ✅ |
 | [pomanga.com](https://pomanga.com) | currently offline ⛓️‍💥 |
 | [rackusreads.com](https://rackusreads.com) | recent check 11.26.25 ✅ |
-| [ragescans.com](https://ragescans.com) | recent check 11.26.25 ✅ |
+| ~~ragescans.com~~ | offline May 2026 ⛓️‍💥 |
 | [RagnarokScanlation](https://ragnarokscanlation.org) | recent check 11.26.25 ✅ |
 | [ravenscans.com](https://ravenscans.com) | recent check 11.26.25 ✅ |
 | [razure.org](https://razure.org) | recent check 11.26.25 ✅ |
@@ -169,8 +171,8 @@
 | [topreadmanhwa.com](https://topreadmanhwa.com) | SSL Error ⛔️ |
 | [tritiniascans.com](https://tritinia.org) | recent check 11.26.25 ✅ |
 | [TurkceMangaOku](https://trmangaoku.com) | chapter filter broken ⛔️ |
-| [utoon.net](https://utoon.net) |recent check 11.26.25 ✅ |
-| [violetscans.org](https://violetscans.org) | recent check 11.26.25 ✅ |
+| [utoon.net](https://utoon.net) | recent check 05.20.26 ✅ |
+| [violetscans.org](https://violetscans.org) | recent check 05.20.26 ✅ |
 | [voyce.me](https://voyce.me) | chapter filter broken ⛔️ |
 | [vyvymanga.org](https://vyvymanga.org) | currently offline ⛓️‍💥 |
 | [wearehunger.site](https://www.wearehunger.site) | cloudflare protection currently, not working 💨 |
@@ -179,7 +181,8 @@
 | [WebtoonHatti](https://webtoonhatti.club) | SSL Error ⛔️ |
 | [WebtoonTR](https://webtoontr.net) | recent check 11.26.25 ✅ |
 | [webtoons.com (LINE Webtoon)](https://www.webtoons.com/en/) | English /en/ only · Originals + Canvas · uses mobile JSON API for fast chapter lists · is_official=true (ranked above fan aggregators in multi-source) · motion-toon: layers as separate pages |
-| [weebcentral.com](https://weebcentral.com) | recent check 11.27.25 ✅ · Supports scanlation group selection |
+| [weebcentral.com](https://weebcentral.com) | recent check 05.20.26 ✅ · Supports scanlation group selection |
+| [webtoon.xyz](https://www.webtoon.xyz) | recent check 05.20.26 ✅ |
 | [whalemanga.com](https://whalemanga.com) | recent check 11.26.25 ✅ |
 | [witchscans.com](https://witchscans.com) | recent check 11.26.25 ✅ |
 | [woopread.com](https://woopread.com) | chapter filter broken ⛔️ |
@@ -189,82 +192,24 @@
 | [zazamanga.com](https://www.zazamanga.com) | chapter filter broken ⛔️ |
 | [zinchanmangacom.com](https://zinchangmanga.com) | chapter filter broken ⛔️ |
 | [zinmanganet.com](https://zinmanga.net) | chapter filter broken ⛔️ |
-| [zscans.com](https://zscans.com) | recent check 11.26.25 ✅ |
+| [zscans.com](https://zscans.com) | temporarily offline May 2026 ⛓️‍💥 |
 
-## Bato mirrors
+## Retired Bato network
 
-| Site | Notes |
-| ----- | ----- |
-| [ato.to](https://ato.to) |  |
-| [bato.ac](https://bato.ac) |  |
-| [bato.bz](https://bato.bz) |  |
-| [bato.cc](https://bato.cc) |  |
-| [bato.cx](https://bato.cx) |  |
-| [bato.day](https://bato.day) |  |
-| [bato.id](https://bato.id) |  |
-| [bato.ing](https://bato.ing) |  |
-| [bato.pw](https://bato.pw) |  |
-| [bato.red](https://bato.red) |  |
-| [bato.run](https://bato.run) |  |
-| [bato.sh](https://bato.sh) |  |
-| [bato.si](https://bato.si) |  |
-| [bato.to](https://bato.to) |  |
-| [bato.vc](https://bato.vc) |  |
-| [batocomic.com](https://batocomic.com) |  |
-| [batocomic.net](https://batocomic.net) |  |
-| [batocomic.org](https://batocomic.org) |  |
-| [batoto.in](https://batoto.in) |  |
-| [batoto.tv](https://batoto.tv) |  |
-| [batotoo.com](https://batotoo.com) |  |
-| [batotwo.com](https://batotwo.com) |  |
-| [batpub.com](https://batpub.com) |  |
-| [batread.com](https://batread.com) |  |
-| [battwo.com](https://battwo.com) |  |
-| [comiko.net](https://comiko.net) |  |
-| [comiko.org](https://comiko.org) |  |
-| [dto.to](https://dto.to) |  |
-| [fto.to](https://fto.to) |  |
-| [hto.to](https://hto.to) |  |
-| [jto.to](https://jto.to) |  |
-| [kuku.to](https://kuku.to) |  |
-| [lto.to](https://lto.to) |  |
-| [mangatoto.com](https://mangatoto.com) |  |
-| [mangatoto.net](https://mangatoto.net) |  |
-| [mangatoto.org](https://mangatoto.org) |  |
-| [mto.to](https://mto.to) |  |
-| [nto.to](https://nto.to) |  |
-| [okok.to](https://okok.to) |  |
-| [readtoto.com](https://readtoto.com) |  |
-| [readtoto.net](https://readtoto.net) |  |
-| [readtoto.org](https://readtoto.org) |  |
-| [ruru.to](https://ruru.to) |  |
-| [vba.to](https://vba.to) |  |
-| [vto.to](https://vto.to) |  |
-| [wba.to](https://wba.to) |  |
-| [wto.to](https://wto.to) |  |
-| [xba.to](https://xba.to) |  |
-| [xbato.com](https://xbato.com) |  |
-| [xbato.net](https://xbato.net) |  |
-| [xbato.org](https://xbato.org) |  |
-| [xdxd.to](https://xdxd.to) |  |
-| [xto.to](https://xto.to) |  |
-| [yba.to](https://yba.to) |  |
-| [yto.to](https://yto.to) |  |
-| [zba.to](https://zba.to) |  |
-| [zbato.com](https://zbato.com) |  |
-| [zbato.net](https://zbato.net) |  |
-| [zbato.org](https://zbato.org) |  |
+Bato.to and related mirror domains were reported shut down in January 2026. The old mirror list is intentionally not presented as supported source coverage.
 
-## MangaBuddy mirrors
+## Retired MangaBuddy network
+
+MangaBuddy and its mirrors went offline in May 2026.
 
 | Site | Notes |
 | ----- | ----- |
-| [mangacute.com](https://mangacute.com/) | also supports `www.mangacute.com` |
-| [mangaforest.com](https://mangaforest.com/) | also supports `www.mangaforest.com` |
-| [mangamirror.com](https://mangamirror.com/) | also supports `www.mangamirror.com` |
-| [mangapuma.com](https://mangapuma.com/) | also supports `www.mangapuma.com` |
-| [mangaxyz.com](https://mangaxyz.com/) | also supports `www.mangaxyz.com` |
-| [truemanga.com](https://truemanga.com/) | also supports `www.truemanga.com` |
+| ~~mangacute.com~~ | offline May 2026 ⛓️‍💥 |
+| ~~mangaforest.com~~ | offline May 2026 ⛓️‍💥 |
+| ~~mangamirror.com~~ | offline May 2026 ⛓️‍💥 |
+| ~~mangapuma.com~~ | offline May 2026 ⛓️‍💥 |
+| ~~mangaxyz.com~~ | offline May 2026 ⛓️‍💥 |
+| ~~truemanga.com~~ | offline May 2026 ⛓️‍💥 |
 
 ## MangaKakalot / Manganato mirrors
 
