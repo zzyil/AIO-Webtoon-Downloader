@@ -9,11 +9,26 @@ import re
 import sys
 import threading
 from typing import Dict, List, Optional, Any
-from urllib.parse import parse_qsl, quote_plus, urlparse
+from urllib.parse import parse_qsl, quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
+
+# Optional zendriver-backed Cloudflare fallback. comix.to added CF
+# protection in upstream's 2026-05 release; direct-HTTP API calls (the
+# v1/v2 manga + chapter-list endpoints we hit through the regular
+# `scraper` session, NOT the Patchright-routed token capture or
+# chapter-detail steal) can drop 403/503 challenge pages. `_cf_aware_request`
+# wraps those calls and falls back through a one-shot zendriver session on
+# confirmed CF challenges. Soft-import so non-zendriver installs still load
+# the module — the wrapper degrades to a straight passthrough.
+# Cross-file: sites/crawlee_utils.py:get_cf_session / is_cf_challenge.
+try:
+    from .crawlee_utils import get_cf_session, is_cf_challenge
+    _CF_AVAILABLE = True
+except ImportError:
+    _CF_AVAILABLE = False
 
 
 # All bare print() calls in this module emit to stderr by default. Why: this
@@ -62,11 +77,84 @@ class ComixSiteHandler(BaseSiteHandler):
     # covers paginated chapter-list fetches.
     _ChaptersTokenCache: Dict[str, str] = {}
 
+    def __init__(self):
+        # BaseSiteHandler has no __init__; super().__init__() falls through
+        # to object.__init__ (no-args). We override here only to attach the
+        # per-instance lazy CF session — the class-level _ChaptersTokenCache
+        # stays shared across instances on purpose (sig tokens are URL-bound,
+        # not session-bound, so cross-instance reuse is correct).
+        super().__init__()
+        # Lazy-init zendriver CF session. Built on first 403/503 in
+        # _cf_aware_request when is_cf_challenge confirms the body is a CF
+        # interstitial, then reused for subsequent direct-HTTP calls within
+        # the same handler instance. Patchright-routed calls (token capture,
+        # chapter-detail steal) don't need this — the browser handles CF
+        # natively via its own cookie store.
+        self._cf_session = None
+
     def configure_session(self, scraper, args) -> None:
         scraper.headers.update({
             "Referer": "https://comix.to/",
             "Origin": "https://comix.to",
         })
+
+    def _get_cf_session(self):
+        """Lazy-build a zendriver-backed requests.Session pre-loaded with
+        valid CF cookies for comix.to. Returns the cached session on
+        subsequent calls; returns None when crawlee_utils isn't importable
+        OR the zendriver solve fails (caller treats None as "no fallback
+        available" and surfaces the original 403/503).
+
+        Cross-file: sites/crawlee_utils.py:get_cf_session handles the
+        zendriver lifecycle + per-domain cookie cache (_CF_COOKIE_TTL).
+        """
+        if self._cf_session is None and _CF_AVAILABLE:
+            try:
+                self._cf_session = get_cf_session("https://comix.to")
+                self._cf_session.headers.update({
+                    "Referer": "https://comix.to/",
+                    "Origin": "https://comix.to",
+                })
+            except Exception as e:
+                # Failure modes: zendriver missing, Chrome not installed,
+                # CF solve timeout, network blip. Log to stderr (via the
+                # _stderr_print shim at module top so we don't corrupt
+                # --search JSON on stdout) and fall through — the caller
+                # keeps the original response.
+                print(f"[!] Comix CF session failed: {e}")
+        return self._cf_session
+
+    def _cf_aware_request(self, url: str, scraper, make_request):
+        """Wraps make_request with a one-shot zendriver CF fallback.
+
+        Behavior: makes the normal request; on a 403/503 that
+        is_cf_challenge confirms IS a CF interstitial (not a legitimate
+        403/503 from the API itself, where we want the real status to
+        propagate to the caller's error handling), retries through the
+        lazy CF session. Any exception in the retry path silently keeps
+        the original response so we never make CF resilience itself the
+        cause of a hard failure.
+
+        Used only for the direct-HTTP paths (fetch_comic_context,
+        get_chapters listing, get_chapter_images HTML fallback). The
+        Patchright-routed token capture and chapter-detail steal handle
+        CF transparently and don't go through this wrapper.
+
+        Cross-file: same idiom as upstream comix.py's _cf_aware_request;
+        ported here on top of the local persistent-browser bridge.
+        """
+        response = make_request(url, scraper)
+        if _CF_AVAILABLE and response.status_code in (403, 503):
+            try:
+                if is_cf_challenge(response.status_code, response.text):
+                    cf = self._get_cf_session()
+                    if cf:
+                        response = cf.get(url, timeout=20)
+            except Exception:
+                # Retry-path failure is non-fatal — keep the original
+                # response so the caller's own error path runs.
+                pass
+        return response
 
     def _get_api_token(self, url: str) -> Optional[str]:
         """Return the `_=<sig>&time=<ts>` query string for the chapter
@@ -217,7 +305,7 @@ class ComixSiteHandler(BaseSiteHandler):
         return names
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
-        response = make_request(url, scraper)
+        response = self._cf_aware_request(url, scraper, make_request)
         html = response.text
         soup = BeautifulSoup(html, "html.parser")
         
@@ -243,10 +331,10 @@ class ComixSiteHandler(BaseSiteHandler):
                 # their JS bundle's axios baseURL. Keep v2 as a fallback in
                 # case they re-enable.
                 api_url = f"https://comix.to/api/v1/manga/{hash_id}"
-                api_response = make_request(api_url, scraper)
+                api_response = self._cf_aware_request(api_url, scraper, make_request)
                 if api_response.status_code == 404:
                     api_url = f"https://comix.to/api/v2/manga/{hash_id}"
-                    api_response = make_request(api_url, scraper)
+                    api_response = self._cf_aware_request(api_url, scraper, make_request)
                 api_data = api_response.json()
 
                 # v1 returns status="ok"; v2 returned status=200. Accept both.
@@ -417,7 +505,7 @@ class ComixSiteHandler(BaseSiteHandler):
             )
             if sig:
                 api_url += f"&_={sig}"
-            response = make_request(api_url, scraper)
+            response = self._cf_aware_request(api_url, scraper, make_request)
             if response.status_code == 404:
                 api_url = (
                     f"https://comix.to/api/v2/manga/{hash_id}/chapters"
@@ -425,7 +513,7 @@ class ComixSiteHandler(BaseSiteHandler):
                 )
                 if sig:
                     api_url += f"&_={sig}"
-                response = make_request(api_url, scraper)
+                response = self._cf_aware_request(api_url, scraper, make_request)
             try:
                 data = response.json()
             except json.JSONDecodeError:
@@ -440,9 +528,23 @@ class ComixSiteHandler(BaseSiteHandler):
                 break
                 
             for item in items:
-                # Filter by language if needed, though the API seems to return 'en' mostly
-                if language and item.get("language") != language:
-                    continue
+                # Lenient language filter (ported from upstream's
+                # "No chapters selected" fix). Two rules:
+                #   1. Items with no `language` field are KEPT — many
+                #      comix payloads omit the field on untranslated /
+                #      original-language entries. The prior strict
+                #      `!= language` silently dropped them (since
+                #      None != "en"), surfacing as zero chapters.
+                #   2. String match is case-insensitive AND accepts
+                #      long-form names: "English" / "english" match
+                #      "en" because the API mixes short codes ("en")
+                #      with display names ("English") across endpoints.
+                item_lang = item.get("language")
+                if language and item_lang is not None:
+                    lang_lower = language.lower()
+                    item_lang_lower = item_lang.lower()
+                    if item_lang_lower != lang_lower and not item_lang_lower.startswith(lang_lower):
+                        continue
 
                 chap_num = item.get("number")
                 # v1 uses `id`; v2 used `chapter_id`. Try v1 first.
@@ -484,39 +586,49 @@ class ComixSiteHandler(BaseSiteHandler):
                 if chap_str is None:
                     continue
 
-                # Construct URL
-                # Format: https://comix.to/title/{hash_id}-{slug}/{chapter_id}-chapter-{number}
-                slug = context.comic.get("slug")
+                # Prefer the canonical chapter URL the API supplies in
+                # `item["url"]` when present (ported from upstream's
+                # _cf_aware refactor). Using the API-supplied URL avoids
+                # drift if comix changes their URL slug format; the
+                # construction path below remains the fallback for
+                # legacy item shapes that omit the field.
+                chap_url = item.get("url")
+                if chap_url and not chap_url.startswith("http"):
+                    chap_url = urljoin("https://comix.to", chap_url)
+                if not chap_url:
+                    # Construct URL
+                    # Format: https://comix.to/title/{hash_id}-{slug}/{chapter_id}-chapter-{number}
+                    slug = context.comic.get("slug")
 
-                # If we don't have the slug from API, try to get it from the context URL
-                if not slug and context.comic.get("url"):
-                     path = urlparse(context.comic["url"]).path
-                     parts = path.split('/')
-                     if len(parts) >= 3:
-                         # This is likely the full slug (hash_id-slug)
-                         slug = parts[2]
-                         # If we use this, we don't need to prepend hash_id again if it's already there
-                         if slug.startswith(f"{hash_id}-"):
-                             pass
-                         else:
-                             # This shouldn't happen if the URL is correct, but let's be safe
-                             pass
+                    # If we don't have the slug from API, try to get it from the context URL
+                    if not slug and context.comic.get("url"):
+                         path = urlparse(context.comic["url"]).path
+                         parts = path.split('/')
+                         if len(parts) >= 3:
+                             # This is likely the full slug (hash_id-slug)
+                             slug = parts[2]
+                             # If we use this, we don't need to prepend hash_id again if it's already there
+                             if slug.startswith(f"{hash_id}-"):
+                                 pass
+                             else:
+                                 # This shouldn't happen if the URL is correct, but let's be safe
+                                 pass
 
-                if not slug:
-                    slug = "unknown"
+                    if not slug:
+                        slug = "unknown"
 
-                # Ensure slug starts with hash_id
-                if not slug.startswith(f"{hash_id}-"):
-                    slug = f"{hash_id}-{slug}"
+                    # Ensure slug starts with hash_id
+                    if not slug.startswith(f"{hash_id}-"):
+                        slug = f"{hash_id}-{slug}"
 
-                # URL still uses the API's raw `number` value (which is
-                # what comix.to's chapter-page URL expects); chap_str is
-                # only for our internal bucketing/sorting. Falls back to
-                # chap_str when the API field was unparseable so the URL
-                # at least targets the right chapter number rather than
-                # the literal string "None".
-                url_chap_part = chap_num if chap_num not in (None, "") else chap_str
-                chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{url_chap_part}"
+                    # URL still uses the API's raw `number` value (which is
+                    # what comix.to's chapter-page URL expects); chap_str is
+                    # only for our internal bucketing/sorting. Falls back to
+                    # chap_str when the API field was unparseable so the URL
+                    # at least targets the right chapter number rather than
+                    # the literal string "None".
+                    url_chap_part = chap_num if chap_num not in (None, "") else chap_str
+                    chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{url_chap_part}"
 
                 # v1 uses `group`; v2 used `scanlation_group`. Try both.
                 group_info = item.get("group") or item.get("scanlation_group") or {}
@@ -577,7 +689,7 @@ class ComixSiteHandler(BaseSiteHandler):
         # ----- HTML-scrape fallback (kept for forward-compat if comix re-enables SSR) -----
         if not url:
             raise RuntimeError("Comix chapter is missing both id and url; cannot fetch images.")
-        response = make_request(url, scraper)
+        response = self._cf_aware_request(url, scraper, make_request)
         html = response.text
 
         next_data = self._extract_next_data(html)
