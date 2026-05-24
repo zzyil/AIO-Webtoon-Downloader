@@ -464,22 +464,21 @@ class ComixSiteHandler(BaseSiteHandler):
             soup=soup
         )
 
-    def get_chapters(
-        self, context: SiteComicContext, scraper, language: str, make_request
+    def _fetch_chapters_api_items(
+        self, hash_id: str, title_url: str, scraper, make_request
     ) -> List[Dict]:
-        hash_id = context.identifier
-        if not hash_id:
-             raise RuntimeError("Missing manga identifier (hash_id).")
+        """Paginate the /api/v1/manga/{hid}/chapters endpoint and return the
+        flat list of raw API items. Empty list signals "API didn't yield" —
+        the caller should fall back to the DOM scrape.
 
-        # Capture the `_=<sig>` query token up front. v1 chapters endpoint
-        # returns 403 without it; v2 is permanently 404. Per probe, the sig
-        # validates the request path only — page/limit/order can vary freely
-        # while the same `_=` is reused. So we capture once, then paginate
-        # with our own params.
-        # When capture fails (no patchright/playwright, browser launch error)
-        # we still attempt the bare API URLs — they'll 403, but the HTML
-        # fallback in get_chapter_images may still get the user images.
-        title_url = context.comic.get("url") or f"https://comix.to/title/{hash_id}"
+        2026-05-24 reality: comix.to now returns encrypted blobs
+        (`{"e": "<base64-ish>"}`) on this endpoint; the page's bundle
+        decrypts client-side. The `status` field is absent in that shape,
+        so the `status not in (200, "ok")` guard breaks the loop on the
+        first encrypted page and we return []. Kept as a fast path in
+        case comix reverts — a single rejected page is cheap, and a real
+        plain-JSON response avoids the much-slower DOM scrape entirely.
+        """
         captured_qs = self._get_api_token(title_url) or ""
         sig = ""
         if captured_qs:
@@ -488,7 +487,7 @@ class ComixSiteHandler(BaseSiteHandler):
                     sig = v
                     break
 
-        chapters = []
+        items_all: List[Dict] = []
         page = 1
         # Server caps at limit=100 (limit=200 → 422 Unprocessable Entity);
         # 100 covers a 67-item title in one page and most series in 1-3
@@ -519,133 +518,170 @@ class ComixSiteHandler(BaseSiteHandler):
             except json.JSONDecodeError:
                 break
 
-            # v1 status="ok"; v2 status=200. Accept both.
+            # v1 status="ok"; v2 status=200. Accept both. Encrypted-blob
+            # responses (`{"e": "..."}`) have neither, so this break
+            # naturally short-circuits and we fall through to the DOM path.
             if data.get("status") not in (200, "ok"):
                 break
-                
+
             items = data.get("result", {}).get("items", [])
             if not items:
                 break
-                
-            for item in items:
-                # Lenient language filter (ported from upstream's
-                # "No chapters selected" fix). Two rules:
-                #   1. Items with no `language` field are KEPT — many
-                #      comix payloads omit the field on untranslated /
-                #      original-language entries. The prior strict
-                #      `!= language` silently dropped them (since
-                #      None != "en"), surfacing as zero chapters.
-                #   2. String match is case-insensitive AND accepts
-                #      long-form names: "English" / "english" match
-                #      "en" because the API mixes short codes ("en")
-                #      with display names ("English") across endpoints.
-                item_lang = item.get("language")
-                if language and item_lang is not None:
-                    lang_lower = language.lower()
-                    item_lang_lower = item_lang.lower()
-                    if item_lang_lower != lang_lower and not item_lang_lower.startswith(lang_lower):
-                        continue
 
-                chap_num = item.get("number")
-                # v1 uses `id`; v2 used `chapter_id`. Try v1 first.
-                chap_id = item.get("id") or item.get("chapter_id")
-                title = item.get("name") or f"Chapter {chap_num}"
-
-                # Normalize chap_num to a parseable numeric string.
-                # The API USUALLY returns int/float (e.g. 47, 47.5), but
-                # has been observed returning None / "" / non-numeric
-                # strings for special chapters (oneshots, side stories,
-                # season-break placeholders). aio-dl.py:5885 calls
-                # float(chap) for chapter bucketing and ValueErrors on
-                # "None" / non-numeric text → the chapter gets skipped
-                # with "Skipping chapter with invalid number: None" and
-                # the user sees zero comix chapters downloaded.
-                # Resolution order:
-                #   1. item["number"] when numeric → "%g" coerce ("47", "47.5").
-                #   2. item["number"] as a string with embedded digits
-                #      → regex-extract.
-                #   3. item["name"] / title → regex-extract.
-                # Skip the chapter entirely when no numeric token is
-                # available — surfacing a non-numeric `chap` would just
-                # trigger the same skip downstream with a misleading
-                # "Skipping chapter with invalid number" log line.
-                chap_str: Optional[str] = None
-                if isinstance(chap_num, (int, float)):
-                    chap_str = f"{chap_num:g}"
-                else:
-                    for source_text in (
-                        chap_num if isinstance(chap_num, str) else None,
-                        title,
-                    ):
-                        if not source_text:
-                            continue
-                        m = re.search(r"(\d+(?:\.\d+)?)", str(source_text))
-                        if m:
-                            chap_str = m.group(1)
-                            break
-                if chap_str is None:
-                    continue
-
-                # Prefer the canonical chapter URL the API supplies in
-                # `item["url"]` when present (ported from upstream's
-                # _cf_aware refactor). Using the API-supplied URL avoids
-                # drift if comix changes their URL slug format; the
-                # construction path below remains the fallback for
-                # legacy item shapes that omit the field.
-                chap_url = item.get("url")
-                if chap_url and not chap_url.startswith("http"):
-                    chap_url = urljoin("https://comix.to", chap_url)
-                if not chap_url:
-                    # Construct URL
-                    # Format: https://comix.to/title/{hash_id}-{slug}/{chapter_id}-chapter-{number}
-                    slug = context.comic.get("slug")
-
-                    # If we don't have the slug from API, try to get it from the context URL
-                    if not slug and context.comic.get("url"):
-                         path = urlparse(context.comic["url"]).path
-                         parts = path.split('/')
-                         if len(parts) >= 3:
-                             # This is likely the full slug (hash_id-slug)
-                             slug = parts[2]
-                             # If we use this, we don't need to prepend hash_id again if it's already there
-                             if slug.startswith(f"{hash_id}-"):
-                                 pass
-                             else:
-                                 # This shouldn't happen if the URL is correct, but let's be safe
-                                 pass
-
-                    if not slug:
-                        slug = "unknown"
-
-                    # Ensure slug starts with hash_id
-                    if not slug.startswith(f"{hash_id}-"):
-                        slug = f"{hash_id}-{slug}"
-
-                    # URL still uses the API's raw `number` value (which is
-                    # what comix.to's chapter-page URL expects); chap_str is
-                    # only for our internal bucketing/sorting. Falls back to
-                    # chap_str when the API field was unparseable so the URL
-                    # at least targets the right chapter number rather than
-                    # the literal string "None".
-                    url_chap_part = chap_num if chap_num not in (None, "") else chap_str
-                    chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{url_chap_part}"
-
-                # v1 uses `group`; v2 used `scanlation_group`. Try both.
-                group_info = item.get("group") or item.get("scanlation_group") or {}
-                group_name = group_info.get("name") if group_info else None
-
-                chapters.append({
-                    "url": chap_url,
-                    "chap": chap_str,
-                    "title": title,
-                    "id": chap_id,
-                    "group": group_name,
-                    "up_count": item.get("votes", 0),
-                })
-
+            items_all.extend(items)
             if len(items) < limit:
                 break
             page += 1
+
+        return items_all
+
+    def get_chapters(
+        self, context: SiteComicContext, scraper, language: str, make_request
+    ) -> List[Dict]:
+        hash_id = context.identifier
+        if not hash_id:
+             raise RuntimeError("Missing manga identifier (hash_id).")
+
+        # Title URL feeds both the sig-capture path and the DOM-scrape
+        # fallback. fetch_comic_context absolutizes this on the comic dict;
+        # the hash_id-only fallback exists for callers that constructed a
+        # context manually without a URL.
+        title_url = context.comic.get("url") or f"https://comix.to/title/{hash_id}"
+
+        # Try the API path first (fast path, ~1-3 paginated calls + sig
+        # capture). Returns [] when comix.to encrypts the response, which
+        # is the steady-state behaviour as of 2026-05-24. The DOM scrape
+        # picks up from there — it's ~10x slower but works because the
+        # browser decrypts in-page before rendering.
+        raw_items = self._fetch_chapters_api_items(hash_id, title_url, scraper, make_request)
+        if not raw_items:
+            # Don't be silent here — the DOM scrape can take 30-90s on a
+            # large series, so the user should know why this step suddenly
+            # got slow. stderr (via the _stderr_print shim) keeps stdout
+            # clean for JSON consumers.
+            print(
+                "[*] Comix: API returned 0 chapters (likely encrypted response); "
+                "falling back to DOM scrape via persistent browser.",
+                flush=True,
+            )
+            raw_items = _COMIX_BROWSER_BRIDGE.fetch_chapters_via_dom(title_url) or []
+
+        chapters: List[Dict] = []
+        for item in raw_items:
+            # Lenient language filter (ported from upstream's
+            # "No chapters selected" fix). Two rules:
+            #   1. Items with no `language` field are KEPT — many
+            #      comix payloads omit the field on untranslated /
+            #      original-language entries. The prior strict
+            #      `!= language` silently dropped them (since
+            #      None != "en"), surfacing as zero chapters.
+            #   2. String match is case-insensitive AND accepts
+            #      long-form names: "English" / "english" match
+            #      "en" because the API mixes short codes ("en")
+            #      with display names ("English") across endpoints.
+            # DOM-scrape items always set language=None and so always
+            # pass this filter; the per-row UI doesn't surface the
+            # language attribute and the title URL implicitly already
+            # restricts to whatever language section the user landed on.
+            item_lang = item.get("language")
+            if language and item_lang is not None:
+                lang_lower = language.lower()
+                item_lang_lower = item_lang.lower()
+                if item_lang_lower != lang_lower and not item_lang_lower.startswith(lang_lower):
+                    continue
+
+            chap_num = item.get("number")
+            # v1 uses `id`; v2 used `chapter_id`. Try v1 first.
+            chap_id = item.get("id") or item.get("chapter_id")
+            title = item.get("name") or f"Chapter {chap_num}"
+
+            # Normalize chap_num to a parseable numeric string.
+            # The API USUALLY returns int/float (e.g. 47, 47.5), but
+            # has been observed returning None / "" / non-numeric
+            # strings for special chapters (oneshots, side stories,
+            # season-break placeholders). aio-dl.py:5885 calls
+            # float(chap) for chapter bucketing and ValueErrors on
+            # "None" / non-numeric text → the chapter gets skipped
+            # with "Skipping chapter with invalid number: None" and
+            # the user sees zero comix chapters downloaded.
+            # Resolution order:
+            #   1. item["number"] when numeric → "%g" coerce ("47", "47.5").
+            #   2. item["number"] as a string with embedded digits
+            #      → regex-extract.
+            #   3. item["name"] / title → regex-extract.
+            # Skip the chapter entirely when no numeric token is
+            # available — surfacing a non-numeric `chap` would just
+            # trigger the same skip downstream with a misleading
+            # "Skipping chapter with invalid number" log line.
+            chap_str: Optional[str] = None
+            if isinstance(chap_num, (int, float)):
+                chap_str = f"{chap_num:g}"
+            else:
+                for source_text in (
+                    chap_num if isinstance(chap_num, str) else None,
+                    title,
+                ):
+                    if not source_text:
+                        continue
+                    m = re.search(r"(\d+(?:\.\d+)?)", str(source_text))
+                    if m:
+                        chap_str = m.group(1)
+                        break
+            if chap_str is None:
+                continue
+
+            # Prefer the canonical chapter URL the API/DOM supplies in
+            # `item["url"]` when present (ported from upstream's
+            # _cf_aware refactor; DOM scrape also populates this).
+            # Using the supplied URL avoids drift if comix changes
+            # their URL slug format; the construction path below
+            # remains the fallback for legacy item shapes that omit
+            # the field.
+            chap_url = item.get("url")
+            if chap_url and not chap_url.startswith("http"):
+                chap_url = urljoin("https://comix.to", chap_url)
+            if not chap_url:
+                # Construct URL
+                # Format: https://comix.to/title/{hash_id}-{slug}/{chapter_id}-chapter-{number}
+                slug = context.comic.get("slug")
+
+                # If we don't have the slug from API, try to get it from the context URL
+                if not slug and context.comic.get("url"):
+                    path = urlparse(context.comic["url"]).path
+                    parts = path.split('/')
+                    if len(parts) >= 3:
+                        # This is likely the full slug (hash_id-slug)
+                        slug = parts[2]
+
+                if not slug:
+                    slug = "unknown"
+
+                # Ensure slug starts with hash_id
+                if not slug.startswith(f"{hash_id}-"):
+                    slug = f"{hash_id}-{slug}"
+
+                # URL still uses the API's raw `number` value (which is
+                # what comix.to's chapter-page URL expects); chap_str is
+                # only for our internal bucketing/sorting. Falls back to
+                # chap_str when the API field was unparseable so the URL
+                # at least targets the right chapter number rather than
+                # the literal string "None".
+                url_chap_part = chap_num if chap_num not in (None, "") else chap_str
+                chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{url_chap_part}"
+
+            # v1 uses `group`; v2 used `scanlation_group`. Try both.
+            # DOM-scrape items also populate `group` with {"name": ...}.
+            group_info = item.get("group") or item.get("scanlation_group") or {}
+            group_name = group_info.get("name") if group_info else None
+
+            chapters.append({
+                "url": chap_url,
+                "chap": chap_str,
+                "title": title,
+                "id": chap_id,
+                "group": group_name,
+                "up_count": item.get("votes", 0),
+            })
 
         return chapters
 
@@ -979,6 +1015,207 @@ class _ComixBrowserSession:
             print(f"[!] Comix: no chapter-API response captured for {chap_id}. Seen API responses (tail): {tail}", flush=True)
         return captured["data"]
 
+    def fetch_chapters_via_dom(
+        self,
+        title_url: str,
+        max_pages: int = 500,
+        time_budget_s: float = 300.0,
+    ) -> List[Dict]:
+        """Paginate the title page (`?page=N`) in the persistent browser and
+        scrape chapter rows from the rendered DOM. Used when the JSON API
+        path returns 0 items because comix.to's `/api/v1/manga/{hid}/chapters`
+        now responds with an encrypted blob (`{"e": "<base64-ish>"}`) that
+        we can't decode in Python — the page's bundle decrypts it via a
+        module-scoped routine that isn't exposed on `window`, so calling it
+        from `page.evaluate` isn't reachable.
+
+        Returns API-item-shaped dicts so the handler's existing per-item
+        processing loop (chap_str normalization, lenient language filter,
+        URL construction, group extraction) keeps working unchanged. The
+        only field that's intentionally None is `language` — comix's DOM
+        doesn't surface a per-row language attribute, and the title-page
+        URL implicitly already filters to whichever language the user
+        landed on; the lenient filter treats None as "keep" anyway.
+
+        Pagination strategy:
+          - Iterate page=1,2,3… via `page.goto`. Each navigation is ~1s
+            with `wait_for_selector(".mchap-row__primary", timeout=10s)`
+            instead of a fixed sleep, and the persistent browser keeps
+            warm so subsequent navs reuse the same TCP/TLS session.
+          - Dedupe by chap_id across pages — comix's pagination occasionally
+            overlaps the boundary chapter between adjacent pages, so naive
+            concatenation would double-count.
+          - Print a progress line every 20 pages so the UI / CLI user
+            doesn't think the process is hung during long scrapes.
+
+        Time budget: default 300s. One Piece is the long-tail outlier
+        (~180 pages * 1s in the warm-browser case = ~3 min); most series
+        fit well under a minute. Truncated runs surface a stderr warning
+        AND return the partial list — better than a hard fail, and the
+        caller's chapter range (`--chapters`) can clip to whatever was
+        scraped.
+
+        Returns empty list on any error so the caller's None-vs-[] check
+        still works as a sentinel for "API exhausted, scrape exhausted".
+        """
+        if not self._start():
+            return []
+        import time as _time
+        # Selectors mirror the DOM probe done during the merge research:
+        # `.mchap-item` is the <li> row, `.mchap-row__primary` is the chapter
+        # link, `.mchap-row__ch` holds "Ch.<num>", `.mchap-row__title` is the
+        # chapter title, `.mchap-row__group` is the scanlation group anchor
+        # (with `.is-official` for official publishers). Cross-file: grep
+        # `mchap-` in this file's history for the probe context.
+        scrape_js = """() => {
+            return Array.from(document.querySelectorAll('.mchap-item')).map(li => {
+                const a = li.querySelector('.mchap-row__primary');
+                const ch = li.querySelector('.mchap-row__ch');
+                const ti = li.querySelector('.mchap-row__title');
+                const gp = li.querySelector('.mchap-row__group');
+                const lk = li.querySelector('.mchap-row__likes');
+                return {
+                    href: a ? a.getAttribute('href') : null,
+                    chap_label: ch ? ch.textContent.trim() : null,
+                    title: ti ? ti.textContent.trim() : null,
+                    group: gp ? (gp.querySelector('span') ? gp.querySelector('span').textContent.trim() : gp.textContent.trim()) : null,
+                    group_official: gp ? gp.classList.contains('is-official') : false,
+                    likes: lk ? parseInt((lk.textContent.match(/\\d+/) || ['0'])[0]) : 0,
+                };
+            });
+        }"""
+        # Drop any trailing ?query so we can append our own pagination param
+        # cleanly. comix accepts ?page=N on the title page and the React
+        # router uses that to drive the chapter-list state.
+        base = title_url.split("?", 1)[0]
+        items: List[Dict] = []
+        seen_ids: set = set()
+        deadline = _time.monotonic() + time_budget_s
+        # Track the first row's href from the previous scrape. Critical for
+        # correctness on back-to-back goto: comix's React component swaps
+        # row CONTENT without unmounting, so the OLD page's `.mchap-row__primary`
+        # nodes survive long enough that a naïve `wait_for_selector` returns
+        # instantly on stale DOM, we re-scrape the previous page's chap_ids,
+        # every row is a dup, and the consecutive_dup early-break fires a
+        # false end-of-list. Waiting for the first row's href to differ
+        # from the previous page is the cheapest reliable freshness signal.
+        prev_first_href: Optional[str] = None
+        consecutive_dup_pages = 0
+        for page_n in range(1, max_pages + 1):
+            if _time.monotonic() > deadline:
+                print(
+                    f"[!] Comix DOM scrape time budget ({time_budget_s:.0f}s) "
+                    f"exceeded at page {page_n}; returning {len(items)} chapters "
+                    f"(use --chapters to limit). Series may be truncated.",
+                    flush=True,
+                )
+                break
+            url = f"{base}?page={page_n}"
+            try:
+                self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                # Page 1 has no prior page to diff against — fall back to
+                # the simple "any chapter row exists" signal. Subsequent
+                # pages wait for the React swap to actually happen.
+                if prev_first_href is None:
+                    try:
+                        self._page.wait_for_selector(".mchap-row__primary", timeout=10000)
+                    except Exception:
+                        # No rows rendered on page 1 → series has no
+                        # chapters OR layout broke. Terminal either way.
+                        break
+                else:
+                    # Wait until the first row's href differs from the
+                    # previous page's first href. Times out at 10s either
+                    # because (a) we're past the last page and React kept
+                    # showing the prior content unchanged, or (b) comix
+                    # legitimately took >10s to re-render. (a) is terminal;
+                    # we treat the empty-rows result that follows as the
+                    # end signal naturally. json.dumps escapes any quotes
+                    # in the href so the literal can't break the JS parse.
+                    js_predicate = (
+                        "(() => { const a = document.querySelector('.mchap-row__primary'); "
+                        f"return a && a.getAttribute('href') !== {json.dumps(prev_first_href)}; }})"
+                    )
+                    try:
+                        self._page.wait_for_function(js_predicate, timeout=10000)
+                    except Exception:
+                        # DOM didn't update — either past end of pagination
+                        # or React is being lazy. Either way scrape what we
+                        # have and let the post-scrape dup-detect handle it.
+                        pass
+                rows = self._page.evaluate(scrape_js) or []
+            except Exception as e:
+                print(f"[!] Comix DOM scrape failed at page {page_n}: {type(e).__name__}: {e}", flush=True)
+                break
+            if not rows:
+                break
+            # Update prev_first_href for the next iteration's freshness check.
+            # Use the raw href (not the normalized url) so the JS predicate
+            # comparison stays exact.
+            prev_first_href = rows[0].get("href")
+            # Progress: emit a heartbeat every 20 pages so the UI / CLI
+            # doesn't look stuck during long scrapes (One Piece is ~180
+            # pages = ~3 minutes wall time with a warm browser). stderr
+            # path keeps stdout clean for JSON consumers.
+            if page_n % 20 == 0:
+                elapsed = int(_time.monotonic() - (deadline - time_budget_s))
+                print(
+                    f"[*] Comix DOM scrape: page {page_n}, "
+                    f"{len(items)} unique chapters so far ({elapsed}s elapsed).",
+                    flush=True,
+                )
+            page_added = 0
+            for row in rows:
+                href = row.get("href")
+                if not href:
+                    continue
+                # Parse `/title/{slug}/{chap_id}-chapter-{chap_num}` —
+                # chap_id is digits, chap_num is the rest (allows .5/.1 etc).
+                m = re.match(r".*/title/[^/]+/(\d+)-chapter-(.+)$", href)
+                if not m:
+                    continue
+                chap_id_str, chap_num_str = m.group(1), m.group(2)
+                if chap_id_str in seen_ids:
+                    continue
+                seen_ids.add(chap_id_str)
+                # Absolutize URL — comix anchors are href-relative on the page.
+                chap_url = href if href.startswith("http") else ("https://comix.to" + href)
+                # Coerce chap_num to int/float where possible so the handler's
+                # `isinstance(chap_num, (int, float))` branch hits the fast
+                # %g formatter; non-numeric specials fall through to the
+                # regex-extract branch (handles oneshots / "1.5" / etc).
+                num_val: Any = chap_num_str
+                try:
+                    fv = float(chap_num_str)
+                    num_val = int(fv) if fv.is_integer() else fv
+                except ValueError:
+                    pass
+                items.append({
+                    "id": int(chap_id_str),
+                    "number": num_val,
+                    "name": row.get("title") or row.get("chap_label"),
+                    "url": chap_url,
+                    "group": {"name": row.get("group")} if row.get("group") else None,
+                    "votes": row.get("likes") or 0,
+                    # Language is unknown from the DOM — the lenient filter
+                    # in get_chapters keeps `None` items, matching the
+                    # "untagged items shouldn't be silently dropped" rule
+                    # ported from upstream.
+                    "language": None,
+                })
+                page_added += 1
+            if page_added == 0:
+                # Every row was a dup of an earlier page. Could be normal
+                # boundary overlap (1-2 dups) or a sign the pagination is
+                # stuck on the same page. Break after 2 consecutive
+                # zero-add pages to bound the worst case.
+                consecutive_dup_pages += 1
+                if consecutive_dup_pages >= 2:
+                    break
+            else:
+                consecutive_dup_pages = 0
+        return items
+
     def close(self):
         self._cleanup()
 
@@ -1135,6 +1372,28 @@ class _ComixBrowserBridge:
 
     def fetch_chapter_api(self, chapter_url: str, chap_id) -> Optional[Dict]:
         return _comix_call("fetch_chapter_api", chapter_url, chap_id)
+
+    def fetch_chapters_via_dom(
+        self,
+        title_url: str,
+        max_pages: int = 500,
+        time_budget_s: float = 300.0,
+    ) -> List[Dict]:
+        """Bridge facade for the DOM-pagination fallback. Default per-call
+        wall clock is `time_budget_s + 30s` (worker overhead + final goto
+        slack) so the bridge timeout doesn't trip BEFORE the in-method
+        budget logic has a chance to return a partial list — the inner
+        budget is the load-bearing one; this is just the outer safety net.
+        Cross-file: see _ComixBrowserSession.fetch_chapters_via_dom for
+        the actual pagination + DOM-scrape implementation.
+        """
+        return _comix_call(
+            "fetch_chapters_via_dom",
+            title_url,
+            max_pages,
+            time_budget_s,
+            _timeout_s=time_budget_s + 30.0,
+        )
 
     def close(self) -> None:
         try:
