@@ -209,6 +209,21 @@ CHAPTER_PROBE_MIN_SEED = 0.65
 # while quick-probing the noise.
 EXPENSIVE_PROBE_QUICK_THRESHOLD = 0.85
 
+# Gate for the official-publisher tiebreaker in _cmp. is_official wins
+# over a non-official peer ONLY when both sources clear this title-match
+# floor AND are within TIEBREAKER_WINDOW of each other; otherwise we
+# fall through to title_match. Prevents a weak-match official hit (e.g.
+# a Canvas series whose normalized title accidentally clustered with a
+# real series via union-find) from outranking a strong-match aggregator.
+# 0.85 aligns with EXPENSIVE_PROBE_QUICK_THRESHOLD: "this is the line
+# below which we already treat title_match as noisy". Strong-match
+# webtoons-vs-toonily case (both score ≈1.0 → within window, both
+# strong → official wins) is preserved; weak-match canvas false-merge
+# case (linewebtoon 1.0 + canvas 1.0 is still possible if the title
+# literally matches, but Fix A + Fix C catch THAT failure path
+# upstream — see SourceEntry.is_official assignment + count_outlier).
+IS_OFFICIAL_REQUIRES_TITLE_MATCH = 0.85
+
 # Hard cap on the entire probe phase. After this, we abandon any still-running
 # probes (their threads keep going but we don't wait — the cache only persists
 # completed probes, so unfinished ones get retried next search). Bounds worst-
@@ -282,6 +297,22 @@ class SourceEntry:
     # Populated in search_all from handler.OFFICIAL_PUBLISHER. Consumed by
     # _cmp as the top tiebreaker within a SeriesCandidate, above quality.
     is_official: bool = False
+    # Wrong-match sink: True when this source's actual_chapter_count is
+    # vastly below peer sources in the same candidate AND the source's
+    # own chapter_count_hint doesn't claim a count comparable to peers
+    # (i.e. it's not a DMCA-affected source claiming chapters it can't
+    # deliver — it's a count-outlier whose union-find-merge with peers is
+    # almost certainly a false-positive driven by title-string collision).
+    # Treated by _cmp identically to dmca_likely (sink to back of the
+    # candidate's source list) but DELIBERATELY not surfaced in to_json /
+    # the UI — the UI's DMCA flag should only fire for actual DMCA-affected
+    # sources to avoid users misreading wrong-match as a takedown. Set by
+    # the same cross-site check at search_orchestrator.py:~5230 that
+    # populates dmca_likely; the differentiator is whether own_hint
+    # supports the high-count claim. See linewebtoon._populate_chapter_counts
+    # for the data source on the webtoons side. NOT surfaced in to_json
+    # intentionally — internal-only ranking signal.
+    count_outlier: bool = False
 
 
 @dataclass
@@ -5181,6 +5212,21 @@ def search_all(
                 per_site_best[hit.site] = (score, hit)
         for site, (score, hit) in per_site_best.items():
             seed_q = seed.get(site.lower(), 0.5)
+            # is_official is the AND of site-level handler.OFFICIAL_PUBLISHER
+            # (set by class attr) AND per-hit SearchHit.is_official (set by
+            # the handler's search() method when a single handler legitimately
+            # serves both official + non-official content — e.g. linewebtoon
+            # for Originals (official) vs Canvas (user-uploaded, not
+            # publisher-curated). hit.is_official=None means the handler
+            # didn't differentiate per-hit, so site-level is the only signal.
+            site_level = site.lower() in official_sites
+            per_hit = hit.is_official
+            if per_hit is None:
+                src_is_official = site_level
+            else:
+                # AND ensures a rogue handler can't claim is_official without
+                # opting in via the class attribute.
+                src_is_official = bool(per_hit) and site_level
             sources.append(
                 SourceEntry(
                     site=site,
@@ -5194,33 +5240,62 @@ def search_all(
                     actual_chapter_count=hit.actual_chapter_count,
                     dmca_likely=hit.dmca_likely,
                     raw_score=hit.raw_score,
-                    is_official=site.lower() in official_sites,
+                    is_official=src_is_official,
                 )
             )
 
-        # Cross-site DMCA detection: when one source reports a meaningful
-        # chapter count (10+) but another source has only a small fraction
-        # actually fetchable, the second is likely DMCA-affected even if its
-        # own metadata didn't expose lastChapter. Catches:
-        #   - Witch Hat Atelier (MangaDex 1 vs MangaFire 96)
-        #   - One Piece (MangaDex 7 vs MangaFire 1181)
-        #   - Eleceed (MangaDex 102 vs ~400 actual; flagged at 25.5%)
-        # Threshold: actual count < 50% of the highest reported count across
-        # other sources. Initially I used 25% but Eleceed slipped through at
-        # 25.5%; 50% catches the intent (substantially incomplete vs others)
-        # without false-positives on series where MD legitimately lags by a
-        # chapter or two.
+        # Cross-site chapter-count divergence detection. Two distinct
+        # failure modes share the same "actual << peers' max" signal:
+        #
+        # (a) DMCA-affected source: source's OWN chapter_count_hint claims
+        #     ~as many chapters as peers (so its metadata is intact) but
+        #     actual_chapter_count is far below — the hosted chapters were
+        #     hollowed by takedown. Originally caught:
+        #       - Witch Hat Atelier (MangaDex hint=96, actual=1, MF=96)
+        #       - One Piece (MangaDex hint=1181, actual=7, MF=1181)
+        #       - Eleceed (MangaDex hint=400+, actual=102 at 25.5%)
+        #     Flagged as dmca_likely → surfaced in to_json/UI.
+        #
+        # (b) Wrong-match / count outlier: source's OWN hint is missing or
+        #     also low — the source genuinely has those few chapters; it
+        #     just isn't the same series despite the union-find merge
+        #     (typically caused by short generic normalized titles like
+        #     "one piece" colliding with Canvas user uploads). Flagged as
+        #     count_outlier → ranking penalty WITHOUT the DMCA claim in
+        #     to_json (avoids users misreading a wrong-match for a
+        #     takedown).
+        #
+        # Both end up sinking to the back of the source list via the _cmp
+        # first check; the differentiator is purely semantic (which flag
+        # is surfaced in the JSON output).
+        #
+        # Threshold: actual < 50% of max peer hint. Tuned for Eleceed
+        # which slipped through at 25.5% under a 25% cap; 50% catches
+        # substantially-incomplete without false-positiving series where
+        # one source legitimately lags by a chapter or two.
         max_other_count = 0
         for s in sources:
             if isinstance(s.chapter_count_hint, int) and s.chapter_count_hint > max_other_count:
                 max_other_count = s.chapter_count_hint
         if max_other_count >= 10:
             for s in sources:
-                if s.dmca_likely:
+                if s.dmca_likely or s.count_outlier:
                     continue
                 actual = s.actual_chapter_count
-                if isinstance(actual, int) and actual < max_other_count * 0.5:
+                if not isinstance(actual, int) or actual >= max_other_count * 0.5:
+                    continue
+                own_hint = s.chapter_count_hint
+                if isinstance(own_hint, int) and own_hint >= max_other_count * 0.5:
+                    # Pattern (a): source claimed it has many, delivered few.
                     s.dmca_likely = True
+                else:
+                    # Pattern (b): source either claims few or didn't expose
+                    # a hint at all — the union-find merge with the high-count
+                    # peer is almost certainly a false-positive driven by a
+                    # title-string collision (e.g. Canvas series titled
+                    # "One Piece" with 20 real episodes union-find-merged
+                    # with the actual 1100-chapter One Piece).
+                    s.count_outlier = True
         # Sort sources within candidate. Order of decision:
         #   1. DMCA-likely sources go to the back. A source with 1/96 chapters
         #      accessible should never beat one with 96/96 regardless of
@@ -5254,10 +5329,29 @@ def search_all(
             return s.img_quality_score if s.img_quality_score is not None else s.seed_quality
 
         def _cmp(a: SourceEntry, b: SourceEntry) -> int:
-            if a.dmca_likely != b.dmca_likely:
-                return 1 if a.dmca_likely else -1
+            # Sink signal: dmca_likely OR count_outlier. Both push the source
+            # to the back of the candidate's source list — they are the same
+            # signal at the ranking layer, surfaced differently in to_json
+            # (only dmca_likely; count_outlier is intentionally internal).
+            # See the cross-site count check above for how each is set.
+            a_sink = a.dmca_likely or a.count_outlier
+            b_sink = b.dmca_likely or b.count_outlier
+            if a_sink != b_sink:
+                return 1 if a_sink else -1
+            # Official-publisher tiebreaker — gated behind a title_match
+            # floor + within-window check so a weak-match official hit can't
+            # outrank a strong-match aggregator. See
+            # IS_OFFICIAL_REQUIRES_TITLE_MATCH for the rationale; the gate
+            # exists alongside per-hit is_official (which already filters
+            # canvas) as a generic backstop for any future handler that
+            # might surface low-confidence official hits.
             if a.is_official != b.is_official:
-                return -1 if a.is_official else 1
+                strong_a = a.title_match >= IS_OFFICIAL_REQUIRES_TITLE_MATCH
+                strong_b = b.title_match >= IS_OFFICIAL_REQUIRES_TITLE_MATCH
+                within = abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW
+                if strong_a and strong_b and within:
+                    return -1 if a.is_official else 1
+                # else fall through — title_match decides below.
             if abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW:
                 qa, qb = _quality_for(a), _quality_for(b)
                 if qa != qb:

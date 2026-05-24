@@ -519,6 +519,16 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
         except ValueError as exc:
             raise RuntimeError(f"Webtoons API returned non-JSON: {exc}") from exc
 
+        # Canvas (/en/canvas/...) is user-uploaded content. webtoons.com hosts
+        # the bytes but LINE Webtoon doesn't curate or publish them — so the
+        # is_official=True / publisher="LINE Webtoon" annotation we emit for
+        # Originals would be a false claim for Canvas. chapter_merger.py:424
+        # (`s[1].get("is_official") is True`) sorts official sources first; a
+        # Canvas chapter outranking a real fan-translation source via that
+        # mechanism is the bug we're fixing. group_name kept distinct ("LINE
+        # Webtoon Canvas") so multi-source diagnostics show which webtoons
+        # surface each chapter actually came from.
+        publisher_label = "LINE Webtoon" if not is_canvas else "LINE Webtoon Canvas"
         episode_list = (data.get("result") or {}).get("episodeList") or []
         chapters: List[Dict] = []
         for ep in episode_list:
@@ -555,15 +565,17 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                     "title": episode_title,
                     "url": viewer_url,
                     "uploaded": exp_ms // 1000,  # epoch seconds for EPUB
-                    # Publisher annotation — webtoons IS the official LINE
-                    # source. chapter_merger.py:367–370 sorts each chapter
-                    # row's source list by is_official, so when a series
-                    # exists on both webtoons and a fan aggregator,
-                    # webtoons ranks first regardless of measured img_quality.
-                    # Same mechanism mangadex.py uses for MangaPlus chapters.
-                    "is_official": True,
-                    "publisher": "LINE Webtoon",
-                    "group_name": "LINE Webtoon",
+                    # Publisher annotation — Originals are the canonical
+                    # LINE source (chapter_merger.py:424 sorts each chapter
+                    # row's source list with is_official=True first, so an
+                    # Originals series on both webtoons and a fan aggregator
+                    # ranks webtoons first regardless of measured img_quality;
+                    # same mechanism mangadex.py uses for MangaPlus chapters).
+                    # Canvas is user-uploaded — is_official=False, group_name
+                    # kept distinct so diagnostics can tell them apart.
+                    "is_official": (not is_canvas),
+                    "publisher": publisher_label,
+                    "group_name": publisher_label,
                     "thumbnail": thumb,
                 }
             )
@@ -837,6 +849,17 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                         alt_titles.append(slug_form)
 
             raw_score = max(0.05, 1.0 - (idx / max(1, len(anchors))))
+            # Per-hit is_official: Originals (/en/<genre>/.../list) are LINE-
+            # curated and inherit handler-level OFFICIAL_PUBLISHER=True. Canvas
+            # (/en/canvas/.../list) is user-uploaded — webtoons.com hosts but
+            # doesn't publish — so canvas hits MUST NOT claim official-
+            # publisher status. search_orchestrator.py ANDs this per-hit
+            # value with the site-level flag when populating
+            # SourceEntry.is_official. Fixes the failure mode where a Canvas
+            # series literally titled "One Piece" (or any famous title)
+            # union-find-merged with the real series and won the
+            # within-candidate tiebreaker via is_official=True.
+            hit_is_official = not self._is_canvas_url(canonical_url)
             hits.append(
                 SearchHit(
                     site=self.name,
@@ -848,9 +871,106 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                     language="en",
                     chapter_count_hint=None,
                     raw_score=raw_score,
+                    is_official=hit_is_official,
                 )
             )
+
+        # Populate actual_chapter_count for each hit via the mobile API so
+        # the orchestrator's cross-site count-divergence check (search_
+        # orchestrator.py around line 5213) can sink a wrong-match Canvas
+        # hit whose normalized title collides with a real series. Without
+        # this signal a 20-episode Canvas "One Piece" stays clustered with
+        # MangaDex's 1100-chapter One Piece purely on title-normalize, and
+        # the per-hit is_official=False alone doesn't sink it below all
+        # the real sources — _cmp would still let it stay where its
+        # title_match places it. Probing the API costs ~1.6s per hit so we
+        # parallelize + cap the total budget. See _populate_chapter_counts
+        # docstring for the bandwidth/timeout tradeoff.
+        if hits:
+            self._populate_chapter_counts(hits, scraper, make_request)
         return hits
+
+    def _populate_chapter_counts(
+        self,
+        hits: List[SearchHit],
+        scraper,
+        make_request,
+        *,
+        max_workers: int = 5,
+        total_budget_s: float = 4.0,
+    ) -> None:
+        """Parallel-fetch episode counts via the mobile API; populate each
+        hit's actual_chapter_count in place.
+
+        Why: the orchestrator's cross-site chapter-count divergence check
+        (sites/search_orchestrator.py around line 5213) compares each
+        source's actual_chapter_count against the max chapter_count_hint
+        across all sources in the same candidate. When a Canvas series with
+        ~20 episodes is union-find-merged with a real 1100-chapter series
+        (because their normalized titles collide), this signal lets the
+        orchestrator demote the Canvas source — labelled count_outlier
+        (NOT dmca_likely, to avoid the UI's DMCA flag being raised for
+        wrong-match cases) — so it sinks to the back of the candidate's
+        source list.
+
+        Budget tradeoff: each API call is ~1.6s + ~60-110 KB. At
+        max_workers=5 and total_budget_s=4.0, up to ~12 hits complete in
+        the budget; any that don't keep actual_chapter_count=None and the
+        cross-site check silently skips them (the source then stays
+        ranked by title_match alone, which is the pre-fix behavior).
+
+        Same endpoint get_chapters uses (m.webtoons.com/api/v1/
+        {webtoon|canvas}/{title_no}/episodes?pageSize=99999). No count
+        field is exposed by the API (only episodeList + nextCursor),
+        verified 2026-05-24 — pulling the full list is the only path.
+        """
+        import concurrent.futures as _cf
+        import time as _t
+        deadline = _t.monotonic() + total_budget_s
+
+        def _count_one(hit: SearchHit) -> None:
+            try:
+                parsed = urlparse(hit.url)
+                qs = parse_qs(parsed.query)
+                tn = (qs.get("title_no") or qs.get("titleNo") or [None])[0]
+                if not tn or not str(tn).isdigit():
+                    return
+                kind = "canvas" if self._is_canvas_url(hit.url) else "webtoon"
+                api = (
+                    f"{_MOBILE_BASE}/api/v1/{kind}/{tn}/episodes"
+                    f"?pageSize=99999"
+                )
+                response = make_request(api, scraper)
+                episodes = (
+                    (response.json().get("result") or {}).get("episodeList")
+                    or []
+                )
+                # Mirror get_chapters' filter: exposureDateMillis > 0 drops
+                # unpublished drafts (rare on Originals, common on Canvas
+                # series the author left mid-edit).
+                hit.actual_chapter_count = sum(
+                    1
+                    for ep in episodes
+                    if (ep.get("exposureDateMillis") or 0) > 0
+                )
+            except Exception:
+                # Network/parse failure: leave actual_chapter_count=None.
+                # The cross-site check skips None values, so this is the
+                # safe-degrade outcome (source ranked by title_match alone).
+                pass
+
+        with _cf.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="webtoons-count"
+        ) as pool:
+            futures = [pool.submit(_count_one, h) for h in hits]
+            for fut in _cf.as_completed(futures):
+                remaining = deadline - _t.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    fut.result(timeout=max(0.1, remaining))
+                except Exception:
+                    pass
 
 
 __all__ = ["LineWebtoonSiteHandler"]

@@ -141,6 +141,17 @@ class SearchHit:
                  substantially exceeds actual_chapter_count (e.g. MD says 96
                  but only 1 EN chapter accessible). The orchestrator surfaces
                  this in JSON so users can see why a source is suspect.
+      - is_official: per-hit override for handler.OFFICIAL_PUBLISHER.
+                 None (default) = "defer to handler.OFFICIAL_PUBLISHER".
+                 False = "this specific hit is NOT publisher-canonical
+                 content" — e.g. linewebtoon Canvas user uploads:
+                 webtoons.com hosts the file but LINE Webtoon doesn't
+                 publish it, so canvas hits must not claim the official-
+                 publisher tiebreaker that originals legitimately do.
+                 Consumed by sites/search_orchestrator.py at the
+                 SourceEntry.is_official assignment (AND'd with site-level
+                 so a rogue handler can't claim official without the class
+                 attribute set).
     """
     site: str
     title: str
@@ -153,6 +164,7 @@ class SearchHit:
     actual_chapter_count: Optional[int] = None
     dmca_likely: bool = False
     raw_score: float = 0.0
+    is_official: Optional[bool] = None
 
 
 class BaseSiteHandler:
