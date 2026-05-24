@@ -98,6 +98,33 @@ class MangaReaderSiteHandler(BaseSiteHandler):
             if a.get_text(strip=True)
         ]
 
+        # Aniwatch-family layout: .anisc-info > .item rows with `.item-head`
+        # (label) and `.name` (value). Each row is "<Label>: <Value>".
+        authors: List[str] = []
+        status: Optional[str] = None
+        year: Optional[int] = None
+        alt_names: List[str] = []
+        for item in soup.select(".anisc-info .item, .anisc-info-v2 .item"):
+            head = item.select_one(".item-head, .item-title")
+            value_node = item.select_one(".name") or item.select_one("a")
+            if not head or not value_node:
+                continue
+            label = head.get_text(strip=True).lower()
+            value = value_node.get_text(" ", strip=True)
+            if not value:
+                continue
+            if "author" in label:
+                anchors = [a.get_text(strip=True) for a in item.select("a") if a.get_text(strip=True)]
+                authors = anchors or [value]
+            elif "status" in label:
+                status = value
+            elif "published" in label or label.startswith("year") or "released" in label:
+                year_match = re.search(r"\b(\d{4})\b", value)
+                if year_match:
+                    year = int(year_match.group(1))
+            elif "alternative" in label or "synonyms" in label:
+                alt_names = [p.strip() for p in re.split(r"[;,]", value) if p.strip()]
+
         comic: Dict[str, object] = {
             "hid": series_id,
             "title": title,
@@ -107,6 +134,14 @@ class MangaReaderSiteHandler(BaseSiteHandler):
             "_slug": slug,
             "_series_id": series_id,
         }
+        if authors:
+            comic["authors"] = authors
+        if status:
+            comic["status"] = status
+        if year is not None:
+            comic["year"] = year
+        if alt_names:
+            comic["alt_names"] = alt_names
 
         return SiteComicContext(comic=comic, title=title, identifier=series_id, soup=None)
 

@@ -72,6 +72,23 @@ const DEFAULT_FORM = {
   // global default; per-job overrides aren't surfaced in this form
   // (the setting is essentially "trust the bytes" yes/no, not per-job).
   cbzPreserveOriginals: true,
+  // LINE Webtoon WebP recompression (Phase 1, 2026-05-11). Re-encodes
+  // each downloaded page from PNG/JPEG to lossy WebP at the chosen quality
+  // before packaging. Only fires on webtoons.com (Python checks
+  // handler.name === "linewebtoon"); silently no-ops elsewhere, so this is
+  // safe to leave on as a global default for users whose library is mostly
+  // webtoons. Target: ~45GB Eleceed library → ~5GB at q85. Same useEffect
+  // at line ~110 spreads settings.defaults onto the form, so the Settings
+  // tab counterparts pre-populate these on a fresh New tab open.
+  webtoonRecompress: false,
+  webtoonRecompressQuality: 85,
+  webtoonRecompressMethod: 4,
+  // Komikku-compatible per-chapter CBZ output (2026-05-12, komikkuspec.md).
+  // When on, Python force-coerces format=cbz / keep-chapters / no-final-file,
+  // writes per-chapter ComicInfo.xml inside each CBZ, plus cover.jpg +
+  // details.json at the series-folder root. settings.defaults.komikku
+  // propagates here via the useEffect at line ~120-124 below.
+  komikku: false,
 };
 
 const FORMATS = [
@@ -180,6 +197,22 @@ export default function DownloadTab({
     if (form.cbzPreserveOriginals === false) {
       args.cbzPreserveOriginals = false;
     }
+    // Webtoon WebP recompression (Phase 1, 2026-05-11). Emit the master
+    // toggle so downloader.js's boolMap picks it up; pass quality/method
+    // through too so buildCliArgs can decide whether to forward them
+    // (it only does when the master toggle is on AND the value differs
+    // from the Python-side default, to keep the spawn line clean).
+    if (form.webtoonRecompress) {
+      args.webtoonRecompress = true;
+      args.webtoonRecompressQuality = form.webtoonRecompressQuality;
+      args.webtoonRecompressMethod = form.webtoonRecompressMethod;
+    }
+    // Komikku output (2026-05-12, komikkuspec.md). One boolean — Python
+    // does all the coercion. downloader.js boolMap emits --komikku when
+    // this is true.
+    if (form.komikku) {
+      args.komikku = true;
+    }
     if (form.splitMode === "size" && form.splitValue) args.split = form.splitValue;
     if (form.splitMode === "chapters" && form.splitValue) args.split = `${form.splitValue}ch`;
     if (form.group.trim()) args.group = form.group.trim();
@@ -287,6 +320,49 @@ export default function DownloadTab({
           </p>
         )}
 
+        {/* Komikku-mode per-job toggle (2026-05-12, komikkuspec.md).
+            Pre-filled from settings.defaults.komikku via the useEffect at
+            line ~120-124 (which spreads settings.defaults into the form).
+            Python-side --komikku auto-coerces format=cbz / keep-chapters /
+            no-final-file, so the format buttons above are effectively
+            ignored when this is on — that's intentional, and the helper
+            text below tells the user. */}
+        <div className={cn(
+          "flex items-center justify-between gap-3 mt-2 rounded-md border p-3 transition-colors",
+          form.komikku
+            ? "border-primary/50 bg-primary/5"
+            : "border-border bg-background"
+        )}>
+          <div className="flex-1">
+            <Label className="text-xs cursor-pointer">
+              Komikku-compatible output
+            </Label>
+            <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug">
+              {form.komikku ? (
+                <>
+                  Overrides format → <span className="font-mono">CBZ</span>. Writes
+                  per-chapter CBZs with their own{" "}
+                  <span className="font-mono">ComicInfo.xml</span>, plus{" "}
+                  <span className="font-mono">cover.jpg</span> +{" "}
+                  <span className="font-mono">details.json</span> at the
+                  series-folder root. Output stays at{" "}
+                  <span className="font-mono">manga/&lt;Series&gt;/</span>.
+                </>
+              ) : (
+                <>
+                  Enable for Mihon/Tachiyomi/Komikku readers. Each chapter
+                  becomes its own CBZ with proper per-chapter metadata, plus
+                  series-level cover.jpg + details.json. Forces format=CBZ.
+                </>
+              )}
+            </p>
+          </div>
+          <Switch
+            checked={!!form.komikku}
+            onCheckedChange={(v) => set("komikku", v)}
+          />
+        </div>
+
         {/* EPUB layout — only shown when EPUB is selected */}
         {form.format === "epub" && (
           <div className="flex items-center gap-4 pt-2 animate-slide-up">
@@ -392,6 +468,81 @@ export default function DownloadTab({
             <Checkbox id="noCleanup" checked={form.noCleanup} onCheckedChange={(v) => set("noCleanup", v)} />
             <Label htmlFor="noCleanup" className="text-xs cursor-pointer">Don't clean up temp folder after completion</Label>
           </div>
+        </div>
+
+        {/* LINE Webtoon WebP recompression (Phase 1, 2026-05-11).
+            Master toggle + quality/method sliders. Only fires when the
+            active handler is `linewebtoon` (Python-side gating; the flag
+            is a no-op for other sites, so leaving it on as a global
+            default is safe for mixed-site libraries). Target case:
+            webtoons.com archival-quality PNGs (~2-3 MB/page) recompress
+            to WebP q85 at ~80-130 KB/page — ~90% disk reduction on
+            verified Eleceed Ch 57 PNGs. Settings tab carries the global
+            default; this block is the per-job override surface, mirroring
+            how Multi-source fallback exposes both per-job and global. */}
+        <SectionHeader>LINE Webtoon recompression</SectionHeader>
+        <div className="space-y-3">
+          <div className="flex items-start gap-3">
+            <Switch
+              id="webtoonRecompress"
+              checked={form.webtoonRecompress}
+              onCheckedChange={(v) => set("webtoonRecompress", v)}
+              className="mt-0.5"
+            />
+            <div className="flex-1">
+              <Label htmlFor="webtoonRecompress" className="text-xs cursor-pointer">
+                Recompress lossless PNG pages to WebP (webtoons.com only)
+              </Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Re-encodes lossless PNG pages to lossy WebP before packaging.
+                JPEG-served chapters (early/low-popularity series) are skipped
+                automatically — they're already small and re-encoding would be
+                generation-loss for tiny gains. Verified: ~90% smaller CBZ
+                files at q85 with no visible quality loss on phone-screen
+                viewing of color webtoons. Requires CBZ or EPUB output.
+              </p>
+            </div>
+          </div>
+          {form.webtoonRecompress && (
+            <div className="pl-12 animate-slide-up grid grid-cols-2 gap-x-6 gap-y-3">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Quality</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {form.webtoonRecompressQuality}
+                  </Badge>
+                </div>
+                <Slider
+                  value={form.webtoonRecompressQuality}
+                  onValueChange={(v) => set("webtoonRecompressQuality", v)}
+                  min={1}
+                  max={100}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  85 = storage-optimized (default). 90 = archival-safe
+                  (~60% larger). 95+ = wasted bytes on color webtoons.
+                </p>
+              </div>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Encoder effort</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {form.webtoonRecompressMethod}
+                  </Badge>
+                </div>
+                <Slider
+                  value={form.webtoonRecompressMethod}
+                  onValueChange={(v) => set("webtoonRecompressMethod", v)}
+                  min={0}
+                  max={6}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  0 = fastest, 6 = smallest. Default 4. method=6 trades
+                  ~2-3× encode time for ~5% smaller files.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Multi-source fallback (cross-site per-chapter retry).

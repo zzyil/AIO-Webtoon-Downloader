@@ -169,6 +169,20 @@ class PythonSetup {
     this._playwrightDir = path.join(envDir, "playwright-browsers");
     this._tempDir = path.join(os.tmpdir(), "aio-setup-temp");
 
+    // Resolve the per-host Python asset (URL + filename + archive type) up
+    // front rather than inside _downloadPython. Both _downloadPython AND
+    // _extractPython need archivePath/archiveType, and with per-step resume
+    // markers (see _step) step 1 may be skipped on retry — meaning a body
+    // that writes these on `this` from _downloadPython would leave them
+    // undefined when _extractPython runs. getPythonAsset is pure (only
+    // reads process.platform / process.arch), so resolving in the ctor
+    // is safe and idempotent.
+    const asset = getPythonAsset();
+    this._archivePath = path.join(this._tempDir, asset.archiveName);
+    this._archiveType = asset.archiveType;
+    this._archiveUrl = asset.url;
+    this._archiveName = asset.archiveName;
+
     this._onStep = onStep || (() => {});
     this._onLog = onLog || (() => {});
     this._onProgress = onProgress || (() => {});
@@ -194,6 +208,47 @@ class PythonSetup {
   /** Full path to the Playwright browsers folder */
   get playwrightDir() {
     return this._playwrightDir;
+  }
+
+  /**
+   * Path to a "stdlib was extracted" sentinel — used by step 2 to tell apart
+   * a real install from a zombie one (bin/python3 present but stdlib missing
+   * because tar got SIGKILL'd / AV-scanner pulled files mid-extract / FS race).
+   *
+   * Unix (PBS install_only): the stdlib lives as loose files under
+   *   <pythonDir>/lib/python<MAJOR.MINOR>/encodings/
+   * Picking encodings/__init__.py specifically because:
+   *   - encodings is the FIRST module CPython imports during interpreter init.
+   *     If it's missing, every subsequent import dies with
+   *     "ModuleNotFoundError: No module named 'encodings'" + "<no Python frame>".
+   *     This is the exact symptom the zombie-state bug produces in step 4.
+   *   - Cheap stat call.
+   * MAJOR.MINOR is derived from PBS_PYTHON_VERSION so a future bump (3.14.x,
+   * 3.15.x) automatically targets the right directory — don't hardcode "3.13".
+   *
+   * Windows (python.org embed): the stdlib ships INSIDE python<MAJOR><MINOR>.zip
+   * (e.g. python313.zip) instead of as loose files, so encodings/__init__.py
+   * never exists on disk. The equivalent "stdlib half of extraction landed"
+   * sentinel is the zip itself — its absence with python.exe present means
+   * the extractor truncated mid-write. The Windows embed extraction tends to
+   * land more atomically than PBS's tarball (smaller, fewer files), so this
+   * is more belt-and-suspenders here than load-bearing — but cheap to check.
+   *
+   * Used by: _extractPython skip check + post-extract verify (both in this
+   * file). Cross-file: deleteEnv() in this same module wipes envDir on full
+   * reset, which clears any stale partial-install sentinel state.
+   */
+  _extractionSentinelPath() {
+    if (process.platform === "win32") {
+      // "3.13.2" → "313"
+      const winMM = WIN_PYTHON_VERSION.split(".").slice(0, 2).join("");
+      return path.join(this._pythonDir, `python${winMM}.zip`);
+    }
+    // "3.13.13" → "3.13"
+    const unixMM = PBS_PYTHON_VERSION.split(".").slice(0, 2).join(".");
+    return path.join(
+      this._pythonDir, "lib", `python${unixMM}`, "encodings", "__init__.py"
+    );
   }
 
   // ═══════════════════════════════════════════
@@ -234,7 +289,44 @@ class PythonSetup {
     this._onStep({ step: num, total: TOTAL_STEPS, label });
     this._onLog(`\n── Step ${num}/${TOTAL_STEPS}: ${label} ──`);
     this._onProgress(0);
+
+    // Per-step resume marker. If a previous setup attempt completed this
+    // step but failed later, the marker lets the retry skip already-done
+    // work and pick up where things broke. The marker is written ONLY
+    // after fn() resolves successfully, so an interrupted step (SIGKILL,
+    // throw mid-body) doesn't leave a "completed" marker behind. Combined
+    // with step 2's sentinel verify (see _extractPython), this means the
+    // marker never papers over a zombie extraction — if fn() returned,
+    // its invariants were satisfied at that moment.
+    //
+    // Cleanup: deleteEnv() at the bottom of this file does rmSync on the
+    // whole envDir, so these markers (and .setup-complete) are wiped on
+    // a full reset together. Do NOT add per-step cleanup anywhere — the
+    // single delete path is what makes "Reset" a hard reset.
+    //
+    // Edge case: if the host's temp dir is cleared between runs (rare on
+    // macOS/Linux/Windows, but possible on some configs), the step-1
+    // marker may outlive the cached archive in this._tempDir. Step 2 then
+    // throws "Python archive not found or corrupt. Click Retry" — at
+    // which point the user's recourse is deleteEnv via the UI's reset
+    // button. Acceptable trade for resume cheapness on the common path.
+    const markerPath = path.join(this._envDir, `.step-${num}-complete`);
+    if (fs.existsSync(markerPath)) {
+      this._onLog(`Step ${num} already complete (marker present), skipping`);
+      return;
+    }
     await fn();
+    try {
+      fs.writeFileSync(markerPath, JSON.stringify({
+        at: new Date().toISOString(),
+        label,
+      }));
+    } catch (err) {
+      // Marker write is a hint, not a hard requirement — if it fails
+      // we lose only the resume optimization, not correctness. The
+      // next retry will just re-do this step (its body is idempotent).
+      this._onLog(`Warning: could not write step ${num} marker: ${err.message}`);
+    }
   }
 
   // ═══════════════════════════════════════════
@@ -242,15 +334,12 @@ class PythonSetup {
   // ═══════════════════════════════════════════
 
   async _downloadPython() {
-    // Resolve URL / asset name per host. Stash type+path on the instance so
-    // _extractPython can choose the right tool without re-resolving.
-    const asset = getPythonAsset();
-    const archivePath = path.join(this._tempDir, asset.archiveName);
-    this._archivePath = archivePath;
-    this._archiveType = asset.archiveType;
+    // Asset fields (path / type / url / name) are resolved once in the
+    // constructor — see the comment there explaining why.
+    const archivePath = this._archivePath;
 
     // If a cached download exists AND validates, reuse it.
-    if (fs.existsSync(archivePath) && this._isValidArchive(archivePath, asset.archiveType)) {
+    if (fs.existsSync(archivePath) && this._isValidArchive(archivePath, this._archiveType)) {
       this._onLog("Using cached download (verified valid)");
       return;
     }
@@ -258,15 +347,15 @@ class PythonSetup {
     // Delete any corrupt/partial cached file.
     try { fs.unlinkSync(archivePath); } catch {}
 
-    this._onLog(`Downloading ${asset.archiveName}…`);
-    this._onLog(`  source: ${asset.url}`);
-    await this._downloadFile(asset.url, archivePath);
+    this._onLog(`Downloading ${this._archiveName}…`);
+    this._onLog(`  source: ${this._archiveUrl}`);
+    await this._downloadFile(this._archiveUrl, archivePath);
 
     // Verify the download is a real archive of the expected type.
-    if (!this._isValidArchive(archivePath, asset.archiveType)) {
+    if (!this._isValidArchive(archivePath, this._archiveType)) {
       try { fs.unlinkSync(archivePath); } catch {}
       throw new Error(
-        `Downloaded file is corrupt (not a valid ${asset.archiveType}). ` +
+        `Downloaded file is corrupt (not a valid ${this._archiveType}). ` +
         "This usually means the download was interrupted. Click Retry."
       );
     }
@@ -280,10 +369,43 @@ class PythonSetup {
   // ═══════════════════════════════════════════
 
   async _extractPython() {
-    // If the interpreter is already present, skip extraction.
-    if (fs.existsSync(this.pythonExe)) {
-      this._onLog(`${path.basename(this.pythonExe)} already exists, skipping extraction`);
+    // Skip extraction only when BOTH the interpreter binary AND the stdlib
+    // sentinel are present. The original check trusted pythonExe alone,
+    // which let a zombie state through: a SIGKILL / AV scanner / FS race
+    // during tar extraction can leave bin/python3 on disk while
+    // lib/.../encodings/ is still missing. On the next launch step 2 would
+    // skip, step 3's `python --version` would short-circuit before stdlib
+    // init and report "Verified ✓", and step 4's pip install would crash
+    // with "ModuleNotFoundError: No module named 'encodings'" + "<no Python
+    // frame>". The sentinel makes both halves of the extraction load-bearing.
+    // See _extractionSentinelPath for what file we pick and why.
+    const sentinel = this._extractionSentinelPath();
+    const exeExists = fs.existsSync(this.pythonExe);
+    const sentinelExists = fs.existsSync(sentinel);
+
+    if (exeExists && sentinelExists) {
+      this._onLog(
+        `${path.basename(this.pythonExe)} already exists (stdlib sentinel verified), skipping extraction`
+      );
       return;
+    }
+    if (exeExists && !sentinelExists) {
+      // Zombie state: pythonExe present, stdlib half missing. Wipe so the
+      // re-extract below starts fresh. The existing "Clean out any leftover
+      // partial extraction" branch a few lines down would also wipe, but
+      // calling it out explicitly here makes the zombie-detection visible
+      // in the wizard log so users understand WHY step 2 is repeating.
+      this._onLog(
+        `Detected partial extraction, cleaning… (missing: ${path.relative(this._pythonDir, sentinel) || path.basename(sentinel)})`
+      );
+      try {
+        fs.rmSync(this._pythonDir, { recursive: true, force: true });
+      } catch (err) {
+        // Best-effort cleanup; the recursive mkdir + tar -xf below tolerates
+        // partial leftovers. Don't fail setup over this — the next loop
+        // through finds a clean state.
+        this._onLog(`Warning: cleanup failed (${err.message}) — continuing`);
+      }
     }
 
     const archivePath = this._archivePath;
@@ -356,6 +478,25 @@ class PythonSetup {
       }
     }
 
+    // Verify the stdlib sentinel landed too, not just pythonExe. Catches
+    // the case where tar exits 0 but the stdlib half was truncated (the
+    // tar process was killed AFTER bin/ was written but BEFORE
+    // lib/.../encodings/ — both are real bytes on disk so tar's exit code
+    // doesn't reflect the truncation). Throwing here means the step-2
+    // marker in _step() never gets written, so the next retry re-enters
+    // this function and the sentinel-aware skip check at the top catches
+    // the zombie state.
+    if (!fs.existsSync(sentinel)) {
+      try { fs.rmSync(this._pythonDir, { recursive: true, force: true }); } catch {}
+      try { fs.unlinkSync(archivePath); } catch {}
+      throw new Error(
+        `Extraction left a partial install — stdlib sentinel missing ` +
+        `(${path.relative(this._pythonDir, sentinel) || path.basename(sentinel)}). ` +
+        "The extractor may have been interrupted (AV scanner, low disk, " +
+        "process kill). Click Retry to re-download and re-extract."
+      );
+    }
+
     this._onLog("Extraction complete ✓");
   }
 
@@ -373,10 +514,38 @@ class PythonSetup {
     // We DO still verify the interpreter starts so Step 4+ get a clean baseline.
     if (process.platform !== "win32") {
       try {
-        const ver = await this._runPython(["--version"]);
-        this._onLog(`Verified: ${ver.trim()} ✓`);
+        // NOT `--version`: CPython prints sys.version to stdout BEFORE
+        // running site.py / initializing the codecs subsystem, so a
+        // partial-extraction Python with no stdlib still passes
+        // `python --version`. That's how the zombie-extraction bug
+        // sneaks past step 3 today, only to crash step 4's pip install
+        // with "ModuleNotFoundError: No module named 'encodings'" and
+        // "<no Python frame>".
+        //
+        // Force actual stdlib loading by importing the modules whose
+        // absence would silently break our pipeline:
+        //   - encodings: required by Python's bytecode + str() loader;
+        //     this is the SPECIFIC failure mode of the zombie bug.
+        //   - ssl: PBS bundles its own OpenSSL; a broken bundle (truncated
+        //     archive, wrong CPU arch) silently breaks pip TLS but
+        //     `python --version` still works.
+        //   - ctypes: depends on libffi linkage; broken libffi breaks
+        //     several wheel-loaded C extensions (cryptography, greenlet).
+        //   - sys + os: always loaded, cheap insurance against weirder
+        //     stdlib-init failures.
+        // If any of these fail, the install is poisoned and step 4 would
+        // crash later — surface the cause NOW with an actionable retry
+        // message instead of a cryptic "<no Python frame>" later.
+        const ver = await this._runPython([
+          "-c",
+          "import sys, os, encodings, ssl, ctypes; print(sys.version.split()[0])",
+        ]);
+        this._onLog(`Verified: Python ${ver.trim()} (stdlib smoke test passed) ✓`);
       } catch (err) {
-        throw new Error(`Python installed but won't start: ${err.message}`);
+        throw new Error(
+          `Python stdlib smoke test failed — likely a partial extraction. ` +
+          `Click Retry to wipe and re-download. Detail: ${err.message}`
+        );
       }
       return;
     }
@@ -663,13 +832,13 @@ class PythonSetup {
   }
 
   // ═══════════════════════════════════════════
-  // STEP 6 — Download Chromium for Patchright
+  // STEP 6 — Download Chromium for Playwright
   // ═══════════════════════════════════════════
   //
-  // Why no separate "install patchright" step: requirements.txt already
-  // pins patchright, so step 5's `pip install -r requirements.txt`
+  // Why no separate "install playwright" step: requirements.txt already
+  // pins playwright>=1.40.0, so step 5's `pip install -r requirements.txt`
   // installs it. The verification smoke test at the end of step 5 confirms
-  // `import patchright` works before we get here.
+  // `import playwright` works before we get here.
 
   async _downloadBrowser() {
     // Check if browsers are already downloaded AND launchable. If only
@@ -698,9 +867,15 @@ class PythonSetup {
       // browser cache, but we use the patchright command to keep the version
       // pin consistent with the runtime — patchright tracks Playwright
       // upstream but pins specific Chromium revisions.
+      //
+      // 20min watchdog override (vs _runPython's 10min default): the
+      // Chromium tarball is ~150 MB and a sluggish CDN mirror or shaped
+      // residential link (think hotel WiFi, mobile tether) can stretch
+      // this to 12-18 min. Don't want to false-positive a real download.
       await this._runPython(
         ["-m", "patchright", "install", "chromium"],
-        { PLAYWRIGHT_BROWSERS_PATH: this._playwrightDir }
+        { PLAYWRIGHT_BROWSERS_PATH: this._playwrightDir },
+        20 * 60_000
       );
     }
 
@@ -838,30 +1013,108 @@ class PythonSetup {
    *
    * The target relative path differs by platform — on Windows we look for
    * a sub-folder containing python.exe, on Unix bin/python3.
+   *
+   * Rollback contract: if any single rename in the inner loop fails, every
+   * already-completed rename is reversed (best-effort) before returning
+   * false. Without rollback, a partial failure left a hybrid layout where
+   * bin/ moved up but lib/ stayed nested — looks "extracted enough" to
+   * survive a sloppy skip check, but Python can't find its stdlib. That's
+   * the same class of zombie state the sentinel check at the top of
+   * _extractPython tries to prevent.
    */
   _fixNestedExtraction() {
-    try {
-      const targetRel = process.platform === "win32"
-        ? "python.exe"
-        : path.join("bin", "python3");
-      const targetLabel = path.basename(this.pythonExe);
-      const entries = fs.readdirSync(this._pythonDir);
-      for (const entry of entries) {
-        const sub = path.join(this._pythonDir, entry);
-        if (!fs.statSync(sub).isDirectory()) continue;
-        const subExe = path.join(sub, targetRel);
-        if (!fs.existsSync(subExe)) continue;
+    const targetRel = process.platform === "win32"
+      ? "python.exe"
+      : path.join("bin", "python3");
+    const targetLabel = path.basename(this.pythonExe);
 
-        this._onLog(`Found ${targetLabel} in sub-folder "${entry}", moving up…`);
-        for (const file of fs.readdirSync(sub)) {
-          const src = path.join(sub, file);
-          const dest = path.join(this._pythonDir, file);
-          fs.renameSync(src, dest);
-        }
-        fs.rmdirSync(sub);
-        return true;
+    let entries;
+    try {
+      entries = fs.readdirSync(this._pythonDir);
+    } catch (err) {
+      this._onLog(`_fixNestedExtraction: cannot read ${this._pythonDir}: ${err.message}`);
+      return false;
+    }
+
+    for (const entry of entries) {
+      const sub = path.join(this._pythonDir, entry);
+      let isDir;
+      try {
+        isDir = fs.statSync(sub).isDirectory();
+      } catch {
+        // Stat failed on this entry (race / permissions) — skip; keep
+        // looking at other entries for a candidate sub-folder.
+        continue;
       }
-    } catch {}
+      if (!isDir) continue;
+      const subExe = path.join(sub, targetRel);
+      if (!fs.existsSync(subExe)) continue;
+
+      this._onLog(`Found ${targetLabel} in sub-folder "${entry}", moving up…`);
+
+      let inner;
+      try {
+        inner = fs.readdirSync(sub);
+      } catch (err) {
+        this._onLog(
+          `_fixNestedExtraction: cannot read sub-folder ${sub}: ${err.message}`
+        );
+        return false;
+      }
+
+      // Track every successful rename so we can reverse them if a later
+      // one fails. Each entry is {from, to} where `from` is the original
+      // path inside the sub-folder and `to` is the destination in
+      // _pythonDir. Rollback re-renames from→to backwards (i.e. to→from).
+      const moved = [];
+
+      for (const file of inner) {
+        const src = path.join(sub, file);
+        const dest = path.join(this._pythonDir, file);
+        try {
+          fs.renameSync(src, dest);
+          moved.push({ from: src, to: dest });
+        } catch (err) {
+          // Mid-loop failure (perm error, AV lock, dest already exists).
+          // Roll every prior move back into the sub-folder so the caller
+          // sees a coherent "nothing happened" state. Best-effort: if a
+          // rollback rename also fails we log it but keep going — the
+          // outer _extractPython then wipes _pythonDir as part of its
+          // "Extraction failed" cleanup, which is the recovery of last
+          // resort.
+          this._onLog(
+            `_fixNestedExtraction: rename failed at "${file}": ${err.message}; ` +
+            `rolling back ${moved.length} prior move(s)`
+          );
+          for (let i = moved.length - 1; i >= 0; i--) {
+            const m = moved[i];
+            try {
+              fs.renameSync(m.to, m.from);
+            } catch (rbErr) {
+              this._onLog(
+                `_fixNestedExtraction: rollback failed for ` +
+                `${path.basename(m.to)}: ${rbErr.message}`
+              );
+            }
+          }
+          return false;
+        }
+      }
+
+      try {
+        fs.rmdirSync(sub);
+      } catch (err) {
+        // Inner loop succeeded so the moves are valid; the sub-folder
+        // should be empty now. A failing rmdir usually means readdir
+        // missed a hidden file or the dir became un-removable mid-op.
+        // Either way the extracted Python is functional — log and
+        // continue rather than treating this as a real failure.
+        this._onLog(
+          `_fixNestedExtraction: failed to remove empty sub-folder ${sub}: ${err.message}`
+        );
+      }
+      return true;
+    }
     return false;
   }
 
@@ -1024,8 +1277,22 @@ class PythonSetup {
    * "Python exited with code 1". Without this, our smoke-test failures
    * surface as opaque "exited with code 1" in the wizard's error box and
    * the real cause is only visible if the user expands the log panel.
+   *
+   * Watchdog: SIGKILLs python if it doesn't exit within `timeoutMs`
+   * (default 10min). Mirrors _runCommand's pattern — without it, a hung
+   * pip resolver, a wedged Chromium probe, or a deadlocked C-extension
+   * import would freeze setup forever with no recourse but Force-Quit.
+   * 10min comfortably accommodates the worst legitimate operation we run:
+   * `pip install -r requirements.txt` on a slow connection, where the
+   * C-extension wheels (cryptography, lxml, greenlet) are 5-15 MB each
+   * and arch-specific. Callers that need longer (Chromium download in
+   * step 6, ~150 MB) pass a larger override.
+   *
+   * @param {string[]} args      argv passed to python
+   * @param {object}   extraEnv  merged into process.env for the child
+   * @param {number}   timeoutMs watchdog timeout in ms (default 10 min)
    */
-  _runPython(args, extraEnv = {}) {
+  _runPython(args, extraEnv = {}, timeoutMs = 10 * 60_000) {
     return new Promise((resolve, reject) => {
       // Verify the interpreter binary exists before trying to spawn it.
       // This gives a clear error instead of cryptic "spawn ENOENT".
@@ -1054,6 +1321,22 @@ class PythonSetup {
       // always at the bottom of a Python traceback.
       let stderr = "";
       const STDERR_CAP = 4096;
+      let timedOut = false;
+
+      // Watchdog. SIGKILL is the right signal here even though Python
+      // would normally honor SIGTERM — pip/playwright/patchright install
+      // sub-spawn multiple workers that don't always propagate SIGTERM
+      // to children, so SIGKILL on the top-level process is the only
+      // reliable way to actually free the wizard. On Windows, Node maps
+      // SIGKILL to TerminateProcess, which is equally final.
+      const argHint = args.length ? args[0] : "interpreter";
+      const watchdog = setTimeout(() => {
+        timedOut = true;
+        this._onLog(
+          `Watchdog: python ${argHint} exceeded ${Math.round(timeoutMs / 1000)}s — terminating`
+        );
+        try { proc.kill("SIGKILL"); } catch {}
+      }, timeoutMs);
 
       proc.stdout.on("data", (d) => {
         const text = d.toString();
@@ -1071,6 +1354,16 @@ class PythonSetup {
       });
 
       proc.on("close", (code) => {
+        clearTimeout(watchdog);
+        if (timedOut) {
+          reject(new Error(
+            `Python (${argHint}) timed out after ` +
+            `${Math.round(timeoutMs / 1000)}s and was terminated. ` +
+            "Most often a stuck pip install (mirror outage / slow link) " +
+            "or a deadlocked C extension. Click Retry."
+          ));
+          return;
+        }
         if (code === 0) {
           resolve(stdout);
           return;
@@ -1088,6 +1381,7 @@ class PythonSetup {
       });
 
       proc.on("error", (err) => {
+        clearTimeout(watchdog);
         reject(new Error(`Failed to start Python: ${err.message}`));
       });
     });

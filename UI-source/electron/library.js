@@ -1,7 +1,7 @@
 // ============================================================
 // LIBRARY SCANNER + THUMBNAIL GENERATOR
 //
-// Scans the configured output directory and returns info about
+// Scans the mangas/ output directory and returns info about
 // each downloaded manga series. Generates cover thumbnails
 // from PDFs using mupdf (WASM) in the main process.
 //
@@ -15,10 +15,9 @@
 //
 // FOLDER STRUCTURE (created by aio-dl.py):
 //
-//   manga/ (default)
+//   mangas/
 //     Solo Leveling/
-//       .series_hid            ← canonical hidden marker (ignored)
-//       .mangafire_hid         ← legacy hidden marker (ignored if present)
+//       .mangafire_hid         ← hidden marker (ignored)
 //       Solo Leveling.pdf
 //       Solo Leveling Ch 1-50.pdf
 //       images/                ← only if --keep-images
@@ -60,22 +59,45 @@ async function loadMupdf() {
 // CHAPTER EXTRACTION FROM FILENAMES
 //
 // aio-dl.py names files like:
-//   "Title Ch 5.pdf"      → chapter 5
-//   "Title Ch 5~5.pdf"    → chapter 5.5 (~ replaces . for sort)
-//   "Title Ch 1-50.pdf"   → combined range: chapters 1 through 50
-//   "Title Ch 1~5-10.pdf" → combined range: chapters 1.5 through 10
-//   "Title.pdf"           → full series (no chapter marker)
+//
+//   Legacy / non-Komikku format (decimal encoded as `~` for sort):
+//     "Title Ch 5.pdf"       → chapter 5
+//     "Title Ch 5~5.pdf"     → chapter 5.5 (`~` replaces `.` for sort)
+//     "Title Ch 1-50.pdf"    → combined range: chapters 1 through 50
+//     "Title Ch 1~5-10.pdf"  → combined range: chapters 1.5 through 10
+//     "Title.pdf"            → full series (no chapter marker)
+//
+//   Komikku-compatible format (--komikku, see komikkuspec.md):
+//     "Ch.005.cbz"           → chapter 5 (zero-padded; raw `.` decimal)
+//     "Ch.005.5 - Title.cbz" → chapter 5.5 with title suffix
+//     "Vol.01 Ch.005.cbz"    → chapter 5 with volume prefix
 //
 // This helper extracts chapter numbers from actual files on disk
 // so we can compare them with the site's chapter list.
+//
+// Cross-file: Komikku filename builder lives in aio-dl.py's
+// _komikku_chapter_filename (grep that name). The output goes through
+// this scanner only when settings.useFileBasedChapterCheck is on; the
+// default JSON-based check (via .aio_series.json:chapters_downloaded)
+// is format-agnostic and works for both layouts.
 // ============================================================
+
+// Match a Komikku-style chapter filename. Anchored at start, so a legacy
+// "<title> Ch <num>" file never trips this (the title prefix wouldn't be
+// "Vol.XX " or empty). The number capture allows integer + optional
+// decimal + optional single alphabetic suffix, e.g. "005", "005.5",
+// "005a", "005.5a". The leading volume prefix is permissive (`\S+`) so
+// non-numeric volume labels — rare, only hit by Python's str-fallback
+// branch in _komikku_chapter_filename — still parse.
+const KOMIKKU_CH_RE = /^(?:Vol\.\S+\s+)?Ch\.(\d+(?:\.\d+)?[a-z]?)/i;
 
 /**
  * Extract chapter numbers from an array of file objects.
  *
  * @param {Array} files - [{ name: "Title Ch 5.pdf", ... }, ...]
  * @returns {{ chapters: Set<string>, ranges: Array<{start:number, end:number}> }}
- *   chapters = individual chapter numbers (already converted ~ → .)
+ *   chapters = individual chapter numbers (already normalized to match
+ *              the stringified-number form that --list-chapters emits)
  *   ranges   = combined-file ranges like [{start:1, end:50}]
  */
 function extractChaptersFromFiles(files) {
@@ -83,8 +105,29 @@ function extractChaptersFromFiles(files) {
   const ranges = [];
 
   for (const file of files) {
-    // Strip extension, then look for the " Ch " marker
+    // Strip the file extension via the last `.xxx` token. Komikku-style
+    // filenames carry "Ch.005" / "Ch.005.5" where the chapter number
+    // itself contains a `.`; the trailing-`.xxx` strip is anchored to
+    // the very last dot, so "Ch.005.5 - Title.cbz" → "Ch.005.5 - Title"
+    // leaves the decimal intact for the regex below.
     const nameNoExt = file.name.replace(/\.[^.]+$/, "");
+
+    // ── Komikku format (--komikku) ──
+    // Anchored at ^ because Komikku files NEVER carry a series-title
+    // prefix (the parent folder IS the title). A legacy file would have
+    // the series title in front of " Ch " and wouldn't match this regex.
+    const komikkuMatch = nameNoExt.match(KOMIKKU_CH_RE);
+    if (komikkuMatch) {
+      const normalized = _normalizeChapterToken(komikkuMatch[1]);
+      if (normalized != null) {
+        chapters.add(normalized);
+        continue;
+      }
+    }
+
+    // ── Legacy format ──
+    // " Ch " marker (space-Ch-space). The legacy formatter rewrites the
+    // decimal `.` to `~` so lexical sort matches chapter order.
     const chIdx = nameNoExt.lastIndexOf(" Ch ");
     if (chIdx === -1) continue;
 
@@ -115,6 +158,30 @@ function extractChaptersFromFiles(files) {
   }
 
   return { chapters, ranges };
+}
+
+/**
+ * Convert a Komikku-style chapter token like "005", "005.5", or "005a"
+ * to the canonical stringified-number form that --list-chapters emits
+ * for site chapters (e.g. "5", "5.5", "5a"). Returns null when the
+ * token isn't a parseable number — caller skips non-numeric chapters
+ * because they can't be matched against the numeric site list anyway.
+ *
+ * Why this matters: Komikku zero-pads to 3 digits via `:03d` in
+ * _komikku_chapter_filename for sort stability, but the site list
+ * uses bare ints/floats. Without normalization, "005" !== "5" at the
+ * Set-membership step and every chapter shows up as "missing".
+ */
+function _normalizeChapterToken(raw) {
+  const alphaMatch = raw.match(/^([\d.]+)([a-z])$/i);
+  if (alphaMatch) {
+    const num = parseFloat(alphaMatch[1]);
+    if (isNaN(num)) return null;
+    return `${num}${alphaMatch[2].toLowerCase()}`;
+  }
+  const num = parseFloat(raw);
+  if (isNaN(num)) return null;
+  return String(num);
 }
 
 /**
@@ -154,20 +221,20 @@ function getChaptersOnDevice(files, siteChapters) {
 // ============================================================
 
 /**
- * Scan the configured library directory and return info about each series.
+ * Scan the mangas directory and return info about each series.
  *
- * @param {string} mangaDir      - Path to the configured library folder
+ * @param {string} mangasDir     - Path to the mangas/ folder
  * @param {string} thumbCacheDir - Path to thumbnail cache folder
  * @returns {Array} Array of series objects
  */
-function scanLibrary(mangaDir, thumbCacheDir) {
+function scanLibrary(mangasDir, thumbCacheDir) {
   const entries = [];
 
-  if (!mangaDir || !fs.existsSync(mangaDir)) return entries;
+  if (!mangasDir || !fs.existsSync(mangasDir)) return entries;
 
   let folders;
   try {
-    folders = fs.readdirSync(mangaDir, { withFileTypes: true });
+    folders = fs.readdirSync(mangasDir, { withFileTypes: true });
   } catch {
     return entries;
   }
@@ -176,7 +243,7 @@ function scanLibrary(mangaDir, thumbCacheDir) {
     // Skip hidden folders (like .aio_coord) and non-directories
     if (!folder.isDirectory() || folder.name.startsWith(".")) continue;
 
-    const folderPath = path.join(mangaDir, folder.name);
+    const folderPath = path.join(mangasDir, folder.name);
 
     let contents;
     try {

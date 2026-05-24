@@ -168,8 +168,21 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         title = title or self._extract_slug(url)
 
         authors = self._extract_list_values(hero or soup, ["author"])
+        # WeebCentral's series template MAY expose a separate "Artist(s)"
+        # row in the .post_content_item list. When present, surface it for
+        # Komikku's details.json. When absent (the dominant case — WeebCentral
+        # typically conflates author + artist into the Author row), `artists`
+        # stays empty and the field is documented as a per-site limitation.
+        # See dry_run_komikku_findings.md §A.
+        artists = self._extract_list_values(
+            hero or soup, ["artist", "illustrator"]
+        )
         tags = self._extract_list_values(hero or soup, ["tag", "type"])
         status_values = self._extract_list_values(hero or soup, ["status"])
+        alt_values = self._extract_list_values(
+            hero or soup, ["associated names", "alternative", "alias"]
+        )
+        year_values = self._extract_list_values(hero or soup, ["released", "year"])
 
         desc = self._extract_description(details)
         cover = self._source_image(hero, url)
@@ -184,10 +197,18 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         }
         if authors:
             comic["authors"] = authors
+        if artists:
+            comic["artists"] = artists
         if tags:
             comic["genres"] = tags
         if status_values:
             comic["status"] = status_values[0]
+        if alt_values:
+            comic["alt_names"] = alt_values
+        if year_values:
+            year_match = re.search(r"\b(\d{4})\b", year_values[0])
+            if year_match:
+                comic["year"] = int(year_match.group(1))
 
         return SiteComicContext(
             comic=comic,
@@ -264,6 +285,119 @@ class WeebCentralSiteHandler(BaseSiteHandler):
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
         group = chapter_version.get("scanlator")
         return group if isinstance(group, str) else None
+
+    # ----------------------------------------------------------------- search
+    # WeebCentral search: HTMX-style endpoint at /search/data with full filter
+    # query string. Returns a fragment of <article class="bg-base-300...">
+    # blocks per result. Each block contains an <a href="/series/<UUID>/<slug>">
+    # wrapping <picture><source srcset=...><img alt="<title> cover"></picture>
+    # and a "Official"/"tooltip 'Official Translation'" affordance for licensed
+    # series — that's a Phase 3 signal for is_official, not used here.
+    _SERIES_HREF_RE = re.compile(r"/series/[A-Z0-9]+/")
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        from urllib.parse import quote_plus
+        # The /search HTML page is JS-driven; /search/data returns the
+        # already-rendered result list as an HTMX fragment.
+        url = (
+            f"{self._BASE_URL}/search/data"
+            f"?text={quote_plus(clean)}"
+            f"&sort=Best+Match&order=Descending&official=Any&anime=Any"
+            f"&adult=Any&display_mode=Full+Display&series_status=Any"
+        )
+        # HTTP errors propagate; orchestrator records the host in the
+        # probe-failure cache.
+        response = make_request(url, scraper)
+        html = response.text
+        if not html or len(html) < 100:
+            return []
+
+        soup = self._make_soup(html)
+        articles = soup.select("article.bg-base-300, article")
+        # Filter to only those that contain a /series/ anchor.
+        articles = [
+            a for a in articles
+            if a.find("a", href=self._SERIES_HREF_RE)
+        ]
+        hits: List[SearchHit] = []
+        seen: set = set()
+        for idx, art in enumerate(articles):
+            if len(hits) >= limit:
+                break
+            anchor = art.find("a", href=self._SERIES_HREF_RE)
+            if not anchor:
+                continue
+            href = (anchor.get("href") or "").strip()
+            abs_url = href if href.startswith("http") else urljoin(self._BASE_URL, href)
+            abs_url = abs_url.split("?")[0].split("#")[0]
+            if abs_url in seen:
+                continue
+            seen.add(abs_url)
+
+            # Title: the <img alt="Foo cover">. Strip trailing " cover".
+            img = art.select_one("img[alt]")
+            title: Optional[str] = None
+            if img:
+                alt = (img.get("alt") or "").strip()
+                if alt.lower().endswith(" cover"):
+                    alt = alt[:-len(" cover")].strip()
+                if alt:
+                    title = alt
+            if not title:
+                # Fallback to the truncated display title.
+                disp = art.select_one(".text-ellipsis")
+                if disp:
+                    title = disp.get_text(strip=True)
+            if not title:
+                # Last resort: derive from URL slug.
+                slug = abs_url.rstrip("/").rsplit("/", 1)[-1]
+                title = slug.replace("-", " ").strip() or slug
+            # Cover: prefer the normal-size source srcset, fall back to <img src>.
+            cover: Optional[str] = None
+            source = art.select_one("source[srcset]")
+            if source:
+                srcset = (source.get("srcset") or "").strip()
+                if srcset:
+                    cover = srcset.split()[0]
+            if not cover and img:
+                src = img.get("src")
+                if src:
+                    cover = src
+
+            # Alt title: derive from URL slug (which on WeebCentral is the
+            # canonical romaji, while the displayed title is usually EN).
+            alt_titles: List[str] = []
+            slug = abs_url.rstrip("/").rsplit("/", 1)[-1]
+            slug_alt = slug.replace("-", " ").strip()
+            if slug_alt and slug_alt.lower() != (title or "").lower():
+                alt_titles.append(slug_alt)
+
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(articles))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=abs_url,
+                    cover=cover,
+                    alt_titles=alt_titles,
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")

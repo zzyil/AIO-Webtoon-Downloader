@@ -106,12 +106,27 @@ function buildCliArgs(args) {
     multiSourceQualityMin: "--multi-source-quality-min",
     multiSourcePrefetched: "--multi-source-prefetched",
     prefetchImageWorkers: "--prefetch-image-workers",
-    // MangaFire-only speed knobs (2026-05-09). Settings injects each only
-    // when not at default (see useDownloader.js:queueDownload), so non-
-    // MangaFire downloads or default-config runs don't carry these flags.
+    // Fast-download knobs (2026-05-13: generalized from MangaFire-only).
+    // Apply to any handler with SUPPORTS_FAST_DOWNLOAD=True
+    // (currently mangafire and linewebtoon; see sites/base.py for the
+    // implementation and aio-dl.py's argparse for full help text).
+    imageConcurrency: "--image-concurrency",
+    imagePrefetchDepth: "--image-prefetch-depth",
+    imagePrefetchParallel: "--image-prefetch-parallel",
+    // Back-compat: kept alongside imageConcurrency so saved settings dicts
+    // that still carry mangafireImageConcurrency (pre-2026-05-13) keep
+    // working. aio-dl.py installs a deprecation shim that routes
+    // --mangafire-image-concurrency to args.image_concurrency. We never
+    // emit BOTH on the same spawn — useDownloader.queueDownload only
+    // injects one key from settings.defaults (it migrated to
+    // imageConcurrency at the same time).
     mangafireImageConcurrency: "--mangafire-image-concurrency",
-    mangafireVrfPrefetchDepth: "--mangafire-vrf-prefetch-depth",
-    mangafireVrfParallel: "--mangafire-vrf-parallel",
+    // MangaFire VRF capture flags (--mangafire-vrf-prefetch-depth and
+    // --mangafire-vrf-parallel) intentionally NOT in flagMap. They were
+    // removed from the Settings UI on 2026-05-13 — argparse defaults
+    // are good for most users; advanced users pass them on the CLI
+    // directly. Keeping them out of flagMap means useDownloader.js
+    // can't accidentally emit them when settings dicts are spread.
     missedRetries: "--missed-retries",
     missedLog: "--missed-log",
     jobStallTimeout: "--job-stall-timeout",
@@ -143,6 +158,28 @@ function buildCliArgs(args) {
     // a separate translation step. aio-dl.py:3589 defines --seeded-only;
     // it's read inside find_alternatives_for_direct_url at line 4432.
     seededOnly: "--seeded-only",
+    // LINE Webtoon WebP recompression master toggle (Phase 1, 2026-05-11).
+    // Python-side gates the actual encode pass on handler.name match, so
+    // emitting this flag for non-webtoons.com downloads is a safe no-op.
+    // The valued companion knobs (quality, method) are NOT in flagMap —
+    // they're handled below the loops so we can suppress them when the
+    // master toggle is off (avoids noisy `--webtoon-recompress-quality 85`
+    // on every spawn just because settings.defaults carry the value).
+    webtoonRecompress: "--webtoon-recompress",
+    // Komikku-compatible per-chapter CBZ output (2026-05-12, komikkuspec.md).
+    // Python-side force-coerces --format cbz / --keep-chapters /
+    // --no-final-file when this is set, so the UI's format selector is
+    // effectively ignored for komikku downloads. Output stays at
+    // <workingDir>/manga/<Series>/ (user syncs that into their phone's
+    // <Komikku-SAF>/local/ themselves). Search/library-initiated downloads
+    // pick this up via App.jsx's settings.defaults spread.
+    komikku: "--komikku",
+    // Escape hatch for curl_cffi fast download path (2026-05-13). When the
+    // user toggles this on in Settings, all handlers fall back to the
+    // legacy ThreadPoolExecutor + dl_image cloudscraper path regardless
+    // of their per-handler SUPPORTS_FAST_DOWNLOAD flag. Useful for
+    // curl_cffi version bugs or CDN-vs-impersonation issues.
+    noFastDownload: "--no-fast-download",
   };
 
   // Add valued arguments
@@ -180,6 +217,25 @@ function buildCliArgs(args) {
   // settings.collapseSplits before calling startDownload.
   if (args.collapseSplits === false) {
     cliArgs.push("--no-collapse-splits");
+  }
+
+  // LINE Webtoon recompression valued knobs (Phase 1, 2026-05-11). Only
+  // emit when the master toggle is on AND the value differs from the
+  // Python-side argparse default (85 for quality, 4 for method). Without
+  // this gate, every spawn carrying settings.defaults would inject both
+  // flags regardless of whether the recompress pass actually runs, which
+  // is noisy (it'd show up on the `$ python aio-dl.py ...` log line in
+  // the LogPanel for non-webtoons.com downloads too). Python ignores the
+  // valued flags when --webtoon-recompress is absent — they're argparse
+  // metadata for the helper function, gated independently in
+  // _process_chapter_impl — so this is purely about spawn-line cleanliness.
+  if (args.webtoonRecompress === true) {
+    if (args.webtoonRecompressQuality != null && args.webtoonRecompressQuality !== 85) {
+      cliArgs.push("--webtoon-recompress-quality", String(args.webtoonRecompressQuality));
+    }
+    if (args.webtoonRecompressMethod != null && args.webtoonRecompressMethod !== 4) {
+      cliArgs.push("--webtoon-recompress-method", String(args.webtoonRecompressMethod));
+    }
   }
 
   return cliArgs;

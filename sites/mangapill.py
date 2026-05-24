@@ -14,11 +14,6 @@ class MangaPillSiteHandler(BaseSiteHandler):
     domains = ("mangapill.com", "www.mangapill.com")
     
     _BASE_URL = "https://mangapill.com"
-    _CHAPTER_RE = re.compile(
-        r"\b(?:chapter|chap|ch)\.?\s*[-_:]?\s*(\d+(?:\.\d+)?)\b",
-        re.I,
-    )
-    _NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.update(
@@ -35,28 +30,28 @@ class MangaPillSiteHandler(BaseSiteHandler):
         # URL: https://mangapill.com/manga/123/title-slug
         parsed = urlparse(url)
         path_parts = [p for p in parsed.path.split("/") if p]
-        
+
         if len(path_parts) >= 2 and path_parts[0] == "manga":
             return path_parts[1] # Return ID as slug/identifier
         return path_parts[-1]
 
-    def _extract_chapter_number(self, title: str, href: str) -> str:
-        text = (title or "").strip()
-        if text.lower() in {"oneshot", "one-shot"}:
-            return "1"
+    # Extract the first numeric token from a chapter title or URL path.
+    # Mirrors sites/madara.py:_extract_chapter_number / weebcentral.py.
+    # Without this, get_chapters() below stored the full "Chapter 123"
+    # title as `chap`, and aio-dl.py's bucketing at ~line 5885 calls
+    # float(chap) which raises ValueError → every chapter logged as
+    # "Skipping chapter with invalid number: Chapter 123" → zero
+    # chapters downloaded. The regex matches both integer and decimal
+    # chapters ("Chapter 47.5" → "47.5"). Returns None when no numeric
+    # token is present (oneshots, omake, side stories) so the caller
+    # can decide whether to skip or surface them as non-numeric.
+    _CHAP_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
-        match = self._CHAPTER_RE.search(text)
-        if not match:
-            # MangaPill chapter hrefs include the human chapter slug near the
-            # end, e.g. ".../one-punch-man-chapter-1". Prefer that over the
-            # internal numeric series/chapter ids earlier in the path.
-            match = self._CHAPTER_RE.search(href or "")
-        if not match:
-            match = self._NUMBER_RE.search(text)
-        if not match:
-            return text
-
-        return f"{float(match.group(1)):g}"
+    def _extract_chapter_number(self, text: Optional[str]) -> Optional[str]:
+        if not text:
+            return None
+        match = self._CHAP_NUM_RE.search(text)
+        return match.group(1) if match else None
 
     # -- Base overrides ----------------------------------------------
     def fetch_comic_context(
@@ -85,8 +80,58 @@ class MangaPillSiteHandler(BaseSiteHandler):
         status_node = soup.select_one("div.container > div:first-child > div:last-child > div:nth-child(3) > div:nth-child(2) > div")
         status = status_node.get_text(strip=True) if status_node else "Unknown"
         
+        # Authors / year / alt names live in the metadata block
+        # (`div.container > div:first-child > div:last-child > div:nth-child(3)`)
+        # alongside status. The existing nth-child selector for status only
+        # picks one specific cell; walk the entire metadata block for the
+        # rest. Robust to label-row reordering, no-op when no label matches.
+        authors: List[str] = []
+        artists: List[str] = []
+        year: Optional[int] = None
+        alt_names: List[str] = []
+        meta_block = soup.select_one(
+            "div.container > div:first-child > div:last-child > div:nth-child(3)"
+        )
+        if meta_block:
+            for row in meta_block.find_all("div", recursive=False):
+                children = list(row.find_all("div", recursive=False))
+                if len(children) < 2:
+                    continue
+                label = children[0].get_text(strip=True).lower()
+                value_node = children[1]
+                value = value_node.get_text(" ", strip=True)
+                if not value:
+                    continue
+                if "author" in label:
+                    anchors = [
+                        a.get_text(strip=True)
+                        for a in value_node.find_all("a")
+                        if a.get_text(strip=True)
+                    ]
+                    authors = anchors or [value]
+                elif "artist" in label or "illustrator" in label:
+                    # Komikku's details.json wants `artist` independently of
+                    # `author`. MangaPill MAY expose this in some series'
+                    # metadata block; surface when present, leave empty when
+                    # not (the common case — MangaPill typically only lists
+                    # an Author row). dry_run_komikku_findings.md §A.
+                    anchors = [
+                        a.get_text(strip=True)
+                        for a in value_node.find_all("a")
+                        if a.get_text(strip=True)
+                    ]
+                    artists = anchors or [value]
+                elif "year" in label or "released" in label:
+                    year_match = re.search(r"\b(\d{4})\b", value)
+                    if year_match:
+                        year = int(year_match.group(1))
+                elif "alternative" in label or label.startswith("alt"):
+                    alt_names = [
+                        p.strip() for p in re.split(r"[;,/]", value) if p.strip()
+                    ]
+
         slug = self._slug_from_url(url)
-        
+
         comic = {
             "hid": slug,
             "title": title,
@@ -96,6 +141,14 @@ class MangaPillSiteHandler(BaseSiteHandler):
             "genres": genres,
             "url": url,
         }
+        if authors:
+            comic["authors"] = authors
+        if artists:
+            comic["artists"] = artists
+        if year is not None:
+            comic["year"] = year
+        if alt_names:
+            comic["alt_names"] = alt_names
 
         return SiteComicContext(
             comic=comic,
@@ -118,15 +171,28 @@ class MangaPillSiteHandler(BaseSiteHandler):
             href = link.get("href")
             if not href:
                 continue
-                
+
             title = link.get_text(strip=True)
             url = urljoin(self._BASE_URL, href)
-            
-            # Extract chapter number from title or URL.
-            # Title example: "Chapter 123"; aio-dl.py expects `chap` to be
-            # numeric for --chapters filtering and version grouping.
-            chap_num = self._extract_chapter_number(title, href)
-            
+
+            # Extract numeric chapter portion. The previous code stored the
+            # full title ("Chapter 123") as `chap`; aio-dl.py:5885 calls
+            # float(chap) for bucketing and ValueErrors on the non-numeric
+            # text, skipping every chapter. Try title first; on failure,
+            # extract the segment after `chapter-` in the URL (MangaPill
+            # chapter URLs are /chapters/<id>-chapter-<num>, so the bare
+            # _CHAP_NUM_RE would mis-grab the leading <id>). When NEITHER
+            # surfaces a number, skip the entry — surfacing a non-numeric
+            # `chap` would just trigger the same skip downstream with a
+            # misleading log line.
+            chap_num = self._extract_chapter_number(title)
+            if chap_num is None and href:
+                m = re.search(r"chapter-(\d+(?:\.\d+)?)", href)
+                if m:
+                    chap_num = m.group(1)
+            if chap_num is None:
+                continue
+
             chapters.append({
                 "hid": href,
                 "chap": chap_num,
@@ -134,7 +200,7 @@ class MangaPillSiteHandler(BaseSiteHandler):
                 "url": url,
                 "uploaded": None, # No date in list
             })
-            
+
         return chapters
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:

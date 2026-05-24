@@ -141,6 +141,7 @@ class MangaHubSiteHandler(BaseSiteHandler):
             "artists": [a.strip() for a in (manga.get("artist") or "").split(",") if a.strip()],
             "genres": manga.get("genres") or [],
             "alt_names": [a.strip() for a in (manga.get("alternativeTitle") or "").split(";") if a.strip()],
+            "status": manga.get("status"),
             "_slug": slug,
             "_chapters": manga.get("chapters") or [],
         }

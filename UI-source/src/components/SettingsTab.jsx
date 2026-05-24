@@ -52,8 +52,22 @@ const DEFAULT_SEARCH_OPTS = {
 // On Reset (handleReset below), dev-mode reverts to these blanks so the
 // user can re-pick their workingDir; packaged-mode preserves the existing
 // value via the prev.isPackaged guard.
+// All three path fields START EMPTY. The empty string is the user's
+// "no override — use the runtime-resolved default" sentinel. Every
+// consumer (main.js spawn sites) does `settings.X || defaultX`, so
+// empty falls through to the runtime default cleanly.
+//
+// This is part of the 2026-05-13 round-trip fix: AppImage / macOS
+// Gatekeeper App Translocation / DMG-direct runs all produce volatile
+// auto-computed paths that change between launches. If we initialized
+// these to non-empty values (or hydrated them from settings.json with
+// the old computed defaults baked in), Save would persist the volatile
+// path back to disk and the next launch would ENOENT. Keeping initial
+// state empty + filtering the hydration spread + reading resolved
+// paths separately via getResolvedPaths() ensures the saved settings
+// dict only carries user-typed overrides.
 const DEV_DEFAULTS = {
-  pythonCmd: "python",
+  pythonCmd: "",
   scriptPath: "",
   workingDir: "",
 };
@@ -81,22 +95,32 @@ export default function SettingsTab({ settings, onSave }) {
     // Drop to 4 (or 0) when the upstream CDN is throttling and the extra
     // concurrent burst from N+1's downloads compounds throttling.
     prefetchImageWorkers: -1,
-    // ── MangaFire-only speed knobs (added 2026-05-09) ──
-    // The MangaFire handler bypasses the generic Image Workers path and
-    // uses curl_cffi async + HTTP/2 multiplex (sites/mangafire.py:
-    // fast_download_images). These three settings tune that path:
-    //   - imageConcurrency: asyncio.Semaphore bound for image fetches.
-    //     8 hits ~5 MB/s (network-ceiling on most home links).
-    //   - vrfPrefetchDepth: how many chapters ahead to queue VRF capture.
-    //     The queued worker captures sequentially; depth=4 fully overlaps
-    //     capture with the previous chapter's image download.
-    //   - vrfParallel: opt-in concurrent multi-page VRF capture (1 = off).
-    //     4 = bench-confirmed 5.2x speedup but can trigger CF rate-limit.
+    // ── Image prefetch & concurrency (generalized 2026-05-13) ──
+    // Apply to any handler with SUPPORTS_FAST_DOWNLOAD=True (currently
+    // mangafire and linewebtoon; see sites/base.py:fast_download_images
+    // for the implementation).
+    //   - imageConcurrency: asyncio.Semaphore bound for image fetches via
+    //     curl_cffi async + HTTP/2 multiplex. 8 hits ~5 MB/s (near network
+    //     ceiling on home links). Auto-dials down per-host on CDN errors.
+    //   - imagePrefetchDepth: how many chapters ahead to keep queued for
+    //     image prefetch. Higher helps when main-loop processing is fast
+    //     relative to network download (CBZ fast-path, LINE Webtoon).
+    //   - imagePrefetchParallel: concurrent prefetch worker threads. =2
+    //     means up to 2 chapters in flight while main processes a third.
+    //   - noFastDownload: escape hatch — force-disable curl_cffi path.
     // queueDownload (useDownloader.js) injects each into args only when
-    // not at default, so older saved settings dicts behave unchanged.
-    mangafireImageConcurrency: 8,
-    mangafireVrfPrefetchDepth: 4,
-    mangafireVrfParallel: 1,
+    // not at default. Pre-2026-05-13 setting `mangafireImageConcurrency`
+    // is migrated to `imageConcurrency` at settings-load time below.
+    imageConcurrency: 8,
+    imagePrefetchDepth: 2,
+    imagePrefetchParallel: 2,
+    noFastDownload: false,
+    // ── MangaFire VRF capture knobs intentionally NOT surfaced in UI ──
+    // VRF is MangaFire-specific browser-automation tuning that users
+    // shouldn't need to touch. The CLI flags
+    // --mangafire-vrf-prefetch-depth (default 4) and
+    // --mangafire-vrf-parallel (default 1) still exist for advanced
+    // tuning; the UI just inherits the argparse defaults.
     // How often the UI refreshes logs & progress (in milliseconds).
     // Lower = more responsive. Default: 100ms (10 updates/sec).
     logUpdateInterval: 100,
@@ -115,7 +139,7 @@ export default function SettingsTab({ settings, onSave }) {
       // at line ~95-99 already spreads settings.defaults onto its form,
       // so this propagates through automatically. Library-tab downloads
       // override with the per-series saved language; Search-tab downloads
-      // inherit through useDownloader.queueDownload.
+      // inherit via App.jsx's defaults-spread.
       language: "en",
       // 100 (not aio-dl.py's argparse default of 85): Phase G4 in aio-dl.py
       // (~line 4272) sets _user_set_quality = (--quality on argv) AND
@@ -152,6 +176,28 @@ export default function SettingsTab({ settings, onSave }) {
       // --scaling 100. The downloader.js boolMap handles the negative-form
       // flag emission. Only meaningful for --format cbz.
       cbzPreserveOriginals: true,
+      // Komikku-compatible per-chapter CBZ output (2026-05-12, komikkuspec.md).
+      // When ON, Python auto-coerces --format cbz --keep-chapters
+      // --no-final-file and writes per-chapter ComicInfo.xml + cover.jpg
+      // + details.json at <out>/manga/<Series>/. The format selector
+      // above is effectively ignored when this is on (Python prints a
+      // [Komikku] coercion notice in the log). DownloadTab's DEFAULT_FORM
+      // spread picks this up via the useEffect at line ~120-124; App.jsx's
+      // search/library wrappers spread it into queueDownload args.
+      komikku: false,
+      // LINE Webtoon WebP recompression defaults (Phase 1, 2026-05-11).
+      // When enabled here, BOTH the New tab AND search/library-initiated
+      // downloads inherit these knobs: the New tab's DEFAULT_FORM spread
+      // (DownloadTab.jsx:~110) and App.jsx's settings.defaults spread for
+      // the search/library onStartDownload wrappers (App.jsx:~155 and
+      // :~192) both pick this up. Master toggle is off by default so
+      // existing user flows are unchanged; toggling on in Settings makes
+      // every new webtoons.com download recompress without per-job UI.
+      // Silently no-ops for non-webtoons.com handlers (Python checks
+      // handler.name === "linewebtoon" before the encode pass).
+      webtoonRecompress: false,
+      webtoonRecompressQuality: 85,
+      webtoonRecompressMethod: 4,
     },
     // Per-search defaults — read by SearchTab on mount via the same
     // settings.searchOpts namespace. Surfaced here so the user has one
@@ -159,14 +205,86 @@ export default function SettingsTab({ settings, onSave }) {
     searchOpts: { ...DEFAULT_SEARCH_OPTS },
   });
 
+  // Display-only resolved paths (what main.js would use as defaults when
+  // local.pythonCmd / .scriptPath / .workingDir are empty). Shown as
+  // placeholders/hints in the path input fields below. NOT persisted —
+  // fetched once via the dedicated read-only IPC so the volatile auto-
+  // resolved values (AppImage /tmp/.mount_*, macOS App Translocation,
+  // DMG-direct) never enter the saveSettings round-trip.
+  const [resolved, setResolved] = useState({
+    pythonCmd: "",
+    scriptPath: "",
+    workingDir: "",
+  });
+
+  // Fetch resolved paths from main.js once on mount. The handler is a
+  // pure read of the computePaths() globals — no side effects, runs in
+  // microseconds. We don't refresh on every settings change because
+  // those globals don't move at runtime.
+  useEffect(() => {
+    let cancelled = false;
+    const api = typeof window !== "undefined" && window.electronAPI;
+    if (api && typeof api.getResolvedPaths === "function") {
+      api.getResolvedPaths()
+        .then((r) => { if (!cancelled && r) setResolved(r); })
+        .catch(() => { /* main.js missing handler → keep empty placeholders */ });
+    }
+    return () => { cancelled = true; };
+  }, []);
+
   // Load settings when they arrive from Electron
   useEffect(() => {
     if (settings) {
+      // Migration: pre-2026-05-13 settings dicts carry
+      // `mangafireImageConcurrency` (MangaFire-only); the flag was
+      // generalized + renamed to `imageConcurrency` and now applies to
+      // any handler with SUPPORTS_FAST_DOWNLOAD. Forward the old key
+      // ONCE on read; the next handleSave persists under the new name
+      // and the old key falls off naturally on the next save round-trip.
+      // Idempotent: no-op when imageConcurrency is already present.
+      const migrated = { ...settings };
+      if (
+        migrated.mangafireImageConcurrency != null &&
+        migrated.imageConcurrency == null
+      ) {
+        migrated.imageConcurrency = migrated.mangafireImageConcurrency;
+      }
+      // Drop the legacy key so it doesn't get written back on save.
+      delete migrated.mangafireImageConcurrency;
+
+      // Volatile-path filter on hydration — mirrors the write-side
+      // filter in history.js:saveSettings. Existing users may have
+      // pre-2026-05-13 settings.json files carrying stale AppImage /
+      // macOS Gatekeeper-translocation paths that were auto-computed
+      // and round-tripped before the fix. Without this filter, the
+      // stale path would hydrate into local.scriptPath, the input
+      // would show the broken path as the value (not a placeholder),
+      // and even though saveSettings would reject the bad write, the
+      // existing on-disk value would never get cleared. Stripping
+      // volatile values here lets the input fall back to the resolved
+      // placeholder so users see what's actually going to run.
+      // Non-volatile customizations (e.g. a custom `python3.13` venv
+      // path the user typed deliberately) pass through unchanged.
+      const VOLATILE_PATH_PATTERNS = [
+        /^\/tmp\/\.mount_/,
+        /\/AppTranslocation\/[0-9A-F-]+\//,
+        /\/Volumes\/[^/]+\.app\//,
+      ];
+      for (const k of ["pythonCmd", "scriptPath", "workingDir"]) {
+        const v = migrated[k];
+        if (typeof v === "string" && v) {
+          const normalized = v.replace(/\\/g, "/");
+          if (VOLATILE_PATH_PATTERNS.some((re) => re.test(normalized))) {
+            delete migrated[k];
+          }
+        }
+      }
+
       setLocal((prev) => ({
         ...prev,
-        ...settings,
-        defaults: { ...prev.defaults, ...(settings.defaults || {}) },
-        searchOpts: { ...prev.searchOpts, ...(settings.searchOpts || {}) },
+        ...migrated,
+        defaults: { ...prev.defaults, ...(migrated.defaults || {}) },
+        searchOpts: { ...prev.searchOpts, ...(migrated.searchOpts || {}) },
       }));
     }
   }, [settings]);
@@ -191,17 +309,23 @@ export default function SettingsTab({ settings, onSave }) {
 
   const handleReset = () => {
     setLocal((prev) => ({
-      // Keep isPackaged from the current state (it's set by main.js)
-      pythonCmd: prev.isPackaged ? prev.pythonCmd : DEV_DEFAULTS.pythonCmd,
-      scriptPath: prev.isPackaged ? prev.scriptPath : DEV_DEFAULTS.scriptPath,
-      workingDir: prev.isPackaged ? prev.workingDir : DEV_DEFAULTS.workingDir,
+      // Keep isPackaged from the current state (it's set by main.js).
+      // Path fields reset to empty in BOTH packaged and dev modes —
+      // empty == "use the runtime-resolved default" per the post-2026-05-13
+      // round-trip-prevention design. The placeholder shown in the UI
+      // (sourced from getResolvedPaths) tells the user what's actually
+      // going to run; the empty string is just the absence of an override.
+      pythonCmd: "",
+      scriptPath: "",
+      workingDir: "",
       isPackaged: prev.isPackaged,
       verboseAlways: true,
       collapseSplits: true,
       prefetchImageWorkers: -1,
-      mangafireImageConcurrency: 8,
-      mangafireVrfPrefetchDepth: 4,
-      mangafireVrfParallel: 1,
+      imageConcurrency: 8,
+      imagePrefetchDepth: 2,
+      imagePrefetchParallel: 2,
+      noFastDownload: false,
       logUpdateInterval: 100,
       useFileBasedChapterCheck: false,
       defaults: {
@@ -224,6 +348,14 @@ export default function SettingsTab({ settings, onSave }) {
         cbzPreserveOriginals: true,
         multiSource: false,
         multiSourceQualityMin: 0.65,
+        // Mirror webtoonRecompress* initial-state defaults so Reset clears
+        // them too. See the rationale block in the initial useState above.
+        webtoonRecompress: false,
+        webtoonRecompressQuality: 85,
+        webtoonRecompressMethod: 4,
+        // Komikku-mode default. Reset mirrors initial-state; see the
+        // rationale block in the initial useState above.
+        komikku: false,
       },
       searchOpts: { ...DEFAULT_SEARCH_OPTS },
     }));
@@ -282,6 +414,7 @@ export default function SettingsTab({ settings, onSave }) {
                 <Input
                   value={local.workingDir}
                   onChange={(e) => set("workingDir", e.target.value)}
+                  placeholder={resolved.workingDir || ""}
                   className="flex-1 font-mono text-xs"
                 />
                 <Button variant="outline" size="sm" onClick={browseWorkingDir}>
@@ -289,7 +422,10 @@ export default function SettingsTab({ settings, onSave }) {
                 </Button>
               </div>
               <p className="text-[10px] text-muted-foreground mt-1">
-                The "manga" folder will be created inside this directory.
+                {local.workingDir
+                  ? <>The "manga" folder will be created inside this directory.</>
+                  : <>Using auto-resolved default. Leave blank to keep it; type a path to override.</>
+                }
               </p>
             </div>
             {/* Reinstall button — re-downloads Python from scratch */}
@@ -324,11 +460,14 @@ export default function SettingsTab({ settings, onSave }) {
               <Input
                 value={local.pythonCmd}
                 onChange={(e) => set("pythonCmd", e.target.value)}
-                placeholder="python"
+                placeholder={resolved.pythonCmd || "python"}
                 className="mt-1 font-mono text-sm"
               />
               <p className="text-[10px] text-muted-foreground mt-1">
-                Usually just "python". Change if you use a virtualenv or custom path.
+                {local.pythonCmd
+                  ? <>Custom override. Clear to fall back to auto-resolved <span className="font-mono">{resolved.pythonCmd || "python"}</span>.</>
+                  : <>Using auto-resolved <span className="font-mono">{resolved.pythonCmd || "python"}</span>. Type to override (e.g. <span className="font-mono">python3.13</span> for a specific venv).</>
+                }
               </p>
             </div>
 
@@ -338,12 +477,19 @@ export default function SettingsTab({ settings, onSave }) {
                 <Input
                   value={local.scriptPath}
                   onChange={(e) => set("scriptPath", e.target.value)}
+                  placeholder={resolved.scriptPath || ""}
                   className="flex-1 font-mono text-xs"
                 />
                 <Button variant="outline" size="sm" onClick={browseScript}>
                   <FileText className="w-3.5 h-3.5" />
                 </Button>
               </div>
+              <p className="text-[10px] text-muted-foreground mt-1">
+                {local.scriptPath
+                  ? <>Custom override. Clear to fall back to the auto-resolved path shown as placeholder.</>
+                  : <>Using auto-resolved default. Leave blank or type a path to override.</>
+                }
+              </p>
             </div>
 
             <div>
@@ -352,6 +498,7 @@ export default function SettingsTab({ settings, onSave }) {
                 <Input
                   value={local.workingDir}
                   onChange={(e) => set("workingDir", e.target.value)}
+                  placeholder={resolved.workingDir || ""}
                   className="flex-1 font-mono text-xs"
                 />
                 <Button variant="outline" size="sm" onClick={browseWorkingDir}>
@@ -359,7 +506,10 @@ export default function SettingsTab({ settings, onSave }) {
                 </Button>
               </div>
               <p className="text-[10px] text-muted-foreground mt-1">
-                Where aio-dl.py runs. The "manga" output folder will be created here.
+                {local.workingDir
+                  ? <>Custom override. The "manga" output folder will be created here. Clear to fall back to the auto-resolved path.</>
+                  : <>Using auto-resolved default. Leave blank or type a path to override.</>
+                }
               </p>
             </div>
           </div>
@@ -444,8 +594,8 @@ export default function SettingsTab({ settings, onSave }) {
           {/* Global default download language. DownloadTab's useEffect
               spreads settings.defaults into its form, so picking a
               language here makes it the default in the New tab AND in
-              search-initiated downloads (queueDownload applies saved
-              defaults centrally). Library-tab downloads still
+              search-initiated downloads (App.jsx:185-194 spreads defaults
+              into the queueDownload args). Library-tab downloads still
               use the per-series saved language from .aio_series.json,
               which is correct — that's the language the series was
               originally fetched in. */}
@@ -482,6 +632,39 @@ export default function SettingsTab({ settings, onSave }) {
           <Switch
             checked={local.defaults.cbzPreserveOriginals !== false}
             onCheckedChange={(v) => setDefault("cbzPreserveOriginals", v)}
+          />
+        </div>
+
+        {/* Komikku output toggle (2026-05-12, komikkuspec.md).
+            When ON, Python force-coerces --format cbz / --keep-chapters /
+            --no-final-file regardless of the Format selector above. Each
+            chapter CBZ gets its own ComicInfo.xml (overrides filename-derived
+            chapter number / title / scanlator in Komikku v1.13.5+), plus
+            cover.jpg + details.json at the series-folder root. Output stays
+            at <workingDir>/manga/<Series>/ — user syncs to phone's
+            <Komikku-SAF>/local/ themselves. DownloadTab's useEffect spreads
+            settings.defaults into its form on mount, so toggling here
+            propagates to every new download. */}
+        <SectionHeader>Komikku Output</SectionHeader>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex-1">
+            <Label className="text-xs cursor-pointer">
+              Write Komikku-compatible per-chapter CBZs
+            </Label>
+            <p className="text-[10px] text-muted-foreground mt-0.5">
+              Each chapter is its own CBZ with a per-chapter{" "}
+              <span className="font-mono">ComicInfo.xml</span> (chapter number,
+              title, scanlator, web URL, upload date). Series folder also gets{" "}
+              <span className="font-mono">cover.jpg</span> +{" "}
+              <span className="font-mono">details.json</span> (status, genres,
+              authors). Forces format=CBZ, keep-chapters, no-final-file.
+              Output stays at <span className="font-mono">manga/&lt;Series&gt;/</span>;
+              sync that into Komikku's storage root yourself.
+            </p>
+          </div>
+          <Switch
+            checked={!!local.defaults.komikku}
+            onCheckedChange={(v) => setDefault("komikku", v)}
           />
         </div>
 
@@ -677,23 +860,22 @@ export default function SettingsTab({ settings, onSave }) {
           </div>
         </div>
 
-        {/* MangaFire Speed (added 2026-05-09) ─────────────────────
-            MangaFire-only optimizations. Bypasses the generic Image Workers
-            setting via SUPPORTS_FAST_DOWNLOAD on MangaFireSiteHandler
-            (sites/mangafire.py). curl_cffi async + HTTP/2 multiplex over a
-            single keep-alive TLS session. Bench (83-page chapter):
-            cloudscraper@3 = 10.20s -> curl_cffi@8 = 6.04s (1.69x). Other
-            sites still use Image Workers from "Default Network Settings". */}
-        <SectionHeader>MangaFire Speed</SectionHeader>
+        {/* Image Prefetch & Concurrency (generalized 2026-05-13) ──
+            Apply to any handler with SUPPORTS_FAST_DOWNLOAD=True (currently
+            mangafire and linewebtoon; see sites/base.py:fast_download_images).
+            curl_cffi async + HTTP/2 multiplex over a single keep-alive TLS
+            session. Bench (MangaFire 83-page chapter): cloudscraper@3 =
+            10.20s -> curl_cffi@8 = 6.04s (1.69x). LINE Webtoon and any
+            future fast-download handler benefits the same way. */}
+        <SectionHeader>Image Prefetch & Concurrency</SectionHeader>
         <p className="text-[10px] text-muted-foreground -mt-1 mb-2">
-          MangaFire-specific tuning. The image fetcher uses HTTP/2 multiplex over a
-          single TLS connection (curl_cffi async), which bypasses the generic
-          Image Workers setting above. Other sites still use Image Workers.
+          Tuning for the curl_cffi fast image-download path (used by MangaFire
+          and LINE Webtoon today). Auto-dials concurrency down per-host on
+          CDN errors. Sites without fast-download support still use Image
+          Workers above.
         </p>
         <div className="space-y-3">
-          {/* Image concurrency for the curl_cffi async fetcher.
-              Same row layout as "Prefetch workers for next chapter" above —
-              left side: label + description; right side: small numeric input. */}
+          {/* Image concurrency for the curl_cffi async fetcher. */}
           <div className="flex items-start justify-between gap-3">
             <div className="flex-1">
               <Label className="text-xs cursor-pointer">Image concurrency</Label>
@@ -701,8 +883,9 @@ export default function SettingsTab({ settings, onSave }) {
                 Concurrent in-flight image fetches via HTTP/2 multiplex. Default
                 {" "}<span className="font-mono">8</span> hits ~5 MB/s — typical home-network ceiling.
                 Past <span className="font-mono">12</span> is diminishing returns. Drop to
-                {" "}<span className="font-mono">3</span> if Cloudflare starts rate-limiting (rare
-                on the cookieless edge cache, but defensive).
+                {" "}<span className="font-mono">3</span> if a CDN starts rate-limiting (rare on
+                cookieless edge caches, but defensive). Auto-dials down on
+                rate-limit / 5xx errors during a download.
               </p>
             </div>
             <Input
@@ -710,83 +893,192 @@ export default function SettingsTab({ settings, onSave }) {
               min={1}
               max={32}
               step={1}
-              value={local.mangafireImageConcurrency ?? 8}
+              value={local.imageConcurrency ?? 8}
               onChange={(e) => {
-                // Same int-parse + clamp pattern as imageWorkers above.
-                // Python's --mangafire-image-concurrency is argparse type=int;
-                // a decimal here would crash the next spawn.
+                // Int-parse + clamp pattern matches imageWorkers above.
+                // Python's --image-concurrency is argparse type=int; a
+                // decimal here would crash the next spawn.
                 const raw = e.target.value;
-                if (raw === "") { set("mangafireImageConcurrency", 8); return; }
+                if (raw === "") { set("imageConcurrency", 8); return; }
                 const v = Number(raw);
-                if (!Number.isFinite(v)) { set("mangafireImageConcurrency", 8); return; }
-                set("mangafireImageConcurrency", Math.max(1, Math.min(32, Math.trunc(v))));
+                if (!Number.isFinite(v)) { set("imageConcurrency", 8); return; }
+                set("imageConcurrency", Math.max(1, Math.min(32, Math.trunc(v))));
               }}
               className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>
 
-          {/* VRF prefetch chain depth. 0 disables; aio-dl.py:
-              _start_vrf_prefetch_chain returns early on depth<=0. */}
+          {/* Image prefetch depth. 0 disables prefetch entirely. */}
           <div className="flex items-start justify-between gap-3">
             <div className="flex-1">
-              <Label className="text-xs cursor-pointer">VRF prefetch depth</Label>
+              <Label className="text-xs cursor-pointer">Prefetch depth</Label>
               <p className="text-[10px] text-muted-foreground mt-0.5">
-                How many chapters ahead to queue VRF token capture during image
-                download. Default <span className="font-mono">4</span> fully overlaps
-                token capture with the previous chapter's image fetch.
-                {" "}<span className="font-mono">0</span> disables prefetch (each chapter waits
-                synchronously for its own VRF — slower but lighter).
+                How many chapters ahead to keep queued for image prefetch.
+                Default <span className="font-mono">2</span> means ~one extra chapter
+                buffered while the main loop processes the current one.
+                Higher helps when main-loop work is fast vs network download
+                (e.g. CBZ fast-path on LINE Webtoon).
+                {" "}<span className="font-mono">0</span> disables prefetch entirely.
               </p>
             </div>
             <Input
               type="number"
               min={0}
-              max={16}
+              max={8}
               step={1}
-              value={local.mangafireVrfPrefetchDepth ?? 4}
+              value={local.imagePrefetchDepth ?? 2}
               onChange={(e) => {
                 const raw = e.target.value;
-                if (raw === "") { set("mangafireVrfPrefetchDepth", 4); return; }
+                if (raw === "") { set("imagePrefetchDepth", 2); return; }
                 const v = Number(raw);
-                if (!Number.isFinite(v) || v < 0) { set("mangafireVrfPrefetchDepth", 4); return; }
-                set("mangafireVrfPrefetchDepth", Math.max(0, Math.min(16, Math.trunc(v))));
+                if (!Number.isFinite(v) || v < 0) { set("imagePrefetchDepth", 2); return; }
+                set("imagePrefetchDepth", Math.max(0, Math.min(8, Math.trunc(v))));
               }}
               className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>
 
-          {/* Multi-page parallel VRF capture (opt-in). When > 1, the chain
-              worker batches and submits to AsyncBatchVRFCapture (Patchright
-              async API). 4 is bench-confirmed working; >=6 reliably trips
-              CF burst-detect. We treat this as opt-in; defaults to 1. */}
+          {/* Concurrent prefetch worker threads. */}
           <div className="flex items-start justify-between gap-3">
             <div className="flex-1">
-              <Label className="text-xs cursor-pointer">Parallel VRF capture</Label>
+              <Label className="text-xs cursor-pointer">Prefetch workers in parallel</Label>
               <p className="text-[10px] text-muted-foreground mt-0.5">
-                Opt-in. Default <span className="font-mono">1</span> = sequential (safe).
-                {" "}<span className="font-mono">4</span> = capture 4 chapters' VRFs concurrently in
-                one browser (bench: 5.2× speedup), but can trigger Cloudflare
-                rate-limit on some sessions. Worth enabling for large downloads
-                (50+ chapters) on a stable IP. Falls back to sequential
-                transparently if Cloudflare bounces a batch.
+                Concurrent prefetch worker threads. Default
+                {" "}<span className="font-mono">2</span> = up to 2 chapters downloading at
+                once while the main thread processes a third. <span className="font-mono">1</span> =
+                legacy single-in-flight behavior. Total concurrent connections
+                per host ≈ this × image concurrency. Webtoons.com and
+                MangaFire's edge cache tolerate 2 well in practice.
               </p>
             </div>
             <Input
               type="number"
               min={1}
-              max={8}
+              max={4}
               step={1}
-              value={local.mangafireVrfParallel ?? 1}
+              value={local.imagePrefetchParallel ?? 2}
               onChange={(e) => {
                 const raw = e.target.value;
-                if (raw === "") { set("mangafireVrfParallel", 1); return; }
+                if (raw === "") { set("imagePrefetchParallel", 2); return; }
                 const v = Number(raw);
-                if (!Number.isFinite(v) || v < 1) { set("mangafireVrfParallel", 1); return; }
-                set("mangafireVrfParallel", Math.max(1, Math.min(8, Math.trunc(v))));
+                if (!Number.isFinite(v) || v < 1) { set("imagePrefetchParallel", 2); return; }
+                set("imagePrefetchParallel", Math.max(1, Math.min(4, Math.trunc(v))));
               }}
               className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>
+
+          {/* Force-disable curl_cffi escape hatch. */}
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">
+                Force-disable fast download path
+              </Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Escape hatch — when on, ALL handlers fall back to the legacy
+                ThreadPoolExecutor + cloudscraper path regardless of their
+                per-handler SUPPORTS_FAST_DOWNLOAD flag. Useful for curl_cffi
+                version regressions or weird CDN-vs-impersonation issues.
+                Off by default; only flip on when troubleshooting.
+              </p>
+            </div>
+            <Switch
+              checked={!!local.noFastDownload}
+              onCheckedChange={(v) => set("noFastDownload", v)}
+            />
+          </div>
+        </div>
+
+        {/* MangaFire VRF capture knobs (--mangafire-vrf-prefetch-depth,
+            --mangafire-vrf-parallel) were removed from the UI on
+            2026-05-13. They're advanced Patchright/Cloudflare tuning
+            most users shouldn't touch; the argparse defaults (depth=4,
+            parallel=1) are bench-good. Advanced users can still pass
+            the CLI flags directly. */}
+
+        {/* LINE Webtoon WebP Recompression (Phase 1, 2026-05-11) ──
+            webtoons.com-only image recompression. Targets the ~45GB-per-
+            series problem caused by archival-quality lossless PNGs on
+            newer chapters (verified: Eleceed Ch 57 → 91% smaller at q85).
+            Python-side `handler.name === "linewebtoon"` gates the actual
+            re-encode pass, so these defaults are safe to enable for users
+            with mixed-site libraries — non-webtoons downloads silently
+            skip the recompression pass. App.jsx's settings.defaults spread
+            for search/library wrappers (:155, :192) AND DownloadTab's
+            DEFAULT_FORM merge (:110-113) both pick these up. */}
+        <SectionHeader>LINE Webtoon Recompression</SectionHeader>
+        <p className="text-[10px] text-muted-foreground -mt-1 mb-2 leading-snug">
+          Re-encode webtoons.com <em className="not-italic font-semibold">lossless PNG</em> pages
+          to lossy WebP before packaging — only fires when the active handler is{" "}
+          <span className="font-mono">linewebtoon</span>, silently ignored for
+          every other site. Skips JPEG-served chapters automatically
+          (webtoons.com only ships PNG once a series gets popular — Eleceed
+          flips at Ch 57; recompressing the small early JPEGs would be
+          generation-loss for ~50 KB of savings). Typical impact on a
+          PNG-heavy series: 45 GB → ~5 GB at q85. Requires CBZ or EPUB output;
+          PDF is rejected at startup.
+        </p>
+        <div className="space-y-3">
+          <div className="flex items-start gap-3">
+            <Switch
+              checked={!!local.defaults.webtoonRecompress}
+              onCheckedChange={(v) => setDefault("webtoonRecompress", v)}
+              className="mt-0.5"
+            />
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">
+                Recompress webtoons.com pages to WebP
+              </Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Applies to every webtoons.com download — direct URL, search-
+                initiated, and library re-downloads.
+              </p>
+            </div>
+          </div>
+          {local.defaults.webtoonRecompress && (
+            <div className="pl-12 animate-slide-up grid grid-cols-2 gap-x-6 gap-y-3">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Quality</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {local.defaults.webtoonRecompressQuality ?? 85}
+                  </Badge>
+                </div>
+                <Slider
+                  value={local.defaults.webtoonRecompressQuality ?? 85}
+                  onValueChange={(v) => setDefault("webtoonRecompressQuality", v)}
+                  min={1}
+                  max={100}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  <span className="font-mono">85</span> = storage-optimized
+                  (default). <span className="font-mono">90</span> =
+                  archival-safe (~60% larger files). Above 95 is wasted
+                  bytes on color webtoon content.
+                </p>
+              </div>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Encoder effort</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {local.defaults.webtoonRecompressMethod ?? 4}
+                  </Badge>
+                </div>
+                <Slider
+                  value={local.defaults.webtoonRecompressMethod ?? 4}
+                  onValueChange={(v) => setDefault("webtoonRecompressMethod", v)}
+                  min={0}
+                  max={6}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  <span className="font-mono">0</span> = fastest,{" "}
+                  <span className="font-mono">6</span> = smallest. Default
+                  4 is the sweet spot; 6 buys ~5% smaller files at ~2-3×
+                  the encode time — fine for overnight bulk runs.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Default Search Options ─────────────────────────────────

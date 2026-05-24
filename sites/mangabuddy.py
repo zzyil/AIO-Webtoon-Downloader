@@ -114,6 +114,30 @@ class MangaBuddySiteHandler(MadaraSiteHandler):
         if desc_node:
             desc = desc_node.get_text("\n", strip=True)
 
+        # Alt names: <p><strong>Other names:</strong> Foo, Bar</p>
+        # Year of release: <p><strong>Year of release:</strong> 2018</p>
+        # Walk by label text — selectors for these rows aren't stable across
+        # MangaBuddy mirror sites (mangacute, mangaforest, etc.), but the
+        # bolded label string is consistent.
+        alt_names: list[str] = []
+        year: int | None = None
+        for label_text, target in (("Other names", "alt"), ("Year of release", "year")):
+            node = soup.find(string=lambda t, lbl=label_text: bool(t) and lbl in t)
+            if not node or not node.parent:
+                continue
+            container = node.parent.parent if node.parent.name == "strong" else node.parent
+            if container is None:
+                continue
+            value_text = re.sub(r"^.*?:", "", container.get_text(" ", strip=True)).strip()
+            if not value_text:
+                continue
+            if target == "alt":
+                alt_names = [p.strip() for p in re.split(r"[;,/|]", value_text) if p.strip()]
+            else:
+                year_match = re.search(r"\b(\d{4})\b", value_text)
+                if year_match:
+                    year = int(year_match.group(1))
+
         comic = {
             "hid": self._slug_from_url(url),
             "title": title,
@@ -125,7 +149,11 @@ class MangaBuddySiteHandler(MadaraSiteHandler):
             "status": status,
             "language": "en",
         }
-        
+        if alt_names:
+            comic["alt_names"] = alt_names
+        if year is not None:
+            comic["year"] = year
+
         return SiteComicContext(comic=comic, title=title, identifier=comic["hid"], soup=soup)
 
 

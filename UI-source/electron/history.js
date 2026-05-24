@@ -133,18 +133,58 @@ class HistoryManager {
     return { ...this._settings };
   }
 
+  /**
+   * Persist settings, with defense-in-depth filtering of volatile path
+   * values for the three path keys (pythonCmd, scriptPath, workingDir).
+   *
+   * The bug we're guarding against (2026-05-13): AppImage mounts its
+   * contents at a random `/tmp/.mount_<basename><random>/` path that
+   * changes on every launch. macOS Gatekeeper App Translocation runs
+   * a fresh-installed .app from `/private/var/folders/.../AppTranslocation/<UUID>/`
+   * and that UUID also rotates. Both flows can leak into the renderer's
+   * Settings state and round-trip back to disk if the upstream
+   * round-trip-prevention layer regresses. This filter drops the bad
+   * values silently rather than persisting paths that will ENOENT on
+   * the next launch.
+   *
+   * Three patterns rejected (any one matches → drop the key):
+   *   - /^\/tmp\/\.mount_/                      AppImage squashfs mount
+   *   - /\/AppTranslocation\/[0-9A-F-]+\//      Gatekeeper translocation
+   *   - /\/Volumes\/[^/]+\.app\//                .app launched from DMG
+   *
+   * Non-path keys pass through unchanged. Other fields aren't filtered
+   * because the failure mode is path-specific — a stale verboseAlways
+   * doesn't break anything.
+   */
   saveSettings(newSettings) {
-    const next = { ...this._settings, ...newSettings };
-    for (const key of ["defaults", "searchOpts", "libraryOpts"]) {
-      if (
-        newSettings[key] &&
-        typeof newSettings[key] === "object" &&
-        !Array.isArray(newSettings[key])
-      ) {
-        next[key] = { ...(this._settings[key] || {}), ...newSettings[key] };
+    const VOLATILE_PATH_PATTERNS = [
+      /^\/tmp\/\.mount_/,
+      /\/AppTranslocation\/[0-9A-F-]+\//,
+      /\/Volumes\/[^/]+\.app\//,
+    ];
+    const PATH_KEYS = ["pythonCmd", "scriptPath", "workingDir"];
+
+    const filtered = { ...newSettings };
+    for (const key of PATH_KEYS) {
+      const value = filtered[key];
+      if (typeof value !== "string" || value === "") continue;
+      // Normalize to forward slashes once so the patterns work on values
+      // that arrived with backslashes (Windows-side cross-platform code
+      // that touched these fields). Pattern matching uses POSIX form.
+      const normalized = value.replace(/\\/g, "/");
+      for (const pattern of VOLATILE_PATH_PATTERNS) {
+        if (pattern.test(normalized)) {
+          console.warn(
+            `[history] Rejecting volatile-path write for ${key}: ${value} ` +
+            `(matched ${pattern}). Path will fall back to the runtime-resolved default.`
+          );
+          delete filtered[key];
+          break;
+        }
       }
     }
-    this._settings = next;
+
+    this._settings = { ...this._settings, ...filtered };
     this._saveJson(this._settingsPath, this._settings);
   }
 }

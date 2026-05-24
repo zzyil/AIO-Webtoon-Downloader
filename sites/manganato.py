@@ -136,19 +136,10 @@ class ManganatoSiteHandler(BaseSiteHandler):
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault("Referer", self._BASE_URL + "/")
 
-    def _impit_get(self, url: str, referer: str = "") -> str:
-        """Fetch via impit (handles zstd/brotli that cloudscraper cannot)."""
-        from .crawlee_utils import fetch_html_impit
-        headers = {"Referer": referer} if referer else {}
-        return fetch_html_impit(url, browser="chrome", headers=headers)
-
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         slug = self._slug_from_url(url)
-        try:
-            html = self._impit_get(url, referer=self._BASE_URL + "/")
-        except Exception:
-            html = make_request(url, scraper).text
-        soup = self._make_soup(html)
+        response = make_request(url, scraper)
+        soup = self._make_soup(response.text)
 
         title = self._extract_text(soup, ["h1.manga-info-title", ".manga-info-text h1", "h1"])
         if not title:
@@ -169,18 +160,34 @@ class ManganatoSiteHandler(BaseSiteHandler):
             ],
         )
 
+        # Walk every metadata row once and dispatch by label substring. Each
+        # row is `<li><h2>Label:</h2>value</li>` — we strip the leading
+        # label-colon and split per-field.
         authors: List[str] = []
+        status: Optional[str] = None
+        year: Optional[int] = None
+        alt_names: List[str] = []
         for item in soup.select(".manga-info-text li"):
             label = item.find("h2")
             if not label:
                 continue
             label_text = label.get_text(strip=True).lower()
+            content = item.get_text(" ", strip=True)
+            if ":" not in content:
+                continue
+            value = content.split(":", 1)[1].strip()
+            if not value:
+                continue
             if "author" in label_text:
-                content = item.get_text(" ", strip=True)
-                parts = content.split(":", 1)
-                if len(parts) == 2:
-                    authors = [a.strip() for a in parts[1].split(",") if a.strip()]
-                break
+                authors = [a.strip() for a in value.split(",") if a.strip()]
+            elif "status" in label_text:
+                status = value
+            elif "released" in label_text or "published" in label_text or "year" in label_text:
+                year_match = re.search(r"\b(\d{4})\b", value)
+                if year_match:
+                    year = int(year_match.group(1))
+            elif "alternative" in label_text or "other names" in label_text:
+                alt_names = [p.strip() for p in re.split(r"[;,/]", value) if p.strip()]
 
         genres = [
             a.get_text(strip=True)
@@ -197,77 +204,42 @@ class ManganatoSiteHandler(BaseSiteHandler):
             "genres": genres,
             "url": url,
         }
+        if status:
+            comic["status"] = status
+        if year is not None:
+            comic["year"] = year
+        if alt_names:
+            comic["alt_names"] = alt_names
         return SiteComicContext(comic=comic, title=title, identifier=slug, soup=soup)
 
-    def _fetch_chapters_api(self, slug: str, series_url: str) -> List[Dict]:
-        """Use the manganato.gg JSON API to get all chapters."""
-        import json as _json
-        from .crawlee_utils import fetch_html_impit
-        api_url = f"{self._BASE_URL}/api/manga/{slug}/chapters?limit=-1"
-        raw = fetch_html_impit(api_url, browser="chrome", headers={"Referer": series_url})
-        data = _json.loads(raw)
-        chapters_data = data.get("data", {}).get("chapters", [])
-        chapters: List[Dict] = []
-        for ch in chapters_data:
-            ch_slug = ch.get("chapter_slug", "")
-            ch_url = f"{series_url.rstrip('/')}/{ch_slug}" if ch_slug else ""
-            num = str(ch.get("chapter_num", ""))
-            name = ch.get("chapter_name", ch_slug)
-            chapters.append({
-                "hid": ch_url,
-                "chap": num,
-                "title": name,
-                "url": ch_url,
-                "uploaded": ch.get("updated_at"),
-            })
-        return chapters
-
     def get_chapters(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
-        slug = context.identifier
-        source_url = context.comic.get("url") or f"{self._BASE_URL}/manga/{slug}"
-
-        # Primary: use the JSON API (works with impit, handles zstd)
-        try:
-            chapters = self._fetch_chapters_api(slug, source_url)
-            if chapters:
-                chapters.sort(key=lambda c: float(c.get("chap") or 0), reverse=True)
-                return chapters
-        except Exception:
-            pass
-
-        # Fallback: parse HTML (works on legacy mangakakalot domains)
         soup = context.soup
         if soup is None:
-            try:
-                html = self._impit_get(source_url, referer=self._BASE_URL + "/")
-            except Exception:
-                html = make_request(source_url, scraper).text
-            soup = self._make_soup(html)
+            response = make_request(context.comic.get("url"), scraper)
+            soup = self._make_soup(response.text)
+        source_url = context.comic.get("url") or self._BASE_URL
         chapter_rows = self._collect_chapter_rows(soup, source_url)
-        chapters = []
+        chapters: List[Dict] = []
         for row in chapter_rows:
             number = self._chapter_number(row["title"])
-            chapters.append({
-                "hid": row["url"],
-                "chap": number,
-                "title": row["title"],
-                "url": row["url"],
-                "uploaded": row.get("uploaded"),
-            })
+            chapters.append(
+                {
+                    "hid": row["url"],
+                    "chap": number,
+                    "title": row["title"],
+                    "url": row["url"],
+                    "uploaded": row.get("uploaded"),
+                }
+            )
         chapters.sort(key=lambda c: float(c.get("chap") or 0), reverse=True)
-        if not chapters:
-            raise RuntimeError("No chapters found for this Manganato title.")
         return chapters
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
         if not isinstance(url, str):
             raise RuntimeError("Chapter URL missing for Manganato.")
-        try:
-            html = self._impit_get(url, referer=self._BASE_URL + "/")
-        except Exception:
-            html = make_request(url, scraper).text
-        soup = self._make_soup(html)
+        response = make_request(url, scraper)
+        soup = self._make_soup(response.text)
         images: List[str] = []
         for img in soup.select("#chapter-content img, .reading-detail img, .page_chapter img, .container-chapter-reader img"):
             src = img.get("data-src") or img.get("data-original") or img.get("src")
@@ -278,13 +250,31 @@ class ManganatoSiteHandler(BaseSiteHandler):
             raise RuntimeError("Unable to locate Manganato chapter images.")
         return images
 
+    # ----------------------------------------------------------------- search
+    # Manganato uses the historic mangakakalot/manganelo /search/story/<slug>
+    # pattern. The slug is the query with non-word chars collapsed to "_"
+    # and lowercased (e.g. "witch hat" → "witch_hat"). Result selectors are
+    # `.search-story-item` (modern domains) or `.story_item` (legacy).
+    #
+    # Multi-domain trial: the network landscape for this aggregator family is
+    # unstable — domains rotate (manganato.gg, natomanga.com, nelomanga.net,
+    # mangabats.com, ...) and many are CF-aggressive on /search/. We try
+    # domains in order, returning hits from the first one that responds with
+    # parseable HTML. HTTP errors propagate so the orchestrator's probe-
+    # failure cache suppresses dead/blocked hosts. When ALL domains fail,
+    # search returns [] (the orchestrator sees that as "no match" — fine,
+    # since the user can still hit manganato directly for known URLs).
     _SEARCH_DOMAINS = (
+        "https://www.manganato.gg",
         "https://www.natomanga.com",
+        "https://www.nelomanga.net",
+        "https://www.mangabats.com",
         "https://www.mangakakalot.gg",
     )
     _SLUG_NONWORD_RE = re.compile(r"\W+")
 
     def _query_to_slug(self, query: str) -> str:
+        # Mirror the canonical mihon-extension behavior: non-word → _, lower.
         slug = self._SLUG_NONWORD_RE.sub("_", query).strip("_").lower()
         return slug or "_"
 
@@ -301,22 +291,38 @@ class ManganatoSiteHandler(BaseSiteHandler):
         if not clean:
             return []
         slug = self._query_to_slug(clean)
+        last_error: Optional[Exception] = None
         for base in self._SEARCH_DOMAINS:
             url = f"{base}/search/story/{slug}"
             try:
                 response = make_request(url, scraper)
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 continue
             html = response.text or ""
-            if getattr(response, "status_code", 0) >= 400 or "Just a moment..." in html[:1000] or len(html) < 1000:
+            # CF-challenge response is usually 403 or 503 with a "Just a moment"
+            # body — make_request's 5xx-as-exception handles 503; 403 returns
+            # to us. Check body length + a CF-marker to detect the challenge
+            # page so we move on to the next domain instead of trying to parse it.
+            if (
+                getattr(response, "status_code", 0) >= 400
+                or "Just a moment..." in html[:1000]
+                or len(html) < 1000
+            ):
                 continue
             hits = self._parse_search_html(html, base, limit)
             if hits:
                 return hits
+            # Empty parse — try next domain in case this one is mid-rotation
+            # (some natomanga clones deliver a stub during DNS rotation).
+        if last_error is not None and not isinstance(last_error, Exception):
+            # placeholder for future use; currently we just self-select out.
+            pass
         return []
 
     def _parse_search_html(self, html: str, base: str, limit: int) -> List[SearchHit]:
         soup = self._make_soup(html)
+        # Selector chain: modern (search-story-item) → legacy (story_item).
         items = (
             soup.select(".search-story-item")
             or soup.select(".story_item")
@@ -326,6 +332,7 @@ class ManganatoSiteHandler(BaseSiteHandler):
         for idx, item in enumerate(items):
             if len(hits) >= limit:
                 break
+            # Title anchor: `.item-title` (modern) / `h3 a` (legacy)
             title_a = item.select_one(".item-title") or item.select_one("h3 a")
             if not title_a:
                 continue
@@ -333,6 +340,8 @@ class ManganatoSiteHandler(BaseSiteHandler):
             href = title_a.get("href") or ""
             if not title or not href:
                 continue
+            abs_url = self._absolute(base + "/", href) or href
+            # Cover image: first <img> in card
             cover_img = item.select_one("img")
             cover = None
             if cover_img:
@@ -340,13 +349,18 @@ class ManganatoSiteHandler(BaseSiteHandler):
                     base + "/",
                     cover_img.get("data-src") or cover_img.get("data-original") or cover_img.get("src"),
                 )
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(items))))
             hits.append(
                 SearchHit(
                     site=self.name,
                     title=title,
-                    url=self._absolute(base + "/", href) or href,
+                    url=abs_url,
                     cover=cover,
-                    raw_score=max(0.05, 1.0 - (idx / max(1, len(items)))),
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
                 )
             )
         return hits

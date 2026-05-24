@@ -68,6 +68,7 @@ from .base import (
     IncompleteChapterError,
     SearchHit,
     SiteComicContext,
+    _CURL_CFFI_AVAILABLE,
 )
 
 
@@ -128,6 +129,30 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
 
     name = "linewebtoon"
     domains = ("webtoons.com",)
+    # webtoons.com IS the publisher (LINE Webtoon) — opt into the
+    # orchestrator's "official wins the tiebreaker" rule so aggregators
+    # re-hosting these series (toonily, etc.) rank below us within a
+    # SeriesCandidate. Without this, aggregators that upscale our PNGs
+    # to higher-res JPEG were winning the image-quality probe despite
+    # being generation-loss copies. See BaseSiteHandler.OFFICIAL_PUBLISHER
+    # for the full rationale and search_orchestrator.py:_cmp for the
+    # consuming sort.
+    OFFICIAL_PUBLISHER = True
+
+    # Opt into the curl_cffi fast image-download path (HTTP/2 multiplex over
+    # one keep-alive TLS session). Webtoons.com chapters are 25-60 PNG pages
+    # at ~2-3 MB each; the per-page TLS handshake dominates the legacy
+    # ThreadPoolExecutor path's wall-clock. curl_cffi cuts a typical chapter
+    # from ~25s → ~10-15s. The image CDN (typically swebtoon-phinf.pstatic.net)
+    # is on a different host than the .webtoons.com cookies — so cookie
+    # forwarding from the cloudscraper session is a no-op for normal series
+    # (cookies don't ride to a different domain). Anti-hotlink Referer is
+    # the only required header; static webtoons.com homepage URL satisfies it.
+    SUPPORTS_FAST_DOWNLOAD = _CURL_CFFI_AVAILABLE
+    FAST_DL_REFERER_FROM = "https://www.webtoons.com/"
+    # FAST_DL_USER_AGENT not set — let curl_cffi's chrome120 default fill it.
+    # The cloudscraper session's _DEFAULT_UA pins Chrome/120 too, so the two
+    # sessions stay roughly in sync without us hard-coding it twice.
 
     def __init__(self) -> None:
         super().__init__()
@@ -434,7 +459,13 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
             "_is_canvas": is_canvas,
             "_slug": slug,
         }
-        if artist and artist != author:
+        # Always populate `artists` when we determined an artist, even when
+        # it equals author. Komikku's details.json `artist` field is independent
+        # of `author`; leaving it empty for solo creators (the common
+        # Webtoons.com case — singNsong, lilprincessember, etc.) made the
+        # Komikku Library show no artist at all. `artist = artist or author`
+        # above guarantees a non-empty value when author was found.
+        if artist:
             comic["artists"] = [artist]
 
         return SiteComicContext(

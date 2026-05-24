@@ -5,6 +5,7 @@
 # -----------------------------------------------------------
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 import base64
 import glob
 import hashlib
@@ -379,6 +380,23 @@ from PIL import Image, ImageDraw, ImageFont
 # MangaFire often has high-resolution pages that exceed the default limit
 Image.MAX_IMAGE_PIXELS = 200_000_000  # 200 megapixels (default is ~89 megapixels)
 
+# pyvips powers the lossy-WebP save fast path inside save_final_images. libvips
+# streams rows directly from a PIL.Image.tobytes() buffer through libwebp,
+# skipping the PIL→libwebp glue layer that costs ~2x on 1500x3750 stitched
+# LineWebtoon pages. Bench numbers on the 12-core test box:
+#   pil-webp-q85-m2   : 4.24 s / 94 pages parallel x6
+#   pyvips-webp-q85-e2: 2.75 s / 94 pages parallel x6   ← 54% faster, same output bytes
+# (see bench/results.csv 2026-05-15). If pyvips or its libvips DLL bundle
+# can't load (older Windows w/o pyvips-binary wheel, ARM Linux without libvips,
+# etc.) we silently fall back to PIL — output bytes are byte-identical-size
+# and SSIM-identical because both call the same libwebp under the hood.
+try:
+    import pyvips  # type: ignore
+    _HAS_PYVIPS = True
+except Exception:  # pragma: no cover
+    pyvips = None  # type: ignore
+    _HAS_PYVIPS = False
+
 _VERBOSE = False  # Global flag for standard verbose output
 _DEBUG = False  # Global flag for debug-level output
 
@@ -453,6 +471,29 @@ def make_request(url: str, scraper):
                         f"Origin error ({r.status_code})", response=r
                     )
 
+                if cls == "retryable":
+                    # 5xx server errors (500/502/503/504) and 408 timeouts. The
+                    # response body is always an error page or maintenance HTML
+                    # — never useful payload — so the body-size threshold below
+                    # is a trap: a 503 with a >100-char MangaDex maintenance
+                    # page slipped through as a "successful" response and
+                    # fetch_comic_context's .json() blew up with the cryptic
+                    # "Expecting value: line 1 column 1 (char 0)" the user
+                    # reported on 2026-05-16 (the chapter-5 follow-up where
+                    # the API was 503'ing). Raise here so the outer retry
+                    # loop engages with exponential backoff — same response
+                    # class as origin_error, just a different status band.
+                    # Symmetric with the origin_error branch above.
+                    raise requests.exceptions.HTTPError(
+                        f"Retryable server error ({r.status_code})", response=r
+                    )
+
+                # cls == "permanent" (4xx with no rate-limit keyword). Some APIs
+                # return structured 4xx with JSON bodies the caller wants to
+                # inspect (MangaDex's API does this for client-side validation
+                # errors), so when the body has content we surface the response
+                # rather than raising. Tiny-body 4xx fails fast — there's
+                # nothing to inspect.
                 if not r.text or len(r.text) < 100:
                     r.raise_for_status()
                 log_verbose(
@@ -611,6 +652,17 @@ _HOST_POLITE_DELAY: Dict[str, float] = {}
 _HOST_FAIL_COUNT: Dict[str, int] = {}
 _HOST_FAIL_URLS: Dict[str, set] = {}
 _HOST_FAIL_LOCK = threading.Lock()
+
+# Phase D (2026-05-13): per-host concurrency cap that dials DOWN on
+# confirmed CDN failures during a run. Distinct from _HOST_FAIL_COUNT
+# (per-chapter, drives the chapter-skip threshold) — this lives across
+# the whole run so a CDN that 520s on chapter 5 stays capped through
+# chapter 50. Reset only by _reset_host_concurrency_caps at run start.
+# Floor is 1; we never reduce below "one request at a time" because
+# concurrency reduction is a coarse control and the polite-delay
+# machinery handles fine-grained request pacing separately.
+_HOST_CONCURRENCY_CAP: Dict[str, int] = {}
+_HOST_CAP_LOCK = threading.Lock()
 
 # Set by the per-chapter watchdog Timer in _process_chapter when the chapter's
 # wall-clock deadline expires. dl_image / _try_download_url check this and
@@ -795,6 +847,13 @@ def _record_failure(host: str, url: str, cls: str) -> None:
     Cls is the classification of the *last* failure; we only count network
     failures (origin_error / rate_limit / retryable) — permanent 4xx errors
     don't indicate the host is broken.
+
+    Phase D (2026-05-13): also feeds _record_host_failure_for_backoff,
+    which dials down the per-host concurrency cap on rate_limit/retryable
+    failures. The backoff cap is per-run (not per-chapter like the URL
+    counter here) and is independent of the chapter-poison threshold —
+    it makes the in-flight fetch lighter BEFORE the threshold trips a
+    chapter abort.
     """
     if not host or cls == "permanent":
         return
@@ -803,6 +862,10 @@ def _record_failure(host: str, url: str, cls: str) -> None:
         if url not in seen:
             seen.add(url)
             _HOST_FAIL_COUNT[host] = _HOST_FAIL_COUNT.get(host, 0) + 1
+    # Dial down concurrency for subsequent fetches against this host.
+    # Outside the _HOST_FAIL_LOCK because _record_host_failure_for_backoff
+    # uses its own _HOST_CAP_LOCK — separate locks prevent contention.
+    _record_host_failure_for_backoff(host, cls)
 
 
 def _host_fail_count(host: str) -> int:
@@ -819,6 +882,74 @@ def _reset_host_failures_for_chapter() -> None:
     with _HOST_FAIL_LOCK:
         _HOST_FAIL_COUNT.clear()
         _HOST_FAIL_URLS.clear()
+
+
+def _record_host_failure_for_backoff(host: str, cls: str) -> None:
+    """Reduce _HOST_CONCURRENCY_CAP[host] in response to a confirmed failure.
+
+    Called from _record_failure right after the URL bookkeeping. Floor is 1.
+    Class behavior:
+      - rate_limit:   cap //= 2  (aggressive — server is mad at request rate)
+      - retryable:    cap -= 1   (we got unlucky; light decrement)
+      - origin_error: no-op      (CF 520-527 — upstream sickness; concurrency
+                                  reduction doesn't help and may slow recovery
+                                  when origin comes back)
+      - permanent:    no-op      (4xx — already filtered by _record_failure)
+
+    Cross-process backoff (sibling worker processes via _COORD) is NOT
+    triggered from here — that path goes through _record_rate_limit which
+    is hit by the in-band retry logic. The concurrency cap is purely
+    local to this process.
+
+    No-op for empty host (defensive — _record_failure already guards but
+    we re-check for cheap insurance)."""
+    if cls in ("permanent", "origin_error"):
+        return
+    if not host:
+        return
+    with _HOST_CAP_LOCK:
+        # Default base is 8 (matches --image-concurrency default). First
+        # failure for this host: start from 8, then reduce per the class.
+        # If user passed --image-concurrency 4 and we've already capped to
+        # 3 from prior failures, _effective_concurrency picks min(4, 3) = 3.
+        current = _HOST_CONCURRENCY_CAP.get(host, 8)
+        if cls == "rate_limit":
+            new_cap = max(1, current // 2)
+        elif cls == "retryable":
+            new_cap = max(1, current - 1)
+        else:
+            return
+        if new_cap < current:
+            _HOST_CONCURRENCY_CAP[host] = new_cap
+            log_verbose(
+                f"  [Backoff] Reducing {host} concurrency: {current} -> "
+                f"{new_cap} (reason={cls})"
+            )
+
+
+def _effective_concurrency(host: str, base: int) -> int:
+    """Return min(base, _HOST_CONCURRENCY_CAP[host]) when capped; else base.
+
+    When the cap hasn't been touched (healthy CDN), returns base unchanged
+    — zero overhead. Callers must invoke this immediately before
+    constructing an asyncio.Semaphore or ThreadPoolExecutor. The host
+    is derived from download_tasks[0][1]'s netloc (single-host-per-chapter
+    assumption — true in 99%+ cases). Empty host returns base unchanged."""
+    if not host:
+        return base
+    with _HOST_CAP_LOCK:
+        cap = _HOST_CONCURRENCY_CAP.get(host)
+    return min(base, cap) if cap is not None else base
+
+
+def _reset_host_concurrency_caps() -> None:
+    """Clear per-run concurrency caps. Called by _apply_runtime_tunables at
+    run start so each run begins with fresh CDN trust. The polite-delay
+    decay (_cool_polite_delay) handles fine-grained request-pacing recovery
+    within a run; concurrency stays capped for the rest of the run once
+    reduced, intentionally — a CDN that 520s once is likely to 520 again."""
+    with _HOST_CAP_LOCK:
+        _HOST_CONCURRENCY_CAP.clear()
 
 
 def _chapter_cancelled() -> bool:
@@ -2065,6 +2196,8 @@ def save_final_images(
     quality: int,
     output_format: str = "auto",
     source_paths: Optional[List[Optional[str]]] = None,
+    *,
+    webp_source_is_lossy: bool = False,
 ) -> List[str]:
     """Saves a list of final PIL images to disk with format-aware encoding.
 
@@ -2075,14 +2208,30 @@ def save_final_images(
     matches (and preserves the quality of) the source:
 
       - "auto": decide per-image from source_paths[i].format. WebP source
-        → WebP lossless output (zero generation loss vs decoded WebP);
-        JPEG source → JPEG at ``quality`` (typically q≥95 from caller);
-        PNG/GIF/other or unknown → PNG (lossless). Falls back to PNG
-        when source_paths isn't provided or doesn't line up 1:1.
-      - "webp_lossless": every output is WebP-lossless at method=4
-        (used by ``auto`` for WebP-source legacy re-encode).
+        → WebP-lossless **by default** (preserves natively-WebP sites like
+        Atsumaru), or WebP lossy q85 when the caller sets
+        ``webp_source_is_lossy=True`` (Phase H, see below); JPEG source →
+        JPEG at ``quality`` (typically q≥95 from caller); PNG/GIF/other or
+        unknown → PNG (lossless). Falls back to PNG when source_paths isn't
+        provided or doesn't line up 1:1.
+      - "webp_lossless": every output is WebP-lossless at method=4. The
+        auto-mode default for WebP source when ``webp_source_is_lossy=False``.
+        Callers can also pick this explicitly.
+      - "webp_q85": every output is lossy WebP q85 method=2. The auto-mode
+        choice for WebP source when ``webp_source_is_lossy=True``. Also
+        usable as an explicit output_format. Routed through pyvips when
+        available (~2x faster than PIL at the same settings); falls back
+        to PIL when pyvips can't load.
       - "jpeg": legacy behavior, every output is JPEG at ``quality``.
       - "png": every output is PNG (lossless).
+
+    The ``webp_source_is_lossy`` keyword-only hint tells auto-mode that any
+    WebP source it probes is already a lossy q85 from our own
+    --webtoon-recompress step (LineWebtoon-specific, see
+    recompress_chapter_images_to_webp at ~line 2300). Default False so
+    sites that ship native WebP (Atsumaru, etc.) get lossless preserve
+    behavior unchanged. Cross-file: set at the CBZ caller around
+    ~line 6890 to ``args.webtoon_recompress and handler.name == 'linewebtoon'``.
 
     Phase G2 (2026-05-08): WebP-lossless encodes go through a
     ThreadPoolExecutor (cap 4 workers). libwebp releases the GIL during
@@ -2100,6 +2249,30 @@ def save_final_images(
     during JPEG encoding, so the same 4-worker pool drops that to ~3-4s.
     User report 2026-05-08: WebP CBZs already-fast (pooled), JPEG CBZs
     15s vs PDF 1s — fix bridges the gap.
+
+    Phase H (2026-05-16): user reported 65 m 20 s Processing for 6
+    chapters with --webtoon-recompress on. Code trace pinpointed this
+    function: the pre-Phase-H auto-mode mapped WEBP source →
+    webp_lossless (method=4, lossless=True, quality=100), which encodes
+    each 1500×3750 stitched page in ~2-3s at ~2.85 MB per page. With
+    --webtoon-recompress the source WebPs are already lossy q85, so the
+    lossless wrapper was wasting both wall time AND disk (the resulting
+    CBZ is ~262 MB / chapter instead of ~30 MB at matched q85). Bench
+    on 94 Eleceed Ch.380 pages at 6 parallel workers:
+        pil-webp-lossless-m4 (BASELINE):  67.6 s   261.8 MB  SSIM 1.0
+        pyvips-webp-q85-e2 (Phase H):      2.75 s   30.0 MB  SSIM 0.99415
+            → 25x faster, 8.7x smaller, q85 indistinguishable on phone.
+    The pyvips path is preferred when available; PIL fallback at q85 m2
+    is still 16x over baseline. See bench/webtoon_encode_bench.py +
+    bench/results.csv.
+
+    SCOPING (2026-05-16 follow-up, per user): the q85 mapping fires ONLY
+    when ``webp_source_is_lossy=True`` is passed. Sites that ship native
+    lossless or near-lossless WebP (Atsumaru is the canonical case;
+    MangaDex and others also serve WebP) keep the original
+    "WEBP → webp_lossless" mapping so their CBZs aren't silently
+    re-encoded at q85. The flag is set at the LineWebtoon + recompress
+    call site (search for ``_webp_source_is_lossy`` in this file).
 
     The PDF path passes ``output_format="jpeg"`` and ``quality=100`` to
     keep the existing PDF re-encode contract unchanged.
@@ -2128,7 +2301,15 @@ def save_final_images(
                 except Exception:
                     src_fmt = None
             if src_fmt == "WEBP":
-                fmt = "webp_lossless"
+                # Phase H (2026-05-16, scoped follow-up): pick lossy q85 only
+                # when the caller signals the source is already lossy (i.e.,
+                # came from our own --webtoon-recompress step on LineWebtoon).
+                # Default stays "webp_lossless" so natively-WebP sites like
+                # Atsumaru, MangaDex, etc. don't get silently degraded —
+                # their WebPs are at the publisher's chosen quality and
+                # losslessly preserving them is the right call. The hint is
+                # plumbed in at the CBZ caller (~line 6890).
+                fmt = "webp_q85" if webp_source_is_lossy else "webp_lossless"
             elif src_fmt == "JPEG":
                 fmt = "jpeg"
             else:
@@ -2140,6 +2321,16 @@ def save_final_images(
             save_kwargs: Dict[str, Any] = dict(
                 format="WebP", lossless=True, method=4, quality=100
             )
+        elif fmt == "webp_q85":
+            ext = ".webp"
+            # Phase H: lossy WebP q85, libwebp method/effort=2. Sweet spot
+            # from bench/results.csv 2026-05-15 — 16x faster than the old
+            # lossless path on PIL alone, 25x with pyvips. SSIM 0.99415 vs
+            # lossless reference, indistinguishable on phone-screen viewing
+            # per existing --webtoon-recompress quality contract.
+            # _save_one dispatches to pyvips when available; the kwargs
+            # below are also valid for PIL.Image.save when pyvips isn't.
+            save_kwargs = dict(format="WebP", quality=85, method=2)
         elif fmt == "jpeg":
             ext = ".jpg"
             save_kwargs = dict(format="JPEG", optimize=True, quality=quality)
@@ -2156,13 +2347,38 @@ def save_final_images(
 
     def _save_one(entry):
         idx, src_img, dst, fmt_local, save_kw = entry
-        # WebP lossless does not accept RGBA in some PIL builds; convert
-        # to a clean RGB/L mode before save. Same for JPEG.
-        if fmt_local.startswith("webp_lossless") and src_img.mode not in ("RGB", "L"):
+        # to a clean RGB/L mode before save. Same for JPEG and the new
+        # Phase H webp_q85 path (which also routes through libwebp).
+        if fmt_local.startswith("webp") and src_img.mode not in ("RGB", "L"):
             src_img = src_img.convert("RGB")
         elif fmt_local == "jpeg" and src_img.mode not in ("RGB", "L"):
             src_img = src_img.convert("RGB")
-        src_img.save(dst, **save_kw)
+
+        # Phase H (2026-05-16): the lossy webp_q85 path prefers pyvips when
+        # the optional dep loaded at import time. libvips streams rows of
+        # the PIL buffer through libwebp without building an intermediate
+        # RGB array, ~2x faster than PIL.Image.save at the same q/method
+        # settings on 1500x3750 stitched LineWebtoon pages (bench/results.csv
+        # 2026-05-15: pil-webp-q85-m2=4.24s vs pyvips-webp-q85-e2=2.75s on
+        # 94 pages parallel x6). Output bytes are size-identical and SSIM-
+        # identical because both call the same libwebp encoder. Fallback
+        # is the legacy PIL path so users on platforms without a pyvips
+        # wheel (uncommon: pyvips-binary wheels cover win/mac/linux x86_64
+        # and arm64) still get the 16x A1 win.
+        if fmt_local == "webp_q85" and _HAS_PYVIPS:
+            # PIL.Image.tobytes("raw","RGB") returns row-major R0G0B0R1G1B1...
+            # which is exactly what pyvips.Image.new_from_memory wants for
+            # bands=3 format="uchar". No numpy import needed on the hot path.
+            w, h = src_img.size
+            buf = src_img.tobytes()
+            v = pyvips.Image.new_from_memory(buf, w, h, 3, "uchar")
+            v.webpsave(
+                str(dst),
+                Q=save_kw["quality"],
+                effort=save_kw["method"],
+            )
+        else:
+            src_img.save(dst, **save_kw)
         log_debug(f"    Saved -> {os.path.basename(dst)}")
         return idx, dst
 
@@ -2191,7 +2407,7 @@ def save_final_images(
         # Thread-name prefix reflects the dominant format in the plan so log
         # output stays readable; doesn't change behavior.
         prefix = "webp-encode" if any(
-            entry[3].startswith("webp_lossless") for entry in plan
+            entry[3].startswith("webp") for entry in plan
         ) else "img-encode"
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix=prefix
@@ -2206,6 +2422,154 @@ def save_final_images(
             output_paths[idx] = dst
 
     return output_paths  # type: ignore[return-value]
+
+
+# -----------------------------------------------------------
+# WebP recompression (LINE Webtoon, opt-in via --webtoon-recompress)
+# -----------------------------------------------------------
+
+def recompress_chapter_images_to_webp(
+    raw_paths: List[str],
+    quality: int,
+    method: int,
+) -> List[str]:
+    """Re-encode source images to lossy WebP at the given quality and
+    encoder method, replacing files in place.
+
+    Used by the LINE Webtoon pipeline (handler.name == 'linewebtoon') to
+    convert webtoons.com's CDN-served archival images (~200-700 KB/page
+    JPEG at q98-99, or historically multi-MB lossless PNG) to storage-
+    optimized WebP (~80-130 KB/page) before the CBZ fast-path or EPUB
+    packager consumes raw_paths.
+
+    Per-file behavior:
+      - Already .webp: passthrough (already in target format). Skipping
+        avoids generation loss from decode → re-encode. webtoons.com
+        doesn't serve .webp today, but the check is cheap and future-
+        proofs the path.
+      - Anything else PIL can decode (.png, .jpg/.jpeg, .gif, .avif via
+        plugin, etc.): decoded, saved as WebP at quality + method, then
+        the original is os.remove'd. Returns the new .webp path in the
+        same slot of the output list.
+      - Decode failures (corrupt files, UnidentifiedImageError,
+        DecompressionBomb): logged via log_verbose, original path kept.
+        Caller still packages the chapter with that page's original
+        bytes.
+
+    Eligibility design (2026-05-16): the older `_is_recompress_eligible`
+    predicate gated JPEG re-encoding behind an estimated-quality + BPP
+    threshold, intended to skip already-small dialogue panels. That
+    skip created a downstream bug: when 5+/83 pages in a chapter stayed
+    .jpg (some panels below BPP threshold), the slow-path 1:N
+    `all(.webp)` check at save_final_images failed and the final output
+    fell back to lossless PNG, producing 130 MB CBZs on Eleceed Ch 25+.
+    The user's call: "compress everything." Simplicity wins; tiny JPEGs
+    re-encode to similar-sized WebPs with negligible generation loss
+    (q98 JPEG → q85 WebP on already-tiny content), and the all-WebP
+    invariant downstream is preserved.
+
+    Concurrency: cpu // 2 workers, matching save_final_images (lines
+    ~2360). libwebp releases the GIL during native encode so per-image
+    saves run in parallel.
+
+    Atomicity: <base>.webp is written first; only on success do we
+    os.remove the original. A crash mid-conversion can leave .webp next
+    to the old ext — the next inline retry wipes the chapter dir
+    (_process_chapter_strict ~line 5518) so leftover state is self-healing.
+
+    Cross-file: read by _process_chapter_impl ~line 6800 (between the
+    --keep-images copytree and the processed_tdir setup); the result
+    becomes raw_image_paths for the rest of the chapter pipeline. CBZ
+    fast-path (~line 6900) and EPUB chapter_content build honor per-file
+    extensions via os.path.splitext, so .webp arcnames flow through.
+    Resume gating: webtoon_recompress / _quality / _method are in
+    _RESUME_GATING_DESTS — changing any invalidates the on-disk images.
+    """
+    if not raw_paths:
+        return list(raw_paths)
+
+    def _convert_one(entry: Tuple[int, str]) -> Tuple[int, str]:
+        idx, src = entry
+        # Already in target format: leave alone to avoid generation loss
+        # from a decode → re-encode round trip. webtoons.com doesn't serve
+        # .webp today, but other sites (Atsumaru, MangaDex) do — relevant
+        # if --webtoon-recompress is ever applied outside LineWebtoon.
+        if os.path.splitext(src)[1].lower() == ".webp":
+            log_debug(
+                f"    Recompress skip (already .webp): {os.path.basename(src)}"
+            )
+            return idx, src
+
+        base, _ = os.path.splitext(src)
+        dst = base + ".webp"
+        try:
+            with Image.open(src) as im:
+                # WebP encode wants RGB or L; webtoon pages are color so
+                # almost always already RGB, but be defensive against PNG
+                # palette / RGBA modes from older site formats.
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                im.save(
+                    dst,
+                    format="WebP",
+                    quality=quality,
+                    method=method,
+                )
+        except Exception as e:
+            # PIL.UnidentifiedImageError ⊂ OSError; DecompressionBombError ⊂
+            # Exception. Broad catch keeps a single corrupt page from
+            # aborting the whole chapter — we keep the original instead.
+            log_verbose(
+                f"  Warning: WebP recompress failed for "
+                f"{os.path.basename(src)}: {e}. Keeping original."
+            )
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+            return idx, src
+
+        try:
+            os.remove(src)
+        except OSError as e:
+            # The new .webp is fine; we just couldn't delete the old file
+            # (locked by AV, OneDrive sync, etc). Return the .webp anyway;
+            # the leftover original gets wiped on the next chapter-dir reset.
+            log_debug(
+                f"    Recompress: kept original alongside webp ({e}): "
+                f"{os.path.basename(src)}"
+            )
+        return idx, dst
+
+    cpu = os.cpu_count() or 4
+    half_cores = max(1, cpu // 2)
+    workers = max(1, min(half_cores, len(raw_paths)))
+
+    out: List[Optional[str]] = [None] * len(raw_paths)
+    with _cpu_guard("recompress_webp"):
+        if workers == 1 or len(raw_paths) == 1:
+            for entry in enumerate(raw_paths):
+                idx, dst = _convert_one(entry)
+                out[idx] = dst
+                if idx % 8 == 0:
+                    _hb("cpu", f"recompress {idx+1}/{len(raw_paths)}")
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="webp-recompress"
+            ) as pool:
+                # pool.map preserves submission order; consumed iteratively
+                # so memory stays bounded. _hb every 8 keeps the per-chapter
+                # watchdog satisfied on long chapters (60+ pages).
+                for idx, dst in pool.map(
+                    _convert_one, list(enumerate(raw_paths))
+                ):
+                    out[idx] = dst
+                    if idx % 8 == 0:
+                        _hb("cpu", f"recompress {idx+1}/{len(raw_paths)}")
+
+    # No None entries possible by construction (every _convert_one returns
+    # idx, str); the cast keeps mypy quiet.
+    return [p for p in out if p is not None]
 
 
 # -----------------------------------------------------------
@@ -2260,6 +2624,245 @@ def build_comic_info_xml(
     return xml_template
 
 
+# -----------------------------------------------------------
+# Komikku-mode helpers (--komikku, see komikkuspec.md)
+# -----------------------------------------------------------
+# These three helpers exist exclusively to produce Komikku/Mihon/Tachiyomi-
+# compatible per-chapter CBZ output. They are zero-cost on non-Komikku runs
+# (never called). Cross-file coupling: the call sites live in main() inside
+# the cbz-cache creation block (grep 'cached_cbz_path = os.path.join') and
+# the --keep-chapters destination filename build (grep 'ch_suffix = f"Ch ').
+# See plan file at C:\Users\legoc\.claude\plans\we-will-be-making-idempotent-parnas.md
+
+def _komikku_status_to_digit(status_str: Optional[str]) -> str:
+    """Map a per-handler status string to Komikku's 0-6 enum digit (string).
+
+    Spec §6.1: details.json `status` field is a JSON string containing one
+    digit. 0=Unknown, 1=Ongoing, 2=Completed, 3=Licensed, 4=Publishing
+    finished, 5=Cancelled, 6=On hiatus. Komikku tolerates out-of-range
+    integers by collapsing to 0.
+
+    Source-side strings are normalized to lowercase. Variants per
+    sites/*.py: "Ongoing"/"Releasing" → 1, "Completed"/"Finished" → 2,
+    "Licensed" → 3, "Cancelled" → 5, "Hiatus"/"On Hiatus" → 6. Unknown
+    or empty falls through to "0".
+    """
+    if not status_str:
+        return "0"
+    s = str(status_str).strip().lower()
+    if s in ("ongoing", "releasing", "publishing", "active"):
+        return "1"
+    if s in ("completed", "finished", "complete", "ended"):
+        return "2"
+    if s == "licensed":
+        return "3"
+    if s in ("publishing finished", "publishingfinished"):
+        return "4"
+    if s in ("cancelled", "canceled", "dropped", "discontinued"):
+        return "5"
+    if s in ("hiatus", "on hiatus", "on_hiatus", "onhiatus", "paused"):
+        return "6"
+    # MangaPark `uploadStatus` returns "pending" for scheduled-but-not-yet-
+    # started series. Explicit Unknown — don't let a future refactor lump it
+    # in with "ongoing" by accident.
+    if s == "pending":
+        return "0"
+    return "0"
+
+
+def build_per_chapter_comic_info_xml(
+    series_title: str,
+    chapter_title: Optional[str],
+    chapter_num: Any,
+    volume: Optional[Any],
+    scanlator: Optional[str],
+    web_url: Optional[str],
+    uploaded_epoch: Optional[Any],
+    comic_info: Dict,
+    publishers: List[str],
+    lang: str,
+    page_count: int,
+) -> str:
+    """Per-chapter ComicInfo.xml string for Komikku-mode CBZs.
+
+    Spec §6.2: Komikku v1.13.5+ reads <Number>/<Title>/<Translator>/<Series>
+    from a ComicInfo.xml at the archive root and these OVERRIDE filename-
+    derived metadata. <Year>/<Month>/<Day> compose to SChapter.date_upload
+    (falls back to file mtime if absent — so we omit the tags when the
+    handler didn't supply an upload epoch).
+
+    Empty/None fields are omitted entirely (not emitted as empty tags) so
+    Komikku falls back cleanly to ChapterRecognition where we don't have
+    data — vs. an empty <Title/> which would suppress the regex.
+    """
+    def escape(s):
+        return xml.sax.saxutils.escape(str(s)) if s not in (None, "") else ""
+
+    authors = ", ".join(comic_info.get("authors", []) or [])
+    artists = ", ".join(comic_info.get("artists", []) or [])
+    publisher = ", ".join(publishers or [])
+    description = comic_info.get("desc", "") or ""
+
+    tags: List[str] = []
+    for key in ("genres", "theme", "format"):
+        if comic_info.get(key):
+            tags.extend(comic_info[key])
+    # Sorted for stable XML output (test/diff friendly); set() dedupes.
+    genre = ", ".join(sorted(set(tags))) if tags else ""
+
+    # Year/Month/Day from uploaded epoch. Many handlers store 0 as a
+    # sentinel for "unknown" (e.g. mangafire.py); treat 0 as missing.
+    # Use time.gmtime (UTC) — Komikku doesn't care about TZ; mtime
+    # fallback would itself be filesystem-local anyway.
+    year = month = day = None
+    if uploaded_epoch:
+        try:
+            epoch_int = int(uploaded_epoch)
+            if epoch_int > 0:
+                tm = time.gmtime(epoch_int)
+                year, month, day = tm.tm_year, tm.tm_mon, tm.tm_mday
+        except (TypeError, ValueError, OverflowError, OSError):
+            # OSError on Windows for epochs outside 1970-3000 range.
+            pass
+
+    # Render <Number> as plain decimal — strip trailing ".0" on integers.
+    num_str = ""
+    if chapter_num not in (None, ""):
+        try:
+            nf = float(chapter_num)
+            num_str = str(int(nf)) if nf.is_integer() else f"{nf:g}"
+        except (TypeError, ValueError):
+            num_str = str(chapter_num)
+
+    vol_str = ""
+    if volume not in (None, "", 0, "0"):
+        try:
+            vf = float(volume)
+            vol_str = str(int(vf)) if vf.is_integer() else f"{vf:g}"
+        except (TypeError, ValueError):
+            vol_str = str(volume)
+
+    lines: List[str] = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+        f'  <Series>{escape(series_title)}</Series>',
+    ]
+    if chapter_title:
+        lines.append(f'  <Title>{escape(chapter_title)}</Title>')
+    if num_str:
+        lines.append(f'  <Number>{escape(num_str)}</Number>')
+    if vol_str:
+        lines.append(f'  <Volume>{escape(vol_str)}</Volume>')
+    if description:
+        lines.append(f'  <Summary>{escape(description)}</Summary>')
+    if authors:
+        lines.append(f'  <Writer>{escape(authors)}</Writer>')
+    if artists:
+        lines.append(f'  <Penciller>{escape(artists)}</Penciller>')
+    if publisher:
+        lines.append(f'  <Publisher>{escape(publisher)}</Publisher>')
+    if scanlator:
+        lines.append(f'  <Translator>{escape(scanlator)}</Translator>')
+    if genre:
+        lines.append(f'  <Genre>{escape(genre)}</Genre>')
+    if web_url:
+        lines.append(f'  <Web>{escape(web_url)}</Web>')
+    if lang:
+        lines.append(f'  <LanguageISO>{escape(lang)}</LanguageISO>')
+    if year is not None:
+        lines.append(f'  <Year>{year}</Year>')
+        lines.append(f'  <Month>{month}</Month>')
+        lines.append(f'  <Day>{day}</Day>')
+    lines.append(f'  <PageCount>{int(page_count) if page_count else 0}</PageCount>')
+    lines.append('</ComicInfo>')
+    return "\n".join(lines) + "\n"
+
+
+def _komikku_chapter_filename(chap: Any, vol: Any, title: Optional[str]) -> str:
+    """Build a Komikku-friendly chapter filename: Vol.{vv} Ch.{ccc} - {title}.cbz.
+
+    Spec §8 + recommendation 7: this layout is parsed correctly by Mihon's
+    ChapterRecognition regex set (vol/ch prefixes stripped, decimal numbers
+    preserved) AND remains readable inside any file manager. ComicInfo.xml
+    <Number>/<Title> override these on read, so the filename is mostly
+    cosmetic — but it should still be parseable for cross-reader fallback.
+
+    - Volume: omit the `Vol.{vv} ` prefix when missing/0; otherwise 2-digit
+      zero-pad on integer parts.
+    - Chapter: integer part zero-pad to 3 digits (5 → "005", 100 → "100",
+      1200 → "1200"). Decimal portion kept verbatim (5.5 → "005.5") —
+      crucially NOT subjected to format_chap_for_filename's '~' substitution
+      which would break ChapterRecognition's decimal parser.
+    - Title: appended only if non-empty AND distinct from the chap label
+      itself (some handlers set ch["title"] == str(ch["chap"])).
+    """
+    # Chapter number → padded label
+    chap_label = ""
+    try:
+        cf = float(chap)
+        int_part = int(cf)
+        if cf.is_integer():
+            chap_label = f"{int_part:03d}" if int_part < 1000 else str(int_part)
+        else:
+            # Strip Python's float repr trailing noise: 5.5 → "5.5", 12.1 → "12.1".
+            # Format with %g then split, in case repr gives 5.500000000000001
+            # (rare but real on some platforms).
+            formatted = f"{cf:g}"  # e.g. "5.5", "12.1", "5"
+            if "." in formatted:
+                int_token, frac_token = formatted.split(".", 1)
+                int_for_pad = abs(int(int_token))
+                int_str = (
+                    f"{int_for_pad:03d}" if int_for_pad < 1000 else str(int_for_pad)
+                )
+                if int_token.startswith("-"):
+                    int_str = "-" + int_str
+                chap_label = f"{int_str}.{frac_token}"
+            else:
+                chap_label = (
+                    f"{int_part:03d}" if int_part < 1000 else str(int_part)
+                )
+    except (TypeError, ValueError):
+        # Non-numeric chap (e.g. "Prologue", "Extra"). Sanitize for filesystem
+        # safety but keep the original token — ChapterRecognition will fail
+        # to extract a number and Komikku will sort the chapter to the bottom
+        # (chapter_number = -1.0), which is correct for non-numeric chapters.
+        chap_label = _sanitize_folder_component(str(chap or "")) or "000"
+
+    # Volume → padded prefix or empty
+    vol_prefix = ""
+    if vol not in (None, "", 0, "0"):
+        try:
+            vf = float(vol)
+            vint = int(vf)
+            if vf.is_integer():
+                vol_prefix = f"Vol.{vint:02d} "
+            else:
+                vol_prefix = f"Vol.{vf:g} "
+        except (TypeError, ValueError):
+            v_sanitized = _sanitize_folder_component(str(vol))
+            if v_sanitized:
+                vol_prefix = f"Vol.{v_sanitized} "
+
+    # Title suffix → "" or " - {title}"
+    title_suffix = ""
+    if title:
+        t_raw = str(title).strip()
+        # Skip when the title duplicates the chap number in any obvious form.
+        # Compare against str(chap), the padded label, and the bare-int form.
+        try:
+            bare_int = str(int(float(chap)))
+        except (TypeError, ValueError):
+            bare_int = ""
+        skip_set = {str(chap or "").strip(), chap_label, bare_int}
+        if t_raw and t_raw not in skip_set:
+            t_clean = _sanitize_folder_component(t_raw)
+            if t_clean and t_clean not in skip_set:
+                title_suffix = f" - {t_clean}"
+
+    return f"{vol_prefix}Ch.{chap_label}{title_suffix}.cbz"
+
+
 def build_cbz(
     slices: List[str],
     out_path: str,
@@ -2267,9 +2870,19 @@ def build_cbz(
     comic_info: Dict,
     publishers: List[str],
     lang: str,
+    chapter_comic_info_xml: Optional[str] = None,
 ):
-    """Builds a CBZ file from a list of image slices with metadata."""
-    xml_content = build_comic_info_xml(
+    """Builds a CBZ file from a list of image slices with metadata.
+
+    chapter_comic_info_xml: when provided, used in place of the series-level
+    ComicInfo.xml that build_comic_info_xml would generate. Used by the
+    legacy --keep-chapters fallback path in --komikku mode to inject the
+    per-chapter ComicInfo.xml (the cbz_cache fast-path embeds the same XML
+    at cache-creation time; this is the slow-path equivalent for pre-Phase-D
+    resumes where chapter_content carries 'image' entries instead of
+    'cbz_cache' entries).
+    """
+    xml_content = chapter_comic_info_xml or build_comic_info_xml(
         title, comic_info, publishers, lang, len(slices)
     )
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as zf:
@@ -2914,6 +3527,20 @@ _RESUME_GATING_DESTS = frozenset({
     "quality", "scaling", "chapters", "group",
     "mix_by_upvote", "no_group_fallback", "no_partials",
     "download_volumes", "collapse_splits", "no_processing",
+    # Phase 1 (2026-05-11): LINE Webtoon WebP recompression. Changing any
+    # of these between runs invalidates the on-disk images because the
+    # conversion deletes the original PNG/JPEG bytes. See
+    # recompress_chapter_images_to_webp() and the call site near line 5559.
+    "webtoon_recompress",
+    "webtoon_recompress_quality",
+    "webtoon_recompress_method",
+    # Komikku-mode (komikkuspec.md, 2026-05-12): the cbz_cache CBZ at
+    # processed_tdir/{n}.cbz either contains the per-chapter ComicInfo.xml
+    # or doesn't, depending on Komikku-mode at create time. Flipping the
+    # toggle between runs must invalidate the cache so resumed chapters
+    # don't end up half-Komikku. See the cbz-cache creation block (grep
+    # 'cached_cbz_path = os.path.join') for where this matters.
+    "komikku",
 })
 
 # Dests that must NEVER be persisted to run_params.json. Every other
@@ -2936,12 +3563,25 @@ _RESUME_TRANSIENT_DESTS = frozenset({
     "restore_parameters",
     # Logging level — per-invocation choice.
     "verbose", "debug",
-    # Search-only mode (mutually exclusive with the download path that
-    # calls save; the save site is unreachable in search mode). Listed
-    # for completeness so the validator passes.
-    "search", "auto_pick", "search_language", "search_parallelism",
-    "search_timeout", "search_min_match", "search_json", "seeded_only",
-    # One-shot mode/input flags.
+    # Pure --search mode flags. The original run resolved a query to a
+    # URL via search; the resume CLI passes that URL directly, so
+    # re-entering search mode would be both wrong and a validation
+    # error (URL + --search are mutually exclusive). search_json is
+    # output-mode plumbing for --search alone.
+    #
+    # NOTE: seeded_only / search_language / search_parallelism /
+    # search_timeout / search_min_match are NOT here — they ALSO drive
+    # find_alternatives_for_direct_url during a regular --multi-source
+    # download (aio_search_cli.py ~line 654), so they must persist on
+    # resume. Classifying them as transient hid the user's
+    # --seeded-only preference on resume and triggered an unfiltered
+    # 297-site search instead of the seeded ~26-site subset.
+    "search", "auto_pick", "search_json",
+    # One-shot mode/input flags. multi_source_prefetched is a
+    # path to a per-spawn cache JSON (UI writes a fresh file before
+    # each search-initiated download); on resume we want the alts
+    # rediscovered against current site state, so this stays
+    # transient and the multi-source path re-runs the lookup.
     "multi_source_prefetched", "list_chapters", "build_final_file",
     "prompt_urls",
     # Multi-URL orchestrator — children get these re-passed by the
@@ -3058,6 +3698,16 @@ def get_resumable_params(args, parser, calculated_width, calculated_aspect_ratio
     # JSON) → still 2000" cleanly.
     out["width"] = calculated_width
     out["aspect_ratio"] = calculated_aspect_ratio
+    # Persist the user-intent flags so --restore-parameters preserves them.
+    # Without these the resume invocation (which doesn't re-pass --width)
+    # would set args.width via setattr from `out["width"]` above, then a
+    # subsequent `args._user_set_width = args.width is not None` would
+    # falsely flip to True, defeating the CBZ fast-path. Cross-file: the
+    # original computation lives near parse_args() (grep '_user_set_width ='),
+    # and the fast-path read site is aio-dl.py:cbz_fast_path (~line 6900).
+    out["_user_set_width"] = bool(getattr(args, "_user_set_width", False))
+    out["_user_set_aspect_ratio"] = bool(getattr(args, "_user_set_aspect_ratio", False))
+    out["_user_set_quality"] = bool(getattr(args, "_user_set_quality", False))
     return out
 
 
@@ -3152,6 +3802,26 @@ def _apply_runtime_tunables(args):
     _vrf_async_batch_state["parallel_count"] = max(
         1, int(getattr(args, "mangafire_vrf_parallel", 1) or 1)
     )
+    # --no-fast-download: force-disable curl_cffi fast path globally. Read
+    # by both the main-path SUPPORTS_FAST_DOWNLOAD gate AND the prefetch
+    # worker's SUPPORTS_FAST_DOWNLOAD gate. Module-global so the prefetch
+    # worker (which doesn't have args in scope as a closure capture) can
+    # read it without parameter threading.
+    globals()["_NO_FAST_DOWNLOAD"] = bool(getattr(args, "no_fast_download", False))
+    # --image-prefetch-parallel: how many concurrent image-prefetch worker
+    # threads. Same module-global pattern as _vrf_async_batch_state since
+    # the workers are spawned by _ensure_image_prefetch_workers without
+    # args in scope. Re-applied on --restore-parameters via the second
+    # call to _apply_runtime_tunables.
+    globals()["_image_prefetch_parallel"] = max(
+        1, int(getattr(args, "image_prefetch_parallel", 2) or 2)
+    )
+    # Phase D (2026-05-13): clear per-run concurrency caps so each run
+    # starts with fresh CDN trust. NOTE: This is called twice in main()
+    # (once after parse_args, once on --restore-parameters); the second
+    # call also resets caps, which is correct — resume = fresh run on
+    # the CDN's side too.
+    _reset_host_concurrency_caps()
 
 
 # -----------------------------------------------------------
@@ -3457,11 +4127,262 @@ def _start_vrf_prefetch(next_chapter: Optional[Dict], handler) -> None:
 # concurrent burst hurts more than the overlap helps; set to a smaller
 # positive number to keep prefetch on but with a lighter footprint.
 #
-# Single in-flight prefetch — main consumes (joins) before firing the next
-# one, so `_image_prefetch_thread` only ever holds one outstanding task.
-_image_prefetch_lock = threading.Lock()
-_image_prefetch_thread: Optional[threading.Thread] = None
-_image_prefetch_target_chap: Optional[str] = None
+# Phase B (2026-05-13): replaced single-in-flight thread with a
+# queue+worker-pool pattern mirroring _vrf_prefetch_*. Multiple chapters
+# can now download in parallel (controlled by --image-prefetch-parallel),
+# and the queue depth (--image-prefetch-depth) lets us push ahead
+# multiple chapters at the chain-fire site. Preserves the filesystem-
+# mediated coordination contract: .download_prefetched marker on full
+# success, rm_tree(target_tdir) on partial failure.
+
+
+@dataclass
+class _ImgPrefetchJob:
+    """One queued image-prefetch task. Carries everything the worker needs
+    to download a chapter's images independently — no shared in-memory
+    state with main beyond the per-chapter Event used for consume-wait."""
+    next_chapter: Dict[str, Any]
+    target_tdir: str
+    scraper: Any
+    handler: Any
+    image_workers: int
+    fast_concurrency: int
+    chap_label: str
+
+
+# Bounded so a runaway depth value can't OOM the process. depth check at
+# the fire site keeps this far below the cap in normal operation; the cap
+# is purely defensive.
+_image_prefetch_queue: "_stdlib_queue.Queue[Optional[_ImgPrefetchJob]]" = (
+    _stdlib_queue.Queue(maxsize=16)
+)
+_image_prefetch_workers: List[threading.Thread] = []
+_image_prefetch_seen: set = set()                       # dedupe: chap_label
+_image_prefetch_done: Dict[str, threading.Event] = {}   # chap_label -> Event
+_image_prefetch_lock = threading.Lock()                 # guards _seen/_done/_workers
+# Set by _apply_runtime_tunables from --image-prefetch-parallel (default 2).
+_image_prefetch_parallel: int = 2
+
+
+def _image_prefetch_worker_loop() -> None:
+    """Dequeue prefetch jobs forever. Daemon thread; exits with the
+    process. Each iteration runs the same body the old _worker closure
+    did, with one diff at the end: setting _image_prefetch_done[chap].set()
+    so _consume_image_prefetch can unblock.
+
+    Multiple workers may run this loop concurrently (one Python thread
+    each). The queue handles synchronization; each chapter is processed
+    by exactly one worker."""
+    while True:
+        job = _image_prefetch_queue.get()
+        if job is None:  # Shutdown sentinel
+            return
+        try:
+            _run_image_prefetch_job(job)
+        finally:
+            # Always signal completion (success or failure) so the main
+            # thread's _consume_image_prefetch doesn't deadlock.
+            evt = _image_prefetch_done.get(job.chap_label)
+            if evt is not None:
+                evt.set()
+            _image_prefetch_queue.task_done()
+
+
+def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
+    """The body of one prefetch job. Lifted verbatim from the old
+    inline _worker closure in _start_image_prefetch (pre-2026-05-13)
+    so the success/failure marker contract is unchanged.
+
+    On full success: writes .download_prefetched marker into target_tdir.
+    On partial failure: wipes target_tdir entirely so main's foreground
+    download starts from a clean slate (no half-populated state)."""
+    next_chapter = job.next_chapter
+    target_tdir = job.target_tdir
+    scraper = job.scraper
+    handler = job.handler
+    image_workers = job.image_workers
+    fast_concurrency = job.fast_concurrency
+    chap_label = job.chap_label
+    try:
+        # ── Phase 1: media_entries (URL list) ──
+        merged_parts = next_chapter.get("_merged_parts")
+        if merged_parts:
+            media_entries: List[Any] = []
+            for part in merged_parts:
+                try:
+                    part_entries = handler.get_chapter_images(
+                        part, scraper, make_request
+                    ) or []
+                    media_entries.extend(part_entries)
+                except Exception as exc:
+                    log_verbose(
+                        f"  [Img Prefetch] Ch {chap_label} part fetch failed: {exc}"
+                    )
+                    return
+        else:
+            try:
+                media_entries = handler.get_chapter_images(
+                    next_chapter, scraper, make_request
+                ) or []
+            except Exception as exc:
+                log_verbose(
+                    f"  [Img Prefetch] Ch {chap_label} get_chapter_images failed: {exc}"
+                )
+                return
+
+        if not media_entries:
+            return
+
+        os.makedirs(target_tdir, exist_ok=True)
+
+        # ── Classify entries (mirrors main's Phase 1 logic) ──
+        download_tasks: List[Tuple[int, str, str, str]] = []
+        page_counter = 1
+        for entry in media_entries:
+            if isinstance(entry, dict):
+                entry_type = entry.get("type")
+                if entry_type == "text":
+                    # Text blocks are re-extracted by main's own Phase 1;
+                    # the prefetch only persists image bytes.
+                    continue
+                if entry_type == "binary_image":
+                    blob = entry.get("data")
+                    if not blob:
+                        continue
+                    explicit_ext = entry.get("extension")
+                    if explicit_ext:
+                        ext = (
+                            explicit_ext
+                            if explicit_ext.startswith(".")
+                            else "." + explicit_ext
+                        )
+                    else:
+                        ext = _sniff_image_extension(
+                            blob[:32]
+                            if isinstance(blob, (bytes, bytearray))
+                            else b"",
+                            entry.get("content_type"),
+                        )
+                    custom_name = entry.get("name")
+                    filename = (
+                        custom_name
+                        if custom_name
+                        else f"{chap_label}_{page_counter:04d}{ext}"
+                    )
+                    pth = os.path.join(target_tdir, filename)
+                    try:
+                        with open(pth, "wb") as fh:
+                            fh.write(blob)
+                    except OSError:
+                        pass
+                    page_counter += 1
+                    continue
+            full_url = entry if isinstance(entry, str) else entry.get("url")
+            if not full_url:
+                continue
+            # Filename uses ".jpg" placeholder; dl_image's Phase A sniff
+            # gives the file its real extension after bytes land.
+            filename = f"{chap_label}_{page_counter:04d}.jpg"
+            download_tasks.append((page_counter, full_url, target_tdir, filename))
+            page_counter += 1
+
+        if not download_tasks:
+            # Pure binary_image chapter — write marker so main skips
+            # Phase 2 anyway (there'd be nothing to download).
+            _write_prefetched_marker(target_tdir)
+            return
+
+        # ── Phase 2: parallel download ──
+        # curl_cffi async path runs concurrently inside this daemon
+        # thread (asyncio.run() spins up its own event loop here).
+        # Handlers without SUPPORTS_FAST_DOWNLOAD (or globally disabled
+        # via --no-fast-download) fall through to ThreadPoolExecutor.
+        failed = 0
+        if (
+            getattr(handler, "SUPPORTS_FAST_DOWNLOAD", False)
+            and not globals().get("_NO_FAST_DOWNLOAD", False)
+        ):
+            fast_conc = max(1, int(fast_concurrency))
+            # Phase D: apply per-host concurrency cap on prefetch too —
+            # if the foreground path dialed concurrency down for this
+            # CDN, prefetch should respect the same limit.
+            fast_conc = _effective_concurrency(
+                urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                fast_conc,
+            )
+            fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
+            # No host-poison feedback here: prefetch is best-effort. If
+            # it fails, the partial-failure branch below wipes tdir and
+            # main's foreground download retries with full instrumentation.
+            fast_results = handler.fast_download_images(
+                download_tasks,
+                concurrency=fast_conc,
+                timeout=fast_timeout,
+                # Forward cookies (e.g. age-gate cookies for LineWebtoon)
+                # so prefetch can fetch the same content the foreground
+                # path would. Base impl filters to host-relevant cookies.
+                scraper=scraper,
+            )
+            failed = sum(1 for _, p in fast_results if not p)
+        else:
+            workers = max(1, min(image_workers, len(download_tasks)))
+            # Phase D: cap prefetch ThreadPool concurrency too.
+            workers = max(1, _effective_concurrency(
+                urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                workers,
+            ))
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=f"img-prefetch-{chap_label}"
+            ) as pool:
+                futures = [
+                    pool.submit(dl_image, url, folder, name, scraper, True)
+                    for _, url, folder, name in download_tasks
+                ]
+                for fut in as_completed(futures):
+                    try:
+                        if not fut.result():
+                            failed += 1
+                    except Exception:
+                        failed += 1
+
+        if failed == 0:
+            _write_prefetched_marker(target_tdir)
+            log_verbose(
+                f"  [Img Prefetch] Ch {chap_label} ready ({len(download_tasks)} imgs)"
+            )
+        else:
+            # Partial failure → wipe so main starts fresh. Don't leave a
+            # half-populated tdir that main's marker check would skip into.
+            log_verbose(
+                f"  [Img Prefetch] Ch {chap_label} partial fail "
+                f"({failed}/{len(download_tasks)}) — discarding"
+            )
+            try:
+                rm_tree(target_tdir)
+            except Exception:
+                pass
+    except Exception as exc:
+        log_verbose(f"  [Img Prefetch] Ch {chap_label} unexpected error: {exc}")
+
+
+def _ensure_image_prefetch_workers() -> None:
+    """Lazy-spawn up to _image_prefetch_parallel daemon worker threads.
+    Mirrors _ensure_vrf_prefetch_worker but with N workers instead of 1.
+    Called from _start_image_prefetch on first enqueue; idempotent on
+    subsequent calls (re-checks alive count and tops up if any died)."""
+    with _image_prefetch_lock:
+        # Filter alive workers; replace died ones up to the target count.
+        alive = [t for t in _image_prefetch_workers if t.is_alive()]
+        _image_prefetch_workers[:] = alive
+        target = max(1, int(globals().get("_image_prefetch_parallel", 2)))
+        while len(_image_prefetch_workers) < target:
+            t = threading.Thread(
+                target=_image_prefetch_worker_loop,
+                daemon=True,
+                name=f"Img-Prefetch-Worker-{len(_image_prefetch_workers) + 1}",
+            )
+            t.start()
+            _image_prefetch_workers.append(t)
 
 
 def _start_image_prefetch(
@@ -3472,182 +4393,105 @@ def _start_image_prefetch(
     image_workers: int,
     fast_concurrency: int = 8,
 ) -> None:
-    """Fire-and-forget background download for next_chapter's images. On
-    success, writes target_tdir/.download_prefetched so the main thread's
-    next iteration can detect and skip its own Phase 2 download.
+    """Enqueue an image-prefetch job for next_chapter. Signature preserved
+    from pre-Phase-B for callsite back-compat; internals are now queue+pool.
 
     Honors split-cluster collapse: if next_chapter carries `_merged_parts`
     (set by group_chapters_for_download for rule-5 clusters), the worker
     fetches each part's media_entries and concatenates them in order —
     matching what _process_chapter_impl would have done synchronously.
 
-    `fast_concurrency` is honored only when handler.SUPPORTS_FAST_DOWNLOAD
-    is True (MangaFire) — it bounds the curl_cffi async semaphore. Other
-    handlers use image_workers via the ThreadPoolExecutor path.
-    """
-    global _image_prefetch_thread, _image_prefetch_target_chap
+    `fast_concurrency` bounds the curl_cffi async semaphore when the
+    handler has SUPPORTS_FAST_DOWNLOAD=True. Other handlers (or runs with
+    --no-fast-download) use image_workers via ThreadPoolExecutor.
 
+    Dedupe: if a job for chap_label is already in flight or queued, skip
+    re-enqueue. _consume_image_prefetch joins the existing job's done event.
+    """
     if next_chapter is None:
         return
     chap_label = str(next_chapter.get("chap", "?"))
     if not chap_label or chap_label == "?":
         return
 
-    def _worker() -> None:
-        try:
-            # ── Phase 1: media_entries (URL list) ──
-            merged_parts = next_chapter.get("_merged_parts")
-            if merged_parts:
-                media_entries: List[Any] = []
-                for part in merged_parts:
-                    try:
-                        part_entries = handler.get_chapter_images(
-                            part, scraper, make_request
-                        ) or []
-                        media_entries.extend(part_entries)
-                    except Exception as exc:
-                        log_verbose(
-                            f"  [Img Prefetch] Ch {chap_label} part fetch failed: {exc}"
-                        )
-                        return
-            else:
-                try:
-                    media_entries = handler.get_chapter_images(
-                        next_chapter, scraper, make_request
-                    ) or []
-                except Exception as exc:
-                    log_verbose(
-                        f"  [Img Prefetch] Ch {chap_label} get_chapter_images failed: {exc}"
-                    )
-                    return
-
-            if not media_entries:
-                return
-
-            os.makedirs(target_tdir, exist_ok=True)
-
-            # ── Classify entries (mirrors main's Phase 1 logic) ──
-            download_tasks: List[Tuple[int, str, str, str]] = []
-            page_counter = 1
-            for entry in media_entries:
-                if isinstance(entry, dict):
-                    entry_type = entry.get("type")
-                    if entry_type == "text":
-                        # Text blocks are re-extracted by main's own Phase 1;
-                        # the prefetch only persists image bytes.
-                        continue
-                    if entry_type == "binary_image":
-                        blob = entry.get("data")
-                        if not blob:
-                            continue
-                        explicit_ext = entry.get("extension")
-                        if explicit_ext:
-                            ext = (
-                                explicit_ext
-                                if explicit_ext.startswith(".")
-                                else "." + explicit_ext
-                            )
-                        else:
-                            ext = _sniff_image_extension(
-                                blob[:32]
-                                if isinstance(blob, (bytes, bytearray))
-                                else b"",
-                                entry.get("content_type"),
-                            )
-                        custom_name = entry.get("name")
-                        filename = (
-                            custom_name
-                            if custom_name
-                            else f"{chap_label}_{page_counter:04d}{ext}"
-                        )
-                        pth = os.path.join(target_tdir, filename)
-                        try:
-                            with open(pth, "wb") as fh:
-                                fh.write(blob)
-                        except OSError:
-                            pass
-                        page_counter += 1
-                        continue
-                full_url = entry if isinstance(entry, str) else entry.get("url")
-                if not full_url:
-                    continue
-                # Filename uses ".jpg" placeholder; dl_image's Phase A sniff
-                # gives the file its real extension after bytes land.
-                filename = f"{chap_label}_{page_counter:04d}.jpg"
-                download_tasks.append((page_counter, full_url, target_tdir, filename))
-                page_counter += 1
-
-            if not download_tasks:
-                # Pure binary_image chapter — write marker so main skips
-                # Phase 2 anyway (there'd be nothing to download).
-                _write_prefetched_marker(target_tdir)
-                return
-
-            # ── Phase 2: parallel download ──
-            # MangaFire's curl_cffi async path runs concurrently inside this
-            # daemon thread (asyncio.run() spins up its own event loop here).
-            # Other handlers fall through to the ThreadPoolExecutor path.
-            failed = 0
-            if getattr(handler, "SUPPORTS_FAST_DOWNLOAD", False):
-                fast_conc = max(1, int(fast_concurrency))
-                fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
-                # No host-poison feedback here: prefetch is best-effort. If
-                # it fails, the partial-failure branch below wipes tdir and
-                # main's foreground download retries with full instrumentation.
-                fast_results = handler.fast_download_images(
-                    download_tasks,
-                    concurrency=fast_conc,
-                    timeout=fast_timeout,
-                )
-                failed = sum(1 for _, p in fast_results if not p)
-            else:
-                workers = max(1, min(image_workers, len(download_tasks)))
-                with ThreadPoolExecutor(
-                    max_workers=workers, thread_name_prefix=f"img-prefetch-{chap_label}"
-                ) as pool:
-                    futures = [
-                        pool.submit(dl_image, url, folder, name, scraper, True)
-                        for _, url, folder, name in download_tasks
-                    ]
-                    for fut in as_completed(futures):
-                        try:
-                            if not fut.result():
-                                failed += 1
-                        except Exception:
-                            failed += 1
-
-            if failed == 0:
-                _write_prefetched_marker(target_tdir)
-                log_verbose(
-                    f"  [Img Prefetch] Ch {chap_label} ready ({len(download_tasks)} imgs)"
-                )
-            else:
-                # Partial failure → wipe so main starts fresh. Don't leave a
-                # half-populated tdir that main's marker check would skip into.
-                log_verbose(
-                    f"  [Img Prefetch] Ch {chap_label} partial fail "
-                    f"({failed}/{len(download_tasks)}) — discarding"
-                )
-                try:
-                    rm_tree(target_tdir)
-                except Exception:
-                    pass
-        except Exception as exc:
-            log_verbose(f"  [Img Prefetch] Ch {chap_label} unexpected error: {exc}")
-
     with _image_prefetch_lock:
-        # If a prior prefetch is somehow still in flight (chapter loop should
-        # have consumed it), let it finish before firing the next one. Keeps
-        # us bounded at one outstanding background task at any time.
-        if _image_prefetch_thread is not None and _image_prefetch_thread.is_alive():
-            log_verbose("  [Img Prefetch] Waiting for prior prefetch to finish")
-            _image_prefetch_thread.join(timeout=120)
-        _image_prefetch_target_chap = chap_label
-        t = threading.Thread(
-            target=_worker, daemon=True, name=f"Img-Prefetch-{chap_label}"
+        if chap_label in _image_prefetch_seen:
+            # Already queued or in-flight for this chapter — second enqueue
+            # is a no-op. The existing job's Event will fire normally on
+            # completion; _consume_image_prefetch joins that Event.
+            return
+        _image_prefetch_seen.add(chap_label)
+        _image_prefetch_done[chap_label] = threading.Event()
+
+    job = _ImgPrefetchJob(
+        next_chapter=next_chapter,
+        target_tdir=target_tdir,
+        scraper=scraper,
+        handler=handler,
+        image_workers=image_workers,
+        fast_concurrency=fast_concurrency,
+        chap_label=chap_label,
+    )
+    try:
+        _image_prefetch_queue.put(job, block=False)
+    except _stdlib_queue.Full:
+        # Queue is at maxsize (defensive cap, depth check usually keeps
+        # us well below). Drop the job — main's foreground download
+        # handles the chapter normally. Clear the seen/done state so a
+        # future enqueue attempt isn't blocked.
+        log_verbose(
+            f"  [Img Prefetch] Queue full, dropping Ch {chap_label} "
+            f"(main will download normally)"
         )
-        _image_prefetch_thread = t
-        t.start()
+        with _image_prefetch_lock:
+            _image_prefetch_seen.discard(chap_label)
+            _image_prefetch_done.pop(chap_label, None)
+        return
+    _ensure_image_prefetch_workers()
+
+
+def _start_image_prefetch_chain(
+    upcoming: List[Dict[str, Any]],
+    main_tmp_dir: str,
+    scraper,
+    handler,
+    image_workers: int,
+    fast_concurrency: int,
+    depth: int,
+    no_processing: bool,
+) -> None:
+    """Push the next `depth` chapters' image-prefetch jobs onto the queue.
+    No-op when depth <= 0 (user opted out). Mirror of
+    _start_vrf_prefetch_chain for the image-download side.
+
+    Skips chapters whose tdir already has a success marker (processed-
+    complete or download-complete depending on --no-processing) — same
+    cache check the single-shot fire site used to do at line ~6253.
+
+    The dedupe in _start_image_prefetch handles overlapping windows
+    (e.g. chain fired at ch 10 queues 11+12; ch 11's chain fires 12+13
+    and 12 is already in the queue from ch 10's chain — skipped)."""
+    if depth <= 0 or not upcoming:
+        return
+    pushed = 0
+    for ch in upcoming[:depth]:
+        chap = ch.get("chap")
+        if chap is None:
+            continue
+        target_tdir = os.path.join(main_tmp_dir, f"ch_{chap}")
+        marker_name = ".download_complete" if no_processing else ".processed_complete"
+        if os.path.exists(os.path.join(target_tdir, marker_name)):
+            # Already fully processed (resume case); no point prefetching
+            # bytes whose ch_dir is already marker-complete.
+            continue
+        _start_image_prefetch(
+            ch, target_tdir, scraper, handler, image_workers, fast_concurrency
+        )
+        pushed += 1
+    if pushed > 0:
+        log_verbose(
+            f"  [Img Prefetch] chain pushed {pushed}/{len(upcoming[:depth])} chapter(s)"
+        )
 
 
 def _write_prefetched_marker(tdir: str) -> None:
@@ -3662,23 +4506,33 @@ def _write_prefetched_marker(tdir: str) -> None:
 
 
 def _consume_image_prefetch(chap_label: str) -> None:
-    """Block until any in-flight prefetch for chap_label finishes, then
-    clear the module-level slot. Idempotent — call at the start of each
+    """Block until the prefetch for chap_label finishes (or no prefetch was
+    queued for this chapter). Idempotent — call at the start of each
     chapter's processing. The prefetch's outputs are picked up via the
-    .download_prefetched marker (filesystem-mediated, not in-memory)."""
-    global _image_prefetch_thread, _image_prefetch_target_chap
+    .download_prefetched marker (filesystem-mediated, not in-memory).
+
+    With the queue+pool refactor, the chapter may be IN-FLIGHT (a worker
+    is processing it) or QUEUED (waiting for a worker). The per-chap Event
+    handles both cases: it gets set when the worker finishes processing,
+    regardless of which worker took the job."""
+    chap_label = str(chap_label)
     with _image_prefetch_lock:
-        thread = _image_prefetch_thread
-        target = _image_prefetch_target_chap
-    if thread is None or target != str(chap_label):
+        evt = _image_prefetch_done.get(chap_label)
+    if evt is None:
+        # No prefetch was queued for this chapter — nothing to consume.
         return
-    if thread.is_alive():
+    if not evt.is_set():
         log_verbose(f"  Waiting for image prefetch of Ch {chap_label}...")
-        thread.join(timeout=300)
+        # 300s timeout matches pre-Phase-B behavior. If a queue backlog
+        # pushes us beyond this, foreground download falls through and
+        # main re-does the work — same recovery semantics as a single-
+        # thread prefetch hanging.
+        evt.wait(timeout=300.0)
     with _image_prefetch_lock:
-        if _image_prefetch_target_chap == str(chap_label):
-            _image_prefetch_thread = None
-            _image_prefetch_target_chap = None
+        # Clean up per-chap state. Keep _image_prefetch_seen entry so a
+        # second enqueue for the same chapter (e.g. inline retry) is
+        # a no-op — main's foreground download path handles retries.
+        _image_prefetch_done.pop(chap_label, None)
 
 
 def main():
@@ -3764,19 +4618,73 @@ def main():
              "Set to 1 to download images one at a time (old behaviour).",
     )
 
-    # MangaFire-specific speed knobs (2026-05-09). Other handlers ignore these.
-    # See sites/mangafire.py:fast_download_images and sites/mangafire_vrf_async_batch.py.
+    # ── Fast-download knobs (2026-05-13: generalized from MangaFire-only) ──
+    # These apply to any handler with SUPPORTS_FAST_DOWNLOAD=True (currently
+    # mangafire and linewebtoon; see sites/base.py:fast_download_images for
+    # the implementation and sites/*.py for opt-ins). Resume-transient — see
+    # _RESUME_TRANSIENT_DESTS for why these don't invalidate on-disk images.
+    p.add_argument(
+        "--image-concurrency",
+        type=int,
+        default=8,
+        help="Concurrent in-flight image fetches for handlers with fast "
+             "download support (curl_cffi async + HTTP/2; default: 8). "
+             "Bench (MangaFire 83-page chapter): 8 hits ~5 MB/s near network "
+             "ceiling; >12 is diminishing returns. Auto-dials down on CDN "
+             "errors via per-host concurrency cap (independent of "
+             "--chapter-host-poison-threshold which is the hard chapter "
+             "abort). Drop to 3 or 4 if a CDN starts rate-limiting (rare on "
+             "cookieless edge caches, but defensive).",
+    )
+    p.add_argument(
+        "--image-prefetch-depth",
+        type=int,
+        default=2,
+        help="How many chapters ahead to keep queued for image prefetch "
+             "(default: 2). Set to 0 to disable image prefetch entirely. "
+             "Higher depths help when main-loop processing is FAST relative "
+             "to network download (e.g. CBZ fast-path on LINE Webtoon) — "
+             "more chapters in the queue mean less waiting between chapters. "
+             "Doesn't help when processing is the bottleneck (PDF assembly, "
+             "WebP recompression with high effort settings).",
+    )
+    p.add_argument(
+        "--image-prefetch-parallel",
+        type=int,
+        default=2,
+        help="Concurrent prefetch worker threads (default: 2). Each worker "
+             "processes one chapter at a time from the queue; parallel=2 "
+             "means up to 2 chapters in flight simultaneously while the main "
+             "thread processes a third. parallel=1 is the legacy single-in-"
+             "flight behavior. Higher values = more concurrent host "
+             "connections (parallel × image-concurrency). Webtoons.com and "
+             "MangaFire's edge cache tolerate 2 well in practice.",
+    )
+    p.add_argument(
+        "--no-fast-download",
+        action="store_true",
+        help="Force-disable the curl_cffi fast download path on all handlers; "
+             "use the legacy ThreadPoolExecutor + dl_image cloudscraper path. "
+             "Escape hatch for curl_cffi version regressions or weird CDN-vs-"
+             "impersonation issues. Equivalent to setting "
+             "SUPPORTS_FAST_DOWNLOAD=False per-handler, but global.",
+    )
+
+    # Deprecated 2026-05-13 — superseded by --image-concurrency (generalized
+    # from MangaFire-only). Still accepted for back-compat; routed onto
+    # args.image_concurrency in main() with a DeprecationWarning emitted
+    # there. Hidden from --help via argparse.SUPPRESS so it doesn't pollute
+    # the visible CLI surface for new scripts.
     p.add_argument(
         "--mangafire-image-concurrency",
         type=int,
-        default=8,
-        help="Concurrent in-flight image fetches for MangaFire's curl_cffi async "
-             "downloader (default: 8). MangaFire only — other handlers use "
-             "--image-workers. Bench (83-page chapter, single network): 8 hits "
-             "~5 MB/s near network ceiling; >12 is diminishing returns. Drop "
-             "to 3 or 4 if CF starts rate-limiting (rare on the cookieless edge "
-             "cache, but defensive).",
+        default=None,
+        help=argparse.SUPPRESS,
     )
+
+    # MangaFire-specific VRF capture knobs (2026-05-09). VRF is MangaFire's
+    # proprietary token-capture problem; no other handler has it. Kept under
+    # the --mangafire- namespace because the flags don't apply to anyone else.
     p.add_argument(
         "--mangafire-vrf-prefetch-depth",
         type=int,
@@ -3897,6 +4805,26 @@ def main():
              "rankings. Significantly faster (typically halves search wall "
              "time on popular queries) at the cost of dropping niche sites "
              "that aren't in the curated list.",
+    )
+    p.add_argument(
+        "--enable-ml-rating",
+        action="store_true",
+        default=os.environ.get("AIO_ENABLE_ML_RATING", "").lower() in (
+            "1", "true", "yes", "on",
+        ),
+        help="Enable ML-based image quality scoring (torch + pyiqa + "
+             "torchmetrics). Off by default. When enabled, the search "
+             "ranker uses T2 (CLIP-IQA + NIQE) and T3 (paired DISTS) on "
+             "top of T1 (pixel-level numpy/PIL scoring), giving ~3-8%% "
+             "more accurate rankings on borderline matches. Cost: torch "
+             "import adds ~2-5 s of process startup, model weights are "
+             "~150 MB on first-use download, and per-source probe gains "
+             "~2-5 s. The default-off rationale (2026-05-20): torch's "
+             "Windows import path calls platform.machine() which Python "
+             "3.13 implements via WMI — that can stall indefinitely on "
+             "hosts with a degraded WMI service, hanging --search forever. "
+             "Honors AIO_ENABLE_ML_RATING=1 env var so power users can "
+             "set the preference once.",
     )
     p.add_argument(
         "--prefetch-image-workers",
@@ -4176,9 +5104,96 @@ def main():
         "This flag forces the legacy decode/recombine/re-encode path even "
         "when no transform was requested.",
     )
+    # ── LINE Webtoon WebP recompression (Phase 1, 2026-05-11) ──
+    # Targets webtoons.com's archival-quality PNG output (~2-3 MB/page on
+    # newer Eleceed / TBATE chapters) which produced 40+ GB libraries. WebP
+    # q85 lands at ~80 KB/page on color webtoon content (visually equivalent
+    # on phone-screen viewing per user research) → ~95% size reduction. Only
+    # applies when handler.name == 'linewebtoon' AND --format is cbz/epub.
+    # See recompress_chapter_images_to_webp() and the call site near
+    # _process_chapter_impl's --keep-images block (grep 'webtoon_recompress').
+    p.add_argument(
+        "--webtoon-recompress",
+        action="store_true",
+        help="LINE Webtoon ONLY (handler.name == 'linewebtoon'): re-encode "
+             "lossless PNG pages to lossy WebP at --webtoon-recompress-quality "
+             "before packaging. JPEG-source chapters are skipped (webtoons.com "
+             "only serves JPEG for low-popularity series — those pages are "
+             "already small and recompressing them is generation-loss). "
+             "Targets the ~45GB per-series problem from the CDN's PNG output "
+             "on popular series; q85 typically lands at ~5-7%% of the "
+             "original library size with results indistinguishable from "
+             "source on phone-screen viewing of color webtoons. Requires "
+             "--format cbz or epub (PDF would re-encode the WebP as "
+             "FlateDecode and INCREASE size). Files are converted in place "
+             "in the tmp directory; original PNG bytes are not preserved on "
+             "disk (use --keep-images to retain a copy in "
+             "<out>/images/Chapter_<n>/). Changing the quality or method "
+             "between runs invalidates the tmp folder via resume gating.",
+    )
+    p.add_argument(
+        "--webtoon-recompress-quality",
+        type=int,
+        default=85,
+        choices=range(1, 101),
+        metavar="[1-100]",
+        help="WebP quality factor for --webtoon-recompress (default: 85). "
+             "85 = storage-optimized, indistinguishable from source on "
+             "phone-screen viewing of color webtoons. 90 = archival-safe "
+             "with insurance margin against zoom/high-DPI artifacts "
+             "(~60%% larger files). Values above 95 produce diminishing "
+             "returns for color content.",
+    )
+    p.add_argument(
+        "--webtoon-recompress-method",
+        type=int,
+        default=4,
+        choices=range(0, 7),
+        metavar="[0-6]",
+        help="libwebp encoder effort for --webtoon-recompress (default: 4). "
+             "0 = fastest/largest, 6 = slowest/smallest. method=4 matches "
+             "the existing WebP-lossless pool default (~line 2119); "
+             "method=6 trades ~2-3x encode time for ~5%% smaller files — "
+             "sensible for overnight bulk runs on a desktop, not phone CPUs.",
+    )
+    # ── Komikku-compatible per-chapter CBZ output (komikkuspec.md) ──
+    # Writes per-chapter CBZs with per-chapter ComicInfo.xml, plus
+    # cover.jpg and details.json at the series-folder root, matching the
+    # Mihon/Tachiyomi/Komikku LocalSource on-disk format. Force-coerces
+    # --format cbz --keep-chapters --no-final-file. Output path stays at
+    # <workingDir>/manga/<Series>/ — sync to your phone's <Komikku-SAF>/
+    # local/ via SyncThing/rclone/manual copy. Helpers + spec details:
+    # grep '_komikku_status_to_digit\|build_per_chapter_comic_info_xml\|
+    # _komikku_chapter_filename'.
+    p.add_argument(
+        "--komikku",
+        action="store_true",
+        help="Write Komikku/Mihon/Tachiyomi-compatible per-chapter CBZs. "
+             "Each chapter gets its own ComicInfo.xml (with <Series>, "
+             "<Number>, <Translator>, <Web>, <Year>/<Month>/<Day>), plus "
+             "cover.jpg and details.json (status/genres/authors as a "
+             "JSON object) at the series-folder root. Auto-coerces "
+             "--format cbz --keep-chapters --no-final-file. Output "
+             "stays at <workingDir>/manga/<Series>/ — sync into "
+             "<Komikku-SAF-root>/local/ yourself.",
+    )
     args = p.parse_args()
     _validate_resume_categories(p)  # fail-fast on dest typos / category overlap
     args.output_dir = resolve_output_dir(getattr(args, "output_dir", None))
+
+    # --mangafire-image-concurrency deprecation routing. Back-compat shim
+    # for scripts that still use the pre-2026-05-13 MangaFire-only flag —
+    # the add_argument earlier in main() declares it with
+    # help=argparse.SUPPRESS so it's hidden from --help. Routes the value
+    # onto args.image_concurrency BEFORE _apply_runtime_tunables or any
+    # fast-download consumer reads it, so the rename is transparent.
+    if getattr(args, "mangafire_image_concurrency", None) is not None:
+        args.image_concurrency = args.mangafire_image_concurrency
+        import warnings
+        warnings.warn(
+            "--mangafire-image-concurrency is deprecated; use --image-concurrency",
+            DeprecationWarning,
+        )
 
     if args.serve:
         try:
@@ -4284,12 +5299,160 @@ def main():
             print(f"Failed: {', '.join(failed)}")
             sys.exit(1)
         return
+
+    # Phase B (2026-05-07) / Phase H follow-up (2026-05-16): snapshot which CLI
+    # flags the user explicitly set on THIS invocation, BEFORE any later
+    # mutations (--restore-parameters setattr loop, format-defaulting,
+    # --komikku coercion) overwrite args.* with derived values. The CBZ
+    # fast-path at ~line 6900 reads these booleans to detect "user wants the
+    # wire bytes verbatim" vs "user asked for a transform." `--width` /
+    # `--aspect-ratio` argparse-default to None so `is None` is the user-set
+    # test; `--quality` defaults to 85 so we sniff sys.argv for it instead.
+    #
+    # Phase G4 (2026-05-08): --quality 100 means "highest quality, no
+    # tradeoffs" — exactly what the fast-path provides. Treating it as a
+    # transform-request would force CBZ into the legacy decode/recombine/
+    # re-encode path, defeating the byte-preservation. The UI's Settings
+    # quality slider defaults to 100, so without this guard EVERY
+    # UI-spawned CBZ download fell into legacy. Only quality < 100 now
+    # signals "user wants smaller/lossy."
+    #
+    # Position note (2026-05-16): this block USED to live after the
+    # --restore-parameters setattr loop, which broke resume — restore
+    # loaded calculated `width=1500` from JSON, then this assignment
+    # flipped `_user_set_width` to True and disabled the fast-path for
+    # every chapter on resume (Ch 25+ in Eleceed bulk download came out
+    # as 130 MB lossless-PNG CBZs). Moved here so the user's CURRENT CLI
+    # is captured first; the restore loop overrides from JSON when the
+    # saved run actually had the flag set (get_resumable_params now
+    # persists `_user_set_*` keys for this purpose).
+    args._user_set_width = args.width is not None
+    args._user_set_aspect_ratio = args.aspect_ratio is not None
+    args._user_set_quality = (
+        any(
+            a == "--quality" or a.startswith("--quality=")
+            for a in sys.argv[1:]
+        )
+        and args.quality < 100
+    )
+
+    # Generic CLI-user-set snapshot. Mirrors the _user_set_* booleans
+    # above but covers EVERY argparse dest, not just the three with
+    # fast-path heuristics. Consumed by the --restore-parameters loop
+    # (~line 5523) so freshly-typed CLI overrides survive resume —
+    # without this, `--restore-parameters --width 3000 URL` would have
+    # the setattr loop silently restore the saved run's width=2000 and
+    # the user got no log indication their override was discarded.
+    # Built from p._actions's option_strings against sys.argv: each
+    # `--flag` (or its `--flag=value` shorthand) maps back to its dest
+    # via the same dest argparse uses for setattr. Positional args
+    # (option_strings == []) are skipped because they are always
+    # re-provided on the resume CLI and never appear in run_params.json
+    # anyway.
+    _user_set_dests: set = set()
+    _opt_to_dest: Dict[str, str] = {}
+    for _action in p._actions:
+        for _opt in _action.option_strings:
+            _opt_to_dest[_opt] = _action.dest
+    for _tok in sys.argv[1:]:
+        if not _tok.startswith("-"):
+            continue
+        _name = _tok.split("=", 1)[0]
+        if _name in _opt_to_dest:
+            _user_set_dests.add(_opt_to_dest[_name])
+    args._user_set_dests = _user_set_dests
+
     # -----------------------------
     # Argument sanity checks / modes
     # -----------------------------
+
+    # --komikku: silently coerce the three implementation flags that the
+    # Komikku output layout requires. Runs BEFORE the "no_final_file requires
+    # keep_chapters" check below so the implied keep_chapters=True satisfies
+    # it. The explicit notice keeps the spawn-line behavior obvious in the
+    # UI's LogPanel for users who toggle Komikku and then wonder why their
+    # format selector was ignored. Cross-file: UI counterparts are
+    # settings.defaults.komikku (SettingsTab.jsx) + form.komikku
+    # (DownloadTab.jsx); both emit --komikku via downloader.js boolMap.
+    if getattr(args, "komikku", False):
+        coerced_bits: List[str] = []
+        if args.format != "cbz":
+            coerced_bits.append(f"--format cbz (was {args.format})")
+            args.format = "cbz"
+        if not args.keep_chapters:
+            coerced_bits.append("--keep-chapters")
+            args.keep_chapters = True
+        if not args.no_final_file:
+            coerced_bits.append("--no-final-file")
+            args.no_final_file = True
+        if coerced_bits:
+            print(
+                f"[Komikku] Forcing { ' '.join(coerced_bits) } for spec-"
+                f"compliant per-chapter output."
+            )
+        else:
+            print("[Komikku] Per-chapter CBZ output enabled (spec-compliant).")
+
     if args.no_final_file and (not args.keep_chapters):
         p.error("--no-final-file requires --keep-chapters.")
 
+    # --webtoon-recompress compatibility checks. Run early so a multi-hour
+    # download isn't started just to discover --format pdf would have made
+    # the whole effort moot. The hard rejections cover combinations that
+    # are strictly worse than not using the flag at all (PDF/FlateDecode
+    # bloat, double-encode through Phase C save_final_images). Warnings
+    # cover combinations that compose but lose extra quality (double-decode
+    # paths) or defeat the disk-saving purpose (--keep-images).
+    if getattr(args, "webtoon_recompress", False):
+        if args.format == "pdf":
+            p.error(
+                "--webtoon-recompress is incompatible with --format pdf: "
+                "PDF embeds JPEG via /DCTDecode but decodes WebP into "
+                "uncompressed FlateDecode pixel data, which INCREASES file "
+                "size. Use --format cbz (recommended) or --format epub."
+            )
+        if args.format == "none":
+            p.error(
+                "--webtoon-recompress requires --format cbz or epub. With "
+                "--format none there is no archive file to write the "
+                "converted pages into."
+            )
+        if getattr(args, "no_cbz_preserve_originals", False):
+            p.error(
+                "--webtoon-recompress is incompatible with "
+                "--no-cbz-preserve-originals: the lossy WebP would be "
+                "decoded and re-encoded again as WebP-lossless via Phase C "
+                "auto-format, wrapping the lossy artifacts in a lossless "
+                "container — strictly worse than either option alone."
+            )
+        # Warnings (not errors) for combinations that compose but produce
+        # a double-encode loss. The user might know what they're doing.
+        if args.width is not None:
+            print(
+                "  [!] --webtoon-recompress with --width forces the slow "
+                "decode-resize-encode path; the output WebP will be "
+                "re-encoded (twice-lossy). Consider dropping --width.",
+                file=sys.stderr,
+            )
+        if args.aspect_ratio is not None:
+            print(
+                "  [!] --webtoon-recompress with --aspect-ratio forces the "
+                "slow decode-resize-encode path (twice-lossy).",
+                file=sys.stderr,
+            )
+        if args.scaling != 100:
+            print(
+                f"  [!] --webtoon-recompress with --scaling={args.scaling} "
+                "forces the slow decode-resize-encode path (twice-lossy).",
+                file=sys.stderr,
+            )
+        if args.keep_images:
+            print(
+                "  [i] --webtoon-recompress with --keep-images preserves "
+                "the original PNG/JPEG downloads alongside the recompressed "
+                "CBZ. Disable --keep-images to maximize disk savings.",
+                file=sys.stderr,
+            )
     # --search is checked before --list-chapters / build-final-file because it
     # resolves the URL, and the downstream modes' "URL required" check would
     # otherwise fire before search runs.
@@ -4672,12 +5835,48 @@ def main():
             else:
                 restored_params = saved
 
-            # Update the args namespace with the restored parameters
+            # Update the args namespace with the restored parameters,
+            # with two exclusions that preserve the user's CURRENT CLI:
+            #
+            #   1. Dests the user explicitly set on the resume CLI
+            #      (tracked at parse_args time via args._user_set_dests).
+            #      `--restore-parameters --width 3000 URL` should keep
+            #      width=3000; the previous unconditional setattr loop
+            #      silently restored the saved run's width and left
+            #      no log indication the override was discarded.
+            #
+            #   2. `_user_set_*` sentinels themselves. get_resumable_params
+            #      persists these alongside real values, but they describe
+            #      THIS invocation's CLI intent (computed earlier from
+            #      sys.argv) and must not be clobbered by the saved run's
+            #      values. The fast-path heuristic at ~line 6892 reads
+            #      _user_set_width/_user_set_aspect_ratio to decide whether
+            #      to engage the CBZ wire-bytes path; flipping it from True
+            #      to False mid-resume defeats the user's width override.
+            _user_set_dests_resume: set = getattr(args, "_user_set_dests", set())
+            _skipped_for_cli_override: List[str] = []
             for key, value in restored_params.items():
+                if key.startswith("_user_set_"):
+                    continue
+                if key in _user_set_dests_resume:
+                    _skipped_for_cli_override.append(key)
+                    continue
                 setattr(args, key, value)
+            if _skipped_for_cli_override:
+                _override_summary = ", ".join(
+                    f"--{k.replace('_', '-')}={getattr(args, k, None)!r}"
+                    for k in sorted(_skipped_for_cli_override)
+                )
+                print(
+                    f"  [resume] Keeping fresh CLI override(s) over saved "
+                    f"values: {_override_summary}"
+                )
 
             # Crucially, apply the new format settings — these are
-            # intentionally re-overrideable on resume.
+            # intentionally re-overrideable on resume. Redundant when the
+            # user passed --format/--epub-layout on the resume CLI (the
+            # _user_set_dests filter above would already have skipped them)
+            # but harmless: the same value gets assigned to the same dest.
             args.format = new_format
             args.epub_layout = new_epub_layout
 
@@ -4690,17 +5889,20 @@ def main():
             # choices instead of the argparse defaults.
             _apply_runtime_tunables(args)
 
+            # Auto-derived: walk the restored params so newly-persisted
+            # flags appear automatically. Underscore-prefixed entries
+            # (`_user_set_*`) are internal fast-path sentinels — they
+            # describe what the original CLI did, not user-meaningful
+            # settings — so suppress them from the listing. Sorted for
+            # determinism. See get_resumable_params() for what lands
+            # in this dict; the print here is purely UX, not state.
             print("  Successfully restored parameters. The following settings will be used:")
-            log_verbose(f"    - Chapters: {args.chapters}")
-            log_verbose(f"    - Group(s): {args.group}")
-            log_verbose(f"    - Width: {args.width}")
-            log_verbose(f"    - Aspect Ratio: {args.aspect_ratio}")
-            log_verbose(f"    - Scaling: {args.scaling}%")
-            log_verbose(f"    - Quality: {args.quality}")
-            log_verbose(f"    - Keep Chapters: {args.keep_chapters}")
-            log_verbose(f"    - No Final File: {args.no_final_file}")
-            log_verbose(f"    - Language: {args.language}")
-            log_verbose(f"    - Site: {args.site}")
+            for _rk in sorted(restored_params.keys()):
+                if _rk.startswith("_"):
+                    continue
+                _rv = restored_params[_rk]
+                _rl = _rk.replace("_", " ").title()
+                log_verbose(f"    - {_rl}: {_rv}")
             print(f"  New output format will be: {args.format.upper()}")
 
         except (json.JSONDecodeError, TypeError) as e:
@@ -4720,30 +5922,11 @@ def main():
             except ValueError as e:
                 sys.exit(e)
 
-    # Phase B (2026-05-07): snapshot which CLI flags the user explicitly set
-    # BEFORE format-defaulting fills in `width` / `aspect_ratio` from the
-    # format-specific defaults below. The CBZ fast-path uses these booleans
-    # to detect "user wants the wire bytes verbatim" vs "user asked for a
-    # transform." `--width` / `--aspect-ratio` argparse-default to None so
-    # `is None` is the user-set test; `--quality` defaults to 85 so we sniff
-    # sys.argv for it instead.
-    args._user_set_width = args.width is not None
-    args._user_set_aspect_ratio = args.aspect_ratio is not None
-    # Phase G4 (2026-05-08): --quality 100 means "highest quality, no
-    # tradeoffs" — exactly what the fast-path provides. Treating it as a
-    # transform-request would force CBZ into the legacy decode/recombine/
-    # re-encode path, defeating the byte-preservation. The UI's Settings
-    # quality slider defaults to 100, so without this guard EVERY
-    # UI-spawned CBZ download fell into legacy. Only quality < 100 now
-    # signals "user wants smaller/lossy."
-    args._user_set_quality = (
-        any(
-            a == "--quality" or a.startswith("--quality=")
-            for a in sys.argv[1:]
-        )
-        and args.quality < 100
-    )
-
+    # Note: _user_set_width / _user_set_aspect_ratio / _user_set_quality
+    # are computed earlier (right after parse_args) so they capture the
+    # CURRENT invocation's CLI flags before --restore-parameters loads
+    # calculated values from run_params.json. See the block tagged
+    # "Position note (2026-05-16)" near parse_args for the full rationale.
     width = args.width
     aspect_ratio_str = args.aspect_ratio
 
@@ -4972,6 +6155,106 @@ def main():
     if epub_dir_base:
         epub_out_dir = allocate_series_output_dir(title, hid, root=epub_dir_base)
         setattr(args, "epub_dir", epub_out_dir)
+
+    # ── Direct-URL multi-source: find alternatives for fallback ──
+    # When --multi-source is set and we got here via a direct URL (not via
+    # --search --auto-pick which already populated _multi_source_alternatives),
+    # search for the series title across other handlers and pre-fetch their
+    # chapter lists so per-chapter fallback in _process_chapter_strict has
+    # alternatives to try. Skipped when --list-chapters is set (read-only
+    # mode, no downloads happening, alternatives discovery would just waste
+    # time).
+    if (
+        getattr(args, "multi_source", False)
+        and not getattr(args, "search", None)
+        and not getattr(args, "list_chapters", False)
+        and not _multi_source_alternatives  # not already populated
+    ):
+        # Fix B (2026-05-07): when the UI passes --multi-source-prefetched, use
+        # the JSON-listed alts instead of running cross-site search again. The
+        # search-tab download path writes this file just before spawning aio-dl
+        # so we skip the redundant ~80s search. Falls back to search if the
+        # file is missing or malformed (defensive — doesn't fail the download).
+        prefetched_path = getattr(args, "multi_source_prefetched", None)
+        try:
+            if prefetched_path:
+                from aio_search_cli import build_alternatives_from_prefetched
+                _ms_alts = build_alternatives_from_prefetched(
+                    prefetched_path=prefetched_path,
+                    primary_handler=handler,
+                    primary_context=context,
+                    primary_chapters=pool,
+                    args=args,
+                    make_request=make_request,
+                    on_status=lambda m: print(m, file=sys.stderr),
+                )
+            else:
+                from aio_search_cli import find_alternatives_for_direct_url
+                _ms_alts = find_alternatives_for_direct_url(
+                    primary_url=args.comic_url,
+                    primary_handler=handler,
+                    primary_context=context,
+                    primary_chapters=pool,
+                    args=args,
+                    make_request=make_request,
+                    record_rate_limit=_record_rate_limit,
+                    on_status=lambda m: print(m, file=sys.stderr),
+                )
+            if _ms_alts:
+                _multi_source_alternatives = _ms_alts
+                n_alts = sum(len(v) for v in _multi_source_alternatives.values())
+                n_chapters_with_alts = len(_multi_source_alternatives)
+                print(
+                    f"[*] Multi-source ON: {n_chapters_with_alts} chapters have "
+                    f"alternative sources ({n_alts} total fallback paths)",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            # Don't let alternatives discovery block the main download. If it
+            # fails, the user gets standard single-source behavior.
+            print(
+                f"[!] Multi-source alternatives discovery failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    # ── --list-chapters: print metadata + chapter list as JSON, then exit ──
+    # Used by the UI to check for new chapters without downloading anything.
+    # Only needs the page HTML + chapter list API call — no image VRF, no downloads.
+    # IMPORTANT: This runs BEFORE allocate_series_output_dir so it doesn't
+    # create empty folders in mangas/ just for checking.
+    if getattr(args, "list_chapters", False):
+        # Deduplicate chapter numbers (pool may have multiple versions per chapter)
+        seen_nums = set()
+        unique_chapters = []
+        for ch in pool:
+            num = ch.get("chap")
+            if num is not None and num not in seen_nums:
+                seen_nums.add(num)
+                unique_chapters.append(num)
+        # Sort numerically
+        try:
+            unique_chapters.sort(key=lambda x: float(x))
+        except (ValueError, TypeError):
+            pass
+
+        result = {
+            "hid": hid,
+            "title": title,
+            "url": args.comic_url,
+            "site": handler.name,
+            "status": comic_data.get("status"),
+            "authors": comic_data.get("authors", []),
+            "cover": comic_data.get("cover"),
+            "genres": comic_data.get("genres", []),
+            "total": len(unique_chapters),
+            "chapters": unique_chapters,
+        }
+        print(json.dumps(result))
+        sys.exit(0)
+
+    # Output goes into a per-title folder under ./mangas (title, with hid only on collision)
+    out_dir = allocate_series_output_dir(title, hid, root="mangas")
+    setattr(args, "output_dir", out_dir)
 
     # --- Chapter Selection Logic ---
     log_verbose("Filtering chapters based on preferences...")
@@ -5223,6 +6506,52 @@ def main():
                 )
                 current_book_size += os.path.getsize(original_cover_path)
 
+    # ── Komikku series-level metadata (cover.jpg + details.json) ──
+    # Spec §5 + §6.1: cover.jpg at series-folder root, details.json with
+    # exact keys {title, author, artist, description, genre, status}.
+    # Written once per run, fresh-or-overwriting on resume so the on-disk
+    # metadata always reflects the latest comic_data (handler-extracted
+    # genres/status may improve between runs as handlers evolve).
+    # Cross-file: _komikku_status_to_digit (top of file, near
+    # build_per_chapter_comic_info_xml). The cover-prepend to
+    # current_book_content above is dead code in Komikku mode (we force
+    # --no-final-file so the final CBZ build never fires) but kept for
+    # parity with the non-Komikku CBZ path.
+    if getattr(args, "komikku", False):
+        try:
+            if original_cover_path and os.path.exists(original_cover_path):
+                cover_dst = os.path.join(out_dir, "cover.jpg")
+                # Use copy2 so the file appears with timestamps from the
+                # tmp copy (preserves mtime for Library-tab thumb-cache).
+                shutil.copy2(original_cover_path, cover_dst)
+                log_verbose(f"  Komikku: wrote cover.jpg → {cover_dst}")
+            details_payload = {
+                "title": title,
+                "author": ", ".join(comic_data.get("authors", []) or []),
+                "artist": ", ".join(comic_data.get("artists", []) or []),
+                "description": comic_data.get("desc") or "",
+                # Spec §6.1: `genre` is a JSON array of strings. Some
+                # handlers merge `theme`/`format` into adjacent fields;
+                # we keep `genre` as the canonical genres list only,
+                # since that's what Komikku renders as tag chips.
+                "genre": list(comic_data.get("genres", []) or []),
+                "status": _komikku_status_to_digit(comic_data.get("status")),
+            }
+            details_path = os.path.join(out_dir, "details.json")
+            with open(details_path, "w", encoding="utf-8") as f:
+                json.dump(details_payload, f, ensure_ascii=False, indent=2)
+            log_verbose(
+                f"  Komikku: wrote details.json (status={details_payload['status']}, "
+                f"{len(details_payload['genre'])} genre tags)"
+            )
+        except OSError as exc:
+            # Don't fail the whole run for a metadata-write error. The
+            # chapter CBZs still carry the same metadata via per-chapter
+            # ComicInfo.xml, so Komikku will still display the manga.
+            print(
+                f"[!] Komikku metadata write failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
     # --- Missed chapter logging + end-of-run retries ---
     retry_missed = not getattr(args, 'no_retry_missed_chapters', False)
     missed_retries = max(0, int(getattr(args, 'missed_retries', 2) or 0))
@@ -5528,6 +6857,32 @@ def main():
                         pages_ok=ice.pages_ok,
                         pages_total=ice.pages_total,
                     ) from ice
+                except Exception as exc:
+                    # Handler raised an arbitrary exception (e.g. requests.HTTPError
+                    # from MangaDex's /at-home/server returning a transient 500
+                    # after retries are exhausted, RuntimeError from a malformed
+                    # API payload, the many `raise RuntimeError("...")` paths in
+                    # the *scans Madara-style handlers, etc.). Convert to
+                    # ChapterSkippedError so the strict wrapper's multi-source
+                    # fallback + inline-retry path picks it up. Without this,
+                    # the exception bypasses _process_chapter_strict (which only
+                    # catches ChapterSkippedError) and the chapter loop's bare
+                    # `except Exception` at the bottom of main() silently
+                    # records the chapter as missed via _record_missed — user
+                    # observes "Chapter N (group)" with no follow-up line,
+                    # indistinguishable from a frozen download. The merged-parts
+                    # branch above (~30 lines up) already has this conversion;
+                    # this branch was the asymmetry letting the silent skip
+                    # through. Symptom that drove this fix: Shuumatsu no
+                    # Valkyrie Ch 5 on MangaDex 2026-05-16, /at-home/server 500.
+                    if os.path.isdir(tdir):
+                        rm_tree(tdir)
+                    raise ChapterSkippedError(
+                        reason=f"get_chapter_images_failed:{type(exc).__name__}",
+                        host="",
+                        pages_ok=0,
+                        pages_total=0,
+                    ) from exc
             _timing["vrf"] += time.monotonic() - _t0_vrf
 
             # --- VRF pipelining: enqueue the next `depth` chapters' VRF
@@ -5652,16 +7007,27 @@ def main():
                             None,
                         )
                         downloaded_images.append((task_page_idx, match))
-                elif getattr(handler, "SUPPORTS_FAST_DOWNLOAD", False):
-                    # MangaFire's curl_cffi async path: HTTP/2 multiplex over
-                    # one keep-alive AsyncSession. Bench (83-page chapter):
+                elif (
+                    getattr(handler, "SUPPORTS_FAST_DOWNLOAD", False)
+                    and not getattr(args, "no_fast_download", False)
+                ):
+                    # curl_cffi async path: HTTP/2 multiplex over one
+                    # keep-alive AsyncSession. Bench (83-page chapter):
                     # ~1.7x faster than the ThreadPoolExecutor cloudscraper
                     # path. Cancellation + host-poison are bridged via
                     # callbacks so the handler stays decoupled from this
                     # module's globals. fast_download_images returns the
                     # same (page_idx, path_or_None) shape as dl_image.
                     fast_conc = max(
-                        1, int(getattr(args, "mangafire_image_concurrency", 8))
+                        1, int(getattr(args, "image_concurrency", 8))
+                    )
+                    # Phase D: apply per-host concurrency cap. If a prior
+                    # rate_limit / retryable failure dialed the cap down
+                    # for this CDN, _effective_concurrency clamps to the
+                    # cap. Healthy CDNs see the user-configured value.
+                    fast_conc = _effective_concurrency(
+                        urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                        fast_conc,
                     )
                     fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
                     log_verbose(
@@ -5678,13 +7044,28 @@ def main():
                         # context out here; the host-poison threshold treats
                         # any non-permanent failure the same).
                         record_host_failure=lambda h, u: _record_failure(h, u, "retryable"),
+                        # Forward cookies from the cloudscraper session so
+                        # handlers whose image CDN gates on session cookies
+                        # (e.g. age-gated content) ride them. Base impl
+                        # filters to host-relevant cookies; no-op for
+                        # cookieless edge-cache CDNs (MangaFire, normal
+                        # webtoons series).
+                        scraper=scraper,
                     )
                     downloaded_images.extend(fast_results)
                 elif image_workers > 1 and len(download_tasks) > 1:
+                    # Phase D: apply per-host concurrency cap. ThreadPool
+                    # max_workers can't be changed after creation, so we
+                    # compute the effective worker count up front.
+                    pool_workers = min(image_workers, len(download_tasks))
+                    pool_workers = max(1, _effective_concurrency(
+                        urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                        pool_workers,
+                    ))
                     log_verbose(
-                        f"  Downloading {len(download_tasks)} image(s) with {min(image_workers, len(download_tasks))} parallel workers..."
+                        f"  Downloading {len(download_tasks)} image(s) with {pool_workers} parallel workers..."
                     )
-                    with ThreadPoolExecutor(max_workers=min(image_workers, len(download_tasks))) as img_pool:
+                    with ThreadPoolExecutor(max_workers=pool_workers) as img_pool:
                         future_to_page = {
                             img_pool.submit(
                                 dl_image,
@@ -5839,33 +7220,87 @@ def main():
                     else:
                         shutil.copytree(tdir, dest_dir)
 
+            # Phase 1 (2026-05-11): LINE Webtoon WebP recompression.
+            # Mutates raw_image_paths in place — converted .webp files
+            # replace the original PNG/JPEG paths so both the CBZ fast
+            # path (~line 5910) and the slow path (~line 5965) see the
+            # already-compressed bytes. Runs AFTER --keep-images copytree
+            # so users opting into both get unconverted originals in
+            # <out>/images/ AND the recompressed CBZ.
+            #
+            # Gating:
+            #   * --webtoon-recompress was passed
+            #   * handler.name == "linewebtoon" (the LINE Webtoon handler;
+            #     multi-source fallback may swap `handler` via `nonlocal`,
+            #     in which case the check correctly evaluates against the
+            #     active source and skips recompression for non-webtoon
+            #     alt sources like mangadex)
+            #   * args.format in ("cbz", "epub") (PDF would re-encode as
+            #     FlateDecode and bloat; argparse validation already
+            #     rejects --format pdf at startup, but we re-check here
+            #     to be defensive against `--format none` and any other
+            #     odd-mode arrival)
+            #   * raw_image_paths is non-empty (defensive)
+            #
+            # Cross-file: argparse flags ~line 4070, _RESUME_GATING_DESTS
+            # ~line 2900, recompress_chapter_images_to_webp() ~line 2190.
+            if (
+                getattr(args, "webtoon_recompress", False)
+                and handler.name == "linewebtoon"
+                and args.format in ("cbz", "epub")
+                and raw_image_paths
+            ):
+                log_verbose(
+                    f"  [recompress] Converting {len(raw_image_paths)} pages "
+                    f"to WebP q{args.webtoon_recompress_quality} "
+                    f"method={args.webtoon_recompress_method}..."
+                )
+                _t0_recompress = time.monotonic()
+                raw_image_paths = recompress_chapter_images_to_webp(
+                    raw_image_paths,
+                    quality=args.webtoon_recompress_quality,
+                    method=args.webtoon_recompress_method,
+                )
+                log_verbose(
+                    f"  [recompress] Done in "
+                    f"{time.monotonic() - _t0_recompress:.1f}s."
+                )
+
             _t0_proc = time.monotonic()
             os.makedirs(processed_tdir, exist_ok=True)
 
-            # Phase G7 (2026-05-08): kick off image prefetch for next_chapter
-            # NOW — after this chapter's downloads + validation succeeded,
-            # before the CPU-bound processing/encoding begins. While the
-            # main thread is decoding/scaling/saving this chapter's images,
-            # the prefetch worker downloads next_chapter's images in
-            # parallel. _process_chapter_impl's next iteration consumes
-            # the prefetch via the .download_prefetched marker.
+            # Phase G7 (2026-05-08; Phase B chain 2026-05-13): kick off
+            # image prefetch chain for upcoming chapters NOW — after this
+            # chapter's downloads + validation succeeded, before the CPU-
+            # bound processing/encoding begins. While the main thread is
+            # decoding/scaling/saving this chapter's images, prefetch
+            # workers download the next `image_prefetch_depth` chapters'
+            # images in parallel (up to `image_prefetch_parallel` workers).
+            # _process_chapter_impl's next iteration consumes the prefetch
+            # via the .download_prefetched marker.
             #
-            # Worker count: --prefetch-image-workers (default -1 = match
-            # --image-workers). 0 disables. Positive N = exact count
-            # regardless of main pool size, useful when the user wants
-            # fewer concurrent connections during prefetch than during
-            # the in-band download (e.g. main=12 prefetch=4 to avoid
-            # CDN-throttle compounding without giving up the overlap).
+            # Worker count knobs:
+            #   --prefetch-image-workers: parallelism WITHIN one chapter
+            #     prefetch (default -1 = match --image-workers). 0
+            #     disables prefetch entirely.
+            #   --image-prefetch-depth: how many chapters ahead to queue
+            #     (default 2).
+            #   --image-prefetch-parallel: concurrent prefetch worker
+            #     threads (default 2). _ensure_image_prefetch_workers
+            #     spawns up to this many daemons.
+            #
+            # Chain dedupe: when ch N fires the chain it queues N+1, N+2;
+            # when ch N+1 fires it tries to queue N+2 (already in queue,
+            # dedup'd) + N+3 (new). _start_image_prefetch's _seen set
+            # handles this.
             #
             # Skipped on:
             #   - prefetch_image_workers <= 0 (user opt-out)
+            #   - image_prefetch_depth <= 0 (chain disabled)
             #   - force_redownload=True (inline retry — don't fire side
             #     work that the retry path will also fire)
-            #   - next_chapter is None (last chapter in the run)
-            #   - next_chapter is already fully processed (resume case;
-            #     prefetching a cached chapter would just download bytes
-            #     into a tdir whose `.processed_complete` marker already
-            #     short-circuits the next iteration)
+            #   - is_alt_source=True (multi-source fallback active)
+            #   - all upcoming chapters already cached
             prefetch_workers_raw = getattr(args, "prefetch_image_workers", -1)
             if prefetch_workers_raw is None:
                 prefetch_workers_raw = -1
@@ -5873,27 +7308,32 @@ def main():
                 effective_prefetch_workers = image_workers
             else:
                 effective_prefetch_workers = int(prefetch_workers_raw)
+            depth = max(0, int(getattr(args, "image_prefetch_depth", 2) or 0))
             if (
                 effective_prefetch_workers > 0
-                and next_chapter is not None
+                and depth > 0
                 and not force_redownload
                 and not is_alt_source
             ):
-                next_n = next_chapter.get("chap")
-                if next_n is not None:
-                    next_tdir = os.path.join(main_tmp_dir, f"ch_{next_n}")
-                    next_marker_name = (
-                        ".download_complete" if args.no_processing else ".processed_complete"
+                # Prefer the windowed upcoming_chapters list (same shape
+                # passed to the VRF chain), falling back to [next_chapter]
+                # when the chapter loop didn't propagate a window.
+                chain_upcoming: List[Dict[str, Any]] = (
+                    list(upcoming_chapters)
+                    if upcoming_chapters
+                    else ([next_chapter] if next_chapter is not None else [])
+                )
+                if chain_upcoming:
+                    _start_image_prefetch_chain(
+                        chain_upcoming,
+                        main_tmp_dir,
+                        scraper,
+                        handler,
+                        effective_prefetch_workers,
+                        fast_concurrency=int(getattr(args, "image_concurrency", 8) or 8),
+                        depth=depth,
+                        no_processing=bool(args.no_processing),
                     )
-                    next_already_cached = os.path.exists(
-                        os.path.join(next_tdir, next_marker_name)
-                    )
-                    if not next_already_cached:
-                        _start_image_prefetch(
-                            next_chapter, next_tdir, scraper, handler,
-                            effective_prefetch_workers,
-                            fast_concurrency=int(getattr(args, "mangafire_image_concurrency", 8) or 8),
-                        )
 
             chapter_content = []
 
@@ -6023,25 +7463,72 @@ def main():
                     # Phase C: pick output format. PDF's _build_images_pdf
                     # consumes JPEG-quality re-encodes, so PDF stays "jpeg".
                     # CBZ asks for "auto" which maps each output to its
-                    # source format (WebP→WebP-lossless, JPEG→JPEG q=95,
-                    # else PNG). When recombination drew from multiple
-                    # inputs (1:N mapping), source_paths is None and "auto"
-                    # falls to PNG — but if every source was WebP we can
-                    # safely keep the lossless promise via webp_lossless.
+                    # source format (WebP→WebP-lossless or webp_q85 per
+                    # Phase H scoping below, JPEG→JPEG q=95, else PNG).
+                    # When recombination drew from multiple inputs (1:N
+                    # mapping), source_paths is None and "auto" falls to
+                    # PNG — but if every source was WebP we route to
+                    # webp_lossless/webp_q85 explicitly based on the same
+                    # Phase H scoping signal.
+                    #
+                    # Phase H (2026-05-16): _webp_source_is_lossy is True
+                    # iff we know the WebP sources are already lossy q85
+                    # from our own recompress step on LineWebtoon. This
+                    # avoids wrapping recompressed q85 in a ~10x bigger
+                    # lossless WebP. It's gated on handler.name +
+                    # args.webtoon_recompress so natively-WebP sites
+                    # (Atsumaru, MangaDex, etc.) keep the lossless preserve
+                    # behavior — re-encoding their publisher-chosen quality
+                    # at q85 would be generation-loss for those archives.
+                    _webp_source_is_lossy = (
+                        getattr(args, "webtoon_recompress", False)
+                        and handler.name == "linewebtoon"
+                    )
                     if args.format == "pdf":
                         _output_format = "jpeg"
                         _src_paths_for_save = None
                     elif args.format == "cbz":
                         if len(images_to_save) == len(raw_image_paths):
+                            # 1:1 mapping: source paths line up per output
+                            # page, so save_final_images' auto-mode can
+                            # probe each one individually.
                             _output_format = "auto"
                             _src_paths_for_save = list(raw_image_paths)
+                        elif _webp_source_is_lossy:
+                            # 1:N mapping AND --webtoon-recompress is on
+                            # for the active LineWebtoon handler. Match
+                            # the user's intent (lossy q85 WebP) regardless
+                            # of the source extension mix. This catches the
+                            # case where some pages stayed .jpg as small
+                            # passthrough (pre-2026-05-16 the JPEG
+                            # eligibility predicate would skip near-empty
+                            # panels; even after dropping it, a corrupt
+                            # page can still fall back to .jpg). Without
+                            # this branch the next `all(.webp)` check
+                            # would fail and the chapter would silently
+                            # fall through to lossless PNG — producing
+                            # 130 MB CBZs on Eleceed Ch 25+.
+                            _output_format = "webp_q85"
+                            _src_paths_for_save = None
                         elif raw_image_paths and all(
                             os.path.splitext(p)[1].lower() == ".webp"
                             for p in raw_image_paths
                         ):
+                            # 1:N mapping with publisher-supplied lossless
+                            # WebP (Atsumaru, MangaDex, etc.). Source
+                            # paths can't be matched per-page so auto-mode
+                            # probing would fall to PNG; pick the lossless
+                            # WebP variant explicitly so the publisher's
+                            # chosen quality is preserved.
                             _output_format = "webp_lossless"
                             _src_paths_for_save = None
                         else:
+                            # 1:N mapping with mixed / non-WebP sources
+                            # AND no --webtoon-recompress intent. Falls
+                            # through to save_final_images' auto-without-
+                            # source-paths default (lossless PNG). This is
+                            # the legacy behavior for sites that don't ship
+                            # uniform-format images.
                             _output_format = "auto"
                             _src_paths_for_save = None
                     else:
@@ -6084,6 +7571,7 @@ def main():
                             _save_quality,
                             output_format=_output_format,
                             source_paths=_src_paths_for_save,
+                            webp_source_is_lossy=_webp_source_is_lossy,
                         )
 
             if args.format == "cbz":
@@ -6103,6 +7591,20 @@ def main():
                 # into the series-wide archive. Mirrors PDF's
                 # processed_tdir/{n}.pdf cache. Replaces chapter_content
                 # with a single cbz_cache entry pointing at the new archive.
+                #
+                # Komikku mode (2026-05-12, komikkuspec.md): when --komikku is
+                # set, embed a per-chapter ComicInfo.xml in the cache zip at
+                # creation time. The XML carries <Series>/<Number>/<Title>/
+                # <Translator>/<Web>/<Year>-<Month>-<Day>, which Komikku
+                # v1.13.5+ uses to override filename-derived metadata. The
+                # cache then becomes byte-identical to what the final
+                # destination CBZ needs, so the --keep-chapters block below
+                # carries the ComicInfo.xml across for free via shutil.copy2.
+                # build_cbz_from_content (series-level wrapper) explicitly
+                # filters ComicInfo.xml during member-copy, so writing it
+                # here doesn't pollute the eventual series archive — though
+                # in Komikku mode we force --no-final-file, so the series
+                # archive never gets built anyway.
                 if processed_page_images:
                     cached_cbz_path = os.path.join(processed_tdir, f"{n}.cbz")
                     with zipfile.ZipFile(
@@ -6110,6 +7612,25 @@ def main():
                     ) as zf:
                         for i, p in enumerate(processed_page_images):
                             zf.write(p, f"{i:04d}{os.path.splitext(p)[1]}")
+                        if getattr(args, "komikku", False):
+                            per_chap_xml = build_per_chapter_comic_info_xml(
+                                series_title=title,
+                                chapter_title=ch.get("title") or "",
+                                chapter_num=n,
+                                volume=ch.get("vol"),
+                                scanlator=grp_name,
+                                web_url=ch.get("url") or args.comic_url,
+                                uploaded_epoch=ch.get("uploaded"),
+                                comic_info=comic_data,
+                                publishers=[grp_name] if grp_name else [],
+                                lang=args.language,
+                                page_count=len(processed_page_images),
+                            )
+                            zf.writestr(
+                                "ComicInfo.xml",
+                                per_chap_xml,
+                                compress_type=zipfile.ZIP_DEFLATED,
+                            )
                     chapter_content = [
                         {"type": "cbz_cache", "path": cached_cbz_path}
                     ]
@@ -6221,9 +7742,24 @@ def main():
             return None, grp_name, n, 0
 
         if args.keep_chapters:
-            ch_suffix = f"Ch {format_chap_for_filename(n)}"
-            ch_filename = f"{join_name(base_filename, ch_suffix)}.{args.format}"
-            active_out_dir = getattr(args, "epub_dir", None) if args.format == "epub" else None
+            # Komikku mode: filename adopts Vol.{vv} Ch.{ccc} - {title}.cbz
+            # (spec recommendation 7) which Mihon's ChapterRecognition parses
+            # correctly AND is human-readable. We drop the series-title
+            # prefix because the parent folder already IS the title under
+            # Komikku's <SAF-root>/local/<Title>/ convention. Komikku also
+            # ignores --epub-dir (Komikku is CBZ-only and lives under
+            # out_dir/<Title>/), so active_out_dir is None in that branch.
+            # See _komikku_chapter_filename for padding/decimal rules.
+            if getattr(args, "komikku", False):
+                ch_filename = _komikku_chapter_filename(
+                    n, ch.get("vol"), ch.get("title")
+                )
+                ch_suffix = f"Ch {format_chap_for_filename(n)}"  # logging only
+                active_out_dir = None  # Komikku always uses out_dir
+            else:
+                ch_suffix = f"Ch {format_chap_for_filename(n)}"
+                ch_filename = f"{join_name(base_filename, ch_suffix)}.{args.format}"
+                active_out_dir = getattr(args, "epub_dir", None) if args.format == "epub" else None
             if active_out_dir:
                 os.makedirs(active_out_dir, exist_ok=True)
             ch_out_path = os.path.join(active_out_dir or out_dir, ch_filename)
@@ -6251,6 +7787,9 @@ def main():
                 # parallel `elif args.format == "pdf"` block below — the
                 # cache is byte-identical to what build_cbz would have
                 # written, so the copy is correct AND skips a re-zip.
+                # In --komikku, the cache already carries the per-chapter
+                # ComicInfo.xml from the cache-create block above, so the
+                # copy ports it across unchanged.
                 if (
                     chapter_content
                     and chapter_content[0].get("type") == "cbz_cache"
@@ -6267,12 +7806,29 @@ def main():
                     print(f"CBZ saved → {os.path.basename(ch_out_path)}")
                 else:
                     # Legacy back-compat: chapter_content carries 'image'
-                    # entries (pre-Phase-D code path). Build directly.
+                    # entries (pre-Phase-D code path). Build directly. In
+                    # --komikku, pass the per-chapter ComicInfo.xml so this
+                    # slow path matches the fast-path output byte-for-byte.
                     cbz_images = [
                         item["path"]
                         for item in chapter_content
                         if item.get("type") == "image"
                     ]
+                    chapter_xml = None
+                    if getattr(args, "komikku", False):
+                        chapter_xml = build_per_chapter_comic_info_xml(
+                            series_title=title,
+                            chapter_title=ch.get("title") or "",
+                            chapter_num=n,
+                            volume=ch.get("vol"),
+                            scanlator=grp_name,
+                            web_url=ch.get("url") or args.comic_url,
+                            uploaded_epoch=ch.get("uploaded"),
+                            comic_info=comic_data,
+                            publishers=[grp_name] if grp_name else [],
+                            lang=args.language,
+                            page_count=len(cbz_images),
+                        )
                     with _cpu_guard('build_cbz'):
                         build_cbz(
                             cbz_images,
@@ -6281,6 +7837,7 @@ def main():
                             comic_data,
                             [grp_name] if grp_name else [],
                             args.language,
+                            chapter_comic_info_xml=chapter_xml,
                         )
             elif args.format == "pdf":
                 if chapter_content:
@@ -6548,6 +8105,24 @@ def main():
                 )
             break
         except Exception as e:
+            # Defense-in-depth: print so the user actually sees the failure
+            # in the live log. Phase 1 (get_chapter_images) exceptions are
+            # converted to ChapterSkippedError at the call site so they engage
+            # multi-source fallback + inline-retry inside _process_chapter_strict
+            # — they won't reach here. This branch catches the residual cases:
+            # Phase 3 build errors (CBZ assembly, PDF encode), unexpected
+            # exceptions inside the handler that slipped past the per-phase
+            # try/except blocks, or a future code path that raises before
+            # being wrapped. Recording the entry without surfacing it was the
+            # bug that masked Shuumatsu no Valkyrie Ch 5 in the user's
+            # 2026-05-16 run; printing here means future regressions of the
+            # same shape are visible immediately rather than only via
+            # missed_chapters.json after the run ends.
+            print(
+                f"  [!] Chapter {ch.get('chap', '?')} hit an unexpected error: "
+                f"{type(e).__name__}: {str(e)[:200]}. "
+                f"Recorded as missed; the run will continue."
+            )
             _record_missed(ch, grp_name, 'exception', repr(e), insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
             continue
 

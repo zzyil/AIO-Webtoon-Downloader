@@ -17,7 +17,13 @@ from .base import BaseSiteHandler, SiteComicContext
 try:  # Optional dependency; only needed for Kagane
     from pywidevine.cdm import Cdm
     from pywidevine.device import Device
-    from pywidevine.pssh import Pssh
+    # pywidevine renamed the class from Pssh to PSSH at some point
+    # (>= 1.9.0). Try the new name first, alias to Pssh so the rest of this
+    # file uses one consistent symbol regardless of the installed version.
+    try:
+        from pywidevine.pssh import PSSH as Pssh  # type: ignore
+    except ImportError:
+        from pywidevine.pssh import Pssh  # type: ignore
 except Exception:  # pragma: no cover - handled at runtime
     Cdm = None  # type: ignore
     Device = None  # type: ignore
@@ -28,10 +34,24 @@ class KaganeSiteHandler(BaseSiteHandler):
     name = "kagane"
     domains = ("kagane.org", "www.kagane.org")
 
+    # Per-process: only show the setup warning once even if the user feeds
+    # multiple Kagane URLs in one run. Reset only on a fresh interpreter.
+    _setup_warning_shown: bool = False
+
     _BASE_URL = "https://kagane.org"
-    _API_URL = "https://api.kagane.org"
-    _CERT_ENDPOINT = f"{_API_URL}/api/v1/static/bin.bin"
-    _THUMBNAIL_TEMPLATE = f"{_API_URL}/api/v1/series/{{series_id}}/thumbnail"
+    # 2026-05-13: api.kagane.org DNS gone; everything migrated to
+    # yuzuki.kagane.org/api/v2/. The series-list/book-list endpoints all live
+    # in the same v2 series payload (series_books field), and cover images are
+    # served at /api/v2/image/{image_id} where image_id comes from the
+    # series_covers entries inside the series payload — NOT from series_id.
+    # The /compressed variant returns a thumbnail-sized webp (~67KB);
+    # bare path returns full-res (~800KB+). We use /compressed for the
+    # cover_thumb and full path elsewhere.
+    _API_URL = "https://yuzuki.kagane.org"
+    _CERT_ENDPOINT = f"{_API_URL}/api/v2/static/bin.bin"
+    _IMAGE_TEMPLATE = f"{_API_URL}/api/v2/image/{{image_id}}"
+    _IMAGE_COMPRESSED_TEMPLATE = f"{_API_URL}/api/v2/image/{{image_id}}/compressed"
+    _INTEGRITY_ENDPOINT = "https://kagane.org/api/integrity"
     _INSTRUCTIONS_URL = (
         "https://github.com/zzyil/comick.io-Downloader/blob/main/docs/Widevine.md"
     )
@@ -42,6 +62,10 @@ class KaganeSiteHandler(BaseSiteHandler):
         self._cdm: Optional[Cdm] = None
         self._device_path: Optional[Path] = None
         self._token_cache: Dict[Tuple[str, str], Dict[str, object]] = {}
+        # Integrity token cached across chapters; refresh when within 30s of
+        # expiry. Required by yuzuki.kagane.org/api/v2/books POSTs (x-integrity-token header).
+        self._integrity_token: Optional[str] = None
+        self._integrity_token_exp: Optional[int] = None
 
     # ------------------------------------------------------------------ helpers
     def _extract_series_id(self, url: str) -> str:
@@ -117,6 +141,37 @@ class KaganeSiteHandler(BaseSiteHandler):
         except Exception:
             return None
 
+    def _fetch_integrity_token(self, scraper) -> str:
+        # 2026-05-13: yuzuki.kagane.org/api/v2/books rejects POSTs without
+        # x-integrity-token. Service lives on the main kagane.org host
+        # (NOT yuzuki) and returns {token, exp}. Cache + refresh 30s pre-exp.
+        now = int(time.time())
+        if (
+            self._integrity_token
+            and self._integrity_token_exp
+            and self._integrity_token_exp - 30 > now
+        ):
+            return self._integrity_token
+        resp = scraper.post(
+            self._INTEGRITY_ENDPOINT,
+            headers={
+                "Content-Type": "application/json",
+                "Referer": f"{self._BASE_URL}/",
+                "Origin": self._BASE_URL,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("token")
+        exp = data.get("exp")
+        if not token:
+            raise RuntimeError(
+                "Kagane integrity token response missing 'token' field."
+            )
+        self._integrity_token = token
+        self._integrity_token_exp = int(exp) if exp else None
+        return token
+
     def _issue_token(
         self,
         series_id: str,
@@ -137,13 +192,15 @@ class KaganeSiteHandler(BaseSiteHandler):
         finally:
             self._cdm.close(session_id)
 
+        integrity_token = self._fetch_integrity_token(scraper)
         payload = {
             "challenge": base64.b64encode(challenge).decode("ascii"),
         }
 
-        url = (
-            f"{self._API_URL}/api/v1/books/{series_id}/file/{chapter_id}"
-        )
+        # 2026-05-13 v2: POST /api/v2/books/{chapter_id}?is_datasaver=false
+        # series_id no longer appears in the path; chapter_id alone is the
+        # book identifier. is_datasaver=false explicitly opts into full-res.
+        url = f"{self._API_URL}/api/v2/books/{chapter_id}?is_datasaver=false"
 
         resp = scraper.post(
             url,
@@ -152,6 +209,7 @@ class KaganeSiteHandler(BaseSiteHandler):
                 "Origin": self._BASE_URL,
                 "Referer": f"{self._BASE_URL}/",
                 "Content-Type": "application/json",
+                "x-integrity-token": integrity_token,
             },
         )
         resp.raise_for_status()
@@ -275,7 +333,11 @@ class KaganeSiteHandler(BaseSiteHandler):
         return descrambled
 
     def _fetch_series_api(self, series_id: str, scraper) -> Dict[str, object]:
-        url = f"{self._API_URL}/api/v1/series/{series_id}"
+        # 2026-05-13: full v2 migration on yuzuki host — /api/v1/series and
+        # /api/v1/books both 404 now. /api/v2/series/{id} returns the whole
+        # series payload + the embedded `series_books` chapter list, so we
+        # use it as the single source of truth for both context AND chapters.
+        url = f"{self._API_URL}/api/v2/series/{series_id}"
         try:
             resp = scraper.get(url, headers={"Referer": f"{self._BASE_URL}/"})
             if resp.status_code != 200:
@@ -295,42 +357,175 @@ class KaganeSiteHandler(BaseSiteHandler):
             "Chrome/125.0.0.0 Safari/537.36",
         )
 
+    @staticmethod
+    def _normalize_v2_genres(genre_blocks) -> List[str]:
+        # v2 genres are dicts: {"genre_id":..., "genre_name":"Romance", "is_spoiler":false}
+        names: List[str] = []
+        if not isinstance(genre_blocks, list):
+            return names
+        for g in genre_blocks:
+            if isinstance(g, dict):
+                n = g.get("genre_name")
+                if isinstance(n, str) and n:
+                    names.append(n)
+        return names
+
+    @staticmethod
+    def _normalize_v2_alt_titles(alt_blocks) -> List[str]:
+        # v2 series_alternate_titles entries: {"label":"ja-Latn", "title":"..."}
+        out: List[str] = []
+        if not isinstance(alt_blocks, list):
+            return out
+        for it in alt_blocks:
+            if isinstance(it, dict):
+                t = it.get("title")
+                if isinstance(t, str) and t:
+                    out.append(t)
+        return out
+
+    @staticmethod
+    def _v2_staff_to_authors(staff_blocks) -> List[str]:
+        # series_staff is a list of staff entries; v2 leaves the staff array
+        # empty for many series. When populated, each entry has fields like
+        # role + name. We collect anything that looks like an author / artist
+        # name; absent data → empty list (handler stays silent).
+        out: List[str] = []
+        if not isinstance(staff_blocks, list):
+            return out
+        for s in staff_blocks:
+            if not isinstance(s, dict):
+                continue
+            nm = s.get("name") or s.get("staff_name") or s.get("title")
+            if isinstance(nm, str) and nm:
+                out.append(nm)
+        return out
+
+    def _check_kagane_setup(self) -> Optional[str]:
+        """Return None if Kagane downloads can proceed, else a short reason
+        string explaining what's missing. Drives the one-shot upfront warning
+        in fetch_comic_context so users see the actionable problem before
+        wasting time on chapter selection + retry passes.
+        """
+        if Cdm is None or Device is None or Pssh is None:
+            return (
+                "the 'pywidevine' package is missing or version-incompatible. "
+                "Install with: pip install pywidevine"
+            )
+        if not self._locate_wvd_file():
+            return (
+                "no Widevine device file (*.wvd) found. Drop a *.wvd in the "
+                "project root, or set KAGANE_WVD=<path-to-file.wvd>."
+            )
+        return None
+
+    def _maybe_show_setup_warning(self) -> None:
+        """Print a once-per-process notice if the Widevine setup is incomplete.
+
+        Why up front instead of letting the chapter-image step fail: Kagane
+        downloads are gated on Widevine DRM. Without pywidevine + a *.wvd
+        device file, every chapter fetch will fail at the token-issue step,
+        and the user only sees that after 'Selected N chapters' + 2 retry
+        passes. Surfacing the actionable problem here saves ~15-30s per
+        wasted attempt and points the user at the docs.
+        """
+        if KaganeSiteHandler._setup_warning_shown:
+            return
+        problem = self._check_kagane_setup()
+        if not problem:
+            return
+        KaganeSiteHandler._setup_warning_shown = True
+        # Plain prints (not log_verbose) so the warning appears regardless
+        # of --verbose flag — this is a hard-fail condition the user
+        # always needs to see.
+        bar = "=" * 70
+        print()
+        print(bar)
+        print("[!] Kagane downloads require Widevine DRM and will fail without setup:")
+        print(f"    {problem}")
+        print(f"    Setup guide: {self._INSTRUCTIONS_URL}")
+        print("    Tip: try --multi-source to fall back to non-DRM mirrors.")
+        print(bar)
+        print()
+
+    @staticmethod
+    def _pick_cover_image_id(details: Dict) -> Optional[str]:
+        # series_covers entries shape:
+        #   {"chapter_number": "1", "cover_id": "<uuid>", "image_id": "<uuid>",
+        #    "language": "en", "note": null, "volume_number": null}
+        # Prefer en-language; fall back to first entry. The image_id is the
+        # actual URL key; cover_id is metadata.
+        covers = details.get("series_covers") if isinstance(details, dict) else None
+        if not isinstance(covers, list) or not covers:
+            return None
+        en = next((c for c in covers if isinstance(c, dict) and c.get("language") == "en"), None)
+        chosen = en or (covers[0] if isinstance(covers[0], dict) else None)
+        if isinstance(chosen, dict):
+            iid = chosen.get("image_id")
+            if isinstance(iid, str) and iid:
+                return iid
+        return None
+
     def fetch_comic_context(
         self, url: str, scraper, make_request
     ) -> SiteComicContext:
+        # Surface DRM-setup problems BEFORE chapter selection so the user
+        # sees the actionable note rather than discovering it after every
+        # chapter "Missed" + retries. See _maybe_show_setup_warning.
+        self._maybe_show_setup_warning()
         series_id = self._extract_series_id(url)
-        resp = make_request(url, scraper)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        title = (soup.title.string or series_id).strip()
-        desc_node = soup.find("meta", attrs={"name": "description"})
-        description = desc_node["content"].strip() if desc_node else None
+        # 2026-05-13: skip HTML scrape entirely — Cloudflare interstitial
+        # parses as "Just a moment..." title which corrupts downstream
+        # filenames. The v2 series API gives a clean title + everything
+        # else we need without ever touching the CF-fronted HTML page.
+        details = self._fetch_series_api(series_id, scraper)
+        title_raw = details.get("title") if isinstance(details, dict) else None
+        title = (title_raw or series_id).strip() if isinstance(title_raw, str) else series_id
+
+        # Cover image_id comes from series_covers — not the series_id (which
+        # would 404 against /api/v2/image/). Fall back to no cover if the
+        # payload didn't list any.
+        cover_image_id = self._pick_cover_image_id(details if isinstance(details, dict) else {})
+        cover_url = self._IMAGE_TEMPLATE.format(image_id=cover_image_id) if cover_image_id else None
 
         comic: Dict[str, object] = {
             "hid": series_id,
             "title": title,
-            "desc": description,
-            "cover": self._THUMBNAIL_TEMPLATE.format(series_id=series_id),
             "_series_id": series_id,
+            # Stash the full v2 payload so get_chapters can reuse it without
+            # a second API call.
+            "_v2_series_payload": details if isinstance(details, dict) else {},
         }
+        if cover_url:
+            comic["cover"] = cover_url
 
-        details = self._fetch_series_api(series_id, scraper)
-        authors = details.get("authors") or []
-        genres = details.get("genres") or []
-        alt_titles = [
-            item.get("title")
-            for item in details.get("alternate_titles", [])
-            if isinstance(item, dict)
-        ]
+        if isinstance(details, dict) and details:
+            description = details.get("description")
+            if isinstance(description, str) and description.strip():
+                comic["desc"] = description.strip()
 
-        if authors:
-            comic["authors"] = authors
-        if genres:
-            comic["genres"] = genres
-        if alt_titles:
-            comic["alt_names"] = alt_titles
-        status = details.get("status")
-        if isinstance(status, str):
-            comic["status"] = status
+            alt_names = self._normalize_v2_alt_titles(details.get("series_alternate_titles"))
+            if alt_names:
+                comic["alt_names"] = alt_names
+
+            genres = self._normalize_v2_genres(details.get("genres"))
+            if genres:
+                comic["genres"] = genres
+
+            authors = self._v2_staff_to_authors(details.get("series_staff"))
+            if authors:
+                comic["authors"] = authors
+
+            status = details.get("publication_status")
+            if isinstance(status, str) and status:
+                comic["status"] = status
+
+            year = details.get("start_year")
+            if isinstance(year, int) and year > 0:
+                comic["year"] = year
+
+            fmt = details.get("format")
+            if isinstance(fmt, str) and fmt:
+                comic["type"] = fmt.lower()
 
         return SiteComicContext(
             comic=comic,
@@ -343,16 +538,33 @@ class KaganeSiteHandler(BaseSiteHandler):
         self, context: SiteComicContext, scraper, language: str, make_request
     ) -> List[Dict]:
         series_id = context.comic.get("_series_id") or context.identifier
-        url = f"{self._API_URL}/api/v1/books/{series_id}"
-        resp = make_request(url, scraper)
-        payload = resp.json()
+        # Prefer the v2 payload stashed by fetch_comic_context to avoid a
+        # second API call. Re-fetch only if context didn't carry it (defensive
+        # — context.comic always contains it after fetch_comic_context).
+        details = context.comic.get("_v2_series_payload")
+        if not isinstance(details, dict) or not details:
+            details = self._fetch_series_api(series_id, scraper) or {}
+
         chapters: List[Dict] = []
-        for entry in payload.get("content", []):
-            chapter_id = entry.get("id")
+        # v2 series payload embeds the chapter list as `series_books`.
+        # Each book has book_id, chapter_no (str), title, page_count,
+        # published_on, groups (list of {group_id, title}).
+        for entry in details.get("series_books", []):
+            if not isinstance(entry, dict):
+                continue
+            chapter_id = entry.get("book_id")
             if not chapter_id:
                 continue
-            pages = entry.get("pages_count") or 0
-            chap_num = entry.get("number_sort") or entry.get("number")
+            pages = entry.get("page_count") or 0
+            chap_num = entry.get("chapter_no")
+            # First group's title is the scanlation group name (most series
+            # have exactly one group per chapter).
+            group_name = None
+            groups = entry.get("groups")
+            if isinstance(groups, list) and groups and isinstance(groups[0], dict):
+                gname = groups[0].get("title") or groups[0].get("group_name")
+                if isinstance(gname, str) and gname:
+                    group_name = gname
             chapters.append(
                 {
                     "hid": chapter_id,
@@ -362,13 +574,14 @@ class KaganeSiteHandler(BaseSiteHandler):
                     "_series_id": series_id,
                     "_chapter_id": chapter_id,
                     "_pages": int(pages),
-                    "uploaded": entry.get("release_date"),
+                    "uploaded": entry.get("published_on"),
+                    "group_name": group_name,
                 }
             )
         return chapters
 
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        return None
+        return chapter_version.get("group_name")
 
     def get_chapter_images(
         self, chapter: Dict, scraper, make_request
@@ -377,10 +590,37 @@ class KaganeSiteHandler(BaseSiteHandler):
         chapter_id = chapter.get("_chapter_id") or chapter.get("hid")
         pages = int(chapter.get("_pages") or 0)
         if not series_id or not chapter_id or pages <= 0:
-            raise RuntimeError("Incomplete Kagane chapter metadata.")
+            raise RuntimeError(
+                f"Kagane chapter metadata incomplete: series_id={series_id!r} "
+                f"chapter_id={chapter_id!r} pages={pages}"
+            )
 
+        # Wrap the whole token-issue + image-fetch path with diagnostics.
+        # Errors here used to bubble up as bare HTTPError / decryption traces
+        # that aio-dl.py's chapter retry loop silently swallowed — making
+        # "Missed N chapter(s)" the only user-visible signal. We surface the
+        # failing step so the user can tell us which stage broke.
         key = (series_id, chapter_id)
-        bundle = self._get_token_bundle(series_id, chapter_id, scraper, make_request)
+        try:
+            bundle = self._get_token_bundle(series_id, chapter_id, scraper, make_request)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            from requests.exceptions import HTTPError
+            status = None
+            body_excerpt = ""
+            if isinstance(e, HTTPError) and getattr(e, "response", None) is not None:
+                status = e.response.status_code
+                try:
+                    body_excerpt = (e.response.text or "")[:200]
+                except Exception:
+                    body_excerpt = ""
+            raise RuntimeError(
+                f"Kagane token-issue failed for chapter {chapter_id!r} "
+                f"(series {series_id!r}): "
+                f"{type(e).__name__}: {e}"
+                + (f" | http_status={status} body={body_excerpt!r}" if status else "")
+            ) from e
         cache_url = bundle["cache_url"]  # type: ignore[assignment]
         token = bundle["token"]  # type: ignore[assignment]
 
@@ -407,8 +647,23 @@ class KaganeSiteHandler(BaseSiteHandler):
                     params={"token": token},
                     headers={"Referer": f"{self._BASE_URL}/"},
                 )
-            resp.raise_for_status()
-            data = self._decrypt_payload(resp.content, series_id, chapter_id, idx)
+            if resp.status_code >= 400:
+                body_excerpt = ""
+                try:
+                    body_excerpt = (resp.text or "")[:200]
+                except Exception:
+                    body_excerpt = ""
+                raise RuntimeError(
+                    f"Kagane image fetch failed: chapter {chapter_id!r} page {idx}/{pages} "
+                    f"-> http_status={resp.status_code} url={image_url} body={body_excerpt!r}"
+                )
+            try:
+                data = self._decrypt_payload(resp.content, series_id, chapter_id, idx)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Kagane image decrypt failed: chapter {chapter_id!r} page {idx}/{pages} "
+                    f"({len(resp.content)} bytes): {type(e).__name__}: {e}"
+                ) from e
             images.append(
                 {
                     "type": "binary_image",

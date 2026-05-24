@@ -178,7 +178,6 @@
 | [webniichan.online](https://webniichan.online) | SSL Error ⛔️ |
 | [WebtoonHatti](https://webtoonhatti.club) | SSL Error ⛔️ |
 | [WebtoonTR](https://webtoontr.net) | recent check 11.26.25 ✅ |
-| [webtoons.com (LINE Webtoon)](https://www.webtoons.com/en/) | English /en/ only · Originals + Canvas · uses mobile JSON API for fast chapter lists · is_official=true (ranked above fan aggregators in multi-source) · motion-toon: layers as separate pages |
 | [weebcentral.com](https://weebcentral.com) | recent check 11.27.25 ✅ · Supports scanlation group selection |
 | [whalemanga.com](https://whalemanga.com) | recent check 11.26.25 ✅ |
 | [witchscans.com](https://witchscans.com) | recent check 11.26.25 ✅ |

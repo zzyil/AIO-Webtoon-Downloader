@@ -17,6 +17,14 @@ except ImportError:
     def fetch_html_playwright(*args, **kwargs):
         raise ImportError("Playwright not available")
 
+# Zendriver-based CF cookie path (ported from upstream/main 2026-05-13).
+# Used by handlers that set use_zendriver=True in sites/__init__.py — these
+# sites' WAF challenges can't be solved by cloudscraper but Zendriver +
+# headless Chrome can. fetch_html_zendriver fetches the page; sync_cf_cookies
+# copies the live cf_clearance cookie into the scraper session so subsequent
+# plain requests (image fetches, chapter pages) inherit the solved challenge.
+# Graceful fallback when zendriver isn't installed — affected handlers will
+# still load but will fail on actual fetch attempts with a clear error.
 try:
     from .crawlee_utils import (
         fetch_html_with_cf_cookies,
@@ -74,12 +82,72 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
     
     def _make_soup(self, html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
-    
+
     def _normalize_url(self, url: str) -> str:
         """Normalize URL if custom normalizer is provided."""
         if self._url_normalizer:
             return self._url_normalizer(url)
         return url
+
+    def _extract_imptdt_values(self, soup: BeautifulSoup, label: str) -> List[str]:
+        """Extract values from a MangaThemesia `.imptdt` label/value row.
+
+        Real MangaThemesia (the WordPress theme this base class is named for)
+        renders series metadata as `<div class="imptdt">Label <i>Value</i></div>`
+        rows — one each for Status, Type, Released, Author, Artist, Serialization,
+        Posted By. The label is plain text at the start; values are wrapped in
+        `<a>` or `<i>` elements (or the bare remainder text when neither).
+
+        This is the canonical extractor. The existing `.author-content`,
+        `.genres-content`, `.post-status` selectors in `fetch_comic_context`
+        below are Madara-theme selectors that happen to also work on a handful
+        of MT sites that mix themes; we keep them as a layered fallback. See
+        sites/tecnoxmoon.py:106-126 for the original implementation this is
+        ported from — that handler had to roll its own enrichment because the
+        base parser didn't read `.imptdt` rows.
+
+        Returns a dedup-preserving list (first occurrence wins). Empty list
+        when no matching row exists.
+        """
+        # Match the label only when followed by `:`, whitespace, or end-of-
+        # string. The previous bare `startswith(label.lower())` accepted
+        # 'Author Note:', 'Authored By:', 'Artist Statement:', 'Status
+        # Update:' — any of which would feed wrong content back through the
+        # `if imptdt_authors: authors = imptdt_authors` assignments below and
+        # silently overwrite the canonical author/artist/status lists parsed
+        # by the Madara-style selectors. The character class `[:\s]` covers
+        # the realistic delimiters MangaThemesia variants render between the
+        # label and its value (`:`, space, NBSP — `\s` covers NBSP per
+        # re.UNICODE which is the default in Py3).
+        label_lower = label.lower()
+        boundary_pattern = re.compile(
+            r"^" + re.escape(label_lower) + r"(?:[:\s]|$)"
+        )
+        for row in soup.select(".imptdt"):
+            text = row.get_text(" ", strip=True)
+            text_lower = text.lower()
+            if not boundary_pattern.match(text_lower):
+                continue
+            values: List[str] = []
+            for node in row.select("a, i"):
+                value = node.get_text(strip=True)
+                if value:
+                    values.append(value)
+            if not values:
+                # Strip the label prefix AND any trailing `:` / whitespace
+                # before re-using the remainder. `len(label)` alone left
+                # entries like ": Real Name" after the boundary-aware match
+                # promoted a `Status:`-prefixed row to a value of `: Real`.
+                remainder = text[len(label):].lstrip(":").strip()
+                if remainder:
+                    values.append(remainder)
+            if values:
+                seen: List[str] = []
+                for val in values:
+                    if val not in seen:
+                        seen.append(val)
+                return seen
+        return []
 
     # ---------------------------------------------------------------- search
     # MangaThemesia framework search: GET /?s=<query> returns the standard
@@ -190,7 +258,17 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         url = self._normalize_url(url)
         if self.use_zendriver:
-            html = fetch_html_zendriver(url, wait_selector="h1.entry-title, h1.series-title, h1.post-title")
+            # Zendriver-based path: fetch via headless Chrome to solve CF
+            # challenges, then sync the captured cf_clearance cookie back
+            # into the scraper so subsequent plain HTTP calls (image fetches,
+            # chapter listing) inherit the solved challenge. wait_selector
+            # waits for the series title element to ensure the page actually
+            # rendered before we parse. Stashed raw HTML lets get_chapters
+            # reuse it without re-launching Chrome.
+            html = fetch_html_zendriver(
+                url,
+                wait_selector="h1.entry-title, h1.series-title, h1.post-title",
+            )
             sync_cf_cookies(scraper, url)
             soup = BeautifulSoup(html, "html.parser")
         elif self.use_playwright:
@@ -214,6 +292,15 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         
         desc_node = soup.select_one(".entry-content p, .summary__content p")
         desc = desc_node.get_text(strip=True) if desc_node else None
+        # Real-MangaThemesia desc fallback: itemprop="description" is the
+        # canonical schema.org tag. Sites that strip the `.entry-content`
+        # wrapper but keep the structured-data markup land here.
+        if not desc:
+            itemprop_desc = soup.select_one("[itemprop='description']")
+            if itemprop_desc is not None:
+                text = itemprop_desc.get_text(" ", strip=True)
+                if text:
+                    desc = text
         
         # Cover image
         cover_node = soup.select_one(".thumb img, .summary_image img")
@@ -238,21 +325,62 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
                 if match:
                     cover = match.group(1)
         
-        # Authors
+        # Authors — Madara-style selectors first (a small minority of MT
+        # sites render Madara markup); imptdt rows are the real MangaThemesia
+        # surface and override when present.
         authors = []
         author_nodes = soup.select(".author-content a, .artist-content a")
         for node in author_nodes:
-            authors.append(node.get_text(strip=True))
-            
-        # Genres
+            text = node.get_text(strip=True)
+            if text:
+                authors.append(text)
+        imptdt_authors = self._extract_imptdt_values(soup, "Author")
+        if imptdt_authors:
+            authors = imptdt_authors
+
+        # Artists — real MangaThemesia exposes a separate Artist row. Komikku's
+        # details.json requires the artist field; we now extract it here. Before
+        # this fix the base parser had no `artists` extraction at all (see
+        # dry_run_komikku_findings.md §A — rizzfables/rizzcomic/violetscans).
+        artists: List[str] = []
+        imptdt_artists = self._extract_imptdt_values(soup, "Artist")
+        if imptdt_artists:
+            artists = imptdt_artists
+
+        # Genres — Madara-style fallback first, then the canonical `.mgen a`
+        # used by real MangaThemesia.
         genres = []
         genre_nodes = soup.select(".genres-content a")
         for node in genre_nodes:
-            genres.append(node.get_text(strip=True))
+            text = node.get_text(strip=True)
+            if text:
+                genres.append(text)
+        if not genres:
+            for node in soup.select(".mgen a"):
+                text = node.get_text(strip=True)
+                if text:
+                    genres.append(text)
 
-        # Status
+        # Status — Madara fallback first, then imptdt Status row.
         status_node = soup.select_one(".post-status .summary-content, .status-content")
         status = status_node.get_text(strip=True) if status_node else "Unknown"
+        if not status or status == "Unknown":
+            imptdt_status = self._extract_imptdt_values(soup, "Status")
+            if imptdt_status:
+                status = imptdt_status[0]
+
+        # Alt titles — MT skins surface them under `.seriestualt`. Splits on
+        # the usual separator zoo; deduped while preserving order. Skip year:
+        # MT's "Posted On" is the series-page creation date, not series start.
+        alt_titles: List[str] = []
+        for el in soup.select(".seriestualt"):
+            text = el.get_text(" ", strip=True)
+            if not text:
+                continue
+            for piece in re.split(r"[,;/|]", text):
+                p = piece.strip()
+                if p and p not in alt_titles:
+                    alt_titles.append(p)
 
         slug = url.rstrip("/").split("/")[-1]
         post_id_from_html = self._extract_post_id(html)
@@ -271,11 +399,18 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             "desc": desc,
             "cover": cover,
             "authors": authors,
+            # `artists` was missing from the base before the 2026-05-19
+            # Komikku-metadata pass. aio-dl.py:6042 joins this list into
+            # details.json's `artist` field; emit it even when empty so the
+            # Komikku writer treats it as "no artist" rather than KeyError.
+            "artists": artists,
             "genres": genres,
             "status": status,
             "url": url,
         }
-        
+        if alt_titles:
+            comic["alt_names"] = alt_titles
+
         comic["_raw_html"] = html
         if post_id_from_html:
             comic["_post_id"] = str(post_id_from_html)
@@ -286,11 +421,13 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         self, context: SiteComicContext, scraper, language: str, make_request
     ) -> List[Dict]:
         url = context.comic["url"]
-        
+
         if self.use_zendriver:
-            # Reuse the HTML already fetched by fetch_comic_context to avoid
-            # launching a second browser window.  CF cookies were cached on
-            # the first call so subsequent plain requests will work too.
+            # Reuse the HTML already fetched by fetch_comic_context (stashed
+            # in context.comic["_raw_html"] above) to avoid launching a
+            # second browser window for the same series. CF cookies were
+            # cached on the first Zendriver call so subsequent plain make_request
+            # calls also inherit the solved challenge.
             cached_html = context.comic.get("_raw_html")
             if cached_html:
                 soup = BeautifulSoup(cached_html, "html.parser")
@@ -399,8 +536,10 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         html: Optional[str]
         soup: Optional[BeautifulSoup]
         if self.use_zendriver:
-            # Reuse CF cookies captured in fetch_comic_context instead of
-            # opening yet another Chrome window for every chapter.
+            # Reuse CF cookies captured in fetch_comic_context. The scraper
+            # session already carries the solved cf_clearance, so a plain
+            # make_request works — no need to open yet another Chrome
+            # window per chapter (which would 5-10× the per-chapter latency).
             sync_cf_cookies(scraper, url)
             response = make_request(url, scraper)
             html = response.text

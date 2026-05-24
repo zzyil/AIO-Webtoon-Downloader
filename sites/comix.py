@@ -1,29 +1,66 @@
 from __future__ import annotations
 
+import atexit
+import builtins as _builtins
+import concurrent.futures as _futures
 import json
+import queue
 import re
+import sys
+import threading
 from typing import Dict, List, Optional, Any
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qsl, quote_plus, urlparse
 
 from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
-try:
-    from .crawlee_utils import get_cf_session, is_cf_challenge
-    _CF_AVAILABLE = True
-except ImportError:
-    _CF_AVAILABLE = False
+
+# All bare print() calls in this module emit to stderr by default. Why: this
+# handler's Patchright bridge logs [!] diagnostic messages when chapter-API
+# capture fails, and when invoked from the orchestrator's search-time probe
+# path (sites/search_orchestrator.py:_probe_one) those lines would land on
+# stdout — which carries the JSON --search output for piped consumers. The
+# UI's searcher.js rejects non-JSON stdout with "Search produced non-JSON
+# stdout" so any leak hard-breaks the search results panel. This shim keeps
+# stdout clean without touching every print site. Explicit file= overrides
+# still work (e.g., pass file=sys.stdout to opt out). Same idiom as
+# sites/mangafire.py:_stderr_print.
+def _stderr_print(*args, **kwargs):
+    kwargs.setdefault("file", sys.stderr)
+    return _builtins.print(*args, **kwargs)
+
+
+print = _stderr_print  # noqa: A001 — intentional shadow of builtins.print
 
 
 class ComixSiteHandler(BaseSiteHandler):
     name = "comix"
     domains = ("comix.to", "www.comix.to")
-    _BASE_URL = "https://comix.to"
 
-    def __init__(self):
-        super().__init__()
-        self._cf_session = None  # Lazy-init zendriver CF session
+    # comix.to API endpoints are token-gated with per-URL HMAC signatures
+    # (`_=<sig>` param) we can't reproduce in Python. The only tractable
+    # path is letting Patchright navigate the page and either capturing the
+    # outgoing request URL (for listing — replayed with cloudscraper) or
+    # reading the response body (for chapter detail — we steal the JSON
+    # directly).
+    #
+    # Patchright's sync API requires that every call run on the same thread
+    # that started the browser, AND that thread must own an asyncio loop.
+    # Probe-phase workers (sites/search_orchestrator.py:4346-4354) and
+    # aio-dl.py's image-prefetch threads can't satisfy either. So we route
+    # all Patchright work through _COMIX_BROWSER_BRIDGE (defined at the
+    # bottom of this file), which serializes calls onto a single dedicated
+    # worker thread, one process-wide. Block-on-future semantics make the
+    # bridge fully synchronous from any caller's perspective.
+    #
+    # Cross-file: identical idiom to sites/mangafire_vrf_simple.py:_VRFBridge.
+    #
+    # Token cache memoizes successful list-API sig captures by title-url
+    # across the bridge's lifetime AND across multiple handler instances.
+    # Tokens are URL-bound (not session-bound) so one capture per title
+    # covers paginated chapter-list fetches.
+    _ChaptersTokenCache: Dict[str, str] = {}
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.update({
@@ -31,75 +68,36 @@ class ComixSiteHandler(BaseSiteHandler):
             "Origin": "https://comix.to",
         })
 
-    def _get_cf_session(self):
-        """Get or create a CF-cookie session for comix.to."""
-        if self._cf_session is None and _CF_AVAILABLE:
-            try:
-                self._cf_session = get_cf_session(self._BASE_URL)
-                self._cf_session.headers.update({
-                    "Referer": "https://comix.to/",
-                    "Origin": "https://comix.to",
-                })
-            except Exception as e:
-                print(f"[!] Comix CF session failed: {e}")
-        return self._cf_session
-
-    def _cf_aware_request(self, url: str, scraper, make_request):
-        """Try standard request first; on CF 403, fall back to zendriver session."""
-        response = make_request(url, scraper)
-
-        # Check if we got a CF challenge
-        if _CF_AVAILABLE and response.status_code in (403, 503):
-            try:
-                if is_cf_challenge(response.status_code, response.text):
-                    cf = self._get_cf_session()
-                    if cf:
-                        response = cf.get(url, timeout=20)
-            except Exception:
-                pass  # Return original response
-
-        return response
-
     def _get_api_token(self, url: str) -> Optional[str]:
-        """Temporarily launches Patchright to capture the token needed for the chapters API."""
-        if not url:
-            return None
-        if not url.startswith("http"):
-            from urllib.parse import urljoin
-            url = urljoin(self._BASE_URL, url)
-        try:
-            try:
-                from patchright.sync_api import sync_playwright
-            except ImportError:
-                from playwright.sync_api import sync_playwright
-            from urllib.parse import parse_qsl
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-                page = browser.new_page()
-                
-                token_query = None
-                
-                def handle_req(request):
-                    nonlocal token_query
-                    if ("chapters?" in request.url or "/chapters/" in request.url) and "_=" in request.url:
-                        parts = request.url.split("?")
-                        if len(parts) > 1:
-                            token_query = parts[1]
-                            
-                page.on("request", handle_req)
-                page.goto(url)
-                
-                # Wait for API request
-                for _ in range(50):
-                    if token_query:
-                        break
-                    page.wait_for_timeout(100)
-                    
-                browser.close()
-                return token_query
-        except Exception as e:
-            print(f"[!] Playwright token capture failed: {e}")
-            return None
+        """Return the `_=<sig>&time=<ts>` query string for the chapter
+        listing API (`/api/v1/manga/{hid}/chapters`).
+
+        Cached per (title url) on the class; first miss drives the bridge,
+        which navigates Patchright to the title URL and intercepts the
+        outgoing /chapters?_=… request. Returns the bare query string
+        (no leading `?`) or None on failure.
+
+        Cross-file: actual Patchright work lives in
+        `_ComixBrowserSession.get_api_token` at the bottom of this file.
+        """
+        cached = ComixSiteHandler._ChaptersTokenCache.get(url)
+        if cached:
+            return cached
+        token_query = _COMIX_BROWSER_BRIDGE.get_api_token(url)
+        if token_query:
+            ComixSiteHandler._ChaptersTokenCache[url] = token_query
+        return token_query
+
+    def _fetch_chapter_api_via_browser(self, chapter_url: str, chap_id) -> Optional[Dict]:
+        """Steal the chapter-detail API response body via Patchright.
+
+        Returns the parsed `/api/v1/chapters/{chap_id}` response dict (with
+        `result.pages`) or None on failure.
+
+        Cross-file: actual Patchright work lives in
+        `_ComixBrowserSession.fetch_chapter_api` at the bottom of this file.
+        """
+        return _COMIX_BROWSER_BRIDGE.fetch_chapter_api(chapter_url, chap_id)
 
     def _extract_next_data(self, html: str) -> List[Any]:
         """Extracts data pushed to self.__next_f."""
@@ -219,7 +217,7 @@ class ComixSiteHandler(BaseSiteHandler):
         return names
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
-        response = self._cf_aware_request(url, scraper, make_request)
+        response = make_request(url, scraper)
         html = response.text
         soup = BeautifulSoup(html, "html.parser")
         
@@ -239,14 +237,19 @@ class ComixSiteHandler(BaseSiteHandler):
         # Try to fetch from API endpoint if we have hash_id
         if hash_id:
             try:
+                # 2026-05-13: comix.to disabled /api/v2/manga/{hid} (returns
+                # 404 with HTML body > 100 bytes, slipping past the warning
+                # path in make_request). v1 is the documented public API per
+                # their JS bundle's axios baseURL. Keep v2 as a fallback in
+                # case they re-enable.
                 api_url = f"https://comix.to/api/v1/manga/{hash_id}"
-                api_response = self._cf_aware_request(api_url, scraper, make_request)
+                api_response = make_request(api_url, scraper)
                 if api_response.status_code == 404:
                     api_url = f"https://comix.to/api/v2/manga/{hash_id}"
-                    api_response = self._cf_aware_request(api_url, scraper, make_request)
-                    
+                    api_response = make_request(api_url, scraper)
                 api_data = api_response.json()
-                
+
+                # v1 returns status="ok"; v2 returned status=200. Accept both.
                 if api_data.get("status") in (200, "ok") and api_data.get("result"):
                     manga_data = api_data["result"]
                     # Ensure hid is set
@@ -329,11 +332,17 @@ class ComixSiteHandler(BaseSiteHandler):
             if desc_meta and desc_meta.get("content"):
                 manga_data["desc"] = desc_meta["content"].strip()
 
-        if manga_data.get("url"):
-            if not manga_data["url"].startswith("http"):
-                from urllib.parse import urljoin
-                manga_data["url"] = urljoin("https://comix.to", manga_data["url"])
-        elif url:
+        # comix.to API returns relative paths (e.g. "/title/pvry-one-piece")
+        # in manga_data["url"]. _get_api_token → page.goto in get_chapters
+        # requires an absolute URL or Patchright raises "Cannot navigate to
+        # invalid URL", which short-circuits the token capture and causes the
+        # downstream /chapters API to 403. Normalize here so every caller of
+        # context.comic["url"] sees a usable absolute URL. Fall back to the
+        # caller-supplied url only when the API didn't populate the field.
+        api_url_value = manga_data.get("url")
+        if isinstance(api_url_value, str) and api_url_value.startswith("/"):
+            manga_data["url"] = "https://comix.to" + api_url_value
+        elif url and not api_url_value:
             manga_data["url"] = url
 
         list_mappings = {
@@ -342,6 +351,7 @@ class ComixSiteHandler(BaseSiteHandler):
             "format": ["format"],
             "authors": ["authors", "author"],
             "artists": ["artists", "artist"],
+            "alt_names": ["alt_names", "alt_titles", "altTitles", "aliases", "alternative_names"],
         }
         for target_key, source_keys in list_mappings.items():
             for source_key in source_keys:
@@ -350,11 +360,20 @@ class ComixSiteHandler(BaseSiteHandler):
                     manga_data[target_key] = normalized
                     break
 
+        # Year may live under any of these depending on the comix.to API
+        # version. Guard tightly: only int values > 0; non-int payloads are
+        # silently dropped so downstream consumers always see a clean field.
+        for year_key in ("year", "release_year", "year_of_release"):
+            year_raw = manga_data.get(year_key)
+            if isinstance(year_raw, int) and year_raw > 0:
+                manga_data["year"] = year_raw
+                break
+
         return SiteComicContext(
             comic=manga_data,
             title=manga_data.get("title", "Unknown"),
             identifier=manga_data.get("hid") or manga_data.get("hash_id"),
-            soup=soup 
+            soup=soup
         )
 
     def get_chapters(
@@ -364,37 +383,56 @@ class ComixSiteHandler(BaseSiteHandler):
         if not hash_id:
              raise RuntimeError("Missing manga identifier (hash_id).")
 
-        # Capture token
-        manga_url = context.comic.get("url", f"https://comix.to/title/{hash_id}")
-        token_qs = self._get_api_token(manga_url)
-        token_params = ""
-        if token_qs:
-            from urllib.parse import parse_qsl, urlencode
-            params = dict(parse_qsl(token_qs))
-            if "_" in params:
-                token_params = urlencode({"time": params.get("time", "1"), "_": params.get("_")})
+        # Capture the `_=<sig>` query token up front. v1 chapters endpoint
+        # returns 403 without it; v2 is permanently 404. Per probe, the sig
+        # validates the request path only — page/limit/order can vary freely
+        # while the same `_=` is reused. So we capture once, then paginate
+        # with our own params.
+        # When capture fails (no patchright/playwright, browser launch error)
+        # we still attempt the bare API URLs — they'll 403, but the HTML
+        # fallback in get_chapter_images may still get the user images.
+        title_url = context.comic.get("url") or f"https://comix.to/title/{hash_id}"
+        captured_qs = self._get_api_token(title_url) or ""
+        sig = ""
+        if captured_qs:
+            for k, v in parse_qsl(captured_qs):
+                if k == "_":
+                    sig = v
+                    break
 
         chapters = []
         page = 1
-        limit = 100 # Use a reasonable limit
-        
+        # Server caps at limit=100 (limit=200 → 422 Unprocessable Entity);
+        # 100 covers a 67-item title in one page and most series in 1-3
+        # pages. limit is NOT part of the signature so we can pick any
+        # accepted value without re-capturing the token.
+        limit = 100
+
         while True:
-            api_url = f"https://comix.to/api/v1/manga/{hash_id}/chapters?order[number]=desc&limit={limit}&page={page}"
-            if token_params:
-                api_url += f"&{token_params}"
-                
-            response = self._cf_aware_request(api_url, scraper, make_request)
+            # 2026-05-13: v2 chapters endpoint 404s; v1 serves but requires
+            # the captured token. Keep v2 as 404 fallback for forward-compat.
+            api_url = (
+                f"https://comix.to/api/v1/manga/{hash_id}/chapters"
+                f"?order[number]=desc&limit={limit}&page={page}"
+            )
+            if sig:
+                api_url += f"&_={sig}"
+            response = make_request(api_url, scraper)
             if response.status_code == 404:
-                api_url = f"https://comix.to/api/v2/manga/{hash_id}/chapters?order[number]=desc&limit={limit}&page={page}"
-                if token_params:
-                    api_url += f"&{token_params}"
-                response = self._cf_aware_request(api_url, scraper, make_request)
+                api_url = (
+                    f"https://comix.to/api/v2/manga/{hash_id}/chapters"
+                    f"?order[number]=desc&limit={limit}&page={page}"
+                )
+                if sig:
+                    api_url += f"&_={sig}"
+                response = make_request(api_url, scraper)
             try:
                 data = response.json()
             except json.JSONDecodeError:
                 break
-                
-            if data.get("status") != "ok" and data.get("status") != 200:
+
+            # v1 status="ok"; v2 status=200. Accept both.
+            if data.get("status") not in (200, "ok"):
                 break
                 
             items = data.get("result", {}).get("items", [])
@@ -402,72 +440,101 @@ class ComixSiteHandler(BaseSiteHandler):
                 break
                 
             for item in items:
-                # Filter by language — but be lenient:
-                # - If the item has no language field, include it (don't silently drop)
-                # - Handle variations like "English" vs "en", case-insensitive
-                item_lang = item.get("language")
-                if language and item_lang is not None:
-                    # Normalize both to lowercase for comparison
-                    lang_lower = language.lower()
-                    item_lang_lower = item_lang.lower()
-                    # Match exact code, or long-form name starting with the code
-                    # e.g. "en" matches "en", "english", "English"
-                    if item_lang_lower != lang_lower and not item_lang_lower.startswith(lang_lower):
-                        continue
-                    
+                # Filter by language if needed, though the API seems to return 'en' mostly
+                if language and item.get("language") != language:
+                    continue
+
                 chap_num = item.get("number")
+                # v1 uses `id`; v2 used `chapter_id`. Try v1 first.
                 chap_id = item.get("id") or item.get("chapter_id")
                 title = item.get("name") or f"Chapter {chap_num}"
-                
-                chap_url = item.get("url")
-                if not chap_url:
-                    # Construct URL
-                    # Format: https://comix.to/title/{hash_id}-{slug}/{chapter_id}-chapter-{number}
-                    slug = context.comic.get("slug")
-                    
-                    # If we don't have the slug from API, try to get it from the context URL
-                    if not slug and context.comic.get("url"):
-                         path = urlparse(context.comic["url"]).path
-                         parts = path.split('/')
-                         if len(parts) >= 3:
-                             # This is likely the full slug (hash_id-slug)
-                             slug = parts[2] 
-                             # If we use this, we don't need to prepend hash_id again if it's already there
-                             if slug.startswith(f"{hash_id}-"):
-                                 pass
-                             else:
-                                 # This shouldn't happen if the URL is correct, but let's be safe
-                                 pass
 
-                    if not slug:
-                        slug = "unknown"
-                    
-                    # Ensure slug starts with hash_id
-                    if not slug.startswith(f"{hash_id}-"):
-                        slug = f"{hash_id}-{slug}"
-
-                    chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{chap_num}"
+                # Normalize chap_num to a parseable numeric string.
+                # The API USUALLY returns int/float (e.g. 47, 47.5), but
+                # has been observed returning None / "" / non-numeric
+                # strings for special chapters (oneshots, side stories,
+                # season-break placeholders). aio-dl.py:5885 calls
+                # float(chap) for chapter bucketing and ValueErrors on
+                # "None" / non-numeric text → the chapter gets skipped
+                # with "Skipping chapter with invalid number: None" and
+                # the user sees zero comix chapters downloaded.
+                # Resolution order:
+                #   1. item["number"] when numeric → "%g" coerce ("47", "47.5").
+                #   2. item["number"] as a string with embedded digits
+                #      → regex-extract.
+                #   3. item["name"] / title → regex-extract.
+                # Skip the chapter entirely when no numeric token is
+                # available — surfacing a non-numeric `chap` would just
+                # trigger the same skip downstream with a misleading
+                # "Skipping chapter with invalid number" log line.
+                chap_str: Optional[str] = None
+                if isinstance(chap_num, (int, float)):
+                    chap_str = f"{chap_num:g}"
                 else:
-                    if not chap_url.startswith("http"):
-                        from urllib.parse import urljoin
-                        chap_url = urljoin(self._BASE_URL, chap_url)
-                
+                    for source_text in (
+                        chap_num if isinstance(chap_num, str) else None,
+                        title,
+                    ):
+                        if not source_text:
+                            continue
+                        m = re.search(r"(\d+(?:\.\d+)?)", str(source_text))
+                        if m:
+                            chap_str = m.group(1)
+                            break
+                if chap_str is None:
+                    continue
+
+                # Construct URL
+                # Format: https://comix.to/title/{hash_id}-{slug}/{chapter_id}-chapter-{number}
+                slug = context.comic.get("slug")
+
+                # If we don't have the slug from API, try to get it from the context URL
+                if not slug and context.comic.get("url"):
+                     path = urlparse(context.comic["url"]).path
+                     parts = path.split('/')
+                     if len(parts) >= 3:
+                         # This is likely the full slug (hash_id-slug)
+                         slug = parts[2]
+                         # If we use this, we don't need to prepend hash_id again if it's already there
+                         if slug.startswith(f"{hash_id}-"):
+                             pass
+                         else:
+                             # This shouldn't happen if the URL is correct, but let's be safe
+                             pass
+
+                if not slug:
+                    slug = "unknown"
+
+                # Ensure slug starts with hash_id
+                if not slug.startswith(f"{hash_id}-"):
+                    slug = f"{hash_id}-{slug}"
+
+                # URL still uses the API's raw `number` value (which is
+                # what comix.to's chapter-page URL expects); chap_str is
+                # only for our internal bucketing/sorting. Falls back to
+                # chap_str when the API field was unparseable so the URL
+                # at least targets the right chapter number rather than
+                # the literal string "None".
+                url_chap_part = chap_num if chap_num not in (None, "") else chap_str
+                chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{url_chap_part}"
+
+                # v1 uses `group`; v2 used `scanlation_group`. Try both.
                 group_info = item.get("group") or item.get("scanlation_group") or {}
                 group_name = group_info.get("name") if group_info else None
 
                 chapters.append({
                     "url": chap_url,
-                    "chap": str(chap_num),
+                    "chap": chap_str,
                     "title": title,
                     "id": chap_id,
                     "group": group_name,
-                    "up_count": item.get("votes", 0)
+                    "up_count": item.get("votes", 0),
                 })
-            
+
             if len(items) < limit:
                 break
             page += 1
-            
+
         return chapters
 
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
@@ -475,71 +542,96 @@ class ComixSiteHandler(BaseSiteHandler):
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
-        if url and not url.startswith("http"):
-            from urllib.parse import urljoin
-            url = urljoin(self._BASE_URL, url)
         chap_id = chapter.get("id")
-        
-        images = []
-        
-        # New API fetching logic
-        if chap_id:
-            token_qs = self._get_api_token(url)
-            from urllib.parse import parse_qsl, urlencode
-            params = dict(parse_qsl(token_qs)) if token_qs else {}
-            token_params = urlencode({"time": params.get("time", "1"), "_": params.get("_")}) if "_" in params else ""
-            
-            api_url = f"https://comix.to/api/v1/chapters/{chap_id}"
-            if token_params:
-                api_url += f"?{token_params}"
-                
-            response = self._cf_aware_request(api_url, scraper, make_request)
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    pages = data.get("result", {}).get("pages", [])
-                    images = [p.get("url") for p in pages if p.get("url")]
-                except json.JSONDecodeError:
-                    pass
-        
-        if not images:
-            # Fallback to HTML parsing if API fails
-            response = self._cf_aware_request(url, scraper, make_request)
-            html = response.text
-            
-            next_data = self._extract_next_data(html)
-            
-            for item in next_data:
-                # Look for "images" key which is a list of strings
-                imgs = self._find_key_recursive(item, "images")
-                if imgs and isinstance(imgs, list) and len(imgs) > 0 and isinstance(imgs[0], str):
-                    images = imgs
-                    break
-            
-            if not images:
-                 # Fallback: regex for "images":["url1", "url2"]
-                 match = re.search(r'"images":\[(.*?)\]', html)
-                 if match:
-                     img_list_str = match.group(1)
-                     # Extract URLs
-                     images = re.findall(r'"(https?://[^"]+)"', img_list_str)
+        images: List[str] = []
 
-            if not images:
-                 # Fallback for escaped JSON (inside Next.js data string)
-                 match = re.search(r'\\"images\\":\[(.*?)\]', html)
-                 if match:
-                     img_list_str = match.group(1)
-                     try:
-                         unescaped = "[" + img_list_str.replace('\\"', '"') + "]"
-                         images = json.loads(unescaped)
-                     except Exception:
-                         images = re.findall(r'\\"(https?://[^"]+)\\"', img_list_str)
+        # 2026-05-13: chapter HTML is now a ~6.7KB SPA shell with no embedded
+        # images — JS calls /api/v1/chapters/{id}?_=<sig> client-side, where
+        # `_=` is a per-URL HMAC we can't reproduce in Python. Patchright
+        # navigates to the chapter URL and we steal the response body the
+        # browser already received. Persistent browser (see _ensure_browser)
+        # amortizes startup cost across chapters in the same download.
+        if chap_id and url:
+            data = self._fetch_chapter_api_via_browser(url, chap_id)
+            if data:
+                # 2026-05-13 v1 chapter-detail shape:
+                #   result.pages = {"baseUrl": "<cdn-path-with-trailing-slash>",
+                #                   "items": [{"url": "01.webp", "width": ..., "height": ...}, ...]}
+                # Full image URL = baseUrl + items[i].url. Items typically all
+                # webp; the baseUrl host rotates per chapter (anti-hotlink).
+                result = data.get("result") or {}
+                pages_obj = result.get("pages") or {}
+                base_url = pages_obj.get("baseUrl") or ""
+                items = pages_obj.get("items") or []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    rel = item.get("url")
+                    if not isinstance(rel, str) or not rel:
+                        continue
+                    images.append(rel if rel.startswith("http") else (base_url + rel))
+
+        if images:
+            return images
+
+        # ----- HTML-scrape fallback (kept for forward-compat if comix re-enables SSR) -----
+        if not url:
+            raise RuntimeError("Comix chapter is missing both id and url; cannot fetch images.")
+        response = make_request(url, scraper)
+        html = response.text
+
+        next_data = self._extract_next_data(html)
+
+        for item in next_data:
+            # Look for "images" key which is a list of strings
+            imgs = self._find_key_recursive(item, "images")
+            if imgs and isinstance(imgs, list) and len(imgs) > 0 and isinstance(imgs[0], str):
+                images = imgs
+                break
+
+        if not images:
+             # Fallback: regex for "images":["url1", "url2"]
+             match = re.search(r'"images":\[(.*?)\]', html)
+             if match:
+                 img_list_str = match.group(1)
+                 # Extract URLs
+                 images = re.findall(r'"(https?://[^"]+)"', img_list_str)
+
+        if not images:
+             # Fallback for escaped JSON (inside Next.js data string)
+             # Matches \"images\":[\"url1\", \"url2\"]
+             match = re.search(r'\\"images\\":\[(.*?)\]', html)
+             if match:
+                 img_list_str = match.group(1)
+                 # Extract URLs (unescaped)
+                 # The URLs will be like \"https://...\"
+                 # We need to capture the URL inside the escaped quotes
+                 # The regex r'\\"(https?://[^"]+)\\"' might fail if there are escaped chars inside the URL, but usually not.
+                 # Safer: unescape the whole string first
+                 try:
+                     # Add brackets to make it a valid JSON list string: ["url1", "url2"]
+                     # But img_list_str is like \"url1\",\"url2\"
+                     # So we wrap it in brackets and unescape quotes? No.
+                     # img_list_str is literally: \"https://...\",\"https://...\"
+                     # We can just replace \" with " and then parse as JSON list
+                     unescaped = "[" + img_list_str.replace('\\"', '"') + "]"
+                     images = json.loads(unescaped)
+                 except Exception:
+                     # Regex fallback for escaped
+                     images = re.findall(r'\\"(https?://[^"]+)\\"', img_list_str)
 
         if not images:
             raise RuntimeError("Could not find images in chapter page.")
-            
+
         return images
 
+    # ----------------------------------------------------------------- search
+    # Comix uses /api/v1/manga?keyword=<query>. The /api/v1/search endpoint
+    # in their JS bundle config IS a thing but returns 404 for unauth GETs;
+    # /api/v1/manga is the public list endpoint with a 'keyword' filter that
+    # behaves as substring/relevance match. (axios baseURL=/api/v1; bundle
+    # exposes a top-level routes.search="/search" but that's a UI route, not
+    # an API one.) The list endpoint is the supported public search path.
     def search(
         self,
         query: str,
@@ -553,7 +645,7 @@ class ComixSiteHandler(BaseSiteHandler):
         if not clean:
             return []
         url = (
-            f"{self._BASE_URL}/api/v1/manga"
+            f"https://comix.to/api/v1/manga"
             f"?keyword={quote_plus(clean)}"
             f"&limit={int(limit)}"
         )
@@ -562,37 +654,402 @@ class ComixSiteHandler(BaseSiteHandler):
             data = response.json()
         except (ValueError, json.JSONDecodeError):
             return []
-        if not isinstance(data, dict) or data.get("status") not in ("ok", 200):
+        if not isinstance(data, dict) or data.get("status") != "ok":
             return []
         items = (data.get("result") or {}).get("items") or []
         if not isinstance(items, list):
             return []
 
         hits: List[SearchHit] = []
-        for idx, item in enumerate(items):
-            hid = item.get("hid")
-            title = (item.get("title") or "").strip()
+        for idx, it in enumerate(items):
+            hid = it.get("hid")
+            title = (it.get("title") or "").strip()
             if not hid or not title:
                 continue
-            poster = item.get("poster") or {}
+            poster = it.get("poster") or {}
             cover = None
             if isinstance(poster, dict):
                 cover = poster.get("large") or poster.get("medium") or poster.get("small")
-            chapter_count = item.get("finalChapter") or item.get("latestChapter")
+            # latestChapter is float (e.g., 686.5 for half chapters); finalChapter
+            # is the canonical end. Use finalChapter when available, else
+            # int(latestChapter).
+            chapter_count = it.get("finalChapter") or it.get("latestChapter")
             if isinstance(chapter_count, (int, float)):
                 chapter_count = int(chapter_count)
             else:
                 chapter_count = None
-            year = item.get("year") if isinstance(item.get("year"), int) else None
+            year = it.get("year")
+            if not isinstance(year, int):
+                year = None
+            # URL: /title/<hid> works without slug — verified live. The
+            # fetch_comic_context handler takes hid from slug_part.split('-')[0]
+            # so the no-slug form is parsed correctly.
+            url_full = f"https://comix.to/title/{hid}"
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(items))))
             hits.append(
                 SearchHit(
                     site=self.name,
                     title=title,
-                    url=f"{self._BASE_URL}/title/{hid}",
+                    url=url_full,
                     cover=cover,
+                    alt_titles=[],
                     year=year,
+                    language=None,
                     chapter_count_hint=chapter_count,
-                    raw_score=max(0.05, 1.0 - (idx / max(1, len(items)))),
+                    raw_score=raw_score,
                 )
             )
         return hits
+
+
+# ---------------------------------------------------------------------------
+# Patchright bridge
+# ---------------------------------------------------------------------------
+# Patchright's sync API has two hard constraints: (1) every call must run on
+# the same thread that called sync_playwright().start(), and (2) that thread
+# must own an asyncio event loop. Probe-phase workers in
+# sites/search_orchestrator.py and image-prefetch threads in aio-dl.py
+# satisfy neither. To make Patchright safely callable from any thread, we
+# serialize all Patchright work onto a single dedicated worker thread (one
+# process-wide) — the daemon `comix-pw` thread started by
+# _ensure_comix_worker(). Callers from any thread submit a (future, fn,
+# args, kwargs) tuple to _COMIX_REQUEST_QUEUE and block on the future's
+# result with a wall-clock timeout (_COMIX_DEFAULT_TIMEOUT_S, 60 s).
+# Synchronous from the caller's perspective.
+#
+# Mirrors sites/mangadex.py:_report_worker / _enqueue_report (same daemon
+# +queue pattern) and sites/mangafire_vrf_simple.py:1965-2106 (the prior
+# pattern this module used to follow before the v8 rewrite). Keep the
+# three structurally similar so the pattern stays recognizable across
+# the codebase.
+
+
+class _ComixBrowserSession:
+    """Patchright lifecycle owner. Every method runs on the daemon
+    `comix-pw` worker (see _comix_worker_loop) so sync_playwright's
+    same-thread contract is upheld.
+
+    Bodies are lifted verbatim from the prior in-class implementation,
+    with the main-thread guard removed (this dedicated thread IS now the
+    only valid caller).
+    """
+
+    def __init__(self):
+        self._pw = None
+        self._browser = None
+        self._page = None
+
+    def _start(self) -> bool:
+        """Lazy-launch Patchright on first use. Returns True if the browser
+        is ready, False if Patchright/Playwright unavailable or launch failed.
+        Subsequent calls are cheap (already-started fast path)."""
+        if self._page is not None:
+            return True
+        try:
+            from patchright.sync_api import sync_playwright  # type: ignore
+        except ImportError:
+            try:
+                from playwright.sync_api import sync_playwright  # type: ignore
+            except ImportError:
+                print("[!] Comix: patchright/playwright not installed; API capture unavailable.")
+                return False
+        try:
+            self._pw = sync_playwright().start()
+        except Exception as e:
+            print(f"[!] Comix Playwright start failed: {e}")
+            return False
+        try:
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            self._page = self._browser.new_page()
+        except Exception as e:
+            print(f"[!] Comix Playwright launch failed: {e}")
+            self._cleanup()
+            return False
+        return True
+
+    def _cleanup(self):
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        except Exception:
+            pass
+        self._browser = None
+        try:
+            if self._pw is not None:
+                self._pw.stop()
+        except Exception:
+            pass
+        self._pw = None
+        self._page = None
+
+    def get_api_token(self, url: str) -> Optional[str]:
+        if not self._start():
+            return None
+        page = self._page
+        token_query: Optional[str] = None
+
+        def handle_req(request):
+            nonlocal token_query
+            if token_query:
+                return
+            u = request.url
+            # Title page only fires the /chapters listing call (not /chapters/{id}).
+            if "/chapters?" in u and "_=" in u:
+                parts = u.split("?", 1)
+                if len(parts) > 1:
+                    token_query = parts[1]
+
+        page.on("request", handle_req)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Poll up to ~5s for the listing XHR to fire.
+            for _ in range(50):
+                if token_query:
+                    break
+                page.wait_for_timeout(100)
+        except Exception as e:
+            print(f"[!] Comix token capture navigation failed: {e}")
+            try:
+                page.remove_listener("request", handle_req)
+            except Exception:
+                pass
+            return None
+        try:
+            page.remove_listener("request", handle_req)
+        except Exception:
+            pass
+        return token_query
+
+    def fetch_chapter_api(self, chapter_url: str, chap_id) -> Optional[Dict]:
+        if not self._start():
+            return None
+        page = self._page
+        captured: Dict[str, Optional[Dict]] = {"data": None}
+        target_path = f"/api/v1/chapters/{chap_id}"
+        seen_responses: List[str] = []
+
+        def handle_response(response):
+            if captured["data"] is not None:
+                return
+            try:
+                u = response.url
+                if "/api/v1/" in u:
+                    seen_responses.append(f"{response.status} {u[:120]}")
+                if target_path in u and response.status == 200:
+                    captured["data"] = response.json()
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+        try:
+            page.goto(chapter_url, wait_until="domcontentloaded", timeout=30000)
+            # Poll up to ~10s for the chapter-detail XHR to land. SPA loads
+            # the viewer JS first, then fires the API call ~1-2s later.
+            for _ in range(100):
+                if captured["data"]:
+                    break
+                page.wait_for_timeout(100)
+        except Exception as e:
+            print(f"[!] Comix chapter browser fetch failed for {chap_id}: {type(e).__name__}: {e}", flush=True)
+        finally:
+            try:
+                page.remove_listener("response", handle_response)
+            except Exception:
+                pass
+
+        if not captured["data"]:
+            # Diagnostic: surface what API responses we DID see so the user
+            # can tell if the site changed structure vs. our listener missed.
+            tail = seen_responses[-6:] if seen_responses else ["(none)"]
+            print(f"[!] Comix: no chapter-API response captured for {chap_id}. Seen API responses (tail): {tail}", flush=True)
+        return captured["data"]
+
+    def close(self):
+        self._cleanup()
+
+
+# v8 bridge rewrite (2026-05-24): replaced module-level ThreadPoolExecutor
+# with a daemon thread + queue.Queue, mirroring sites/mangadex.py's report
+# pipeline. The TPE approach had two latent failure modes that the
+# code review surfaced:
+#
+#   1. INTERPRETER HANG AT EXIT. concurrent.futures._python_exit
+#      registers with `threading._register_atexit` and runs BEFORE the
+#      atexit module's hooks. It calls join() on every TPE worker
+#      unconditionally — even after shutdown(wait=False, cancel_futures=True).
+#      If Patchright nav was wedged on a Cloudflare turnstile spin at
+#      Ctrl-C, the comix-pw worker stayed blocked in page.goto and
+#      the user's process hung for up to 30s waiting for the goto's
+#      own timeout. Same anti-pattern that sites/mangadex.py's daemon
+#      rewrite explicitly addressed earlier in the same diff
+#      (mangadex.py:41-58 comment).
+#   2. CALLER DEADLOCK ON HUNG NAV. `fut.result()` had no timeout, so
+#      any single hung Patchright op deadlocked every concurrent caller
+#      submitting through the same single-worker executor (and there
+#      IS only one worker — max_workers=1). The probe phase has 6 parallel
+#      probe-pool workers all routing through this bridge; one comix
+#      candidate getting stuck would freeze all six.
+#
+# Daemon thread + queue resolves both: daemons are skipped by _python_exit
+# (clean Ctrl-C semantics), and the worker dequeues one job at a time so
+# we can attach an explicit per-call timeout on fut.result() without
+# changing the single-thread-owns-the-browser invariant. Bridge public
+# API (_COMIX_BROWSER_BRIDGE) is unchanged so existing call sites in
+# this file don't move.
+_COMIX_REQUEST_QUEUE: queue.Queue = queue.Queue()
+_COMIX_WORKER_STARTED = False
+_COMIX_WORKER_LOCK = threading.Lock()
+_COMIX_BROWSER: Optional[_ComixBrowserSession] = None  # owned by the worker thread
+_COMIX_SHUTDOWN_SENTINEL = object()
+# Per-call wall-clock cap on Patchright work. Real-world page.goto
+# timeouts inside _ComixBrowserSession sit at 30s; the bridge cap is
+# the sum of those plus a small slack so a legitimate slow nav still
+# completes but a stuck one surfaces as TimeoutError rather than
+# deadlocking the caller. Search-phase callers should also have their
+# own outer deadline (PROBE_PHASE_DEADLINE_S in search_orchestrator);
+# this is the inner guard.
+_COMIX_DEFAULT_TIMEOUT_S = 60.0
+
+
+def _comix_worker_loop() -> None:
+    """Daemon thread that owns the single Patchright browser instance.
+
+    Pulls (future, fn_name, args, kwargs) tuples and sets the future's
+    result/exception. Exits cleanly on the shutdown sentinel. Lazy-inits
+    the session singleton on the first non-sentinel job so import-time
+    cost stays at zero for non-comix runs (sites/__init__.py imports
+    this module eagerly so every aio-dl process touches these globals,
+    but no Patchright launch happens until a user actually hits comix).
+    """
+    global _COMIX_BROWSER
+    while True:
+        item = _COMIX_REQUEST_QUEUE.get()
+        if item is _COMIX_SHUTDOWN_SENTINEL:
+            try:
+                if _COMIX_BROWSER is not None:
+                    try:
+                        _COMIX_BROWSER.close()
+                    except Exception:
+                        pass
+                    _COMIX_BROWSER = None
+            finally:
+                return
+        try:
+            fut, fn_name, args, kwargs = item
+        except (TypeError, ValueError):
+            # Malformed enqueue — skip without dying. Belt-and-suspenders
+            # against future maintainers putting unexpected sentinels on
+            # the queue (matches the mangadex worker's None-safe pattern).
+            continue
+        # Caller's fut.result(timeout=...) may have already given up and
+        # the future could be cancelled; honor the cancel without doing
+        # the work (avoids redundant Patchright nav for callers who
+        # already moved on).
+        if fut.cancelled():
+            continue
+        try:
+            if _COMIX_BROWSER is None:
+                _COMIX_BROWSER = _ComixBrowserSession()
+            fn = getattr(_COMIX_BROWSER, fn_name)
+            result = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 — propagate to caller
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+
+def _ensure_comix_worker() -> None:
+    """Lazy-start the single Patchright worker daemon. Double-checked
+    locking so concurrent first-callers don't race to spawn duplicates.
+    """
+    global _COMIX_WORKER_STARTED
+    if _COMIX_WORKER_STARTED:
+        return
+    with _COMIX_WORKER_LOCK:
+        if _COMIX_WORKER_STARTED:
+            return
+        threading.Thread(
+            target=_comix_worker_loop,
+            name="comix-pw",
+            daemon=True,
+        ).start()
+        _COMIX_WORKER_STARTED = True
+
+
+def _comix_call(fn_name: str, *args, _timeout_s: float = _COMIX_DEFAULT_TIMEOUT_S, **kwargs):
+    """Submit a session method call onto the daemon worker and block on
+    its result, bounded by ``_timeout_s`` (default 60 s). Synchronous
+    from the caller's perspective — same contract as the previous
+    ThreadPoolExecutor-based implementation, but with an explicit
+    wall-clock cap so a hung Patchright nav surfaces as TimeoutError
+    instead of an indefinite deadlock.
+
+    Per-call timeout can be overridden via the keyword `_timeout_s`
+    (kw-only so it doesn't collide with method args). Cancellation
+    after timeout sets the future cancelled; the worker honors the
+    cancel and skips the underlying call if it hadn't started yet.
+    """
+    _ensure_comix_worker()
+    fut: _futures.Future = _futures.Future()
+    _COMIX_REQUEST_QUEUE.put((fut, fn_name, args, kwargs))
+    try:
+        return fut.result(timeout=_timeout_s)
+    except _futures.TimeoutError:
+        # Best-effort cancel so the worker can skip the call if it
+        # hasn't started. If the worker is already executing this
+        # future, set_running_or_notify_cancel returns False internally
+        # and the underlying Patchright op continues (no thread
+        # cancellation in Python) — but at least subsequent callers
+        # aren't blocked behind a future we've stopped waiting for.
+        fut.cancel()
+        raise
+
+
+class _ComixBrowserBridge:
+    """Thread-safe facade over _ComixBrowserSession. Every method routes
+    through _comix_call so the underlying Patchright calls always run
+    on the daemon worker thread that owns the browser instance.
+
+    Cross-file: mirrors sites/mangafire_vrf_simple.py:_VRFBridge in
+    spirit; the v8 rewrite swaps the executor for daemon+queue (see
+    block-comment near _COMIX_REQUEST_QUEUE for rationale).
+    """
+
+    def get_api_token(self, url: str) -> Optional[str]:
+        return _comix_call("get_api_token", url)
+
+    def fetch_chapter_api(self, chapter_url: str, chap_id) -> Optional[Dict]:
+        return _comix_call("fetch_chapter_api", chapter_url, chap_id)
+
+    def close(self) -> None:
+        try:
+            _comix_call("close", _timeout_s=5.0)
+        except Exception:
+            pass
+
+
+_COMIX_BROWSER_BRIDGE = _ComixBrowserBridge()
+
+
+def _shutdown_comix_bridge():
+    """At-exit best-effort cleanup. Daemon worker dies with the
+    interpreter regardless (the whole reason for the daemon+queue
+    rewrite), so the goal here is just to close the Patchright session
+    cleanly when there's time. We enqueue the shutdown sentinel and
+    rely on the daemon to drain — no join, no wait."""
+    if not _COMIX_WORKER_STARTED:
+        return
+    try:
+        _COMIX_REQUEST_QUEUE.put_nowait(_COMIX_SHUTDOWN_SENTINEL)
+    except queue.Full:
+        # The unbounded queue can't actually go full here; the except
+        # is defensive belt-and-suspenders in case the queue is ever
+        # given a maxsize. Silent drop matches the rest of the bridge's
+        # at-exit semantics.
+        pass
+
+
+atexit.register(_shutdown_comix_bridge)

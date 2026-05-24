@@ -1,6 +1,7 @@
 beautifulsoup4
 cloudscraper
 lxml
+numpy>=1.24  # v5 image-quality scoring uses FFT/blockiness/Tenengrad/JPEG-QF LSM in sites/search_orchestrator.py
 Pillow
 pypdf
 requests
@@ -13,3 +14,27 @@ zendriver
 patchright>=1.40.0  # Drop-in Playwright fork with CDP-leak patches (Cloudflare-stealthier). Drives sites/mangafire_vrf_simple.py and sites/playwright_utils.py.
 rapidfuzz  # Cross-site search title matching (sites/search_orchestrator.py)
 curl_cffi>=0.7.0  # MangaFire fast image-download path (HTTP/2 + Chrome120 TLS fingerprint, async). See sites/mangafire.py:fast_download_images.
+# Phase H (2026-05-16) — pyvips powers the lossy-WebP save fast path in
+# aio-dl.py:save_final_images. ~2x faster than PIL.Image.save at the same
+# libwebp settings on 1500x3750 stitched LineWebtoon pages (bench/results.csv:
+# pyvips-webp-q85-e2=2.75s vs pil-webp-q85-m2=4.24s on 94 pages parallel x6).
+# Optional: the code falls back to PIL when these can't load. pyvips-binary
+# bundles the libvips DLLs on Windows so users don't need a separate install.
+pyvips>=2.2.0
+pyvips-binary>=8.18.0
+
+# === Optional ML-rating extras for search v5.1 ===
+# These are NOT installed by default — install only if you want CLIP-IQA+ /
+# NIQE / DISTS image-quality ranking in cross-site search results. Triggered
+# at runtime by setting AIO_ENABLE_ML_RATING=1 (env var) or
+# --enable-ml-rating (CLI flag). Otherwise the orchestrator runs T1-only
+# (pixel-based scoring; no torch). All four can be installed together:
+#     pip install pyiqa>=0.1.10 piq>=0.8 torchmetrics>=1.0 easyocr>=1.7.2
+# Brings in PyTorch CPU (~700 MB). See sites/search_orchestrator.py for
+# the lazy-import gates and per-module fallback behavior.
+# - pyiqa: NIQE / ARNIQA wrappers (T2 fallback path)
+# - piq: PSNR / SSIM / DISTS for T3 paired-comparison ranking
+# - torchmetrics: CLIP-IQA+ primary T2 signal (HF CLIP backend; sidesteps
+#   pyiqa's broken clip-by-openai dep on Py3.13+)
+# - easyocr: text/watermark detection (CRAFT model; ~200 MB weights on
+#   first use). Watermark penalty in scoring; degrades gracefully if missing.

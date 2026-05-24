@@ -18,7 +18,14 @@ class OmegaScansSiteHandler(BaseSiteHandler):
         # Extract buildId and series_id
         build_id = None
         series_id = None
-        
+        # Extra metadata from the Next.js series payload — heancms exposes
+        # status, tags, release_year, alternative_names server-rendered.
+        # All optional; absent fields stay None and don't enter the comic dict.
+        ns_status = None
+        ns_year = None
+        ns_genres = []
+        ns_alt = []
+
         # Try __NEXT_DATA__ first as it's most reliable
         next_data_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html_content)
         if next_data_match:
@@ -29,6 +36,19 @@ class OmegaScansSiteHandler(BaseSiteHandler):
                 series_data = data.get('props', {}).get('pageProps', {}).get('series', {})
                 if series_data:
                     series_id = series_data.get('id')
+                    raw_status = series_data.get('status')
+                    if isinstance(raw_status, str) and raw_status:
+                        ns_status = raw_status
+                    raw_year = series_data.get('release_year') or series_data.get('year')
+                    if isinstance(raw_year, int) and raw_year > 0:
+                        ns_year = raw_year
+                    for tag in series_data.get('tags') or []:
+                        name = tag.get('name') if isinstance(tag, dict) else tag
+                        if isinstance(name, str) and name and name not in ns_genres:
+                            ns_genres.append(name)
+                    for nm in series_data.get('alternative_names') or []:
+                        if isinstance(nm, str) and nm and nm not in ns_alt:
+                            ns_alt.append(nm)
             except Exception as e:
                 pass
 
@@ -86,16 +106,25 @@ class OmegaScansSiteHandler(BaseSiteHandler):
         description = html.unescape(desc_match.group(1)).strip() if desc_match else None
 
         from .base import SiteComicContext
+        comic_dict = {
+            'hid': series_slug,
+            'build_id': build_id,
+            'series_id': series_id,
+            'series_slug': series_slug,
+            'authors': authors,
+            'cover': cover_url,
+            'desc': description,
+        }
+        if ns_status:
+            comic_dict['status'] = ns_status
+        if ns_year:
+            comic_dict['year'] = ns_year
+        if ns_genres:
+            comic_dict['genres'] = ns_genres
+        if ns_alt:
+            comic_dict['alt_names'] = ns_alt
         return SiteComicContext(
-            comic={
-                'hid': series_slug,
-                'build_id': build_id,
-                'series_id': series_id,
-                'series_slug': series_slug,
-                'authors': authors,
-                'cover': cover_url,
-                'desc': description
-            },
+            comic=comic_dict,
             title=title,
             identifier=series_slug
         )

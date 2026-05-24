@@ -70,24 +70,10 @@ function resolveAppIconPath() {
 
 const APP_ICON_PATH = resolveAppIconPath();
 
-const DEFAULT_DOWNLOAD_DEFAULTS = {
-  format: "pdf",
-  language: "en",
-  quality: 100,
-  scaling: 100,
-  keepChapters: false,
-  noFinalFile: false,
-  keepImages: false,
-  noProcessing: false,
-  noCleanup: false,
-  imageWorkers: 3,
-  httpTimeout: 30,
-  httpMaxRetries: 6,
-  jobs: 1,
-  multiSource: false,
-  multiSourceQualityMin: 0.65,
-  cbzPreserveOriginals: true,
-};
+// DEFAULT_DOWNLOAD_DEFAULTS removed 2026-05-13: SettingsTab.jsx now owns
+// the defaults dict. The architectural triad (main.js + useDownloader.js
+// + SettingsTab.jsx) must agree — if you re-introduce defaults here,
+// also update the other two.
 
 // Fix for dark gradient banding (dithering) on high-DPI / 4K monitors.
 // Without this, Electron may use limited color depth which causes
@@ -509,24 +495,61 @@ function initDownloader() {
 
 function setupIPC() {
   // ── Get settings ──
+  // Returns ONLY what was actually saved on disk plus genuine user-pref
+  // defaults (verboseAlways, logUpdateInterval, defaults, searchOpts).
+  //
+  // CRITICAL: This handler used to merge defaultPythonCmd / defaultScriptPath
+  // / defaultWorkingDir into the response. That round-trip caused AppImage
+  // (random /tmp/.mount_*/ paths), macOS Gatekeeper App Translocation, and
+  // .app-launched-from-DMG users to persist volatile paths to settings.json
+  // — paths that no longer existed on the next launch and produced ENOENT
+  // on every spawn. The renderer now hydrates the path FIELDS from the new
+  // get-resolved-paths IPC below; when settings.json has an empty/missing
+  // value, every existing spawn site falls back to defaultX via
+  // `settings.X || defaultX` (empty string is falsy), so the consumer side
+  // works unchanged. See history.js:saveSettings for the defense-in-depth
+  // write-side volatile-path filter that prevents the regression from
+  // re-emerging via a future code path that does happen to send a stale
+  // path back.
   ipcMain.handle("get-settings", async () => {
     const saved = history.getSettings();
     return {
-      // Start with everything that was saved (preserves any extra fields
-      // like useFileBasedChapterCheck without having to list them here)
       ...saved,
-      // Override specific fields that need fallback defaults
-      pythonCmd: saved.pythonCmd || defaultPythonCmd,
-      scriptPath: saved.scriptPath || defaultScriptPath,
-      workingDir: saved.workingDir || defaultWorkingDir,
-      defaults: { ...DEFAULT_DOWNLOAD_DEFAULTS, ...(saved.defaults || {}) },
+      // Genuine user-pref defaults — these have meaningful "missing →
+      // assume default" semantics and stay merged here. SettingsTab.jsx
+      // owns the DEFAULT_DOWNLOAD_DEFAULTS dict; we just pass through
+      // whatever the user has actually saved (or an empty object so
+      // SettingsTab can hydrate from its own defaults on first load).
+      defaults: saved.defaults || {},
       verboseAlways: saved.verboseAlways !== false,
       logUpdateInterval: saved.logUpdateInterval || 100,
       isPackaged: IS_PACKAGED,
+      // NOTE: intentionally NOT merging pythonCmd / scriptPath / workingDir.
+      // The renderer calls get-resolved-paths separately for display, and
+      // saves an empty string when the user hasn't customized those fields.
+    };
+  });
+
+  // ── Get resolved paths (display only) ──
+  // Returns the currently-resolved Python command, aio-dl.py script path,
+  // and working directory. The renderer uses these for placeholder text
+  // in the Settings UI so users see what's auto-resolved without those
+  // values getting saved to settings.json. Pure-read; no side effects.
+  // This handler is the structural fix to the AppImage / Gatekeeper
+  // App Translocation / DMG-direct stale-path bug — see get-settings
+  // above for the full story.
+  ipcMain.handle("get-resolved-paths", async () => {
+    return {
+      pythonCmd: defaultPythonCmd,
+      scriptPath: defaultScriptPath,
+      workingDir: defaultWorkingDir,
     };
   });
 
   // ── Save settings ──
+  // Validation lives in history.saveSettings — see that method's
+  // docstring for the volatile-path filter that rejects bad writes
+  // even if main.js / the renderer ever regresses.
   ipcMain.handle("save-settings", async (_event, newSettings) => {
     history.saveSettings(newSettings);
     return { ok: true };

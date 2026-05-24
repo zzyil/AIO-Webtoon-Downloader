@@ -20,61 +20,10 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { formatDuration } from "@/lib/utils";
 
-const DEFAULT_DOWNLOAD_DEFAULTS = {
-  format: "pdf",
-  language: "en",
-  quality: 100,
-  scaling: 100,
-  keepChapters: false,
-  noFinalFile: false,
-  keepImages: false,
-  noProcessing: false,
-  noCleanup: false,
-  imageWorkers: 3,
-  httpTimeout: 30,
-  httpMaxRetries: 6,
-  jobs: 1,
-  multiSource: false,
-  multiSourceQualityMin: 0.65,
-  cbzPreserveOriginals: true,
-};
-
-function mergeSettings(prev = {}, updates = {}) {
-  const next = { ...prev, ...updates };
-  if (updates.defaults) {
-    next.defaults = {
-      ...(prev.defaults || DEFAULT_DOWNLOAD_DEFAULTS),
-      ...updates.defaults,
-    };
-  } else {
-    next.defaults = {
-      ...DEFAULT_DOWNLOAD_DEFAULTS,
-      ...(prev.defaults || {}),
-    };
-  }
-  if (updates.searchOpts) {
-    next.searchOpts = { ...(prev.searchOpts || {}), ...updates.searchOpts };
-  }
-  if (updates.libraryOpts) {
-    next.libraryOpts = { ...(prev.libraryOpts || {}), ...updates.libraryOpts };
-  }
-  return next;
-}
-
-function normalizeDownloadArgs(args = {}) {
-  const normalized = { ...args };
-  if (normalized.format !== "epub") {
-    delete normalized.epubLayout;
-  }
-  if (
-    normalized.format === "none" &&
-    !normalized.keepImages &&
-    !normalized.keepChapters
-  ) {
-    normalized.keepImages = true;
-  }
-  return normalized;
-}
+// DEFAULT_DOWNLOAD_DEFAULTS / mergeSettings / normalizeDownloadArgs were
+// removed 2026-05-13: SettingsTab.jsx now owns the defaults dict. The
+// architectural triad (main.js #3 + this file + SettingsTab.jsx #5) must
+// agree — if you re-introduce defaults here, also update the other two.
 
 // ── Helper: check if Electron IPC is available ──
 // When running with just `npm run dev` (Vite only, no Electron),
@@ -97,7 +46,7 @@ export function useDownloader() {
     pythonCmd: "python",
     scriptPath: "",
     workingDir: "",
-    defaults: { ...DEFAULT_DOWNLOAD_DEFAULTS },
+    defaults: {},
     verboseAlways: true,
     // Global toggle: collapse split-cluster chapters at download time AND in
     // search-display diagnostic counts. Default ON. The Python side reads
@@ -206,7 +155,7 @@ export function useDownloader() {
     if (!hasAPI()) return;
 
     window.electronAPI.getSettings().then((s) => {
-      if (s) setSettings((prev) => mergeSettings(prev, s));
+      if (s) setSettings(s);
     });
 
     window.electronAPI.scanResumable().then((r) => {
@@ -459,18 +408,15 @@ export function useDownloader() {
   // ── Public: add a download (starts immediately or queues) ──
   // url can be a string (single) or string[] (multi-URL batch with --jobs)
   //
-  // Injects saved download defaults plus global toggles before passing args
-  // to the spawn so search/library/queue callsites don't have to re-implement
-  // them. Caller-provided args win on conflict, so DownloadTab's explicit
-  // per-job settings still take priority over the saved defaults.
+  // Injects global defaults (verbose, collapseSplits) before passing args to
+  // the spawn so search/library/queue callsites don't have to re-implement
+  // those in every callsite. Caller-provided args win on conflict (the spread
+  // is positioned after the defaults), so DownloadTab's explicit verbose
+  // setting still takes priority over the global default.
   const queueDownload = useCallback(
-    async (url, args = {}) => {
+    async (url, args) => {
       const s = settingsRef.current;
-      const defaultArgs = normalizeDownloadArgs({
-        ...DEFAULT_DOWNLOAD_DEFAULTS,
-        ...(s?.defaults || {}),
-      });
-      const injectedArgs = {
+      const finalArgs = {
         verbose: s?.verboseAlways !== false,
         collapseSplits: s?.collapseSplits !== false,
         // Curated-sites toggle. Persisted under settings.searchOpts.seededOnly
@@ -490,26 +436,31 @@ export function useDownloader() {
         ...(s?.prefetchImageWorkers != null && s.prefetchImageWorkers !== -1
           ? { prefetchImageWorkers: s.prefetchImageWorkers }
           : {}),
-        // ── MangaFire-only speed knobs (added 2026-05-09) ──
+        // ── Fast-download knobs (added 2026-05-09; generalized 2026-05-13) ──
         // Same "skip if at default" pattern as prefetchImageWorkers above:
         // when the setting matches the Python-side default, leave it out of
         // the spawn so older saved settings dicts that don't have the field
-        // still produce identical CLI invocations. Python defaults: 8, 4, 1.
-        ...(s?.mangafireImageConcurrency != null && s.mangafireImageConcurrency !== 8
-          ? { mangafireImageConcurrency: s.mangafireImageConcurrency }
+        // still produce identical CLI invocations. Python defaults:
+        //   imageConcurrency=8, imagePrefetchDepth=2, imagePrefetchParallel=2.
+        // MangaFire VRF capture knobs (--mangafire-vrf-prefetch-depth,
+        // --mangafire-vrf-parallel) were dropped from the UI on 2026-05-13
+        // — argparse defaults serve everyone now; advanced users pass the
+        // CLI flags directly. Migration note: settings dicts persisted
+        // before 2026-05-13 carry `mangafireImageConcurrency` instead of
+        // `imageConcurrency`. The SettingsTab loader migrates them at read
+        // time, so by the time we get here `s.imageConcurrency` is live.
+        ...(s?.imageConcurrency != null && s.imageConcurrency !== 8
+          ? { imageConcurrency: s.imageConcurrency }
           : {}),
-        ...(s?.mangafireVrfPrefetchDepth != null && s.mangafireVrfPrefetchDepth !== 4
-          ? { mangafireVrfPrefetchDepth: s.mangafireVrfPrefetchDepth }
+        ...(s?.imagePrefetchDepth != null && s.imagePrefetchDepth !== 2
+          ? { imagePrefetchDepth: s.imagePrefetchDepth }
           : {}),
-        ...(s?.mangafireVrfParallel != null && s.mangafireVrfParallel !== 1
-          ? { mangafireVrfParallel: s.mangafireVrfParallel }
+        ...(s?.imagePrefetchParallel != null && s.imagePrefetchParallel !== 2
+          ? { imagePrefetchParallel: s.imagePrefetchParallel }
           : {}),
-      };
-      const finalArgs = normalizeDownloadArgs({
-        ...defaultArgs,
-        ...injectedArgs,
+        ...(s?.noFastDownload === true ? { noFastDownload: true } : {}),
         ...args,
-      });
+      };
 
       // Display label: show first URL + count for batches
       const displayUrl = Array.isArray(url)
@@ -634,12 +585,10 @@ export function useDownloader() {
 
   // ── Public: save settings ──
   const saveSettings = useCallback(async (newSettings) => {
-    const merged = mergeSettings(settingsRef.current, newSettings);
-    settingsRef.current = merged;
-    setSettings(merged);
     if (hasAPI()) {
       await window.electronAPI.saveSettings(newSettings);
     }
+    setSettings((prev) => ({ ...prev, ...newSettings }));
   }, []);
 
   // ── Public: refresh resumable list ──

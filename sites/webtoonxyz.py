@@ -12,8 +12,16 @@ class WebtoonXYZSiteHandler(MadaraSiteHandler):
     name = "webtoonxyz"
 
     def __init__(self) -> None:
-        super().__init__("WebtoonXYZ", "https://www.webtoon.xyz", use_zendriver=True)
-        self.name = "webtoonxyz"
+        # 2026-05-13: webtoon.xyz unreachable (network timeout, in probe_failures.json);
+        # site relocated to webtoonxyz.co. Same Madara/WordPress framework — /read/<slug>
+        # URL pattern and chapter_selectors unchanged. www.webtoonxyz.co 301s to apex.
+        # Keep old webtoon.xyz hostnames in extra_domains so cached/bookmarked URLs
+        # still route to this handler via BaseSiteHandler.matches().
+        super().__init__(
+            "WebtoonXYZ",
+            "https://webtoonxyz.co",
+            extra_domains=("webtoon.xyz", "www.webtoon.xyz"),
+        )
 
     def _slug_from_url(self, url: str) -> str:
         # Override to handle "read" instead of "manga" if needed,

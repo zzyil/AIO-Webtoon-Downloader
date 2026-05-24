@@ -154,7 +154,9 @@ export default function App() {
         <div className="flex-1 min-h-0 overflow-hidden">
           {activeTab === "library" && (
             <LibraryTab
-              onStartDownload={dl.queueDownload}
+              onStartDownload={(url, args) =>
+                dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args })
+              }
               onSwitchTab={setActiveTab}
               settings={dl.settings}
               onSaveSettings={dl.saveSettings}
@@ -185,7 +187,15 @@ export default function App() {
               resumable={dl.resumable}
               onResumeDownload={dl.resumeDownload}
               onStartDownload={(url, args) => {
-                dl.queueDownload(url, args);
+                // Fix A (2026-05-07): merge settings.defaults so search- and
+                // library-driven downloads inherit format / quality / scaling /
+                // image-workers / etc. without going through the New tab. The
+                // caller-passed `args` wins on conflicts (search may set
+                // `multiSource: true` even when defaults.multiSource is false,
+                // because the search itself was multi-source). DownloadTab does
+                // its own merge via form initialization, so it doesn't need
+                // this wrapper. Same fix applied to LibraryTab above.
+                dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args });
                 setActiveTab("queue");
               }}
             />

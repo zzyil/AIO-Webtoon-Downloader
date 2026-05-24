@@ -84,6 +84,33 @@ class AlignmentResult:
     collapse_splits_applied: bool = True
 
 
+def _is_sequential_split_decimals(decimals_rel: List[float]) -> bool:
+    """True iff the decimals form a sequential split starting at .1.
+
+    A "sequential split" is the .1/.2/.3/... pattern that MangaDex (and other
+    sources following the same convention) emits when one canonical chapter
+    is uploaded as N consecutive fragments. The signature of a true split is
+    that it starts at .1 AND has no gaps:
+
+      [0.1, 0.2, 0.3]         → True  (3 sequential fragments)
+      [0.1, 0.2, 0.3, 0.4]    → True
+      [0.1, 0.5]              → False (gap — .5 is a sub-chapter, not a fragment)
+      [0.2, 0.3]              → False (doesn't start at .1 — likely scattered)
+      [0.1]                   → False (single decimal; caller handles separately)
+
+    Used by both `_classify_main_chapters` (diagnostic count) and
+    `group_chapters_for_download` (Rule 3 / Rule 5 vs Rule 6 fork) so the
+    "split fragments collapse" interpretation is applied consistently. Values
+    are rounded to 1 decimal place before comparison to absorb float drift
+    from `0.1 + 0.2` style arithmetic.
+    """
+    if len(decimals_rel) < 2:
+        return False
+    sorted_decimals = sorted(round(d, 1) for d in decimals_rel)
+    expected = [round(0.1 * (k + 1), 1) for k in range(len(sorted_decimals))]
+    return sorted_decimals == expected
+
+
 def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[int, int]:
     """Compute (unique_main_chapters, effective_chapters) for a chapter-number set.
 
@@ -96,14 +123,23 @@ def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[i
     depends on `collapse_splits`:
 
       - ``collapse_splits=True`` (default): split-only clusters X.1 / X.2 /
-        ... / X.k where the integer X is *absent* collapse to ONE main
-        chapter (treat them as parts of the missing main). X.5 alongside an
-        existing X stays distinct (treated as a side story). Catches the
-        MangaFire-style inflation where chapter 1 is split into 1.1/1.2/1.3/
-        1.4 separate rows — without collapse, MangaFire's 362-entry catalog
-        for Talentless Nana shows alongside atsumaru's 119, misleadingly
-        suggesting atsumaru is missing 2/3 of content. With collapse, both
-        report ~119 main chapters.
+        ... / X.k where the decimals form a sequential .1/.2/.3 pattern
+        collapse to ONE chapter (split fragments of the integer parent).
+        Scattered decimals like {X, X.1, X.5} keep ONE side-story slot for
+        the highest decimal (the canonical "X.5"-style sub-chapter); the
+        intermediate .1/.2/.3 fragments are not counted. {X, X.5} alone
+        keeps both as effective (Rule 2: true side story).
+
+        This catches both:
+          (a) MangaDex/MangaFire-style inflation where chapter 1 is split
+              into 1.1/1.2/1.3/1.4 separate rows — without collapse,
+              MangaFire's 362-entry catalog for Talentless Nana shows
+              alongside atsumaru's 119, misleadingly suggesting atsumaru is
+              missing 2/3 of content. With collapse, both report ~119.
+          (b) MangaFire's mixed-pattern case (e.g. Kagurabachi Ch 8) where
+              {8, 8.1, 8.5} represents Chapter 8 + a partial-upload split
+              (.1) + a canonical side-story (.5). The split fragment is
+              counted out; .5 is preserved as a side story.
 
       - ``collapse_splits=False``: equals ``len(numbers)``. The toggle exists
         because some series legitimately use sequential decimal numbering
@@ -112,11 +148,13 @@ def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[i
         would falsely merge those.
 
     Examples (collapse_splits=True):
-      {1, 2, 3}            → (3, 3)   — all integers, no decimals
-      {1.1, 1.2, 1.3, 1.4} → (1, 1)   — split-cluster, no integer parent
-      {4, 4.5}             → (1, 2)   — main + side story
-      {1, 2, 2.5, 3}       → (3, 4)   — three mains + one side
-      {1.1, 1.2, 2, 3}     → (3, 3)   — 1.x splits collapse, then 2 + 3
+      {1, 2, 3}                 → (3, 3)   — all integers, no decimals
+      {1.1, 1.2, 1.3, 1.4}      → (1, 1)   — split-cluster, no integer parent
+      {4, 4.5}                  → (1, 2)   — main + side story (Rule 2)
+      {1, 2, 2.5, 3}            → (3, 4)   — three mains + one side
+      {1.1, 1.2, 2, 3}          → (3, 3)   — 1.x splits collapse, then 2 + 3
+      {8, 8.1, 8.2, 8.3}        → (1, 1)   — sequential splits collapse
+      {8, 8.1, 8.5}             → (1, 2)   — scattered: integer + highest .5
 
     Examples (collapse_splits=False):
       Each example above yields (unique_main, len(numbers)) instead.
@@ -124,18 +162,35 @@ def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[i
     Cross-file: align_chapter_lists() invokes this for each source's
     chapter-number set when populating merge_diagnostics; the results power
     the SearchChapterMap.jsx "X main / Y entries" display.
+    `group_chapters_for_download` applies the same sub-classification to
+    decide what to actually emit per floor.
     """
     if not numbers:
         return 0, 0
-    floors = {int(n) for n in numbers}
-    unique_main = len(floors)
     if not collapse_splits:
-        return unique_main, len(numbers)
-    integers_present = {int(n) for n in numbers if n == int(n)}
-    side_stories = sum(
-        1 for n in numbers if n != int(n) and int(n) in integers_present
-    )
-    return unique_main, unique_main + side_stories
+        return len({int(n) for n in numbers}), len(numbers)
+
+    by_floor: Dict[int, List[float]] = {}
+    for n in numbers:
+        by_floor.setdefault(int(n), []).append(n)
+
+    unique_main = len(by_floor)
+    effective = 0
+    for floor, group in by_floor.items():
+        integer_present = any(n == floor for n in group)
+        decimals_rel = [n - floor for n in group if n != floor]
+        if integer_present:
+            effective += 1  # the integer
+            if len(decimals_rel) == 1:
+                effective += 1  # Rule 2: true side story
+            elif len(decimals_rel) >= 2 and not _is_sequential_split_decimals(decimals_rel):
+                # Rule 3 scattered: highest decimal is a canonical side story.
+                # Sequential splits (Rule 3 sequential) contribute nothing.
+                effective += 1
+        else:
+            # Rule 4/5/6: no integer; the cluster collapses to one chapter.
+            effective += 1
+    return unique_main, effective
 
 
 def _extract_chapter_num(label) -> Optional[float]:
@@ -425,9 +480,16 @@ def group_chapters_for_download(
               → 2 groups: ChapterGroup(label="X", parts=[X])
                           ChapterGroup(label="X.k", parts=[X.k])
                 (true partial preserved)
-        Rule 3. Integer X + ≥2 decimals (e.g. {1, 1.1, 1.2, 1.3})
-              → 1 group: ChapterGroup(label="X", parts=[X])
-                (decimals are redundant duplicate uploads of X; dropped)
+        Rule 3. Integer X + ≥2 decimals — sub-classified:
+              3a (sequential .1/.2/.3...): e.g. {1, 1.1, 1.2, 1.3}
+                → 1 group: ChapterGroup(label="X", parts=[X])
+                  (decimals are MangaDex-style split fragments of X; dropped)
+              3b (scattered, e.g. {8, 8.1, 8.5}):
+                → 2 groups: ChapterGroup(label="X", parts=[X])
+                            ChapterGroup(label="X.k_max", parts=[highest decimal])
+                  (the highest decimal is a canonical sub-chapter like
+                  MangaFire's "X.5: Side Story"; intermediate .1/.2/etc. are
+                  partial-upload fragments and dropped)
         Rule 4. No integer X, 1 decimal X.k
               → 1 group: ChapterGroup(label="X.k", parts=[X.k])
         Rule 5. No integer X, decimals form .1, .2, .3, ... starting at .1
@@ -435,11 +497,21 @@ def group_chapters_for_download(
                 (split-cluster: caller concatenates image_items)
         Rule 6. No integer X, decimals scattered or not starting at .1
                 (e.g. {1.5, 1.6}, {1.5, 1.1}, {1.2, 1.3})
-              → 1 group: ChapterGroup(label="X.k_min", parts=[lowest decimal])
-                (treat as duplicate partial uploads; emit one. Label uses
-                the actual decimal value rather than the integer floor so
-                the on-disk tdir doesn't collide with a real Chapter X
-                from another source on resume.)
+              → 1 group: ChapterGroup(label="X.k_max", parts=[highest decimal])
+                (treat as duplicate partial uploads; emit the canonical one.
+                Label uses the actual decimal value rather than the integer
+                floor so the on-disk tdir doesn't collide with a real
+                Chapter X from another source on resume.)
+
+    Why "highest decimal" in Rules 3b and 6:
+        MangaFire (and similar aggregators) sometimes emit a chapter as
+        both an early partial upload (X.1, X.2, ...) AND the eventual
+        canonical sub-chapter (X.5 — the publisher's actual designation
+        like "Chapter 8.5: Side Story"). The user-facing chapter to keep
+        is the canonical one, which by convention is the higher decimal.
+        Empirically: Kagurabachi on MangaFire returns {8, 8.1, 8.5},
+        {58, 58.1, 58.5}, etc.; keeping the .5 surfaces the side story
+        that other sources cleanly expose as a single ".5" entry.
 
     When `collapse_splits=False`, returns one group per chapter with its
     original label preserved (passthrough — no merging, no dropping).
@@ -484,8 +556,31 @@ def group_chapters_for_download(
             # occasionally return chapter 1 twice from different scanlators).
             integer_ch = integer_entries[0][1]
             if len(decimal_entries) >= 2:
-                # Rule 3: drop splits, emit only X.
-                groups.append(ChapterGroup(label=str(floor), parts=[integer_ch]))
+                # Rule 3: sub-classify the decimals.
+                # _is_sequential_split_decimals returns True only when the
+                # decimals form a contiguous .1/.2/.3... sequence — the
+                # MangaDex-style split-fragment signature where the
+                # decimals are PARTS of the integer chapter, not separate
+                # sub-chapters. Round to 1 decimal place inside the helper
+                # to absorb 0.1+0.2 float drift.
+                decimals_rel = [e[0] - floor for e in decimal_entries]
+                if _is_sequential_split_decimals(decimals_rel):
+                    # Rule 3a: sequential splits — drop all decimals.
+                    groups.append(ChapterGroup(
+                        label=str(floor), parts=[integer_ch],
+                    ))
+                else:
+                    # Rule 3b: scattered — keep integer X AND the highest
+                    # decimal (canonical sub-chapter). Highest is the
+                    # last after ascending sort.
+                    groups.append(ChapterGroup(
+                        label=str(floor), parts=[integer_ch],
+                    ))
+                    highest_num, highest_ch = decimal_entries[-1]
+                    groups.append(ChapterGroup(
+                        label=_format_chapter_label(highest_num),
+                        parts=[highest_ch],
+                    ))
             elif len(decimal_entries) == 1:
                 # Rule 2: emit both X and the partial.
                 groups.append(ChapterGroup(label=str(floor), parts=[integer_ch]))
@@ -505,31 +600,31 @@ def group_chapters_for_download(
                     label=_format_chapter_label(num), parts=[ch],
                 ))
             else:
-                # Rules 5 or 6 — distinguish by sub-index shape.
-                # Round to 1 decimal place to handle float drift (0.1+0.2 cases).
-                sorted_decimals = sorted(round(e[0] - floor, 1) for e in decimal_entries)
-                expected = [round(0.1 * (k + 1), 1) for k in range(len(sorted_decimals))]
-                if sorted_decimals == expected:
+                # Rules 5 or 6 — distinguish by sub-index shape via the
+                # shared helper. See its docstring for the signature of
+                # a true sequential split.
+                decimals_rel = [e[0] - floor for e in decimal_entries]
+                if _is_sequential_split_decimals(decimals_rel):
                     # Rule 5: sequential split-cluster — combine all parts.
                     groups.append(ChapterGroup(
                         label=str(floor),
                         parts=[e[1] for e in decimal_entries],
                     ))
                 else:
-                    # Rule 6: scattered decimals = duplicate partials.
-                    # Keep only the lowest (first by sort). Label uses the
-                    # actual decimal value (e.g. "1.5") rather than the
-                    # integer floor — labelling as floor risks tdir collision
-                    # on resume when another source provides a real Chapter
-                    # X. With label="X", `main_tmp_dir/ch_X` would match
-                    # both the rule-6 group and a real X from a separate
-                    # source on subsequent runs, falsely treating one as
-                    # the resume target for the other. Using the actual
-                    # decimal keeps the on-disk identity unique.
-                    lowest_num, lowest_ch = decimal_entries[0]  # already sorted ascending
+                    # Rule 6: scattered decimals. Keep the HIGHEST (the
+                    # canonical "X.5"-style sub-chapter); drop the rest
+                    # as duplicate partial uploads. Label uses the actual
+                    # decimal value rather than the integer floor so the
+                    # on-disk tdir doesn't collide with a real Chapter X
+                    # from another source on resume — with label="X",
+                    # `main_tmp_dir/ch_X` would match both the rule-6
+                    # group and a real X from a separate source on
+                    # subsequent runs, falsely treating one as the resume
+                    # target for the other.
+                    highest_num, highest_ch = decimal_entries[-1]  # ascending sort
                     groups.append(ChapterGroup(
-                        label=_format_chapter_label(lowest_num),
-                        parts=[lowest_ch],
+                        label=_format_chapter_label(highest_num),
+                        parts=[highest_ch],
                     ))
 
     # Pass unparseable chapters through as singletons rather than dropping

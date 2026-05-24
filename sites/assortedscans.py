@@ -179,17 +179,130 @@ class AssortedScansSiteHandler(BaseSiteHandler):
             "title": title,
             "url": self._series_url(slug),
         }
+        # AssortedScans-family sites use the MangAdventure framework. On
+        # arc-relight.com the server populates `<meta name="description">` and
+        # `<meta name="keywords">`; on assortedscans.com itself those tags are
+        # left blank and the visible info is rendered in the DOM via Jinja
+        # template macros. We try meta first (cheaper / canonical when
+        # available) then fall through to DOM scrapes so both sites work.
+        # See dry_run_komikku_findings.md §A for the 2026-05-19 audit that
+        # surfaced the assortedscans 0/5 case.
         desc = self._meta_content(initial_soup, "description")
+        if not desc:
+            dom_desc = initial_soup.select_one(
+                "article.info p, .info > p, .series-info p, .description, "
+                ".info .description"
+            )
+            if dom_desc is not None:
+                text = dom_desc.get_text(" ", strip=True)
+                if text:
+                    desc = text
+        if not desc:
+            og_desc = self._meta_content(initial_soup, property_name="og:description")
+            if og_desc:
+                desc = og_desc
         if desc:
             comic["desc"] = desc
         cover = self._meta_content(initial_soup, property_name="og:image")
         if cover:
             comic["cover"] = cover
+
+        # Authors — MangAdventure's series template renders the value in a
+        # plain `.author` div (NOT an /author/<slug> anchor). The "Author:"
+        # label is a sibling `<strong>` for human display. Verified live on
+        # assortedscans.com 2026-05-19.
+        authors: List[str] = []
+        seen_authors: set = set()
+        for node in initial_soup.select("#series-authors .author, .author"):
+            text = node.get_text(" ", strip=True)
+            # Skip the wrapper itself if it bundled the "Author:" label —
+            # the real value lives inside a child .author div.
+            #
+            # Match "Author:" or "Author<whitespace>" at the start (case-
+            # insensitive). The previous `'Author' not in text.split()` guard
+            # was broken because text.get_text(' ', strip=True) collapses the
+            # label and value to "Author: Real Name" → split() yields
+            # ['Author:', 'Real', 'Name'] (colon attached), and bare 'Author'
+            # was never in that list — the wrapper always passed the guard
+            # and "Author: Real Name" got appended as a literal author.
+            # re.match anchors at start, so a real author name like "Author
+            # Smith" (extremely rare) would still be skipped — acceptable
+            # because the child .author div carries the bare name as a
+            # separate node anyway.
+            if (
+                text
+                and not re.match(r"^author[:\s]", text, re.IGNORECASE)
+                and text not in seen_authors
+            ):
+                seen_authors.add(text)
+                authors.append(text)
+        # Fallback for variant templates that DO link to /author/<slug>.
+        if not authors:
+            for a in initial_soup.select("a[href*='/author/']"):
+                text = a.get_text(strip=True)
+                if text and text not in seen_authors:
+                    seen_authors.add(text)
+                    authors.append(text)
+        if authors:
+            comic["authors"] = authors
+
+        # Artists — same pattern.
+        artists: List[str] = []
+        seen_artists: set = set()
+        for node in initial_soup.select("#series-artists .artist, .artist"):
+            text = node.get_text(" ", strip=True)
+            # Same wrapper-label skip pattern as authors above — see the
+            # extended rationale there. `Artist:` / `Artist<space>` matches
+            # the bundled label form; the child .artist div renders just
+            # the bare name.
+            if (
+                text
+                and not re.match(r"^artist[:\s]", text, re.IGNORECASE)
+                and text not in seen_artists
+            ):
+                seen_artists.add(text)
+                artists.append(text)
+        if not artists:
+            for a in initial_soup.select("a[href*='/artist/']"):
+                text = a.get_text(strip=True)
+                if text and text not in seen_artists:
+                    seen_artists.add(text)
+                    artists.append(text)
+        if artists:
+            comic["artists"] = artists
+
         keywords = self._meta_content(initial_soup, "keywords")
         if keywords:
             genres = [kw.strip() for kw in keywords.split(",") if kw.strip()]
             if genres:
                 comic["genres"] = genres
+        # Genres DOM fallback when meta keywords is empty. MangAdventure uses
+        # "categories" as the human-facing term — anchors point to
+        # /category/<slug>. Some templates also expose .categories a / .tags a.
+        # `#series-categories` is the canonical wrapper on assortedscans.
+        if "genres" not in comic:
+            dom_genres: List[str] = []
+            seen_genres: set = set()
+            for a in initial_soup.select(
+                "#series-categories a, a[href*='/category/'], "
+                ".categories a, .tags a, .genre a"
+            ):
+                text = a.get_text(strip=True)
+                if text and text not in seen_genres:
+                    seen_genres.add(text)
+                    dom_genres.append(text)
+            if dom_genres:
+                comic["genres"] = dom_genres
+
+        # Status — MangAdventure renders status as `<span>Completed</span>`
+        # inside `#series-status`. Layered fallbacks cover variant templates.
+        status_node = initial_soup.select_one(
+            "#series-status span, .status, span.status, .series-status, .info .status"
+        )
+        if status_node is not None:
+            status_text = status_node.get_text(strip=True)
+            if status_text:
+                comic["status"] = status_text
 
         soup = initial_soup
         if not self._has_dropdown(soup):
@@ -249,37 +362,11 @@ class AssortedScansSiteHandler(BaseSiteHandler):
         if not first_page_url:
             raise RuntimeError("Chapter URL missing.")
 
-        # Use impit (Chrome TLS impersonation) for all per-page requests.
-        # impit is much faster than cloudscraper for this site and handles
-        # the per-page fetches within the timeout budget.
-        try:
-            from .crawlee_utils import fetch_html_impit, IMPIT_AVAILABLE
-            if IMPIT_AVAILABLE:
-                first_html = fetch_html_impit(first_page_url, browser="chrome",
-                                              headers={"Referer": self._BASE_URL + "/"})
-                first_page_soup = self._make_soup(first_html)
-                page_urls = self._extract_page_urls(first_page_soup, first_page_url)
-                images: List[str] = []
-                for idx, page_url in enumerate(page_urls):
-                    if idx == 0:
-                        img_src = self._extract_page_image(first_page_soup, page_url)
-                    else:
-                        page_html = fetch_html_impit(page_url, browser="chrome",
-                                                     headers={"Referer": first_page_url})
-                        page_soup = self._make_soup(page_html)
-                        img_src = self._extract_page_image(page_soup, page_url)
-                    if img_src and img_src not in images:
-                        images.append(img_src)
-                if images:
-                    return images
-        except Exception:
-            pass
-
-        # Fallback: original per-page scraper loop
         first_page_response = make_request(first_page_url, scraper)
         first_page_soup = self._make_soup(first_page_response.text)
+
         page_urls = self._extract_page_urls(first_page_soup, first_page_url)
-        images = []
+        images: List[str] = []
         for idx, page_url in enumerate(page_urls):
             if idx == 0:
                 img_src = self._extract_page_image(first_page_soup, page_url)
@@ -294,6 +381,15 @@ class AssortedScansSiteHandler(BaseSiteHandler):
             raise RuntimeError("No images were extracted for this chapter.")
         return images
 
+    # ----------------------------------------------------------------- search
+    # AssortedScans-family sites (assortedscans + arc_relight via inheritance)
+    # don't have a server-side search endpoint. Their /reader/ page is the
+    # full catalog (~56 series for assortedscans) listed as
+    # <a href="/reader/<slug>/" title="Title">Title</a>. Client-side filter
+    # on title — same pattern as flamecomics/zeroscans/tcbscans.
+    #
+    # Uses self._BASE_URL so subclasses (arcrelight) route to their own
+    # domain via the same code path with no override needed.
     def search(
         self,
         query: str,
@@ -306,44 +402,60 @@ class AssortedScansSiteHandler(BaseSiteHandler):
         clean = (query or "").strip()
         if not clean:
             return []
-        response = make_request(f"{self._BASE_URL}/reader/", scraper)
+        url = f"{self._BASE_URL}/reader/"
+        response = make_request(url, scraper)
         html = response.text or ""
         if len(html) < 200:
             return []
         soup = self._make_soup(html)
+
+        # Each series is a single anchor with both an href like /reader/<slug>/
+        # AND a title= attr. Filter to those — there are other anchors on the
+        # page (chapter links, navigation, etc.) we don't want.
         slug_re = re.compile(r"^/reader/[^/]+/?$")
-        seen: Dict[str, str] = {}
-        for anchor in soup.select("a[href]"):
-            href = (anchor.get("href") or "").strip()
+        seen_hrefs: Dict[str, str] = {}  # href -> title (dedupe; keep first non-empty)
+        for a in soup.select("a[href]"):
+            href = (a.get("href") or "").strip()
             if not slug_re.match(href):
                 continue
-            title = (anchor.get("title") or "").strip() or anchor.get_text(strip=True)
-            if title:
-                seen.setdefault(href.rstrip("/"), title)
+            title = (a.get("title") or "").strip() or a.get_text(strip=True)
+            if not title:
+                continue
+            href_norm = href.rstrip("/")
+            if href_norm not in seen_hrefs:
+                seen_hrefs[href_norm] = title
 
         ql = clean.lower()
-        tokens = {token for token in ql.split() if token}
-        scored: List[tuple] = []
-        for href, title in seen.items():
+        query_tokens = set(t for t in ql.split() if t)
+
+        scored: List = []
+        for href, title in seen_hrefs.items():
             tl = title.lower()
             if ql in tl:
                 relevance = 1.0
-            elif tokens and all(token in tl for token in tokens):
+            elif query_tokens and all(tok in tl for tok in query_tokens):
                 relevance = 0.7
             else:
                 continue
             scored.append((relevance, title, href))
-        scored.sort(key=lambda item: -item[0])
+
+        scored.sort(key=lambda x: -x[0])
 
         hits: List[SearchHit] = []
         for idx, (relevance, title, href) in enumerate(scored[:limit]):
+            url_full = urljoin(self._BASE_URL, href + "/")
+            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
             hits.append(
                 SearchHit(
                     site=self.name,
                     title=title,
-                    url=urljoin(self._BASE_URL, href + "/"),
-                    cover=None,
-                    raw_score=max(0.05, relevance * (1.0 - (idx / max(1, len(scored))))),
+                    url=url_full,
+                    cover=None,  # /reader/ index has no thumbnails — chapter probe fetches via fetch_comic_context which has og:image
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
                 )
             )
         return hits

@@ -102,6 +102,12 @@ class DynastySiteHandler(BaseSiteHandler):
             alias_block = f"Aliases:\n{alias_text}"
             description = f"{description}\n\n{alias_block}".strip() if description else alias_block
 
+        # NOTE: Dynasty's /series/<slug>.json API does NOT return a `status`
+        # field — only `tags`, `aliases`, `description`, `name`, `cover`,
+        # `pages`. For Komikku-mode details.json, the status digit will be
+        # "0" (Unknown). Per user direction 2026-05-19 we accept this rather
+        # than HTML-scrape the series page for an extra request. See
+        # dry_run_komikku_findings.md §C.
         comic = {
             "hid": slug,
             "title": title,
@@ -114,6 +120,17 @@ class DynastySiteHandler(BaseSiteHandler):
         authors = [tag["name"] for tag in data.get("tags", []) if tag.get("type") == "Author"]
         if authors:
             comic["authors"] = authors
+        artists = [tag["name"] for tag in data.get("tags", []) if tag.get("type") == "Artist"]
+        if artists:
+            comic["artists"] = artists
+
+        # Aliases already merged into desc above for human-readable display;
+        # also surface as a structured field for the Komikku/ComicInfo pipeline.
+        aliases_raw = data.get("aliases")
+        if isinstance(aliases_raw, list):
+            cleaned = [a for a in aliases_raw if isinstance(a, str) and a]
+            if cleaned:
+                comic["alt_names"] = cleaned
 
         return SiteComicContext(comic=comic, title=title, identifier=slug, soup=None)
 

@@ -10,6 +10,11 @@ from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class AsmotoonSiteHandler(BaseSiteHandler):
+    # NOTE: Asmotoon's series template surfaces only description + genres +
+    # cover. There is no author/artist/status data on the page (verified
+    # 2026-05-19 audit, dry_run_komikku_findings.md §C). Komikku's details.json
+    # for asmotoon-sourced series will leave author/artist empty and status
+    # defaults to "0" (Unknown). Site limitation, not a parser bug.
     name = "asmotoon"
     domains = ("asmotoon.com", "www.asmotoon.com")
 
