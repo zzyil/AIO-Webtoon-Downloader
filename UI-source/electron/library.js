@@ -67,7 +67,7 @@ async function loadMupdf() {
 //     "Title Ch 1~5-10.pdf"  → combined range: chapters 1.5 through 10
 //     "Title.pdf"            → full series (no chapter marker)
 //
-//   Komikku-compatible format (--komikku, see komikkuspec.md):
+//   Komikku-compatible format (--komikku, see Komikku LocalSource format):
 //     "Ch.005.cbz"           → chapter 5 (zero-padded; raw `.` decimal)
 //     "Ch.005.5 - Title.cbz" → chapter 5.5 with title suffix
 //     "Vol.01 Ch.005.cbz"    → chapter 5 with volume prefix

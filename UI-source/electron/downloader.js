@@ -166,7 +166,7 @@ function buildCliArgs(args) {
     // master toggle is off (avoids noisy `--webtoon-recompress-quality 85`
     // on every spawn just because settings.defaults carry the value).
     webtoonRecompress: "--webtoon-recompress",
-    // Komikku-compatible per-chapter CBZ output (2026-05-12, komikkuspec.md).
+    // Komikku-compatible per-chapter CBZ output (2026-05-12, Komikku LocalSource format).
     // Python-side force-coerces --format cbz / --keep-chapters /
     // --no-final-file when this is set, so the UI's format selector is
     // effectively ignored for komikku downloads. Output stays at

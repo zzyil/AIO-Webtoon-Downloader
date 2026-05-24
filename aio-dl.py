@@ -2625,7 +2625,7 @@ def build_comic_info_xml(
 
 
 # -----------------------------------------------------------
-# Komikku-mode helpers (--komikku, see komikkuspec.md)
+# Komikku-mode helpers (--komikku, see Komikku LocalSource format)
 # -----------------------------------------------------------
 # These three helpers exist exclusively to produce Komikku/Mihon/Tachiyomi-
 # compatible per-chapter CBZ output. They are zero-cost on non-Komikku runs
@@ -3534,7 +3534,7 @@ _RESUME_GATING_DESTS = frozenset({
     "webtoon_recompress",
     "webtoon_recompress_quality",
     "webtoon_recompress_method",
-    # Komikku-mode (komikkuspec.md, 2026-05-12): the cbz_cache CBZ at
+    # Komikku-mode (Komikku LocalSource format, 2026-05-12): the cbz_cache CBZ at
     # processed_tdir/{n}.cbz either contains the per-chapter ComicInfo.xml
     # or doesn't, depending on Komikku-mode at create time. Flipping the
     # toggle between runs must invalidate the cache so resumed chapters
@@ -5156,7 +5156,7 @@ def main():
              "method=6 trades ~2-3x encode time for ~5%% smaller files — "
              "sensible for overnight bulk runs on a desktop, not phone CPUs.",
     )
-    # ── Komikku-compatible per-chapter CBZ output (komikkuspec.md) ──
+    # ── Komikku-compatible per-chapter CBZ output (Komikku LocalSource format) ──
     # Writes per-chapter CBZs with per-chapter ComicInfo.xml, plus
     # cover.jpg and details.json at the series-folder root, matching the
     # Mihon/Tachiyomi/Komikku LocalSource on-disk format. Force-coerces
@@ -7592,7 +7592,7 @@ def main():
                 # processed_tdir/{n}.pdf cache. Replaces chapter_content
                 # with a single cbz_cache entry pointing at the new archive.
                 #
-                # Komikku mode (2026-05-12, komikkuspec.md): when --komikku is
+                # Komikku mode (2026-05-12, Komikku LocalSource format): when --komikku is
                 # set, embed a per-chapter ComicInfo.xml in the cache zip at
                 # creation time. The XML carries <Series>/<Number>/<Title>/
                 # <Translator>/<Web>/<Year>-<Month>-<Day>, which Komikku

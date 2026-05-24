@@ -176,7 +176,7 @@ export default function SettingsTab({ settings, onSave }) {
       // --scaling 100. The downloader.js boolMap handles the negative-form
       // flag emission. Only meaningful for --format cbz.
       cbzPreserveOriginals: true,
-      // Komikku-compatible per-chapter CBZ output (2026-05-12, komikkuspec.md).
+      // Komikku-compatible per-chapter CBZ output (2026-05-12, Komikku LocalSource format).
       // When ON, Python auto-coerces --format cbz --keep-chapters
       // --no-final-file and writes per-chapter ComicInfo.xml + cover.jpg
       // + details.json at <out>/manga/<Series>/. The format selector
@@ -635,7 +635,7 @@ export default function SettingsTab({ settings, onSave }) {
           />
         </div>
 
-        {/* Komikku output toggle (2026-05-12, komikkuspec.md).
+        {/* Komikku output toggle (2026-05-12, Komikku LocalSource format).
             When ON, Python force-coerces --format cbz / --keep-chapters /
             --no-final-file regardless of the Format selector above. Each
             chapter CBZ gets its own ComicInfo.xml (overrides filename-derived

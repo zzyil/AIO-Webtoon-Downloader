@@ -83,7 +83,7 @@ const DEFAULT_FORM = {
   webtoonRecompress: false,
   webtoonRecompressQuality: 85,
   webtoonRecompressMethod: 4,
-  // Komikku-compatible per-chapter CBZ output (2026-05-12, komikkuspec.md).
+  // Komikku-compatible per-chapter CBZ output (2026-05-12, Komikku LocalSource format).
   // When on, Python force-coerces format=cbz / keep-chapters / no-final-file,
   // writes per-chapter ComicInfo.xml inside each CBZ, plus cover.jpg +
   // details.json at the series-folder root. settings.defaults.komikku
@@ -207,7 +207,7 @@ export default function DownloadTab({
       args.webtoonRecompressQuality = form.webtoonRecompressQuality;
       args.webtoonRecompressMethod = form.webtoonRecompressMethod;
     }
-    // Komikku output (2026-05-12, komikkuspec.md). One boolean — Python
+    // Komikku output (2026-05-12, Komikku LocalSource format). One boolean — Python
     // does all the coercion. downloader.js boolMap emits --komikku when
     // this is true.
     if (form.komikku) {
@@ -320,7 +320,7 @@ export default function DownloadTab({
           </p>
         )}
 
-        {/* Komikku-mode per-job toggle (2026-05-12, komikkuspec.md).
+        {/* Komikku-mode per-job toggle (2026-05-12, Komikku LocalSource format).
             Pre-filled from settings.defaults.komikku via the useEffect at
             line ~120-124 (which spreads settings.defaults into the form).
             Python-side --komikku auto-coerces format=cbz / keep-chapters /
