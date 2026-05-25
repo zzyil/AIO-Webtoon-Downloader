@@ -98,7 +98,6 @@ console.log("  ✓ requirements.txt");
 for (const file of [
   "aio_search_cli.py",
   "aio_config.py",
-  "aio_config.json",
   "library_state.py",
   "metadata_editor.py",
   "metadata_cli.py",
@@ -112,6 +111,30 @@ for (const file of [
   }
   fs.copyFileSync(src, path.join(DEST, file));
   console.log(`  ✓ ${file}`);
+}
+
+// aio_config.json is a runtime USER config file that's gitignored at source
+// (users customize it locally to override library output_dir / HID-marker
+// filenames; absent file means "use the defaults baked into aio_config.py").
+// The CI release builds — and any fresh clone — therefore don't have it,
+// which used to crash this step. Handle both shapes:
+//   - File exists in source     → copy it (a contributor was testing their
+//                                  own overrides; preserve them in the bundle).
+//   - File missing from source  → generate an empty `{}` in the bundle. The
+//                                  runtime's load_aio_config() also handles
+//                                  the truly-missing case (returns {}), but
+//                                  shipping a valid JSON file matches the
+//                                  rest of python-src/ and silences any
+//                                  ENOENT log noise from the Electron side.
+// Cross-file: aio_config.py:CONFIG_FILENAME (line 12), load_aio_config (line 20).
+const configSrc = path.join(AIO_SOURCE, "aio_config.json");
+const configDest = path.join(DEST, "aio_config.json");
+if (fs.existsSync(configSrc)) {
+  fs.copyFileSync(configSrc, configDest);
+  console.log("  ✓ aio_config.json (copied from source)");
+} else {
+  fs.writeFileSync(configDest, "{}\n", "utf-8");
+  console.log("  ✓ aio_config.json (generated default empty config)");
 }
 
 // Copy sites/ folder
