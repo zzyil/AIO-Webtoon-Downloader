@@ -2,6 +2,7 @@
   "name": "aio-downloader-ui",
   "version": "1.7.2",
   "description": "Desktop UI for AIO Manga/Webtoon Downloader",
+  "homepage": "https://github.com/zzyil/AIO-Webtoon-Downloader",
   "main": "electron/main.js",
   "scripts": {
     "dev": "vite",
@@ -77,6 +78,7 @@
         { "target": "deb", "arch": ["x64"] }
       ],
       "category": "Network",
+      "maintainer": "AIO Downloader Project <noreply@github.com>",
       "synopsis": "Multi-site manga/webtoon downloader with PDF/EPUB/CBZ output",
       "description": "Desktop app for downloading manga, webtoons, and comics from 50+ sites with cross-site search and quality ranking. Builds PDF, EPUB, or CBZ output (with optional Mihon/Komikku-compatible per-chapter CBZs). Bundles Python + Patchright Chromium for VRF-gated sources. Resume-safe by default; configurable per-host concurrency throttling on CDN errors."
     },
