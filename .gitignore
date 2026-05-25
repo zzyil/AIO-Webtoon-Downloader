@@ -62,6 +62,5 @@ UI-source/dist/
 search_out.json
 settings-full.png
 probe_*.py
-tests/
 aio_config.json
 test_downloads.py
