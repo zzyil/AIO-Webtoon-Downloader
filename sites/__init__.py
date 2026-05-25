@@ -175,9 +175,16 @@ _REGISTERED_HANDLERS: Iterable[BaseSiteHandler] = tuple(
 
 
 def get_handler_by_name(name: str) -> Optional[BaseSiteHandler]:
+    # Case-insensitive lookup on BOTH sides. Some Madara child handlers
+    # (Toonily, WebtoonXYZ) pass a mixed-case display name to the parent's
+    # __init__, which overwrites the lowercase class attribute and leaves
+    # handler.name capitalized at runtime. Before this fix the comparison
+    # silently failed for those two sites — get_handler_by_name("toonily")
+    # returned None even though the handler was registered. Regression
+    # guards: tests/test_komikku_metadata.py::test_get_handler_by_name_case_insensitive_*
     lowered = name.lower()
     for handler in _REGISTERED_HANDLERS:
-        if handler.name == lowered:
+        if handler.name.lower() == lowered:
             return handler
     return None
 
