@@ -3,7 +3,10 @@
 #
 # Triggers:
 #   - push of any tag matching v*  (cuts a draft GitHub Release)
-#   - manual workflow_dispatch     (smoke-test changes without tagging)
+#   - manual workflow_dispatch     (also cuts a draft release — tag is
+#                                   either provided via the `tag_name`
+#                                   input or auto-derived from
+#                                   UI-source/package.json + timestamp)
 #
 # Jobs:
 #   build   — matrix over windows-latest / macos-latest / ubuntu-latest.
@@ -11,9 +14,11 @@
 #             `dist:<os>` script. macOS DMGs cannot be cross-built from
 #             Windows or Linux (Apple's hdiutil is required), which is
 #             why the matrix exists.
-#   release — only on tag push. Downloads the per-OS artifacts and
-#             attaches them to a draft release. Manual smoke-test runs
-#             stop after `build` and just upload artifacts.
+#   release — fires on tag push AND on workflow_dispatch. Downloads the
+#             per-OS artifacts and attaches them to a draft release. The
+#             draft has to be manually published in the GitHub UI before
+#             the tag is actually created on the commit, so manual runs
+#             with a synthesized tag are safe to discard.
 #
 # Notes:
 #   - All builds are unsigned (no Apple Developer cert, no Authenticode).
@@ -31,6 +36,18 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    # Manual runs cut a draft release too — handy for shipping a build
+    # without pushing a real vX.Y.Z tag yet. Either supply the tag name
+    # explicitly, or leave it blank and the release job will synthesize
+    # `v<package.json.version>-draft-<UTC timestamp>` so multiple manual
+    # runs never collide. The tag is only materialized on the commit
+    # when the maintainer clicks "Publish" on the draft.
+    inputs:
+      tag_name:
+        description: 'Tag for the draft release (e.g. v1.7.3). Leave empty to auto-generate from UI-source/package.json version + UTC timestamp.'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write  # needed by softprops/action-gh-release to create the draft
@@ -96,10 +113,19 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Fire on tag pushes (the canonical release path) AND manual runs
+    # (workflow_dispatch). Without the second clause, a manual run would
+    # stop at `build` and leave the artifacts unattached to anything.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
+      # Checkout is needed by "Determine release tag" below so it can read
+      # UI-source/package.json on manual runs without an explicit tag input.
+      # Cheap (shallow clone, no LFS) and a no-op on tag-push runs that
+      # already have the tag in github.ref.
+      - uses: actions/checkout@v6
+
       # download-artifact@v8 errors on hash mismatch by default (was warning
       # in v7). That's the secure default we want — a hash mismatch indicates
       # a corrupted upload-or-transfer and shipping it would be worse than
@@ -109,10 +135,39 @@ jobs:
         with:
           path: artifacts
 
-      # gh-release v3 is the Node 24 line; same API as v2.
+      # Tag-push runs: re-use the pushed ref (refs/tags/vX.Y.Z → vX.Y.Z).
+      # Manual runs: prefer the user-supplied input; otherwise synthesize
+      # v<package.json.version>-draft-<UTC timestamp> so repeat manual
+      # runs each get a unique draft. softprops/action-gh-release only
+      # materializes the tag on the run's commit when the maintainer
+      # publishes the draft via the UI, so the synthesized name is safe
+      # to throw away if the draft is discarded.
+      - name: Determine release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT_TAG="${{ inputs.tag_name }}"
+            if [ -n "$INPUT_TAG" ]; then
+              TAG="$INPUT_TAG"
+            else
+              VERSION=$(node -p "require('./UI-source/package.json').version")
+              STAMP=$(date -u +%Y%m%d-%H%M%S)
+              TAG="v${VERSION}-draft-${STAMP}"
+            fi
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: ${TAG}"
+
+      # gh-release v3 is the Node 24 line; same API as v2. tag_name is
+      # passed explicitly (not inferred from github.ref) so the manual
+      # path can supply a synthesized tag without confusing the action.
       - name: Create draft GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           draft: true
+          tag_name: ${{ steps.tag.outputs.tag }}
           files: artifacts/**/*
           generate_release_notes: true
