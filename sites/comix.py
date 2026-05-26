@@ -8,7 +8,8 @@ import queue
 import re
 import sys
 import threading
-from typing import Dict, List, Optional, Any
+import time
+from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import parse_qsl, quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -101,6 +102,24 @@ class ComixSiteHandler(BaseSiteHandler):
         # chapter (the "data.keys()=['e']" warning + 300-char snippet + the
         # "falling back to DOM-scrape-for-images" follow-up).
         self._chapter_api_known_encrypted = False
+        # Memoize get_chapter_images results so the prefetch worker and
+        # the main download flow don't both run the ~20s canvas scrape
+        # per chapter. Both threads share THIS handler instance (the
+        # prefetch job carries `handler` by reference). Comix's
+        # Patchright bridge serializes every scrape through one daemon
+        # worker, so a duplicate main-flow scrape gets queued behind
+        # every other in-flight prefetch — turning the supposed-to-be-
+        # instant prefetch_hit path into a wait worth several chapters'
+        # scrape time (~14-20s each). Keyed by chapter URL because
+        # merged-part chapters share an id but have distinct part URLs.
+        # 600s TTL matches sites/image_cache._TTL_SECONDS so cached
+        # URLs and the cached bytes behind them expire together — a
+        # URL whose bytes have been evicted points at a CDN signed
+        # token that's almost certainly rotated by then, so we want a
+        # fresh scrape rather than serving stale URLs that would
+        # 404-on-fetch.
+        self._chapter_images_cache: Dict[str, Tuple[List[str], float]] = {}
+        self._chapter_images_cache_lock = threading.Lock()
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.update({
@@ -712,10 +731,56 @@ class ComixSiteHandler(BaseSiteHandler):
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
         return chapter_version.get("group")
 
+    # Module-level TTL constant used by _get/_cache_chapter_images.
+    # Defined here (class-scope) instead of top-of-file so it stays
+    # adjacent to the methods that read it; 600 s matches
+    # sites/image_cache._TTL_SECONDS by intent — see __init__'s
+    # _chapter_images_cache comment for why both clocks share a TTL.
+    _CHAPTER_IMAGES_CACHE_TTL = 600.0
+
+    def _get_cached_chapter_images(self, chapter_url: str) -> Optional[List[str]]:
+        """Return a defensive copy of the cached URL list for this
+        chapter, or None on miss / TTL-expired. Thread-safe."""
+        with self._chapter_images_cache_lock:
+            entry = self._chapter_images_cache.get(chapter_url)
+            if entry is None:
+                return None
+            urls, ts = entry
+            if time.monotonic() - ts > self._CHAPTER_IMAGES_CACHE_TTL:
+                del self._chapter_images_cache[chapter_url]
+                return None
+            return list(urls)
+
+    def _cache_chapter_images(self, chapter_url: str, urls: List[str]) -> None:
+        """Stash this chapter's URL list. No-op on empty inputs
+        (don't poison the cache with a known-bad result that would
+        short-circuit a future retry). Thread-safe."""
+        if not chapter_url or not urls:
+            return
+        with self._chapter_images_cache_lock:
+            self._chapter_images_cache[chapter_url] = (list(urls), time.monotonic())
+
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
         chap_id = chapter.get("id")
         images: List[str] = []
+
+        # Memoization fast path. The prefetch worker and the main
+        # download flow share this handler instance and BOTH call
+        # into get_chapter_images for every chapter — the comment
+        # in aio-dl.py around _ImgPrefetchJob explicitly chose not
+        # to share media_entries via sidecar JSON because for
+        # mangafire the redo is ~0.5-1 s. For comix the redo is a
+        # ~20 s canvas scrape AND it serializes through the bridge's
+        # single daemon worker behind any pending prefetches, so
+        # main was waiting several chapters' worth of scrape time
+        # for a result it could have served from memory. Cache hit
+        # → return immediately, no API call, no DOM scrape, no
+        # bridge enqueue. See __init__ for the cache + TTL setup.
+        if url:
+            cached = self._get_cached_chapter_images(url)
+            if cached is not None:
+                return cached
 
         # 2026-05-13: chapter HTML is now a ~6.7KB SPA shell with no embedded
         # images — JS calls /api/v1/chapters/{id}?_=<sig> client-side, where
@@ -780,6 +845,8 @@ class ComixSiteHandler(BaseSiteHandler):
                         pass
 
         if images:
+            if url:
+                self._cache_chapter_images(url, images)
             return images
 
         # ──────────────────────────────────────────────────────────────
@@ -809,6 +876,7 @@ class ComixSiteHandler(BaseSiteHandler):
                 )
             images = _COMIX_BROWSER_BRIDGE.fetch_chapter_images_via_dom(url) or []
             if images:
+                self._cache_chapter_images(url, images)
                 return images
 
         # ----- HTML-scrape fallback (kept for forward-compat if comix re-enables SSR) -----
@@ -860,6 +928,8 @@ class ComixSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("Could not find images in chapter page.")
 
+        if url:
+            self._cache_chapter_images(url, images)
         return images
 
     # ----------------------------------------------------------------- search
