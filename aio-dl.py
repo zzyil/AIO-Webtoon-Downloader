@@ -1149,6 +1149,42 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
             fh.write(data)
         return _finalize_pending_image(pending_pth, folder, base, ct)
 
+    # Browser-byte-capture cache check (sites/image_cache). Some site
+    # handlers (comix.to) capture image response bodies via Patchright's
+    # response listener during their chapter scrape, because the CDN's
+    # signed tokens expire within ~minute-scale TTL and the HTTP fetch
+    # below would 404 by the time it tries. When the cache has the bytes
+    # we write them directly to the pending tempfile and skip every HTTP
+    # path entirely — including the _host_fail_count and watchdog checks
+    # below, because we're not touching the CDN at all. Cross-file:
+    # sites/comix.py:_ComixBrowserSession.fetch_chapter_images_via_dom
+    # (handle_response) populates the cache; sites/image_cache.py owns
+    # the dict + locks; clear_cache() is called at the start of each
+    # chapter scrape.
+    try:
+        from sites import image_cache as _ic
+        _cached = _ic.get_cached_image(url)
+    except Exception:
+        _cached = None
+    if _cached is not None:
+        _body, _ct = _cached
+        try:
+            with open(pending_pth, "wb") as fh:
+                fh.write(_body)
+            log_debug(
+                f"  Used cached bytes for {os.path.basename(name)} "
+                f"(browser-capture cache hit, {len(_body)} bytes, "
+                f"content_type={_ct or 'unknown'})"
+            )
+            return _finalize_pending_image(pending_pth, folder, base, _ct)
+        except Exception as _e:
+            log_verbose(
+                f"  Cache write failed for {os.path.basename(name)} "
+                f"({_e}); falling through to HTTP fetch."
+            )
+            # Fall through to existing HTTP path — defensive, the
+            # write should almost never fail (we own the folder).
+
     # Fast-fail: chapter watchdog already fired, or this host has accumulated
     # too many fully-failed URLs this chapter. No point even starting.
     # These checks are no-ops outside the chapter loop (e.g. cover download).
@@ -6155,106 +6191,6 @@ def main():
     if epub_dir_base:
         epub_out_dir = allocate_series_output_dir(title, hid, root=epub_dir_base)
         setattr(args, "epub_dir", epub_out_dir)
-
-    # ── Direct-URL multi-source: find alternatives for fallback ──
-    # When --multi-source is set and we got here via a direct URL (not via
-    # --search --auto-pick which already populated _multi_source_alternatives),
-    # search for the series title across other handlers and pre-fetch their
-    # chapter lists so per-chapter fallback in _process_chapter_strict has
-    # alternatives to try. Skipped when --list-chapters is set (read-only
-    # mode, no downloads happening, alternatives discovery would just waste
-    # time).
-    if (
-        getattr(args, "multi_source", False)
-        and not getattr(args, "search", None)
-        and not getattr(args, "list_chapters", False)
-        and not _multi_source_alternatives  # not already populated
-    ):
-        # Fix B (2026-05-07): when the UI passes --multi-source-prefetched, use
-        # the JSON-listed alts instead of running cross-site search again. The
-        # search-tab download path writes this file just before spawning aio-dl
-        # so we skip the redundant ~80s search. Falls back to search if the
-        # file is missing or malformed (defensive — doesn't fail the download).
-        prefetched_path = getattr(args, "multi_source_prefetched", None)
-        try:
-            if prefetched_path:
-                from aio_search_cli import build_alternatives_from_prefetched
-                _ms_alts = build_alternatives_from_prefetched(
-                    prefetched_path=prefetched_path,
-                    primary_handler=handler,
-                    primary_context=context,
-                    primary_chapters=pool,
-                    args=args,
-                    make_request=make_request,
-                    on_status=lambda m: print(m, file=sys.stderr),
-                )
-            else:
-                from aio_search_cli import find_alternatives_for_direct_url
-                _ms_alts = find_alternatives_for_direct_url(
-                    primary_url=args.comic_url,
-                    primary_handler=handler,
-                    primary_context=context,
-                    primary_chapters=pool,
-                    args=args,
-                    make_request=make_request,
-                    record_rate_limit=_record_rate_limit,
-                    on_status=lambda m: print(m, file=sys.stderr),
-                )
-            if _ms_alts:
-                _multi_source_alternatives = _ms_alts
-                n_alts = sum(len(v) for v in _multi_source_alternatives.values())
-                n_chapters_with_alts = len(_multi_source_alternatives)
-                print(
-                    f"[*] Multi-source ON: {n_chapters_with_alts} chapters have "
-                    f"alternative sources ({n_alts} total fallback paths)",
-                    file=sys.stderr,
-                )
-        except Exception as exc:
-            # Don't let alternatives discovery block the main download. If it
-            # fails, the user gets standard single-source behavior.
-            print(
-                f"[!] Multi-source alternatives discovery failed: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-
-    # ── --list-chapters: print metadata + chapter list as JSON, then exit ──
-    # Used by the UI to check for new chapters without downloading anything.
-    # Only needs the page HTML + chapter list API call — no image VRF, no downloads.
-    # IMPORTANT: This runs BEFORE allocate_series_output_dir so it doesn't
-    # create empty folders in mangas/ just for checking.
-    if getattr(args, "list_chapters", False):
-        # Deduplicate chapter numbers (pool may have multiple versions per chapter)
-        seen_nums = set()
-        unique_chapters = []
-        for ch in pool:
-            num = ch.get("chap")
-            if num is not None and num not in seen_nums:
-                seen_nums.add(num)
-                unique_chapters.append(num)
-        # Sort numerically
-        try:
-            unique_chapters.sort(key=lambda x: float(x))
-        except (ValueError, TypeError):
-            pass
-
-        result = {
-            "hid": hid,
-            "title": title,
-            "url": args.comic_url,
-            "site": handler.name,
-            "status": comic_data.get("status"),
-            "authors": comic_data.get("authors", []),
-            "cover": comic_data.get("cover"),
-            "genres": comic_data.get("genres", []),
-            "total": len(unique_chapters),
-            "chapters": unique_chapters,
-        }
-        print(json.dumps(result))
-        sys.exit(0)
-
-    # Output goes into a per-title folder under ./mangas (title, with hid only on collision)
-    out_dir = allocate_series_output_dir(title, hid, root="mangas")
-    setattr(args, "output_dir", out_dir)
 
     # --- Chapter Selection Logic ---
     log_verbose("Filtering chapters based on preferences...")

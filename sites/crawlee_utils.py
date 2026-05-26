@@ -108,18 +108,108 @@ _cf_cookie_cache: dict = {}          # domain -> {cookies, user_agent, ts}
 _cf_cookie_lock = _threading.Lock()
 _CF_COOKIE_TTL = 25 * 60             # 25 minutes (cf_clearance lasts ~30 min)
 
+# Memoized Patchright/Playwright Chromium path used as a zendriver fallback
+# when no system Chrome is installed. Tri-state: None = not probed yet,
+# "" = probed and nothing found, anything else = absolute path to the
+# executable. See _find_patchright_chromium for full rationale.
+_PATCHRIGHT_CHROMIUM_PATH: Optional[str] = None
 
-async def _solve_cf_async(url: str, overall_timeout: float = 45.0) -> dict:
+
+def _find_patchright_chromium() -> Optional[str]:
+    """Resolve the path to Patchright (or Playwright) bundled Chromium.
+
+    Why: zendriver's default browser lookup walks the system PATH plus
+    common Chrome install locations and raises "could not find a valid
+    browser binary" when nothing is installed. That breaks every
+    CF-protected site in environments without system Chrome — Windows
+    Sandbox / WDAG, the Electron AppImage's slim bundled Python env,
+    minimal CI runners. But Patchright already installs a full Chromium
+    binary for its own automation, so we hand zendriver THAT path.
+
+    Probes patchright first (the stealthier build), falls back to
+    vanilla playwright. Memoized at module scope because sync_playwright
+    startup is ~200 ms and CF retries can fire repeatedly across a
+    single downloader run, so the cost needs to amortize. The empty-
+    string sentinel marks "probed and failed" so subsequent calls don't
+    re-pay the probe cost.
+
+    Returns the absolute path string, or None when neither package is
+    installed / their Chromium isn't on disk. None makes the caller fall
+    through to zendriver's default lookup, which will raise the original
+    "could not find a valid browser binary" error — that's still the
+    right behavior because there's nothing left to try.
+
+    Cross-file: called from get_cf_session and fetch_html_zendriver,
+    threaded into _solve_cf_async / _fetch_html_zendriver_async via
+    the browser_executable_path kwarg. Cooperates with the existing
+    `_PATCHRIGHT_CHROMIUM_PATH` cache.
+    """
+    global _PATCHRIGHT_CHROMIUM_PATH
+    if _PATCHRIGHT_CHROMIUM_PATH is not None:
+        return _PATCHRIGHT_CHROMIUM_PATH or None  # "" → None for caller
+    import os as _os
+    from importlib import import_module
+    for module_name in ("patchright", "playwright"):
+        try:
+            mod = import_module(f"{module_name}.sync_api")
+        except ImportError:
+            continue
+        path: Optional[str] = None
+        try:
+            # sync_playwright().start() spawns ONLY the driver subprocess —
+            # the chromium binary is launched lazily on chromium.launch(),
+            # which we never call. So this is a string-lookup, not a
+            # browser launch; cost is ~200ms of subprocess overhead.
+            pw = mod.sync_playwright().start()
+            try:
+                path = pw.chromium.executable_path
+            finally:
+                pw.stop()
+        except Exception:
+            continue
+        if path and _os.path.exists(path):
+            _PATCHRIGHT_CHROMIUM_PATH = path
+            try:
+                import sys as _sys
+                print(
+                    f"[*] zendriver: using {module_name}-bundled Chromium "
+                    f"({path}) for CF challenges",
+                    file=_sys.stderr,
+                )
+            except Exception:
+                pass
+            return path
+    _PATCHRIGHT_CHROMIUM_PATH = ""
+    return None
+
+
+async def _solve_cf_async(
+    url: str,
+    overall_timeout: float = 45.0,
+    *,
+    browser_executable_path: Optional[str] = None,
+) -> dict:
     """Open a visible Chrome, solve CF challenge, return {cookies, user_agent}.
 
     The zendriver ``Cookie.from_json`` bug (``KeyError: 'sameParty'``) is
     fixed by the module-level monkey-patch above, so we can safely use
     ``browser.cookies.get_all()`` directly.
+
+    ``browser_executable_path``: when set, zendriver launches THAT
+    Chromium instead of its default system-Chrome lookup. Threaded in
+    from get_cf_session via _find_patchright_chromium so the call works
+    in environments where only Patchright's bundled Chromium exists
+    (Windows Sandbox, the Electron AppImage's slim Python env). None →
+    use zendriver's default lookup (which raises "could not find a valid
+    browser binary" if no system Chrome is installed).
     """
     from zendriver.core.cloudflare import cf_is_interactive_challenge_present, verify_cf
     import signal as _signal
 
-    browser = await _zd.start(headless=False)
+    browser = await _zd.start(
+        headless=False,
+        browser_executable_path=browser_executable_path,
+    )
     chrome_pid = None
     try:
         if hasattr(browser, '_process') and browser._process:
@@ -162,6 +252,23 @@ async def _solve_cf_async(url: str, overall_timeout: float = 45.0) -> dict:
             ]
         except Exception as e:
             print(f"[!] cookie retrieval warning: {e}")
+
+        # Diagnostic: surface what zendriver actually captured so silent-
+        # failure cases (Chrome opened but CF wasn't actually solved, so
+        # cookies list is empty / missing cf_clearance) are visible. Without
+        # this the cookie-injection-into-Patchright path in sites/comix.py
+        # looks like it failed when really there was nothing to inject.
+        cf_clearance_present = any(c.get("name") == "cf_clearance" for c in cookies)
+        try:
+            import sys as _sys
+            print(
+                f"[*] zendriver: captured {len(cookies)} cookie(s) from "
+                f"{url} (cf_clearance: "
+                f"{'present' if cf_clearance_present else 'MISSING'})",
+                file=_sys.stderr,
+            )
+        except Exception:
+            pass
 
         return {"cookies": cookies, "user_agent": ua}
 
@@ -213,7 +320,18 @@ def get_cf_session(base_url: str) -> "requests.Session":
             cookies = cached["cookies"]
             user_agent = cached["user_agent"]
         else:
-            result = _asyncio.run(_solve_cf_async(base_url))
+            # Probe for a Patchright/Playwright Chromium up-front so
+            # zendriver doesn't blow up with "could not find a valid
+            # browser binary" on sandboxed boxes (Windows Sandbox /
+            # WDAG, the Electron bundle's slim Python env). When the
+            # probe returns None, the call still goes through with
+            # browser_executable_path=None and zendriver's default
+            # lookup runs unchanged — so installs with system Chrome
+            # behave exactly as before.
+            browser_path = _find_patchright_chromium()
+            result = _asyncio.run(
+                _solve_cf_async(base_url, browser_executable_path=browser_path)
+            )
             cookies = result["cookies"]
             user_agent = result["user_agent"]
             _cf_cookie_cache[domain] = {"cookies": cookies, "user_agent": user_agent, "ts": now}
@@ -343,13 +461,20 @@ def sync_cf_cookies(scraper, url: str) -> None:
 
 
 async def _fetch_html_zendriver_async(
-    url: str, wait_selector: Optional[str] = None, overall_timeout: float = 60.0
+    url: str,
+    wait_selector: Optional[str] = None,
+    overall_timeout: float = 60.0,
+    *,
+    browser_executable_path: Optional[str] = None,
 ) -> dict:
     from zendriver.core.cloudflare import cf_is_interactive_challenge_present, verify_cf
     import asyncio as _asyncio
     import signal as _signal
 
-    browser = await _zd.start(headless=False)
+    browser = await _zd.start(
+        headless=False,
+        browser_executable_path=browser_executable_path,
+    )
     chrome_pid = None
     try:
         if hasattr(browser, "_process") and browser._process:
@@ -429,7 +554,15 @@ def fetch_html_zendriver(url: str, wait_selector: Optional[str] = None) -> str:
     import asyncio as _asyncio
 
     domain = _urlparse(url).netloc
-    result = _asyncio.run(_fetch_html_zendriver_async(url, wait_selector))
+    # Same Patchright Chromium fallback as get_cf_session — see
+    # _find_patchright_chromium for the why. None passthrough preserves
+    # zendriver's default lookup on installs with system Chrome.
+    browser_path = _find_patchright_chromium()
+    result = _asyncio.run(
+        _fetch_html_zendriver_async(
+            url, wait_selector, browser_executable_path=browser_path
+        )
+    )
 
     # Cache cookies
     now = _time.time()
