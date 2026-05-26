@@ -149,6 +149,20 @@ class ComixSiteHandler(BaseSiteHandler):
                 if is_cf_challenge(response.status_code, response.text):
                     cf = self._get_cf_session()
                     if cf:
+                        # Push the freshly-captured CF cookies into the
+                        # caller's scraper so subsequent make_request calls
+                        # — chapter API HTML fallback, cover-image download
+                        # via the global scraper, anything else hitting
+                        # comix.to or its CDN — inherit the cf_clearance
+                        # instead of each one re-tripping the 403 + CF retry
+                        # cycle on the same cookies we already have. No-op
+                        # when the cookie cache is empty (CF wasn't solved).
+                        # Cross-file: sites/crawlee_utils.py:sync_cf_cookies.
+                        try:
+                            from .crawlee_utils import sync_cf_cookies
+                            sync_cf_cookies(scraper, url)
+                        except Exception:
+                            pass
                         response = cf.get(url, timeout=20)
             except Exception:
                 # Retry-path failure is non-fatal — keep the original
@@ -718,9 +732,51 @@ class ComixSiteHandler(BaseSiteHandler):
                     if not isinstance(rel, str) or not rel:
                         continue
                     images.append(rel if rel.startswith("http") else (base_url + rel))
+                # If the bridge captured a response but we couldn't parse
+                # image URLs, surface the response shape so the user knows
+                # whether comix encrypted the chapter API (like they did
+                # for the listing, where the shape became {"e": "<blob>"})
+                # or changed the schema. Without this the call silently
+                # falls through to HTML scrape and the user sees a 403
+                # retry loop with no clue why.
+                if not images:
+                    try:
+                        keys = list(data.keys())[:8]
+                        snippet = json.dumps(data, ensure_ascii=False)[:300]
+                        print(
+                            f"[!] Comix: chapter API returned data for "
+                            f"chap_id={chap_id} but no image URLs parsed. "
+                            f"data.keys()={keys} snippet={snippet}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
 
         if images:
             return images
+
+        # ──────────────────────────────────────────────────────────────
+        # 2026-05-26: DOM-scrape-for-images fallback. The chapter API now
+        # returns the same encrypted shape that the listing API does
+        # (`{"e": "<base64>"}`); the bridge captures the response but the
+        # parse loop above can't extract image URLs from an opaque blob.
+        # The in-page JS DOES decrypt it client-side and renders <img>
+        # tags, so navigate the chapter via the bridge (which has CF
+        # cookies + matching UA from _sync_cf_cookies) and scrape the
+        # rendered DOM. Same strategy as fetch_chapters_via_dom for the
+        # listing; pre-empts the HTML scrape below because chapter HTML
+        # is a SPA shell with no embedded image URLs anyway.
+        # Cross-file: _ComixBrowserSession.fetch_chapter_images_via_dom.
+        # ──────────────────────────────────────────────────────────────
+        if chap_id and url:
+            print(
+                f"[*] Comix: falling back to DOM-scrape-for-images "
+                f"(chap_id={chap_id})...",
+                flush=True,
+            )
+            images = _COMIX_BROWSER_BRIDGE.fetch_chapter_images_via_dom(url) or []
+            if images:
+                return images
 
         # ----- HTML-scrape fallback (kept for forward-compat if comix re-enables SSR) -----
         if not url:
@@ -885,7 +941,18 @@ class _ComixBrowserSession:
     def __init__(self):
         self._pw = None
         self._browser = None
+        # _context is an explicit BrowserContext so we can set User-Agent at
+        # creation time AND call add_cookies later. browser.new_page() gives
+        # an anonymous default context with neither lever exposed — and CF
+        # binds cf_clearance to (UA, IP, TLS fp), so a UA mismatch between
+        # the zendriver-captured cookie and the Patchright request would
+        # make injection useless.
+        self._context = None
         self._page = None
+        # Monotonic-ish ts of the last crawlee_utils._cf_cookie_cache entry
+        # we synced into _context. Used by _sync_cf_cookies to skip
+        # redundant add_cookies calls when the cache hasn't changed.
+        self._last_cf_cookie_ts: float = 0.0
 
     def _start(self) -> bool:
         """Lazy-launch Patchright on first use. Returns True if the browser
@@ -911,14 +978,35 @@ class _ComixBrowserSession:
                 headless=True,
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
-            self._page = self._browser.new_page()
+            # Create an explicit context so we can (a) match the UA that
+            # zendriver used to solve CF and (b) inject cookies after the
+            # fact. The cached UA is set at context-creation because it
+            # cannot be changed on an existing context — if no CF solve
+            # has happened yet, Patchright's default stealth UA is used.
+            ctx_kwargs: Dict[str, Any] = {}
+            cached_ua = self._cached_cf_user_agent()
+            if cached_ua:
+                ctx_kwargs["user_agent"] = cached_ua
+            self._context = self._browser.new_context(**ctx_kwargs)
+            self._page = self._context.new_page()
         except Exception as e:
             print(f"[!] Comix Playwright launch failed: {e}")
             self._cleanup()
             return False
+        # Inject any cookies already captured by a prior zendriver solve.
+        # Public methods also re-call _sync_cf_cookies in case the cache
+        # gets a fresher generation between the bridge launching and the
+        # actual navigation.
+        self._sync_cf_cookies()
         return True
 
     def _cleanup(self):
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
+        self._context = None
         try:
             if self._browser is not None:
                 self._browser.close()
@@ -932,10 +1020,90 @@ class _ComixBrowserSession:
             pass
         self._pw = None
         self._page = None
+        self._last_cf_cookie_ts = 0.0
+
+    def _cached_cf_user_agent(self) -> Optional[str]:
+        """Return the User-Agent string from any cached zendriver CF solve
+        for comix.to, or None if no solve has run yet. Using THAT exact UA
+        in the Patchright context is what keeps the cf_clearance cookie
+        valid on Patchright-issued requests — CF rejects cookie+UA
+        mismatches as bot signals.
+
+        Cross-file: cache populated by sites/crawlee_utils.py:_solve_cf_async
+        via get_cf_session; key is the bare netloc ("comix.to").
+        """
+        try:
+            from . import crawlee_utils as _cu
+            with _cu._cf_cookie_lock:
+                cached = _cu._cf_cookie_cache.get("comix.to")
+            if cached:
+                return cached.get("user_agent") or None
+        except Exception:
+            pass
+        return None
+
+    def _sync_cf_cookies(self) -> None:
+        """Copy the latest crawlee CF cookies into this bridge's Patchright
+        context so the headless DOM scrape inherits the cf_clearance
+        that zendriver captured visibly. Idempotent — tracks last-synced
+        timestamp and no-ops when the cache is empty or hasn't changed
+        since the last sync.
+
+        Caveat: even with matching UA + cookies, CF can still re-challenge
+        because the TLS fingerprint of Patchright's bundled Chromium may
+        differ from the headed Chrome that zendriver used. If it does,
+        the page-1 selector wait still times out and the comix.py
+        diagnostic block surfaces it — at which point this strategy is
+        exhausted and the user should rerun with --multi-source.
+
+        Cross-file: cookies populated in sites/crawlee_utils.py via
+        get_cf_session → _solve_cf_async; serialized through
+        _cu._cf_cookie_lock for cross-thread safety.
+        """
+        if self._context is None:
+            return
+        try:
+            from . import crawlee_utils as _cu
+            with _cu._cf_cookie_lock:
+                cached = _cu._cf_cookie_cache.get("comix.to")
+        except Exception:
+            return
+        if not cached:
+            return
+        ts = float(cached.get("ts", 0) or 0)
+        if ts <= self._last_cf_cookie_ts:
+            return  # already injected this generation
+        raw = cached.get("cookies") or []
+        if not raw:
+            return
+        pw_cookies: List[Dict[str, Any]] = []
+        for c in raw:
+            entry: Dict[str, Any] = {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain") or "comix.to",
+                "path": c.get("path") or "/",
+            }
+            pw_cookies.append(entry)
+        try:
+            self._context.add_cookies(pw_cookies)
+            self._last_cf_cookie_ts = ts
+            print(
+                f"[*] Comix: injected {len(pw_cookies)} CF cookie(s) "
+                f"captured by zendriver into the Patchright context",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[!] Comix: failed to inject CF cookies into Patchright: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def get_api_token(self, url: str) -> Optional[str]:
         if not self._start():
             return None
+        self._sync_cf_cookies()
         page = self._page
         token_query: Optional[str] = None
 
@@ -974,6 +1142,7 @@ class _ComixBrowserSession:
     def fetch_chapter_api(self, chapter_url: str, chap_id) -> Optional[Dict]:
         if not self._start():
             return None
+        self._sync_cf_cookies()
         page = self._page
         captured: Dict[str, Optional[Dict]] = {"data": None}
         target_path = f"/api/v1/chapters/{chap_id}"
@@ -1060,6 +1229,7 @@ class _ComixBrowserSession:
         """
         if not self._start():
             return []
+        self._sync_cf_cookies()
         import time as _time
         # Selectors mirror the DOM probe done during the merge research:
         # `.mchap-item` is the <li> row, `.mchap-row__primary` is the chapter
@@ -1119,9 +1289,50 @@ class _ComixBrowserSession:
                 if prev_first_href is None:
                     try:
                         self._page.wait_for_selector(".mchap-row__primary", timeout=10000)
-                    except Exception:
-                        # No rows rendered on page 1 → series has no
-                        # chapters OR layout broke. Terminal either way.
+                    except Exception as wait_exc:
+                        # Surface why the scrape gave up on page 1. The prior
+                        # silent break made "comix returns 0 chapters"
+                        # debugging opaque — sandboxed Chromium can silently
+                        # masquerade a CF challenge or a slow SPA render as
+                        # an empty series. Dump page title/URL/body-text +
+                        # CF-challenge sniff so the user can tell which.
+                        # Diagnostic-only; control flow still breaks after.
+                        # Cross-file: is_cf_challenge in sites/crawlee_utils.py.
+                        try:
+                            page_title = self._page.title() or "(no title)"
+                            page_url = self._page.url
+                            body_text = self._page.evaluate(
+                                "document.body ? document.body.innerText.slice(0, 500) : ''"
+                            ) or ""
+                            snippet = body_text.replace("\n", " ").strip()
+                            cf_msg = ""
+                            if _CF_AVAILABLE:
+                                try:
+                                    if is_cf_challenge(200, body_text):
+                                        cf_msg = " — looks like a Cloudflare challenge"
+                                except Exception:
+                                    pass
+                            print(
+                                f"[!] Comix DOM scrape: page 1 selector "
+                                f"'.mchap-row__primary' did not render "
+                                f"within 10s{cf_msg}. "
+                                f"title={page_title!r} url={page_url!r}",
+                                flush=True,
+                            )
+                            if snippet:
+                                print(
+                                    f"[!] Comix DOM scrape: page 1 visible "
+                                    f"text (first 500 chars): {snippet}",
+                                    flush=True,
+                                )
+                        except Exception as diag_exc:
+                            print(
+                                f"[!] Comix DOM scrape: page 1 selector timed "
+                                f"out ({type(wait_exc).__name__}); diagnostic "
+                                f"dump also failed: {type(diag_exc).__name__}: "
+                                f"{diag_exc}",
+                                flush=True,
+                            )
                         break
                 else:
                     # Wait until the first row's href differs from the
@@ -1148,6 +1359,35 @@ class _ComixBrowserSession:
                 print(f"[!] Comix DOM scrape failed at page {page_n}: {type(e).__name__}: {e}", flush=True)
                 break
             if not rows:
+                # On page 1 the selector wait already passed (so
+                # `.mchap-row__primary` rendered) — `.mchap-item` returning
+                # 0 here means the DOM scheme changed. On later pages this
+                # is the normal end-of-pagination signal; silent is correct
+                # there. Probe both selectors so the user can see the gap.
+                if prev_first_href is None:
+                    try:
+                        primary_count = self._page.evaluate(
+                            "document.querySelectorAll('.mchap-row__primary').length"
+                        )
+                        item_count = self._page.evaluate(
+                            "document.querySelectorAll('.mchap-item').length"
+                        )
+                        print(
+                            f"[!] Comix DOM scrape: page 1 had "
+                            f"{primary_count} `.mchap-row__primary` "
+                            f"element(s) but {item_count} `.mchap-item` "
+                            f"row(s). scrape_js queries `.mchap-item`, so "
+                            f"comix likely renamed the row container — "
+                            f"update the selectors in fetch_chapters_via_dom.",
+                            flush=True,
+                        )
+                    except Exception as diag_exc:
+                        print(
+                            f"[!] Comix DOM scrape: page 1 returned 0 rows "
+                            f"and the diagnostic probe also failed: "
+                            f"{type(diag_exc).__name__}: {diag_exc}",
+                            flush=True,
+                        )
                 break
             # Update prev_first_href for the next iteration's freshness check.
             # Use the raw href (not the normalized url) so the JS predicate
@@ -1214,7 +1454,318 @@ class _ComixBrowserSession:
                     break
             else:
                 consecutive_dup_pages = 0
+        # Always emit a final tally so the caller's "API returned 0
+        # chapters, falling back to DOM scrape" line in get_chapters has
+        # a corresponding "DOM scrape gave us X" line. Without this the
+        # silent-empty path looked identical to the success path from
+        # the get_chapters caller's perspective, and the user only saw
+        # "No chapters selected" with no clue what happened in between.
+        print(
+            f"[*] Comix DOM scrape: complete. {len(items)} chapter(s) "
+            f"collected across {page_n} page(s).",
+            flush=True,
+        )
         return items
+
+
+    def fetch_chapter_images_via_dom(
+        self,
+        chapter_url: str,
+        time_budget_s: float = 300.0,
+    ) -> list:
+        """Capture chapter pages by reading the rendered canvas/img
+        elements one at a time. Each scrambled page is unscrambled by
+        comix's own JS (function `Mr` exported from secure-tfmtlr-*.js)
+        when the page's parent .rpage-page enters the viewport; we
+        read the resulting canvas pixels via canvas.toDataURL.
+
+        Why this and not a URL-list approach: comix scrambles chapter
+        images server-side. Every webp response from the CDN ships
+        with `x-scramble-seed: <int>` and `x-scramble-grid: <NxN>`
+        response headers, and the in-page JS decodes the webp, splits
+        it into an N×N tile grid, applies a seeded Fisher-Yates
+        permutation, and redraws the unscrambled image onto a
+        <canvas>. We can't replicate that algorithm in Python because
+        the JS function `Mr` lives inside a VM-obfuscated bundle
+        (`secure-tfmtlr-DRWN4DsO.js`, opcode 243 inside `vmm_bab755`).
+        Reverse-engineering the VM is deep work; reading the canvas
+        pixels after the browser unscrambles is one page.evaluate.
+
+        Flow:
+          1. Pre-flight: visit comix.to once to set localStorage
+             `reader.default.preload = 'all'` so the reader eagerly
+             renders every page's canvas, not just the visible ones.
+          2. Navigate to the chapter URL. Wait for the React app to
+             mount and the chapter API response to populate the DOM
+             with one .rpage-page <div> per page (which is how we
+             know the total page count).
+          3. For each page index 1..N:
+               a. scrollIntoView the .rpage-page[data-page=N] element
+                  (triggers IntersectionObserver → Mr fires).
+               b. Poll for the canvas or img child to be fully
+                  rendered (canvas.width > 0 and parent is not
+                  .is-loading). 10 s max per page.
+               c. If <canvas>: read pixels via canvas.toDataURL,
+                  stash bytes in image_cache under a synthetic URL
+                  key (comix-page://<chap_id>/<NNNN>.webp), append
+                  the key to the return list. dl_image's cache
+                  check (see aio-dl.py:dl_image) finds the bytes and
+                  bypasses any HTTP fetch.
+               d. If <img>: use the real img.src as the URL.
+                  Plain (non-scrambled) pages — cloudscraper can
+                  fetch these the normal way.
+
+        Cross-file: called from sites/comix.py:ComixSiteHandler
+        .get_chapter_images via _COMIX_BROWSER_BRIDGE
+        .fetch_chapter_images_via_dom. image_cache populated here is
+        read by aio-dl.py:dl_image. Runs on the comix-pw daemon worker
+        per the bridge's same-thread Patchright contract.
+        """
+        if not self._start():
+            return []
+        self._sync_cf_cookies()
+        import base64 as _b64
+        import re as _re
+        import time as _time
+
+        page = self._page
+        if page is None:
+            return []
+
+        try:
+            from . import image_cache as _image_cache
+            _image_cache.clear_cache()
+        except Exception:
+            _image_cache = None
+
+        m_id = _re.search(r"/(\d+)-chapter-\d+", chapter_url or "")
+        chap_id = m_id.group(1) if m_id else "unknown"
+
+        deadline = _time.monotonic() + time_budget_s
+
+        # ── Step 1: set preload=all in localStorage on the comix.to
+        # origin. Localstorage is per-origin so we navigate to the
+        # homepage first (cheap because we already have CF cookies).
+        # If this fails we still proceed — the per-page scrollIntoView
+        # loop below works without preload-all, just slower.
+        try:
+            page.goto(
+                "https://comix.to/",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            page.evaluate("""() => {
+                try {
+                    const k = 'reader.default';
+                    const cur = JSON.parse(localStorage.getItem(k) || '{}');
+                    cur.preload = 'all';
+                    localStorage.setItem(k, JSON.stringify(cur));
+                } catch (e) {}
+            }""")
+        except Exception as e:
+            print(
+                f"[*] Comix: localStorage preload-all setup failed "
+                f"({type(e).__name__}: {e}); continuing with default "
+                f"preload setting.",
+                flush=True,
+            )
+
+        # ── Step 2: navigate to chapter and wait for .rpage-page divs.
+        try:
+            page.goto(
+                chapter_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except Exception as e:
+            print(
+                f"[!] Comix chapter image canvas scrape: nav failed for "
+                f"{chapter_url}: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            return []
+
+        # Wait for the React app to mount and the chapter API to fire,
+        # which populates .rpage-page divs. Poll up to 30 s — most
+        # chapters mount in 3-8 s but the CF turnstile / slow networks
+        # can push that out.
+        page_count = 0
+        for _ in range(60):
+            if _time.monotonic() > deadline:
+                break
+            try:
+                page_count = page.evaluate(
+                    "() => document.querySelectorAll('.rpage-page').length"
+                ) or 0
+            except Exception:
+                page_count = 0
+            if page_count > 0:
+                break
+            page.wait_for_timeout(500)
+
+        if page_count == 0:
+            print(
+                f"[!] Comix: chapter had 0 .rpage-page divs in DOM "
+                f"after wait. Either the React app failed to mount or "
+                f"CF re-challenged. URL={chapter_url}",
+                flush=True,
+            )
+            return []
+
+        print(
+            f"[*] Comix: chapter has {page_count} pages; capturing "
+            f"each via Patchright (canvas pixels for scrambled pages, "
+            f"<img> src for plain pages).",
+            flush=True,
+        )
+
+        # ── Step 3: per-page scroll + capture.
+        # Per-page wait is capped at 10 s. Pages that don't render in
+        # time are logged and skipped (very long chapters may still
+        # come up; the user can retry with a longer time_budget_s).
+        urls: list = []
+        canvas_count = 0
+        img_count = 0
+        failed_pages: list = []
+
+        for p in range(1, page_count + 1):
+            if _time.monotonic() > deadline:
+                print(
+                    f"[!] Comix: hit time budget {time_budget_s:.0f}s "
+                    f"at page {p}/{page_count} — returning what we have.",
+                    flush=True,
+                )
+                break
+
+            # Scroll the page's div into view. instant + center so the
+            # IntersectionObserver fires immediately and the canvas
+            # ends up vertically centered, helping the surrounding
+            # pages preload too.
+            try:
+                page.evaluate(
+                    "(n) => { const el = document.querySelector("
+                    "'.rpage-page[data-page=\"' + n + '\"]'); "
+                    "if (el) el.scrollIntoView("
+                    "{behavior: 'instant', block: 'center'}); }",
+                    p,
+                )
+            except Exception:
+                pass
+
+            # Poll for the page to be ready. The polling JS returns
+            # either {type: canvas, ...} or {type: img, ...} once a
+            # rendered child exists with non-zero dimensions and the
+            # parent has shed the .is-loading class.
+            ready = None
+            for _attempt in range(40):  # 40 * 250ms = 10s
+                if _time.monotonic() > deadline:
+                    break
+                try:
+                    ready = page.evaluate(
+                        "(n) => { "
+                        "const el = document.querySelector("
+                        "'.rpage-page[data-page=\"' + n + '\"]'); "
+                        "if (!el) return null; "
+                        "const isLoading = "
+                        "el.classList.contains('is-loading'); "
+                        "const c = el.querySelector('canvas'); "
+                        "if (c && c.width > 0 && c.height > 0 "
+                        "&& !isLoading) "
+                        "return {type: 'canvas', w: c.width, h: c.height}; "
+                        "const i = el.querySelector('img'); "
+                        "if (i && i.src && i.complete "
+                        "&& i.naturalWidth > 0) "
+                        "return {type: 'img', src: i.src, "
+                        "w: i.naturalWidth, h: i.naturalHeight}; "
+                        "return null; }",
+                        p,
+                    )
+                except Exception:
+                    ready = None
+                if ready:
+                    break
+                page.wait_for_timeout(250)
+
+            if not ready:
+                failed_pages.append(p)
+                continue
+
+            if ready.get("type") == "canvas":
+                # Read canvas pixels. Use webp at q=0.95 — comparable
+                # to the original (the source is already webp) and
+                # smaller than PNG by a factor of 5-10x.
+                try:
+                    data_url = page.evaluate(
+                        "(n) => { const c = document.querySelector("
+                        "'.rpage-page[data-page=\"' + n + '\"] canvas'); "
+                        "return c ? c.toDataURL('image/webp', 0.95) "
+                        ": null; }",
+                        p,
+                    )
+                except Exception as e:
+                    print(
+                        f"  page {p}: toDataURL threw "
+                        f"{type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    failed_pages.append(p)
+                    continue
+                if not data_url or not data_url.startswith("data:image/"):
+                    failed_pages.append(p)
+                    continue
+                try:
+                    _hdr, b64 = data_url.split(",", 1)
+                    decoded = _b64.b64decode(b64)
+                except Exception:
+                    failed_pages.append(p)
+                    continue
+                # Synthetic URL key — comix's real /si/ URLs cannot
+                # be re-fetched by cloudscraper (they'd return the
+                # SCRAMBLED bytes, and we can't undo the scrambling
+                # in Python). The cache hit short-circuits dl_image
+                # before any HTTP work.
+                synthetic_url = (
+                    f"comix-page://{chap_id}/{p:04d}.webp"
+                )
+                if _image_cache is not None:
+                    _image_cache.cache_image(
+                        synthetic_url, decoded, "image/webp",
+                    )
+                urls.append(synthetic_url)
+                canvas_count += 1
+            else:
+                # Plain image — non-scrambled. img.src is the real
+                # CDN URL; cloudscraper can fetch it the normal way.
+                urls.append(ready["src"])
+                img_count += 1
+
+        # Final summary so the user knows the capture rate. Failed
+        # pages aren't FATAL on their own — aio-dl.py:_process_chapter
+        # will treat the chapter as incomplete and inline-retry, which
+        # gives the reader another shot to render any laggards.
+        if failed_pages:
+            sample = ", ".join(str(p) for p in failed_pages[:10])
+            more = (
+                f" (+{len(failed_pages) - 10} more)"
+                if len(failed_pages) > 10 else ""
+            )
+            print(
+                f"[!] Comix canvas scrape: {len(urls)}/{page_count} "
+                f"pages captured ({canvas_count} via canvas, "
+                f"{img_count} via <img>). {len(failed_pages)} pages "
+                f"failed to render in 10 s each: pages {sample}{more}.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[*] Comix canvas scrape: {len(urls)}/{page_count} "
+                f"pages captured ({canvas_count} via canvas, "
+                f"{img_count} via <img>). All pages rendered.",
+                flush=True,
+            )
+        return urls
+
+
 
     def close(self):
         self._cleanup()
@@ -1305,9 +1856,22 @@ def _comix_worker_loop() -> None:
             fn = getattr(_COMIX_BROWSER, fn_name)
             result = fn(*args, **kwargs)
         except BaseException as exc:  # noqa: BLE001 — propagate to caller
-            fut.set_exception(exc)
+            # Race: caller's fut.result(timeout=...) may have hit the
+            # timeout and called fut.cancel() AFTER our cancelled-check
+            # above but BEFORE we got here. set_exception raises
+            # InvalidStateError on a cancelled future, which would kill
+            # the worker thread. Suppress — the caller already moved on.
+            try:
+                fut.set_exception(exc)
+            except _futures.InvalidStateError:
+                pass
         else:
-            fut.set_result(result)
+            try:
+                fut.set_result(result)
+            except _futures.InvalidStateError:
+                # Same race as above, success path. Worker just discards
+                # its result because the caller no longer cares.
+                pass
 
 
 def _ensure_comix_worker() -> None:
@@ -1391,6 +1955,37 @@ class _ComixBrowserBridge:
             "fetch_chapters_via_dom",
             title_url,
             max_pages,
+            time_budget_s,
+            _timeout_s=time_budget_s + 30.0,
+        )
+
+    def fetch_chapter_images_via_dom(
+        self,
+        chapter_url: str,
+        time_budget_s: float = 300.0,
+    ) -> List[str]:
+        """Bridge facade for chapter-page canvas capture.
+
+        Used as the fallback when `/api/v1/chapters/{id}` returns an
+        encrypted blob (`{"e": "..."}`) we can't decrypt in Python.
+        The in-page JS decrypts the blob, unscrambles each page via
+        the closure-scoped `Mr` function (canvas tile permutation
+        seeded by `x-scramble-seed` response header), and renders to
+        a <canvas>. We read those canvas pixels out via Patchright.
+
+        Default 300 s budget covers ~126-page chapters; a typical
+        chapter takes ~1-2 s per page (scroll + render wait). Bump
+        this for chapters that exceed the budget. Inner deadline +
+        30 s outer cap matches fetch_chapters_via_dom.
+
+        Cross-file: see _ComixBrowserSession.fetch_chapter_images_via_dom
+        for the actual implementation. Populates sites/image_cache.py
+        with unscrambled bytes; aio-dl.py:dl_image reads from there
+        via synthetic `comix-page://<chap_id>/<NNNN>.webp` URL keys.
+        """
+        return _comix_call(
+            "fetch_chapter_images_via_dom",
+            chapter_url,
             time_budget_s,
             _timeout_s=time_budget_s + 30.0,
         )
