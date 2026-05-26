@@ -1308,6 +1308,31 @@ class PythonSetup {
           ...process.env,
           ...extraEnv,
           PYTHONUNBUFFERED: "1",
+          // PYTHONNOUSERSITE=1 isolates setup from any pre-existing Python
+          // install on the host. The Windows embed ships a ._pth file with
+          // `import site` (added by _configurePython so pip-installed packages
+          // resolve from Lib\site-packages). site.main() respects this env var
+          // and skips appending %APPDATA%\Python\Python313\site-packages.
+          // Without that suppression, a host with `setuptools` in user-site
+          // (very common — anyone with python.org's installer + `pip install
+          // --user`) causes a two-step failure during step 5:
+          //   1. `pip install setuptools wheel` finds the user-site setuptools,
+          //      prints "Requirement already satisfied", and never writes it
+          //      into the embed's Lib\site-packages.
+          //   2. pip then builds pyvips from sdist. pip's BuildEnvironment
+          //      spawns the backend in a subprocess with PYTHONNOUSERSITE=1 +
+          //      PYTHONPATH=<build-env-temp>. _pth makes Python IGNORE
+          //      PYTHONPATH (this is core embed behavior) but it still honors
+          //      PYTHONNOUSERSITE. Result: subprocess sys.path = _pth entries
+          //      only — no user-site, no build-env, no setuptools anywhere →
+          //      BackendUnavailable: Cannot import 'setuptools.build_meta'.
+          // Setting it here in the parent makes step 5's first `pip install`
+          // mirror the build subprocess's view of sys.path, so pip actually
+          // installs setuptools into Lib\site-packages where the build
+          // subprocess can find it via _pth. Symptom never reproduced in
+          // Windows Sandbox because the sandbox has no user-site. extraEnv
+          // can NOT override (intentional — same posture as PYTHONUNBUFFERED).
+          PYTHONNOUSERSITE: "1",
         },
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,

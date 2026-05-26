@@ -1157,10 +1157,11 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
     # we write them directly to the pending tempfile and skip every HTTP
     # path entirely — including the _host_fail_count and watchdog checks
     # below, because we're not touching the CDN at all. Cross-file:
-    # sites/comix.py:_ComixBrowserSession.fetch_chapter_images_via_dom
-    # (handle_response) populates the cache; sites/image_cache.py owns
-    # the dict + locks; clear_cache() is called at the start of each
-    # chapter scrape.
+    # sites/comix.py:_ComixBrowserSession._start attaches the session-
+    # level response listener that populates the cache; sites/image_cache.py
+    # owns the dict + locks and handles TTL/size-based eviction (no
+    # per-scrape clear — that broke under the prefetch chain, see the
+    # module docstring there).
     try:
         from sites import image_cache as _ic
         _cached = _ic.get_cached_image(url)

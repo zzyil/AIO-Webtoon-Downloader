@@ -8,7 +8,8 @@ import queue
 import re
 import sys
 import threading
-from typing import Dict, List, Optional, Any
+import time
+from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import parse_qsl, quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -91,6 +92,34 @@ class ComixSiteHandler(BaseSiteHandler):
         # chapter-detail steal) don't need this — the browser handles CF
         # natively via its own cookie store.
         self._cf_session = None
+        # Latched once we confirm comix is serving encrypted chapter-API
+        # responses (the steady-state behaviour as of 2026-05-26 — every
+        # /api/v1/chapters/{id} call returns {"e": "<base64>"} that the
+        # in-page JS decrypts client-side, but Python can't). Set in
+        # get_chapter_images the first time we see the shape; on every
+        # subsequent chapter we skip the API call entirely and go straight
+        # to the browser DOM scrape. Eliminates ~5 lines of noise per
+        # chapter (the "data.keys()=['e']" warning + 300-char snippet + the
+        # "falling back to DOM-scrape-for-images" follow-up).
+        self._chapter_api_known_encrypted = False
+        # Memoize get_chapter_images results so the prefetch worker and
+        # the main download flow don't both run the ~20s canvas scrape
+        # per chapter. Both threads share THIS handler instance (the
+        # prefetch job carries `handler` by reference). Comix's
+        # Patchright bridge serializes every scrape through one daemon
+        # worker, so a duplicate main-flow scrape gets queued behind
+        # every other in-flight prefetch — turning the supposed-to-be-
+        # instant prefetch_hit path into a wait worth several chapters'
+        # scrape time (~14-20s each). Keyed by chapter URL because
+        # merged-part chapters share an id but have distinct part URLs.
+        # 600s TTL matches sites/image_cache._TTL_SECONDS so cached
+        # URLs and the cached bytes behind them expire together — a
+        # URL whose bytes have been evicted points at a CDN signed
+        # token that's almost certainly rotated by then, so we want a
+        # fresh scrape rather than serving stale URLs that would
+        # 404-on-fetch.
+        self._chapter_images_cache: Dict[str, Tuple[List[str], float]] = {}
+        self._chapter_images_cache_lock = threading.Lock()
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.update({
@@ -702,10 +731,56 @@ class ComixSiteHandler(BaseSiteHandler):
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
         return chapter_version.get("group")
 
+    # Module-level TTL constant used by _get/_cache_chapter_images.
+    # Defined here (class-scope) instead of top-of-file so it stays
+    # adjacent to the methods that read it; 600 s matches
+    # sites/image_cache._TTL_SECONDS by intent — see __init__'s
+    # _chapter_images_cache comment for why both clocks share a TTL.
+    _CHAPTER_IMAGES_CACHE_TTL = 600.0
+
+    def _get_cached_chapter_images(self, chapter_url: str) -> Optional[List[str]]:
+        """Return a defensive copy of the cached URL list for this
+        chapter, or None on miss / TTL-expired. Thread-safe."""
+        with self._chapter_images_cache_lock:
+            entry = self._chapter_images_cache.get(chapter_url)
+            if entry is None:
+                return None
+            urls, ts = entry
+            if time.monotonic() - ts > self._CHAPTER_IMAGES_CACHE_TTL:
+                del self._chapter_images_cache[chapter_url]
+                return None
+            return list(urls)
+
+    def _cache_chapter_images(self, chapter_url: str, urls: List[str]) -> None:
+        """Stash this chapter's URL list. No-op on empty inputs
+        (don't poison the cache with a known-bad result that would
+        short-circuit a future retry). Thread-safe."""
+        if not chapter_url or not urls:
+            return
+        with self._chapter_images_cache_lock:
+            self._chapter_images_cache[chapter_url] = (list(urls), time.monotonic())
+
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
         chap_id = chapter.get("id")
         images: List[str] = []
+
+        # Memoization fast path. The prefetch worker and the main
+        # download flow share this handler instance and BOTH call
+        # into get_chapter_images for every chapter — the comment
+        # in aio-dl.py around _ImgPrefetchJob explicitly chose not
+        # to share media_entries via sidecar JSON because for
+        # mangafire the redo is ~0.5-1 s. For comix the redo is a
+        # ~20 s canvas scrape AND it serializes through the bridge's
+        # single daemon worker behind any pending prefetches, so
+        # main was waiting several chapters' worth of scrape time
+        # for a result it could have served from memory. Cache hit
+        # → return immediately, no API call, no DOM scrape, no
+        # bridge enqueue. See __init__ for the cache + TTL setup.
+        if url:
+            cached = self._get_cached_chapter_images(url)
+            if cached is not None:
+                return cached
 
         # 2026-05-13: chapter HTML is now a ~6.7KB SPA shell with no embedded
         # images — JS calls /api/v1/chapters/{id}?_=<sig> client-side, where
@@ -713,7 +788,15 @@ class ComixSiteHandler(BaseSiteHandler):
         # navigates to the chapter URL and we steal the response body the
         # browser already received. Persistent browser (see _ensure_browser)
         # amortizes startup cost across chapters in the same download.
-        if chap_id and url:
+        #
+        # 2026-05-26: also gated by `_chapter_api_known_encrypted`. Comix
+        # encrypted the response shape sometime after 2026-05-13 — every
+        # call now returns {"e": "<base64>"} that only the in-page JS can
+        # decrypt. Once we confirm that on the FIRST chapter, every later
+        # chapter skips the API path entirely and goes straight to the
+        # canvas/DOM scrape below. Without this latch, every chapter ate a
+        # ~1s API call + spammed ~5 lines of "encrypted" warnings.
+        if chap_id and url and not self._chapter_api_known_encrypted:
             data = self._fetch_chapter_api_via_browser(url, chap_id)
             if data:
                 # 2026-05-13 v1 chapter-detail shape:
@@ -732,27 +815,38 @@ class ComixSiteHandler(BaseSiteHandler):
                     if not isinstance(rel, str) or not rel:
                         continue
                     images.append(rel if rel.startswith("http") else (base_url + rel))
-                # If the bridge captured a response but we couldn't parse
-                # image URLs, surface the response shape so the user knows
-                # whether comix encrypted the chapter API (like they did
-                # for the listing, where the shape became {"e": "<blob>"})
-                # or changed the schema. Without this the call silently
-                # falls through to HTML scrape and the user sees a 403
-                # retry loop with no clue why.
+                # API returned data but no image URLs. Two paths:
+                #   (a) Encrypted shape ({"e": "<blob>"}) — latch the flag
+                #       so every subsequent chapter skips the API call
+                #       outright. Print ONE clean line, no base64 snippet.
+                #   (b) Anything else — keep the diagnostic but drop the
+                #       300-char data snippet (just noise; the key list is
+                #       enough to debug a future schema change).
                 if not images:
                     try:
-                        keys = list(data.keys())[:8]
-                        snippet = json.dumps(data, ensure_ascii=False)[:300]
-                        print(
-                            f"[!] Comix: chapter API returned data for "
-                            f"chap_id={chap_id} but no image URLs parsed. "
-                            f"data.keys()={keys} snippet={snippet}",
-                            flush=True,
-                        )
+                        keys = list(data.keys())
+                        if keys == ["e"]:
+                            self._chapter_api_known_encrypted = True
+                            print(
+                                "[*] Comix: chapter API is serving "
+                                "encrypted responses; switching to "
+                                "browser DOM scrape for the rest of "
+                                "this run.",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[!] Comix: chapter API returned data "
+                                f"for chap_id={chap_id} but no image "
+                                f"URLs parsed. data.keys()={keys[:8]}",
+                                flush=True,
+                            )
                     except Exception:
                         pass
 
         if images:
+            if url:
+                self._cache_chapter_images(url, images)
             return images
 
         # ──────────────────────────────────────────────────────────────
@@ -769,13 +863,20 @@ class ComixSiteHandler(BaseSiteHandler):
         # Cross-file: _ComixBrowserSession.fetch_chapter_images_via_dom.
         # ──────────────────────────────────────────────────────────────
         if chap_id and url:
-            print(
-                f"[*] Comix: falling back to DOM-scrape-for-images "
-                f"(chap_id={chap_id})...",
-                flush=True,
-            )
+            # Silent fallback once the encrypted flag is latched — every
+            # chapter takes this path, so the "falling back" line would
+            # just be 72 lines of noise. Only print when something
+            # unexpected drove us here (API errored without latching the
+            # flag, or an unrecognized non-encrypted schema shape).
+            if not self._chapter_api_known_encrypted:
+                print(
+                    f"[*] Comix: falling back to DOM-scrape-for-images "
+                    f"(chap_id={chap_id})...",
+                    flush=True,
+                )
             images = _COMIX_BROWSER_BRIDGE.fetch_chapter_images_via_dom(url) or []
             if images:
+                self._cache_chapter_images(url, images)
                 return images
 
         # ----- HTML-scrape fallback (kept for forward-compat if comix re-enables SSR) -----
@@ -827,6 +928,8 @@ class ComixSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("Could not find images in chapter page.")
 
+        if url:
+            self._cache_chapter_images(url, images)
         return images
 
     # ----------------------------------------------------------------- search
@@ -993,6 +1096,66 @@ class _ComixBrowserSession:
             print(f"[!] Comix Playwright launch failed: {e}")
             self._cleanup()
             return False
+
+        # Session-level <img> byte capture. This is the single most
+        # important wire in the comix chapter pipeline once the API
+        # is encrypted — without it the 70-80 plain (non-scrambled)
+        # pages per chapter come back as real CDN URLs and dl_image
+        # re-fetches them later via HTTP, by which time the signed
+        # token has expired or the CDN is rate-limiting from the
+        # parallel canvas-scrape traffic. Empirically this is what
+        # was causing the [Backoff]/[Fallback]/[Error: Skipping]
+        # cascades and the 30s long-retries per chapter. Stashing
+        # the bytes here at the moment the browser pulls them lets
+        # dl_image short-circuit straight to disk on lookup.
+        #
+        # Filter on request.resource_type == "image": only true
+        # <img>-tag fetches qualify. JS-driven fetch()/XHR calls
+        # (which carry the SCRAMBLED canvas-source webps we'd need
+        # the in-page Mr unscramble to use) are resource_type
+        # "fetch"/"xhr" and get skipped — caching them would just
+        # waste the 256MB cap. Cross-file: sites/image_cache.py
+        # owns the cache + eviction; aio-dl.py:dl_image reads from
+        # it at the top of dl_image before any HTTP work.
+        try:
+            from . import image_cache as _image_cache_module
+        except Exception:
+            _image_cache_module = None
+
+        def _capture_image_response(response):
+            if _image_cache_module is None:
+                return
+            try:
+                try:
+                    if response.request.resource_type != "image":
+                        return
+                except Exception:
+                    pass
+                ct = (response.headers.get("content-type") or "").lower()
+                if not ct.startswith("image/"):
+                    return
+                body = response.body()
+                if body:
+                    _image_cache_module.cache_image(response.url, body, ct)
+            except Exception:
+                # response.body() can throw if the response was
+                # aborted or the page navigated before the body
+                # arrived. Silent skip — the chapter's canvas
+                # toDataURL path or dl_image's HTTP fallback will
+                # handle the missing entry.
+                pass
+
+        try:
+            self._page.on("response", _capture_image_response)
+        except Exception as e:
+            print(
+                f"[!] Comix: failed to attach image-response "
+                f"listener ({type(e).__name__}: {e}); plain <img> "
+                f"pages will fall through to HTTP fetch with the "
+                f"signed-token-expiry risk that implies.",
+                flush=True,
+            )
+
         # Inject any cookies already captured by a prior zendriver solve.
         # Public methods also re-call _sync_cf_cookies in case the cache
         # gets a fresher generation between the bridge launching and the
@@ -1534,7 +1697,13 @@ class _ComixBrowserSession:
 
         try:
             from . import image_cache as _image_cache
-            _image_cache.clear_cache()
+            # No clear_cache() here. The image-prefetch chain in
+            # aio-dl.py runs scrape N+1 while chapter N's
+            # downloader is still draining cached bytes for N, so
+            # a clear would wipe still-needed entries and force
+            # dl_image to fall through to HTTP (where the signed
+            # CDN tokens may have already expired). Eviction is
+            # TTL- and size-based — see sites/image_cache.py.
         except Exception:
             _image_cache = None
 
