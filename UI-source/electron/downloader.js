@@ -210,13 +210,15 @@ function buildCliArgs(args) {
     cliArgs.push("--no-cbz-preserve-originals");
   }
 
-  // Global collapse-splits toggle (item 8 in snappy-forging-waffle.md).
-  // Same negative-default pattern as cbzPreserveOriginals: aio-dl.py defaults
-  // to collapse=True, we emit --no-collapse-splits only when the user has it
-  // explicitly off. useDownloader.queueDownload injects the field from
-  // settings.collapseSplits before calling startDownload.
-  if (args.collapseSplits === false) {
-    cliArgs.push("--no-collapse-splits");
+  // Global collapse-splits toggle (item 8 in snappy-forging-waffle.md,
+  // updated 2026-05-27 for the opt-in flip). aio-dl.py now defaults
+  // collapse=False; we emit the positive --collapse-splits flag only
+  // when the user has explicitly turned it on. useDownloader.queueDownload
+  // injects the field from settings.collapseSplits before calling
+  // startDownload. The deprecated --no-collapse-splits is still a hidden
+  // alias on the Python side for any script users — we just don't emit it.
+  if (args.collapseSplits === true) {
+    cliArgs.push("--collapse-splits");
   }
 
   // LINE Webtoon recompression valued knobs (Phase 1, 2026-05-11). Only

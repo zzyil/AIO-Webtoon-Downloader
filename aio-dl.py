@@ -18,13 +18,32 @@ import re
 import shutil
 import subprocess
 import sys
+
+# Force UTF-8 on stdio before anything prints. When Electron spawns this
+# script (UI-source/electron/downloader.js:585, searcher.js:160,
+# main.js:195/878), stdio is a pipe, not a TTY, so Python falls back to
+# locale.getpreferredencoding(False) → cp1252 on default Western Windows
+# (ACP=1252). Many log lines use → ─ — × ≥ which cp1252 can't encode,
+# crashing the run with UnicodeEncodeError mid-listing. errors='replace'
+# keeps it crash-proof for any future char. No-op on UTF-8-ACP boxes
+# (Win11 Beta UTF-8 mode) and real terminals (PEP 528 WriteConsoleW).
+# Grep target: UnicodeEncodeError reconfigure
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import threading
 import time
 import textwrap
 import xml.sax.saxutils
 import zipfile
 import zlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, unquote_to_bytes
 
 from aio_config import (
@@ -57,14 +76,23 @@ class ChapterSkippedError(Exception):
       - any page failed to download (zero-tolerance: pages_ok < pages_total)
       - watchdog deadline fired (chapter took too long)
       - host poison threshold hit (≥N distinct URLs to one host fully failed)
+      - ghost chapter (every page returns an identical structural error response
+        — uniform status + uniform body size — indicating the chapter doesn't
+        exist on the primary source despite being listed in the chapter index;
+        canonical example: mangafire "chapter 0" placeholder entries whose
+        image URLs all return the same 5051-byte 403 template body)
 
     Caught by _process_chapter_strict, which performs an inline retry pass
     (long wait + redo the chapter from scratch). After inline retries are
     exhausted, _process_chapter_strict converts this into ChapterAbortedError
-    which the main loop treats as a fatal stop.
+    which the main loop treats as a fatal stop — EXCEPT for ghost_chapter,
+    which short-circuits inline-retry (a structural failure won't fix itself
+    after 30s of sleep) and raises ChapterGhostError instead, which the main
+    loop catches as skip-and-continue.
 
     Attributes:
-        reason:       short tag, one of: 'incomplete', 'time_budget', 'host_poison'
+        reason:       short tag, one of: 'incomplete', 'time_budget',
+                      'host_poison', 'ghost_chapter'
         host:         netloc that triggered the bail (for diagnostic logging)
         pages_ok:     count of pages successfully downloaded before the bail
         pages_total:  total pages the chapter was supposed to have
@@ -104,6 +132,57 @@ class ChapterAbortedError(Exception):
         super().__init__(
             f"chapter {chap} aborted after {attempts} attempt(s): "
             f"reason={reason} host={host or '-'} pages={pages_ok}/{pages_total}"
+        )
+
+
+class ChapterGhostError(Exception):
+    """Raised by _process_chapter_strict when the primary source returned a
+    'ghost chapter' signature (every page failed with an identical error
+    response: same status, same body-size bucket) AND no alternative source
+    could deliver the chapter. Distinct from ChapterAbortedError on purpose:
+    the main loop treats this as skip-and-continue, NOT abort.
+
+    Why a distinct exception (not just another ChapterSkippedError reason):
+    a ghost signature on the primary means the chapter is structurally absent
+    there — VRF token rotated to a different URL space, soft-launched
+    placeholder, CDN URL signed for a chapter that was unpublished, etc. No
+    amount of inline retry will help, because the response template that
+    every page returns won't change after a 30s/60s sleep (mangafire's
+    5051-byte CF 'access denied' is the canonical case — see the 2026-05-27
+    Shangri-La Frontier failure for the original observed pattern). Aborting
+    the whole run on a single fake chapter punishes 290 valid chapters for
+    one structural mismatch we can prove is structural. Recording as missed
+    + continuing preserves the all-or-nothing guarantee at the CHAPTER level
+    (we never produced partial PDF output for it) while not sacrificing the
+    run-level coverage.
+
+    The caller-loop path:
+        ChapterSkippedError(reason='ghost_chapter') (one attempt)
+          → _process_chapter_strict tries multi-source alts (might recover)
+          → if every alt also fails: raise ChapterGhostError (no inline-retry)
+          → main for-loop's except clause: _record_missed + continue
+
+    Attributes:
+        chap:         chapter label (from ch.get('chap'))
+        host:         netloc whose responses formed the ghost signature
+        pages_total:  total pages the chapter was supposed to have
+        primary_only: True if the alignment data shows no non-primary source
+                      listed this chapter number (strong "ghost" corroboration);
+                      False otherwise; None if multi-source isn't enabled and
+                      the cross-source check couldn't be evaluated. Surfaced
+                      so the log line tells the user WHICH ghost-chapter shape
+                      this was (primary-only is the canonical "fake placeholder"
+                      pattern; non-primary-only just means the alt sources
+                      also couldn't deliver).
+    """
+    def __init__(self, chap, host: str = "", pages_total: int = 0, primary_only: Optional[bool] = None):
+        self.chap = chap
+        self.host = host
+        self.pages_total = pages_total
+        self.primary_only = primary_only
+        super().__init__(
+            f"chapter {chap} ghost: host={host or '-'} pages={pages_total} "
+            f"primary_only={primary_only}"
         )
 
 
@@ -653,6 +732,31 @@ _HOST_FAIL_COUNT: Dict[str, int] = {}
 _HOST_FAIL_URLS: Dict[str, set] = {}
 _HOST_FAIL_LOCK = threading.Lock()
 
+# Per-chapter response-signature accumulator for ghost-chapter detection.
+# Each entry is (status_code, body_size) — raw response bytes, NOT bucketed.
+# Initially designed with 64-byte bucketing for fuzzy match, but real CF
+# error responses are byte-identical even when Ray IDs differ (Ray IDs are
+# fixed-format 16-char hex strings, so the BYTE length is constant across
+# responses with different Ray IDs). The 64-byte bucketing introduced
+# false-negatives when responses straddled bucket boundaries (e.g. 5051
+# vs 5060 split between buckets 4992 and 5056); exact-match is both more
+# correct AND simpler. If future handlers produce ghost patterns with
+# genuinely-variable body lengths, we can revisit with a tolerance-based
+# detector — but for the mangafire case (the canonical 5051-byte CF 403
+# placeholder) exact match is provably right.
+#
+# Read by _is_ghost_chapter_signature at chapter-failure time. Cleared at
+# the start of every chapter via _reset_host_failures_for_chapter() so the
+# detector is scoped per chapter — a prior chapter's ghosts must not
+# poison the next chapter's classification.
+#
+# Cross-file: written from sites/base.py:fast_download_images via the
+# record_host_failure callback (aio-dl.py:_record_failure now accepts a
+# signature kwarg), and from _try_download_url's failure path at the
+# bottom of the retry loop.
+_CHAPTER_FAIL_SIGNATURES: List[Tuple[Optional[int], int]] = []
+_CHAPTER_FAIL_SIG_LOCK = threading.Lock()
+
 # Phase D (2026-05-13): per-host concurrency cap that dials DOWN on
 # confirmed CDN failures during a run. Distinct from _HOST_FAIL_COUNT
 # (per-chapter, drives the chapter-skip threshold) — this lives across
@@ -837,16 +941,34 @@ def _looks_like_rate_limit(status: Optional[int], body_snippet: str) -> bool:
     return _classify_response_failure(status, body_snippet) == "rate_limit"
 
 
-def _record_failure(host: str, url: str, cls: str) -> None:
+def _record_failure(
+    host: str,
+    url: str,
+    cls: str,
+    *,
+    status: Optional[int] = None,
+    body_size: Optional[int] = None,
+) -> None:
     """Record a fully-failed URL (after retries exhausted) against a host so
     the per-chapter poison threshold can detect a broken host. Counts each
     URL only once per chapter — multiple retry attempts on the same URL
     increment the counter once.
 
-    Called from _try_download_url after the retry loop ends without success.
-    Cls is the classification of the *last* failure; we only count network
+    Called from _try_download_url after the retry loop ends without success,
+    and from sites/base.py:fast_download_images via the record_host_failure
+    callback when curl_cffi exhausts its 2 attempts.
+
+    `cls` is the classification of the *last* failure; we only count network
     failures (origin_error / rate_limit / retryable) — permanent 4xx errors
-    don't indicate the host is broken.
+    don't indicate the host is broken. NOTE on mangafire's ghost-chapter 403s:
+    those classify as 'rate_limit' (the 5051-byte body contains 'cloudflare'
+    /'ray id' rate-limit keywords per _classify_response_failure ~line 819),
+    so they DO get counted here and DO trip _HOST_FAIL_COUNT. That's
+    intentional — the chapter-poison threshold and the ghost-signature
+    detector are complementary: poison says "many distinct URLs failed,"
+    ghost says "every failure looks structurally identical." Ghost takes
+    precedence in the reason ladder (~line 7110) because it's the more
+    specific signal.
 
     Phase D (2026-05-13): also feeds _record_host_failure_for_backoff,
     which dials down the per-host concurrency cap on rate_limit/retryable
@@ -854,7 +976,24 @@ def _record_failure(host: str, url: str, cls: str) -> None:
     counter here) and is independent of the chapter-poison threshold —
     it makes the in-flight fetch lighter BEFORE the threshold trips a
     chapter abort.
+
+    `status` and `body_size`, when provided, feed the ghost-chapter
+    signature accumulator (_CHAPTER_FAIL_SIGNATURES) so a uniform
+    "every page returned identical structural error" pattern can be
+    detected. Optional/keyword-only so existing call sites that don't
+    have response metadata (the failing-without-a-response exception
+    path in fast_download_images) keep working unchanged. Recording is
+    independent of `cls == "permanent"` early-return: even permanent
+    4xx failures contribute to ghost detection if they came with a
+    body (the host-fail count guard stays gated on non-permanent only).
     """
+    # Signature recording happens BEFORE the cls=="permanent" gate so that
+    # uniform 4xx ghost responses (e.g. true 403 placeholder pages whose
+    # body lacks rate-limit keywords) still feed the detector. Without
+    # this, a "pure 403" ghost would never be classified as such — only
+    # the rate-limit-classified ones would.
+    if body_size is not None:
+        _record_failure_signature(status, body_size)
     if not host or cls == "permanent":
         return
     with _HOST_FAIL_LOCK:
@@ -868,6 +1007,118 @@ def _record_failure(host: str, url: str, cls: str) -> None:
     _record_host_failure_for_backoff(host, cls)
 
 
+def _record_failure_signature(status: Optional[int], body_size: int) -> None:
+    """Append one failed-URL response signature to the per-chapter
+    accumulator for ghost-chapter detection. Stored as raw (status,
+    body_size) — exact-match comparison at detection time. See the
+    _CHAPTER_FAIL_SIGNATURES module-level comment for why we don't bucket.
+
+    Negative or None body_size is treated as 0 (the exception path passes
+    no body when the request never produced a response). Zero-byte
+    signatures still contribute to the uniformity check, which is correct:
+    a chapter where every page exception'd with the same error class is
+    also structurally broken even if there's no body to fingerprint.
+
+    No-op outside a chapter (when _CHAPTER_FAIL_SIG_LOCK has just been
+    cleared) — the lock and list are process-wide but only meaningful
+    inside _process_chapter; callers outside that scope just contribute
+    noise that the next _reset_host_failures_for_chapter wipes.
+    """
+    sz = max(0, int(body_size)) if body_size is not None else 0
+    with _CHAPTER_FAIL_SIG_LOCK:
+        _CHAPTER_FAIL_SIGNATURES.append((status, sz))
+
+
+def _is_ghost_chapter_signature(
+    *,
+    pages_ok: int,
+    pages_total: int,
+    primary_only: Optional[bool] = None,
+) -> bool:
+    """Return True iff this chapter's failure pattern matches a ghost.
+
+    A "ghost chapter" is a chapter listed in the source's chapter index
+    whose image URLs all return the same structural error response —
+    indicating the chapter doesn't actually have images on the source,
+    not that the CDN is having a moment. Canonical example: mangafire
+    "chapter 0" placeholder entries where every page returns a 5051-byte
+    CF 403 (same status + same byte-bucket = uniform signature).
+
+    Detection signal set:
+      1. pages_ok == 0 (literally nothing succeeded — real transient
+         failures rarely take ALL pages down; usually at least one slips
+         through). Hard requirement.
+      2. pages_total >= threshold. Default 5; lowered to 3 when
+         primary_only is True (the cross-source alignment showed no other
+         site lists this chapter number, which is independent corroboration
+         for "this is fake / soft-launched"). Don't false-positive on
+         legit 1-2 page placeholders.
+      3. len(set(signatures)) == 1. The smoking gun: every failure was
+         the EXACT same (status, body_size). Real CDN issues vary in body
+         length because error pages have varying request-context lines
+         (Ray IDs, timestamps, paths) — but the Ray-ID-bearing parts of
+         CF templates are fixed-format strings, so the BYTE length stays
+         constant across responses with different Ray IDs. Identical
+         signatures across many pages = "the server is intentionally
+         returning a fixed response template" = structural.
+      4. The single signature's status is a 4xx (400 <= status < 500).
+         5xx errors and pure network failures (status=None from
+         timeouts/connection-reset) are inherently transient — the host
+         is sick, not lying about chapter existence — and need the normal
+         host_poison → inline-retry → abort path. 4xx is the discriminator
+         that says "the server is intentionally rejecting this URL,"
+         which IS the ghost shape. The mangafire ghost case is 403; a
+         future "404 placeholder" handler would also fit.
+      5. len(signatures) >= max(3, pages_total // 2). Don't trip on
+         fewer than 3 recorded signatures (statistical floor) and require
+         at least half the chapter's pages have contributed a signature
+         (so we don't ghost-classify a chapter that mostly succeeded but
+         then deadline-cancelled). pages_total // 2 caps at 3 minimum to
+         keep small chapters checkable.
+
+    Cross-source quorum (Idea B from the design brainstorm) is folded
+    into the threshold knob (rule 2) — primary_only=True lowers the
+    pages_total floor from 5 to 3, making detection slightly more
+    aggressive when we have independent evidence the chapter is fake.
+    primary_only=None (multi-source disabled, can't evaluate) treats
+    the chapter as not-primary-only (use the default threshold of 5).
+
+    Cross-file: called from _process_chapter_impl's reason-determination
+    block (~line 7105) BEFORE host_poison/time_budget/incomplete checks
+    so a uniform-signature failure is classified as 'ghost_chapter' even
+    when the host-poison threshold also tripped. Both are real signals
+    about the same failure; ghost is the more specific (and actionable)
+    one.
+    """
+    if pages_ok != 0:
+        return False
+    pages_floor = 3 if primary_only is True else 5
+    if pages_total < pages_floor:
+        return False
+    with _CHAPTER_FAIL_SIG_LOCK:
+        sigs = list(_CHAPTER_FAIL_SIGNATURES)
+    if not sigs:
+        return False
+    sample_floor = max(3, pages_total // 2)
+    if len(sigs) < sample_floor:
+        return False
+    sig_set = set(sigs)
+    if len(sig_set) != 1:
+        return False
+    # 4xx-only gate (rule 4 in the docstring). 5xx and None (timeouts /
+    # network errors) are transient host-level issues that must NOT classify
+    # as ghost — they need the existing host_poison → inline-retry → abort
+    # path. Without this gate, a true host outage (every request times out
+    # → every signature is (None, 0)) would silently skip the ENTIRE
+    # chapter queue chapter-by-chapter, wasting an hour before the user
+    # realizes the host is down. 4xx is the actionable shape: server is
+    # intentionally rejecting THESE URLs, not failing globally.
+    (only_status, _only_size) = next(iter(sig_set))
+    if only_status is None or not (400 <= only_status < 500):
+        return False
+    return True
+
+
 def _host_fail_count(host: str) -> int:
     """Distinct URLs that have fully failed against this host this chapter."""
     if not host:
@@ -878,10 +1129,18 @@ def _host_fail_count(host: str) -> int:
 
 def _reset_host_failures_for_chapter() -> None:
     """Clear per-chapter host-failure state. Called at the top of every chapter
-    in _process_chapter so the threshold is scoped per chapter, not per run."""
+    in _process_chapter so the threshold is scoped per chapter, not per run.
+
+    Also clears _CHAPTER_FAIL_SIGNATURES so the ghost-chapter detector starts
+    fresh for each chapter — without this, a previous chapter's ghost
+    signatures would persist and false-positive subsequent chapters that
+    happen to share the same body-size bucket on partial failures.
+    """
     with _HOST_FAIL_LOCK:
         _HOST_FAIL_COUNT.clear()
         _HOST_FAIL_URLS.clear()
+    with _CHAPTER_FAIL_SIG_LOCK:
+        _CHAPTER_FAIL_SIGNATURES.clear()
 
 
 def _record_host_failure_for_backoff(host: str, cls: str) -> None:
@@ -996,6 +1255,18 @@ def _try_download_url(
     host = urlparse(url).netloc
     last_error: Optional[requests.exceptions.RequestException] = None
     last_class = "retryable"
+    # Track the last response's status code + full body length for the
+    # ghost-chapter signature accumulator. _extract_error_info only returns
+    # a 200-char snippet; for the ghost detector we need the FULL body
+    # length (the discriminator for mangafire's 5051-byte uniform 403s).
+    # Captured per iteration so the LAST iteration's values are what we
+    # record at the failure point — matching the existing last_class
+    # convention. Both default to None outside the response path so a
+    # network-only failure (Timeout, ConnectionError with no response
+    # attached) forwards (None, None) and the detector treats it as a
+    # zero-bucket signature.
+    last_status: Optional[int] = None
+    last_body_size: Optional[int] = None
     poison_threshold = int(globals().get("_CHAPTER_HOST_POISON", 5))
 
     for attempt in range(max_retries):
@@ -1046,6 +1317,22 @@ def _try_download_url(
             status, body_snippet = _extract_error_info(e)
             cls = _classify_response_failure(status, body_snippet)
             last_class = cls
+            last_status = status
+            # Capture full body length for ghost-chapter signature. text[:200]
+            # was already read by _extract_error_info, so the response body
+            # is already drained — len(response.text) reads from the cached
+            # buffer (no extra network I/O). Network-only errors (Timeout,
+            # ConnectionError) have no response attached; leave last_body_size
+            # as None in that case so the detector treats it as zero-bucket.
+            try:
+                resp = getattr(e, "response", None)
+                if resp is not None:
+                    last_body_size = len(resp.text or "")
+            except Exception:
+                # Defensive: any exception reading body text shouldn't
+                # affect the retry decision. Leave last_body_size as
+                # whatever the previous iteration set it to.
+                pass
 
             if cls == "rate_limit":
                 # Bounded cooldown: 3-12s. The browser-equivalent server response
@@ -1089,7 +1376,13 @@ def _try_download_url(
 
     # Loop ended without success — record the URL once against the host so
     # the chapter-level poison threshold can fire if many distinct URLs fail.
-    _record_failure(host, url, last_class)
+    # status + body_size feed the ghost-chapter signature accumulator (uniform
+    # signatures across all chapter pages → ghost_chapter reason).
+    _record_failure(
+        host, url, last_class,
+        status=last_status,
+        body_size=last_body_size,
+    )
     return False, last_error, None
 
 
@@ -4880,21 +5173,38 @@ def main():
              "sequential download → process → next-download.",
     )
     p.add_argument(
+        "--collapse-splits",
+        dest="collapse_splits",
+        action="store_true",
+        default=False,
+        help="Enable split-fragment + cross-source-duplicate chapter collapse. "
+             "Default OFF (2026-05-27 opt-in flip — see "
+             "~/.claude/plans/ultrathink-mangafire-and-some-flickering-sparkle.md). "
+             "When ON, the following are merged or dropped: "
+             "(a) sequential X.1/X.2/X.3 splits with no integer X "
+             "(MangaDex-style upload fragments) → merged into one chapter X; "
+             "(b) integer X + scattered decimals like {X, X.1, X.5} → X kept, "
+             ".5 kept as side story, .1 dropped as fragment; "
+             "(c) integer X + single fragment-shaped decimal "
+             "(.1/.2/.3/.4) with no peer source confirming it → "
+             "the decimal is dropped as a duplicate upload of X. "
+             "Decimals at .5 or higher, peer-confirmed decimals of any "
+             "shape, chapter 0 / prologues, and source-only integer "
+             "chapters are ALWAYS kept. The cross-source duplicate "
+             "signal only fires under --multi-source / "
+             "--multi-source-prefetched; direct-URL runs fall back to "
+             "the in-source heuristics (current Rule 3a / 3b / 6 "
+             "behavior with no consensus refinement).",
+    )
+    # Hidden deprecated alias — old --no-collapse-splits is now a no-op
+    # (the new default IS "no collapse"), but keep parsing it so any script
+    # pinned to the old flag continues to launch. Suppressed from --help to
+    # avoid confusing new users with both flag forms.
+    p.add_argument(
         "--no-collapse-splits",
         dest="collapse_splits",
         action="store_false",
-        default=True,
-        help="Disable split-cluster collapse in --multi-source coverage "
-             "diagnostics. By default (collapse ON), decimal sub-chapters "
-             "X.1/X.2/X.3 with no integer X are reported as ONE main "
-             "chapter for the per-source 'effective' count — fixes the "
-             "misleading 362-vs-119 display where one aggregator splits "
-             "each chapter into 4 decimal entries. Pass this flag if your "
-             "series legitimately uses decimal numbering (some webnovel "
-             "adaptations / episodic releases) and you want each decimal "
-             "counted as its own chapter. Affects only the displayed "
-             "counts; the per-chapter download alternatives in the "
-             "chapter_map are unchanged either way.",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--multi-source-prefetched",
@@ -5551,6 +5861,12 @@ def main():
     # _process_chapter_strict for per-chapter fallback. Empty/None means
     # single-source mode (existing behavior unchanged).
     _multi_source_alternatives: Dict[float, List[Dict[str, Any]]] = {}
+    # consensus_set for the refined collapse-splits Rule 2 / 3b / 6 drops at
+    # group_chapters_for_download (2026-05-27). Populated alongside
+    # _multi_source_alternatives from the same three carriers (auto-pick,
+    # prefetched JSON, direct-URL discovery). None = no peer signal; the
+    # group helper falls through to original in-source-only heuristics.
+    _multi_source_consensus_set: Optional[Set[float]] = None
 
     if getattr(args, "search", None):
         from aio_search_cli import run_search_mode, take_latest_multi_source_state
@@ -5568,6 +5884,7 @@ def main():
         _ms_state = take_latest_multi_source_state()
         if _ms_state and _ms_state.get("alternatives_by_chap_num"):
             _multi_source_alternatives = _ms_state["alternatives_by_chap_num"]
+            _multi_source_consensus_set = _ms_state.get("consensus_set")
             n_alts = sum(len(v) for v in _multi_source_alternatives.values())
             n_chapters_with_alts = len(_multi_source_alternatives)
             print(
@@ -6112,7 +6429,7 @@ def main():
         try:
             if prefetched_path:
                 from aio_search_cli import build_alternatives_from_prefetched
-                _ms_alts = build_alternatives_from_prefetched(
+                _ms_result = build_alternatives_from_prefetched(
                     prefetched_path=prefetched_path,
                     primary_handler=handler,
                     primary_context=context,
@@ -6123,7 +6440,7 @@ def main():
                 )
             else:
                 from aio_search_cli import find_alternatives_for_direct_url
-                _ms_alts = find_alternatives_for_direct_url(
+                _ms_result = find_alternatives_for_direct_url(
                     primary_url=args.comic_url,
                     primary_handler=handler,
                     primary_context=context,
@@ -6133,8 +6450,19 @@ def main():
                     record_rate_limit=_record_rate_limit,
                     on_status=lambda m: print(m, file=sys.stderr),
                 )
+            # New return shape (2026-05-27): both helpers now return a dict
+            # with alts + consensus. Tolerate the legacy bare-dict shape too
+            # in case some downstream call path bypassed the update.
+            if isinstance(_ms_result, dict) and "alternatives_by_chap_num" in _ms_result:
+                _ms_alts = _ms_result.get("alternatives_by_chap_num") or {}
+                _ms_consensus = _ms_result.get("consensus_set")
+            else:
+                # Legacy / unexpected shape — treat the whole thing as the alts dict.
+                _ms_alts = _ms_result if isinstance(_ms_result, dict) else {}
+                _ms_consensus = None
             if _ms_alts:
                 _multi_source_alternatives = _ms_alts
+                _multi_source_consensus_set = _ms_consensus
                 n_alts = sum(len(v) for v in _multi_source_alternatives.values())
                 n_chapters_with_alts = len(_multi_source_alternatives)
                 print(
@@ -6264,8 +6592,23 @@ def main():
     # carrying `_merged_parts`; _process_chapter_impl detects this and
     # fetches each part's images in order. Output filename uses
     # group.label so the user sees "Title Ch 1.pdf".
-    collapse_splits_enabled = bool(getattr(args, "collapse_splits", True))
-    groups = group_chapters_for_download(chapters, collapse_splits=collapse_splits_enabled)
+    # Default flipped to False (opt-in) as of 2026-05-27. The new collapse
+    # logic drops source-only .1/.2/.3/.4 fragments under --multi-source,
+    # which is more aggressive than the old behavior — explicit user buy-in
+    # is required to avoid surprise drops. Both --collapse-splits and the
+    # deprecated --no-collapse-splits set this same dest.
+    collapse_splits_enabled = bool(getattr(args, "collapse_splits", False))
+    # consensus_set is sourced from whichever multi-source path populated it
+    # (auto-pick search, prefetched JSON, or direct-URL discovery). None when
+    # no peer data is available — group_chapters_for_download then falls
+    # through to the original in-source-only Rule 2 / 3b / 6 behavior.
+    # When non-None, Rule 2's lone source-only .1 fragment gets dropped
+    # (the user's Shangri-La Frontier 52.1 / 75.1 / etc. case).
+    groups = group_chapters_for_download(
+        chapters,
+        collapse_splits=collapse_splits_enabled,
+        consensus_set=_multi_source_consensus_set,
+    )
     grouped_chapters: List[Dict[str, Any]] = []
     for group in groups:
         if len(group.parts) == 1:
@@ -6980,7 +7323,16 @@ def main():
                         # failures as 'retryable' (we don't have HTTP status
                         # context out here; the host-poison threshold treats
                         # any non-permanent failure the same).
-                        record_host_failure=lambda h, u: _record_failure(h, u, "retryable"),
+                        # status/body_size are forwarded by the kwargs path
+                        # in sites/base.py:_fetch_one when an HTTP response
+                        # was received (vs. an exception with no body). They
+                        # feed the ghost-chapter signature accumulator so
+                        # uniform "every page returned identical error" is
+                        # detected as ghost_chapter rather than host_poison.
+                        # See aio-dl.py:_record_failure + _is_ghost_chapter_signature.
+                        record_host_failure=lambda h, u, *, status=None, body_size=None: _record_failure(
+                            h, u, "retryable", status=status, body_size=body_size,
+                        ),
                         # Forward cookies from the cloudscraper session so
                         # handlers whose image CDN gates on session cookies
                         # (e.g. age-gated content) ride them. Base impl
@@ -7056,9 +7408,18 @@ def main():
             # hit on Record of Ragnarok: 4-of-65 pages failed but a 61-page PDF
             # was saved with silent gaps. Now: chapter is all-or-nothing.
             #
-            # Reason precedence: 'incomplete' < 'time_budget' < 'host_poison'.
+            # Reason precedence: 'incomplete' < 'time_budget' < 'host_poison'
+            #   < 'ghost_chapter'.
             # The most informative reason takes priority for the diagnostic
-            # log line and the timing summary block.
+            # log line and the timing summary block. ghost_chapter trumps
+            # host_poison when both signals fire because ghost is the more
+            # SPECIFIC classification — "every page returned identical
+            # structural error" implies host_poison (5+ distinct URLs failed)
+            # but the inverse isn't true. The ChapterSkippedError raised
+            # with reason='ghost_chapter' causes _process_chapter_strict to
+            # short-circuit the inline-retry path (no point retrying a
+            # structural failure) and raise ChapterGhostError, which the
+            # main loop catches as skip-and-continue instead of abort.
             pages_total = len(download_tasks) + len(immediate_images)
             pages_ok = sum(1 for _, p in downloaded_images if p) + len(immediate_images)
             poison_threshold = int(globals().get("_CHAPTER_HOST_POISON", 5))
@@ -7102,7 +7463,37 @@ def main():
                         except Exception:
                             pass
                     return ""
-                if poisoned_hosts:
+                # Ghost-chapter check FIRST. The detector uses pages_ok=0 +
+                # uniform signatures across all recorded failures, which is
+                # disjoint from "any pages succeeded" — so a chapter that
+                # had even one successful download will never classify here.
+                # primary_only feeds the threshold knob: when the alignment
+                # data shows no non-primary source for this chapter, drop
+                # the pages_total floor from 5 to 3 (independent corroboration
+                # the chapter is fake). Cross-file:
+                # _is_ghost_chapter_signature lives at ~line 990 here, the
+                # alignment dict (_multi_source_alternatives) is populated
+                # in main() at ~line 5821 / 6388.
+                primary_only_for_ghost: Optional[bool] = None
+                if _multi_source_alternatives:
+                    try:
+                        chap_str = str(ch.get("chap") or "").strip()
+                        m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
+                        if m:
+                            chap_float = float(m.group(1))
+                            primary_only_for_ghost = (
+                                not _multi_source_alternatives.get(chap_float)
+                            )
+                    except (TypeError, ValueError):
+                        primary_only_for_ghost = None
+                if _is_ghost_chapter_signature(
+                    pages_ok=pages_ok,
+                    pages_total=pages_total,
+                    primary_only=primary_only_for_ghost,
+                ):
+                    reason = "ghost_chapter"
+                    host_blame = _resolve_host_blame()
+                elif poisoned_hosts:
                     reason = "host_poison"
                     host_blame = poisoned_hosts[0]
                 elif deadline_hit:
@@ -7111,10 +7502,47 @@ def main():
                 else:
                     reason = "incomplete"
                     host_blame = _resolve_host_blame()
-                print(
-                    f"  [!] Chapter {n} incomplete: {pages_ok}/{pages_total} pages "
-                    f"(reason={reason}, host={host_blame or '-'}). Will inline-retry."
-                )
+                # Reason-aware log line. The "Will inline-retry" suffix is
+                # false for ghost_chapter — _process_chapter_strict
+                # short-circuits the inline-retry sleep + redo when the
+                # primary reason is ghost (a structural failure won't
+                # change after a 30s sleep). For ghost, we hand the
+                # decision off to multi-source alts and, if those also
+                # fail, raise ChapterGhostError (skip+continue, not abort).
+                #
+                # primary_only-aware descriptor: "ghost" alone is misleading
+                # for chapters that exist on alt sources but happen to be
+                # broken on the primary (the canonical 2026-05-27 case:
+                # mangafire chapter 1 has uniform 5051-byte 403s but is on
+                # atsumaru, mangakatana, etc.). User feedback was clear that
+                # such chapters aren't "ghosts" — they're broken-on-primary
+                # and exactly the scenario multi-source exists to fix. The
+                # three states:
+                #   primary_only=True  → genuine placeholder (no other source
+                #                        lists this chapter); skip is the
+                #                        right disposition
+                #   primary_only=False → real chapter, primary CDN broken;
+                #                        multi-source alt-fetch should rescue
+                #   primary_only=None  → multi-source disabled / alignment
+                #                        not built; can't tell
+                if reason == "ghost_chapter":
+                    if primary_only_for_ghost is True:
+                        descriptor = "ghost (primary-only — no other source has this chapter)"
+                    elif primary_only_for_ghost is False:
+                        descriptor = "primary unavailable (alt sources have this chapter — will rescue if possible)"
+                    else:
+                        descriptor = "uniform error on primary"
+                    print(
+                        f"  [!] Chapter {n} {descriptor}: "
+                        f"{pages_ok}/{pages_total} pages, every failure had identical "
+                        f"signature (host={host_blame or '-'}). "
+                        f"Trying alternative sources next."
+                    )
+                else:
+                    print(
+                        f"  [!] Chapter {n} incomplete: {pages_ok}/{pages_total} pages "
+                        f"(reason={reason}, host={host_blame or '-'}). Will inline-retry."
+                    )
                 # Wipe partial chapter dir so the inline retry starts fresh.
                 rm_tree(tdir)
                 raise ChapterSkippedError(
@@ -7916,9 +8344,35 @@ def main():
                     # silently fail and waste a worker pool. Subsequent
                     # chapters resume on the primary anyway (strict wrapper's
                     # finally restores primary state).
-                    return _process_chapter(
+                    alt_result = _process_chapter(
                         alt_chapter, force_redownload=True, next_chapter=next_chapter, is_alt_source=True
                     )
+                    # Alt rescue succeeded. Record the rescue in the
+                    # cross-chapter tally so the timing summary can
+                    # surface multi-source value. Also print an explicit
+                    # "rescued" line when the primary failure was the
+                    # ghost-signature shape (the canonical case the user
+                    # said "multi-source exists exactly for this" about).
+                    # For other reasons (host_poison / time_budget /
+                    # incomplete) the existing "[Multi-source] -> X"
+                    # line + the per-chapter "CBZ saved" already make
+                    # the rescue obvious; we only need the extra line for
+                    # ghost because the in-chapter log claimed "every
+                    # failure had identical signature" and we want to
+                    # close the loop visually.
+                    multi_source_rescues.append({
+                        "chap": n_for_log,
+                        "alt_site": alt_handler.name,
+                        "primary_site": primary_state[0].name,
+                        "primary_reason": primary_err.reason,
+                    })
+                    if primary_err.reason == "ghost_chapter":
+                        print(
+                            f"    [Multi-source] ✓ Chapter {n_for_log} rescued "
+                            f"from {primary_state[0].name} ({primary_err.reason}) "
+                            f"via {alt_handler.name}"
+                        )
+                    return alt_result
                 except ChapterSkippedError as cse_alt:
                     print(
                         f"    [Multi-source] {alt_handler.name} also failed "
@@ -7930,8 +8384,42 @@ def main():
                     # on the primary source (the alignment anchor).
                     handler, scraper, context, comic_data = primary_state
 
-        # All alternatives failed (or none available). Fall back to the
-        # existing inline-retry on the primary source.
+        # All alternatives failed (or none available).
+        #
+        # Ghost-chapter short-circuit: when the PRIMARY failed with the ghost
+        # signature (every page returned an identical structural error), the
+        # inline-retry sleep + redo is pointless — the response template that
+        # produced the signature is generated by a server-side rule that won't
+        # change in 30s or 60s. mangafire's 5051-byte CF 403 for chapter-0
+        # placeholders is the canonical case. Hand off to ChapterGhostError
+        # (caught by the main loop as skip-and-continue) so the run isn't
+        # aborted on a structurally-fake chapter. Cross-source diagnostic:
+        # carry the primary_only flag through from the alignment lookup so
+        # the log line tells the user whether the chapter was primary-only
+        # (strongest fake signal) or just unavailable everywhere (alts
+        # listed it but couldn't deliver — could be coincident outage).
+        if primary_err.reason == "ghost_chapter":
+            primary_only_for_ghost: Optional[bool] = None
+            if _multi_source_alternatives:
+                try:
+                    chap_str = str(ch.get("chap") or "").strip()
+                    m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
+                    if m:
+                        chap_float = float(m.group(1))
+                        primary_only_for_ghost = (
+                            not _multi_source_alternatives.get(chap_float)
+                        )
+                except (TypeError, ValueError):
+                    primary_only_for_ghost = None
+            raise ChapterGhostError(
+                chap=n_for_log,
+                host=primary_err.host,
+                pages_total=primary_err.pages_total,
+                primary_only=primary_only_for_ghost,
+            ) from primary_err
+
+        # Other reasons (incomplete / time_budget / host_poison): fall back
+        # to inline-retry on the primary source — these CAN be transient.
         last_err: ChapterSkippedError = primary_err
         for retry_attempt in range(max_retries):
             wait = base_backoff * (2 ** retry_attempt)
@@ -7975,6 +8463,51 @@ def main():
     aborted_remaining = False
     aborted_chapter: Optional[Dict[str, Any]] = None
 
+    # Consecutive-ghost escalation. Ghost detection alone is right for the
+    # canonical "chapter 0 is a fake placeholder" case (skip + continue), but
+    # WRONG when the host is globally CF-blocked / auth-expired and EVERY
+    # chapter ghosts identically — silently slogging through 290 chapters of
+    # uniform 403s is the "reliability compromise" we explicitly rejected.
+    # Real-world test 2026-05-27: user's mangafire was returning uniform
+    # 5051-byte 403s for chapter 0 (host l1n.mfcdn2.xyz) AND chapter 1 (host
+    # k99.mfcdn2.xyz) — different hosts, same ghost shape — meaning the
+    # block was at the auth/account level, not the chapter level.
+    #
+    # Escalation rule: when GHOST_ABORT_THRESHOLD consecutive chapters
+    # classify as ghost without a successful chapter or non-ghost failure
+    # between them, escalate to abort. The user sees the same FATAL message
+    # they would have seen pre-fix, just slightly later (after N ghosts
+    # instead of after the very first chapter's inline-retries exhausted).
+    #
+    # Threshold = 3:
+    #   - 2 would catch the host-outage case but false-trigger on real
+    #     series with two placeholder chapters at the start (e.g. chapter 0
+    #     + chapter 0.5 both fake — rare but documented).
+    #   - 3 is a safe margin: a user who hits 3 placeholder chapters at the
+    #     start of a manga has bigger problems than this escalator. Real
+    #     host outages produce many more than 3 consecutive ghosts, so 3 is
+    #     fine for the escalation trigger.
+    #
+    # Reset conditions (counter goes back to 0):
+    #   - any successful chapter (chapter_content non-empty after the
+    #     strict wrapper returns)
+    #   - any non-ghost ChapterAbortedError (we're aborting anyway)
+    #   - any generic Exception (recorded as 'exception' missed; not ghost)
+    #   - any empty_content miss (no content but not ghost either)
+    consecutive_ghosts = 0
+    GHOST_ABORT_THRESHOLD = 3
+
+    # Multi-source rescue tally: chapters whose primary source failed AND
+    # an alt source successfully delivered them. Each entry is a dict with
+    # chap, alt_site, primary_site, primary_reason. Surfaced in the
+    # end-of-run timing summary so the user can see multi-source's value
+    # at a glance. User feedback 2026-05-27: "chapter 1 isn't a ghost
+    # chapter, it's an exact target for multi-source since it's broken on
+    # MF. That's exactly why multi-source exists." The summary line makes
+    # that value tangible — without it, users may think the run "had
+    # failures" when in fact half the failures were silently rescued.
+    multi_source_rescues: List[Dict[str, Any]] = []
+
     for ch_idx, ch in enumerate(chapters):
         grp_name = handler.get_group_name(ch)
         insert_list_index = len(current_book_content)
@@ -7994,6 +8527,118 @@ def main():
             chapter_content, grp_name, n, chapter_content_size = _process_chapter_strict(
                 ch, next_chapter=next_ch, upcoming_chapters=upcoming_slice
             )
+        except ChapterGhostError as cge:
+            # Soft skip: chapter looks structurally absent on the primary
+            # (uniform error signature across every page) and no alternative
+            # source could deliver it either. NOT abort by default — recording
+            # missed and continuing is the right call, because the failure
+            # shape is "this chapter doesn't exist here" not "the CDN is
+            # broken." See ChapterGhostError docstring near top of file for
+            # rationale, and _process_chapter_strict's
+            # primary_err.reason == "ghost_chapter" branch for the raise site.
+            # Cross-file: _is_ghost_chapter_signature is the detector;
+            # _record_failure_signature is what feeds it from the download
+            # paths.
+            #
+            # EXCEPT when GHOST_ABORT_THRESHOLD consecutive ghosts have fired
+            # without a successful chapter between — see the
+            # consecutive_ghosts comment block above main()'s for-loop for
+            # why. At that point we escalate to abort because the failure
+            # is host-level, not chapter-level, and slogging through the
+            # remaining queue is the "speed and reliability compromise" the
+            # user explicitly rejected.
+            consecutive_ghosts += 1
+            # primary_only-aware descriptor (same three-state taxonomy as
+            # the in-chapter log line ~line 7385). When this branch runs,
+            # the alt loop in _process_chapter_strict has already been
+            # tried and exhausted — so primary_only=False here means "alts
+            # exist but ALSO couldn't deliver this chapter," which is
+            # a different shape than "primary-only ghost" (genuinely fake)
+            # OR "primary unavailable, untried" (the in-chapter pre-alt
+            # message). Keep these distinct so the user can tell at a
+            # glance whether the missed chapter is a placeholder or a
+            # multi-source rescue that just didn't pan out.
+            if cge.primary_only is True:
+                descriptor = "primary-only ghost (no other source has this chapter)"
+            elif cge.primary_only is False:
+                descriptor = "primary unavailable AND all alt sources failed"
+            else:
+                descriptor = "uniform-error ghost on primary (multi-source disabled)"
+            if consecutive_ghosts >= GHOST_ABORT_THRESHOLD:
+                # Escalate. Print FATAL message + record this chapter as
+                # aborted:ghost_chapter (NOT plain ghost_chapter) so the
+                # missed-chapters log distinguishes the escalation chapter
+                # from the leading ghost-skipped ones. Record remaining
+                # chapters as not_attempted_after_abort to mirror the
+                # ChapterAbortedError branch's bookkeeping.
+                print(
+                    f"\n[!] FATAL: Chapter {cge.chap} is the "
+                    f"{GHOST_ABORT_THRESHOLD}rd consecutive uniform-error "
+                    f"chapter on primary (host={cge.host or '?'}; {descriptor}). "
+                    f"The uniform-error pattern across multiple chapters "
+                    f"indicates a host-level block (auth expired, CF rule "
+                    f"tightened, CDN broken globally) rather than per-chapter "
+                    f"placeholder absence."
+                )
+                print(
+                    f"    Aborting run. Chapters successfully saved before "
+                    f"this point are kept (per-chapter files via "
+                    f"--keep-chapters)."
+                )
+                _record_missed(
+                    ch, grp_name, "aborted:ghost_chapter",
+                    f"escalated after {consecutive_ghosts} consecutive ghosts on primary",
+                    insert_list_index=insert_list_index,
+                    insert_chapter_index=insert_chapter_index,
+                    insert_marker_index=insert_marker_index,
+                    insert_page_index=insert_page_index,
+                    host=cge.host,
+                    pages_ok=0,
+                    pages_total=cge.pages_total,
+                )
+                aborted_remaining = True
+                aborted_chapter = ch
+                for j in range(ch_idx + 1, len(chapters)):
+                    skipped_ch = chapters[j]
+                    _record_missed(
+                        skipped_ch,
+                        handler.get_group_name(skipped_ch),
+                        "not_attempted_after_abort",
+                        f"main pass aborted after {GHOST_ABORT_THRESHOLD} consecutive ghosts",
+                        insert_list_index=len(current_book_content),
+                        insert_chapter_index=len(current_book_chapters),
+                        insert_marker_index=len(current_epub_markers),
+                        insert_page_index=_running_page_count if args.format == 'epub' else 0,
+                        host=cge.host,
+                        pages_ok=0,
+                        pages_total=0,
+                    )
+                break
+
+            # Normal ghost handling — skip + continue, with a counter hint
+            # so the user sees the escalation looming.
+            counter_hint = (
+                f" [{consecutive_ghosts}/{GHOST_ABORT_THRESHOLD} "
+                f"consecutive — will abort at {GHOST_ABORT_THRESHOLD}]"
+                if consecutive_ghosts > 1 else ""
+            )
+            print(
+                f"\n[!] Chapter {cge.chap}: {descriptor} on "
+                f"{cge.host or '?'} ({cge.pages_total} pages, 0 succeeded). "
+                f"Recorded as missed; the run continues.{counter_hint}"
+            )
+            _record_missed(
+                ch, grp_name, "ghost_chapter",
+                f"uniform error signature on primary; primary_only={cge.primary_only}",
+                insert_list_index=insert_list_index,
+                insert_chapter_index=insert_chapter_index,
+                insert_marker_index=insert_marker_index,
+                insert_page_index=insert_page_index,
+                host=cge.host,
+                pages_ok=0,
+                pages_total=cge.pages_total,
+            )
+            continue
         except ChapterAbortedError as cae:
             # Hard abort: a chapter could not be downloaded fully even after
             # inline retries. The user explicitly asked for this — refuse to
@@ -8055,6 +8700,7 @@ def main():
             # 2026-05-16 run; printing here means future regressions of the
             # same shape are visible immediately rather than only via
             # missed_chapters.json after the run ends.
+            consecutive_ghosts = 0  # reset: this is not a ghost
             print(
                 f"  [!] Chapter {ch.get('chap', '?')} hit an unexpected error: "
                 f"{type(e).__name__}: {str(e)[:200]}. "
@@ -8064,8 +8710,14 @@ def main():
             continue
 
         if not chapter_content:
+            consecutive_ghosts = 0  # reset: empty content is not a ghost
             _record_missed(ch, grp_name, 'empty_content', 'No downloadable content', insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
             continue
+
+        # Successful chapter — reset the consecutive-ghost counter. The
+        # canonical "chapter 0 fake" pattern produces 1 ghost then real
+        # downloads; this reset is what keeps that working.
+        consecutive_ghosts = 0
 
         should_split_by_size = (
             split_size_bytes > 0
@@ -8346,6 +8998,33 @@ def main():
     print(f"  Processing       : {_fmt_time(_timing['processing'])}")
     print(f"  Other (overhead) : {_fmt_time(_timing_other)}")
     print(f"  Total            : {_fmt_time(_timing_total)}")
+
+    # --- Multi-source rescue tally ---
+    # Surfaces the value of multi-source: chapters whose primary source
+    # failed (any reason — ghost / host_poison / time_budget / incomplete)
+    # and were successfully delivered from an alternative source. The
+    # tally is built up during the main loop in _process_chapter_strict's
+    # alt-success branch. Skipped entirely when empty so single-source
+    # runs aren't polluted with a hollow header. Cross-file:
+    # multi_source_rescues declared near the top of main()'s chapter loop
+    # (~line 8355 with the consecutive_ghosts state). For why this block
+    # exists at all: user feedback 2026-05-27 emphasized that broken-on-
+    # primary chapters (chapter 1 in the Shangri-La Frontier failure case)
+    # are exactly what multi-source exists to handle — making the rescue
+    # visible in the summary closes the loop visually for the user.
+    if multi_source_rescues:
+        print(f"\n--- Multi-source Rescues ---")
+        print(
+            f"  {len(multi_source_rescues)} chapter(s) rescued from primary "
+            f"failures via alternative sources:"
+        )
+        # Stable ordering: insertion order matches chapter-loop order which
+        # is already chap-ascending after collapse-splits + filter.
+        for r in multi_source_rescues:
+            print(
+                f"    Ch {r['chap']:<8} <- {r['alt_site']:<14} "
+                f"(primary {r['primary_site']} failed: {r['primary_reason']})"
+            )
 
     # --- Skipped chapters report ---
     # Printed AFTER the timing summary but BEFORE 'Done.' so the Electron

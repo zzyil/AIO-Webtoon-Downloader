@@ -25,6 +25,34 @@ function qualityTier(score) {
   return { color: "bg-red-500", label: "weak" };
 }
 
+// Source-level "currently broken / degraded handler" flags. Keyed by
+// site name — must match handler.name in the Python `sites/<file>.py`
+// (which is a stable identifier, not a display string). When a handler
+// is known to be functionally broken (downloads usually fail, output is
+// incomplete, etc.) we render a red AlertTriangle next to the site name
+// so users see the warning BEFORE clicking Download and wasting a slot
+// in their queue. The download path itself isn't blocked — users may
+// still try, and the source might recover.
+//
+// Add/remove entries here when handlers break / get fixed. Each value
+// is the tooltip text the user sees on hover.
+//
+// Entries:
+//   - comix (added 2026-05-27): the canvas-scrape fallback for
+//     unscrambled chapter images can't render all pages within the 300s
+//     per-chapter time budget. Chapter downloads time out at single-
+//     digit page counts (e.g. 3/193 pages in the 2026-05-27 Shangri-La
+//     Frontier run). The Patchright bridge is single-threaded so
+//     increasing parallelism doesn't help. See sites/comix.py for the
+//     in-progress work and the PR-31 context doc's "fix comix" pointer.
+const BROKEN_HANDLERS = {
+  comix: (
+    "Currently broken: canvas-scrape can't capture all pages within the "
+    + "per-chapter time budget. Downloads typically time out at a small "
+    + "number of pages. You can still try, but expect failure."
+  ),
+};
+
 export default function SearchSourceCard({
   source,           // SourceEntry from JSON (site, url, cover, scores, etc.)
   officialPublisher, // string | null — non-null if any chapter via this site is is_official=true
@@ -155,11 +183,31 @@ export default function SearchSourceCard({
 
       {/* Body */}
       <div className="px-2.5 py-2 space-y-1.5">
-        {/* Site name + format chip + chapter count */}
+        {/* Site name + broken-handler warning + format chip + chapter count */}
         <div className="flex items-center gap-1 min-w-0">
           <span className="font-mono text-[11px] font-medium text-foreground truncate">
             {source.site}
           </span>
+          {/* Broken-handler danger icon. Sourced from BROKEN_HANDLERS map at
+              the top of this file — keyed by source.site, value is the
+              tooltip text. Red AlertTriangle distinguishes "handler is
+              broken" (this) from the yellow outlier-flag AlertTriangle on
+              the score row below (which is "this source's image quality is
+              suspect"). Inline span carries the title because lucide-react's
+              SVGs don't surface native tooltips reliably across browsers.
+              Cross-file: BROKEN_HANDLERS comment for current entries and
+              the why; remove an entry when the handler is fixed. */}
+          {BROKEN_HANDLERS[source.site] && (
+            <span
+              className="shrink-0 inline-flex items-center"
+              title={BROKEN_HANDLERS[source.site]}
+            >
+              <AlertTriangle
+                className="w-3 h-3 text-red-500"
+                aria-label={`${source.site} is currently broken: ${BROKEN_HANDLERS[source.site]}`}
+              />
+            </span>
+          )}
           {formatLabel && (
             // Format chip from Phase H metadata. Lowercase font-mono lines up
             // with the site name visually; muted color keeps it secondary.

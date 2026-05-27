@@ -69,12 +69,14 @@ function buildSearchArgs(query, opts = {}) {
   // Boolean toggles
   if (opts.seededOnly) args.push("--seeded-only");
   if (opts.multiSource) args.push("--multi-source");
-  // collapseSplits defaults TRUE; we only emit the negative flag when the
-  // user has explicitly turned it off in Settings or the inline toggle.
-  // `=== false` is intentional: undefined / null / true all mean "leave
-  // default ON" so older saved searchOpts dicts without the field don't
-  // accidentally disable collapse.
-  if (opts.collapseSplits === false) args.push("--no-collapse-splits");
+  // collapseSplits defaults FALSE as of 2026-05-27 (opt-in flip); we emit
+  // the positive --collapse-splits flag only when the user has explicitly
+  // turned it on in Settings or the inline toggle. `=== true` is
+  // intentional: undefined / null / false all mean "leave default OFF"
+  // so older saved searchOpts dicts without the field stay off (the new
+  // safer default). aio-dl.py's argparse keeps --no-collapse-splits as a
+  // hidden alias for script users; we don't emit it.
+  if (opts.collapseSplits === true) args.push("--collapse-splits");
   // enableMlRating defaults FALSE (production default; matches argparse).
   // Only emit the flag when explicitly enabled. Wiring this through so
   // users can opt into torch-backed T2/T3 image-quality scoring (CLIP-IQA,

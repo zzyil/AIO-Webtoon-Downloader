@@ -28,8 +28,8 @@ Cross-file:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 
 
 # Compiled once. Matches the FIRST decimal-or-integer chapter number in a
@@ -37,6 +37,49 @@ from typing import Dict, List, Optional, Tuple
 # include "Ch 47", "Chapter 47", "047", "Ch.47.5", etc. We just want the
 # first numeric token that can act as a chapter ordinal.
 _CHAPTER_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+# Fragment-shaped decimal values: typically partial-upload chunks of the
+# integer parent, not canonical sub-chapters. Empirically, sites that emit
+# X.Y as a real "Chapter X.5: Side Story" overwhelmingly use Y ∈ {.5..9};
+# Y ∈ {.1..4} are almost always upload fragments (the publisher's first-
+# pass partial release before the canonical chapter is bundled). The
+# cross-source check still gates the drop — if a peer source also has
+# X.1, we keep it. So this is a safe-by-default heuristic, not a hard ban.
+# Grep target: _is_source_only_fragment, group_chapters_for_download Rule 2.
+_FRAGMENT_DECIMAL_VALUES = (0.1, 0.2, 0.3, 0.4)
+
+
+def _is_fragment_shaped_decimal(num: float, floor: int) -> bool:
+    """True iff the decimal portion of ``num`` is one of .1/.2/.3/.4.
+
+    Round to 1 dp to absorb 0.1+0.2-style float drift (same convention as
+    _is_sequential_split_decimals). Pure value check — does NOT consult any
+    consensus set; combine with _is_source_only_fragment for the gated drop.
+    """
+    rel = round(num - floor, 1)
+    return rel in _FRAGMENT_DECIMAL_VALUES
+
+
+def _is_source_only_fragment(
+    num: float, floor: int, consensus_set: Optional[Set[float]],
+) -> bool:
+    """Should this decimal be treated as a duplicate fragment?
+
+    True iff the decimal value is fragment-shaped (.1/.2/.3/.4) AND no peer
+    source confirms it (it's not in the cross-source consensus). Requires
+    a non-empty ``consensus_set`` to fire — when there's no peer signal
+    (single-source run, direct URL, or just no overlap among sources) the
+    function returns False so the existing in-source heuristics own the
+    decision. Used by both ``group_chapters_for_download`` (the actual
+    drop site) and ``_classify_chapter_breakdown`` (diagnostic counting),
+    keeping the two perfectly in sync.
+    """
+    if consensus_set is None or not consensus_set:
+        return False
+    if num in consensus_set:
+        return False
+    return _is_fragment_shaped_decimal(num, floor)
 
 
 @dataclass
@@ -78,10 +121,76 @@ class AlignmentResult:
     identical regardless — collapse only affects the diagnostic counts, not
     the per-chapter download alternatives. See `_classify_main_chapters` for
     the collapse rules.
+
+    `consensus_set` is the set of chapter numbers that appear in ≥2 sources
+    after alignment. Used by ``group_chapters_for_download`` (download side)
+    and ``_classify_chapter_breakdown`` (display side) to identify source-only
+    fragment-shaped decimals (.1/.2/.3/.4) for duplicate detection — see the
+    Rule 2 refinement and the duplicate-detection-plan in
+    ~/.claude/plans/ultrathink-mangafire-and-some-flickering-sparkle.md.
+    Empty when only one source contributed (no peer signal); the consumers
+    fall through to current single-source heuristics in that case.
+
+    `consensus_max` is the highest chapter number in `consensus_set`, or
+    None when consensus is empty. Used to distinguish "source-only latest"
+    (legitimate fresh chapters above the peer-confirmed range) from
+    "source-only orphan" (suspicious mid-range chapters peers don't have).
     """
     chapter_map: List[ChapterMapEntry]
     merge_diagnostics: Dict[str, Dict] = field(default_factory=dict)
     collapse_splits_applied: bool = True
+    consensus_set: Set[float] = field(default_factory=set)
+    consensus_max: Optional[float] = None
+
+
+@dataclass
+class ChapterBreakdown:
+    """Per-source classification of a chapter list using cross-source consensus
+    as ground truth. Computed by ``_classify_chapter_breakdown``; surfaced in
+    ``merge_diagnostics[site]['breakdown']`` regardless of collapse state.
+
+    Buckets are MUTUALLY EXCLUSIVE — every chapter falls into exactly one.
+    Sum of all fields == count of chapters in this source's get_chapters
+    output (including unparseable). The UI renders these as separate sub-
+    labels alongside the main count so users can see where the "X main" /
+    "Y entries" gap comes from.
+
+    Bucket semantics:
+      consensus_main           — integer ≥ 1, present in ≥2 sources (counted toward "main")
+      source_only_latest       — integer ≥ 1, > consensus_max, source-only (legit fresh chapter, counted toward "main")
+      consensus_side_stories   — fractional > 0, in consensus (peer-confirmed X.5-style side story)
+      safe_decimals            — fractional > 0, source-only, value ≥ .5 (kept as side story; cannot confidently call duplicate)
+      prologue_count           — chapter num ≤ 0 (chapter 0, negatives — kept but not in main count)
+      source_only_orphans      — integer ≥ 1, ≤ consensus_max, NOT in consensus (suspicious re-release; kept but flagged)
+      fragments_dropped        — fractional > 0, value ∈ {.1,.2,.3,.4}, NOT in consensus (Rule 2 refinement target: dropped when collapse ON)
+      unparseable_passthrough  — _extract_chapter_num returned None (oneshots, omakes by name only)
+
+    Why this dataclass exists alongside _classify_main_chapters:
+    `_classify_main_chapters` returns a single ``effective_chapters`` count
+    for the back-compat headline; ``ChapterBreakdown`` exposes the components
+    so the UI can render "266 main · 16 side stories · 1 prologue · 22
+    fragments dropped" instead of a single number. The two functions share
+    the same predicates (``_is_source_only_fragment`` etc.) so the displayed
+    breakdown is always consistent with what ``group_chapters_for_download``
+    will actually emit when the user turns collapse on.
+
+    Cross-file: SearchChapterMap.jsx reads ``breakdown`` from merge_diagnostics
+    and renders the bucketed line. aio_search_cli.py serializes the dataclass
+    via dataclasses.asdict() into the winner_chapter_map JSON.
+    """
+    # MAIN — counted toward the "X main" headline
+    consensus_main: int = 0
+    source_only_latest: int = 0
+    # EXTRAS — kept as content, shown in a separate UI sub-label
+    consensus_side_stories: int = 0
+    safe_decimals: int = 0
+    prologue_count: int = 0
+    # SUSPICIOUS — kept but flagged
+    source_only_orphans: int = 0
+    # DROPPED when collapse ON — flagged in UI as "N fragments dropped"
+    fragments_dropped: int = 0
+    # PASSTHROUGH — non-numeric labels (oneshots, omakes by name only)
+    unparseable_passthrough: int = 0
 
 
 def _is_sequential_split_decimals(decimals_rel: List[float]) -> bool:
@@ -111,7 +220,12 @@ def _is_sequential_split_decimals(decimals_rel: List[float]) -> bool:
     return sorted_decimals == expected
 
 
-def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[int, int]:
+def _classify_main_chapters(
+    numbers,
+    *,
+    collapse_splits: bool = True,
+    consensus_set: Optional[Set[float]] = None,
+) -> Tuple[int, int]:
     """Compute (unique_main_chapters, effective_chapters) for a chapter-number set.
 
     `unique_main_chapters` is the count of unique floor() values across the
@@ -120,7 +234,7 @@ def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[i
     entry or split across N decimals. The UI surfaces this as "X main".
 
     `effective_chapters` is what the UI shows as the headline count, and
-    depends on `collapse_splits`:
+    depends on `collapse_splits` AND ``consensus_set``:
 
       - ``collapse_splits=True`` (default): split-only clusters X.1 / X.2 /
         ... / X.k where the decimals form a sequential .1/.2/.3 pattern
@@ -147,7 +261,15 @@ def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[i
         1.5 is a real distinct chapter, not a side story or split. Collapse
         would falsely merge those.
 
-    Examples (collapse_splits=True):
+      - ``consensus_set`` (NEW 2026-05-27, cross-source duplicate detection):
+        when provided AND collapse is on, refines Rule 2 / 3b / 6 by dropping
+        fragment-shaped decimals (.1/.2/.3/.4) that no peer source confirms.
+        Mirrors the actual drops in ``group_chapters_for_download`` so the
+        displayed count matches the downloaded count. When ``consensus_set``
+        is None or empty (single-source run / direct URL), the function
+        falls through to in-source heuristics — same numbers as today.
+
+    Examples (collapse_splits=True, consensus_set=None):
       {1, 2, 3}                 → (3, 3)   — all integers, no decimals
       {1.1, 1.2, 1.3, 1.4}      → (1, 1)   — split-cluster, no integer parent
       {4, 4.5}                  → (1, 2)   — main + side story (Rule 2)
@@ -155,6 +277,10 @@ def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[i
       {1.1, 1.2, 2, 3}          → (3, 3)   — 1.x splits collapse, then 2 + 3
       {8, 8.1, 8.2, 8.3}        → (1, 1)   — sequential splits collapse
       {8, 8.1, 8.5}             → (1, 2)   — scattered: integer + highest .5
+
+    Examples (collapse_splits=True, consensus_set={52}):
+      {52, 52.1}                → (1, 1)   — Rule 2 refined: 52.1 is source-only fragment
+      {52, 52.5}                → (1, 2)   — Rule 2 unchanged: .5 not fragment-shaped
 
     Examples (collapse_splits=False):
       Each example above yields (unique_main, len(numbers)) instead.
@@ -178,19 +304,105 @@ def _classify_main_chapters(numbers, *, collapse_splits: bool = True) -> Tuple[i
     effective = 0
     for floor, group in by_floor.items():
         integer_present = any(n == floor for n in group)
-        decimals_rel = [n - floor for n in group if n != floor]
+        decimal_values = sorted(n for n in group if n != floor)
+        decimals_rel = [n - floor for n in decimal_values]
         if integer_present:
             effective += 1  # the integer
-            if len(decimals_rel) == 1:
-                effective += 1  # Rule 2: true side story
-            elif len(decimals_rel) >= 2 and not _is_sequential_split_decimals(decimals_rel):
-                # Rule 3 scattered: highest decimal is a canonical side story.
-                # Sequential splits (Rule 3 sequential) contribute nothing.
-                effective += 1
+            if len(decimal_values) == 1:
+                # Rule 2 refined: drop fragment-shaped source-only decimal
+                # (the .1 in {52, 52.1} when peers don't have 52.1). The
+                # check matches group_chapters_for_download's Rule 2 branch.
+                if not _is_source_only_fragment(
+                    decimal_values[0], floor, consensus_set,
+                ):
+                    effective += 1  # Rule 2 kept: true side story
+            elif len(decimal_values) >= 2 and not _is_sequential_split_decimals(decimals_rel):
+                # Rule 3b scattered: highest decimal is a canonical side
+                # story IF not a source-only fragment. Mirrors the Rule 3b
+                # refinement in group_chapters_for_download.
+                highest = decimal_values[-1]
+                if not _is_source_only_fragment(highest, floor, consensus_set):
+                    effective += 1
+            # else: Rule 3a sequential splits — decimals contribute nothing.
         else:
-            # Rule 4/5/6: no integer; the cluster collapses to one chapter.
-            effective += 1
+            # Rule 4/5/6: no integer.
+            if len(decimal_values) == 1:
+                # Rule 4: singleton partial — always kept (the only entry).
+                effective += 1
+            elif _is_sequential_split_decimals(decimals_rel):
+                # Rule 5: sequential split-cluster collapses to one chapter.
+                effective += 1
+            else:
+                # Rule 6 refined: highest decimal kept UNLESS it's a source-
+                # only fragment AND the integer parent is in consensus
+                # (peer says floor is the canonical chapter). Mirrors the
+                # Rule 6 refinement in group_chapters_for_download.
+                highest = decimal_values[-1]
+                parent_in_consensus = float(floor) in (consensus_set or set())
+                if not (
+                    parent_in_consensus
+                    and _is_source_only_fragment(highest, floor, consensus_set)
+                ):
+                    effective += 1
     return unique_main, effective
+
+
+def _classify_chapter_breakdown(
+    chapters: List[Dict],
+    consensus_set: Optional[Set[float]],
+    consensus_max: Optional[float],
+) -> ChapterBreakdown:
+    """Route each chapter dict into exactly one ChapterBreakdown bucket.
+
+    Mirrors the predicates in ``group_chapters_for_download`` (same
+    fragment-shape and consensus checks) so the displayed bucket counts
+    always match what the download path actually emits when collapse is on.
+
+    When ``consensus_set`` is empty / None (single-source run or no peer
+    overlap), there's no signal: integers go to ``consensus_main`` (we
+    can't downgrade them), decimals ≥ .5 go to ``safe_decimals``, fragment-
+    shaped decimals also go to ``safe_decimals`` (not ``fragments_dropped``)
+    because the download path won't drop them either without peer signal.
+
+    Note: this operates on the post-handler-dedup chapter dicts (one entry
+    per chapter number). align_chapter_lists deduplicates per source before
+    calling this, so we don't see the same number twice from one source.
+    """
+    bd = ChapterBreakdown()
+    has_consensus = bool(consensus_set)
+    for ch in chapters:
+        num = _extract_chapter_num(ch.get("chap"))
+        if num is None:
+            bd.unparseable_passthrough += 1
+            continue
+        if num <= 0:
+            bd.prologue_count += 1
+            continue
+        floor = int(num)
+        is_integer = (num == floor)
+        if is_integer:
+            if has_consensus and num in consensus_set:
+                bd.consensus_main += 1
+            elif has_consensus and consensus_max is not None and num > consensus_max:
+                bd.source_only_latest += 1
+            elif has_consensus:
+                # Peer signal exists but this integer is mid-range and source-only.
+                bd.source_only_orphans += 1
+            else:
+                # No peer signal — treat as main (can't downgrade without data).
+                bd.consensus_main += 1
+        else:
+            # Fractional > 0
+            if has_consensus and num in consensus_set:
+                bd.consensus_side_stories += 1
+            elif _is_source_only_fragment(num, floor, consensus_set):
+                # Fragment-shaped (.1-.4), source-only, peer signal exists →
+                # would be dropped by the download path when collapse ON.
+                bd.fragments_dropped += 1
+            else:
+                # Either no peer signal, or decimal ≥ .5 — kept as safe extra.
+                bd.safe_decimals += 1
+    return bd
 
 
 def _extract_chapter_num(label) -> Optional[float]:
@@ -283,6 +495,8 @@ def align_chapter_lists(
             chapter_map=[],
             merge_diagnostics={},
             collapse_splits_applied=collapse_splits,
+            consensus_set=set(),
+            consensus_max=None,
         )
 
     # Pick anchor by largest chapter set, breaking ties by orchestrator order
@@ -302,17 +516,29 @@ def align_chapter_lists(
     ]
     sources_with_chapters = reordered
     anchor_site, anchor_chapters = sources_with_chapters[0]
+
+    # Build per-source {chapter_num → chapter_dict} maps in a single upfront
+    # pass. Per-site dedup (keep first occurrence) matches the original loop
+    # behavior — multiple chapter entries with the same number on the same
+    # site (e.g. different scanlator versions on MangaDex) collapse to the
+    # first. Doing this upfront lets us compute consensus_set AFTER the
+    # cross-source merge but BEFORE writing diagnostics, so each source's
+    # breakdown is graded against the full peer set.
+    per_source_nums: Dict[str, Dict[float, Dict]] = {}
+    for site_name, chapters in sources_with_chapters:
+        source_nums: Dict[float, Dict] = {}
+        for ch in (chapters or []):
+            num = _extract_chapter_num(ch.get("chap"))
+            if num is None:
+                continue
+            if num in source_nums:
+                continue
+            source_nums[num] = ch
+        per_source_nums[site_name] = source_nums
+
+    # Seed anchor_index from the anchor's per-source map.
     anchor_index: Dict[float, ChapterMapEntry] = {}
-    for ch in anchor_chapters or []:
-        num = _extract_chapter_num(ch.get("chap"))
-        if num is None:
-            continue
-        if num in anchor_index:
-            # Multiple chapter entries with the same number on the same site
-            # (rare but happens — different scanlator versions of the same
-            # chapter on MangaDex). Keep the first; subsequent ones are
-            # ignored at the merger level. Per-site dedup happened upstream.
-            continue
+    for num, ch in per_source_nums[anchor_site].items():
         label = str(ch.get("chap") or "").strip() or f"{num:g}"
         anchor_index[num] = ChapterMapEntry(
             chapter_num=num,
@@ -320,83 +546,50 @@ def align_chapter_lists(
             sources=[(anchor_site, ch)],
         )
 
-    # Phase 2/3 diagnostic enrichment: compute (unique_main_chapters,
-    # effective_chapters) for the anchor as well so the UI can render its
-    # "X main / Y entries" badge consistently across all rows. The anchor's
-    # chapter-number set is anchor_index.keys() — by construction every
-    # number is unique because anchor_index dedupes by chapter number.
-    anchor_unique_main, anchor_effective = _classify_main_chapters(
-        list(anchor_index.keys()), collapse_splits=collapse_splits
-    )
-    diagnostics: Dict[str, Dict] = {
+    # Track per-source overlap / compatibility / skipped_reason now;
+    # _classify_main_chapters + breakdown computation is deferred until
+    # AFTER consensus is known so the diagnostic counts incorporate it.
+    per_source_meta: Dict[str, Dict] = {
         anchor_site: {
-            "role": "anchor",
-            "total_chapters": len(anchor_index),
-            "unique_main_chapters": anchor_unique_main,
-            "effective_chapters": anchor_effective,
-            "matched_with_anchor": len(anchor_index),
+            "overlap": len(anchor_index),
             "compatibility": 1.0,
+            "role": "anchor",
+            "skipped_reason": None,
         }
     }
 
-    # Process remaining sources.
-    for site_name, chapters in sources_with_chapters[1:]:
-        if not chapters:
-            diagnostics[site_name] = {
-                "role": "alternative",
-                "total_chapters": 0,
-                "unique_main_chapters": 0,
-                "effective_chapters": 0,
-                "matched_with_anchor": 0,
+    # Process remaining sources: compute overlap, merge into anchor_index.
+    for site_name, _chapters in sources_with_chapters[1:]:
+        source_nums = per_source_nums[site_name]
+        if not source_nums:
+            per_source_meta[site_name] = {
+                "overlap": 0,
                 "compatibility": 0.0,
+                "role": "alternative",
                 "skipped_reason": "empty chapter list",
             }
             continue
 
-        # Index this source's chapters by extracted number.
-        source_nums: Dict[float, Dict] = {}
-        for ch in chapters:
-            num = _extract_chapter_num(ch.get("chap"))
-            if num is None:
-                continue
-            if num in source_nums:
-                continue  # keep first occurrence
-            source_nums[num] = ch
-
-        # How many of this source's chapters have a number that exists in the
-        # anchor? Determines whether the source's numbering system is
-        # compatible enough for a full merge.
-        if source_nums:
-            overlap = len([n for n in source_nums if n in anchor_index])
-            compatibility = overlap / len(source_nums)
-        else:
-            overlap = 0
-            compatibility = 0.0
-
-        # Phase 2/3 enrichment — see anchor block above for rationale.
-        unique_main, effective = _classify_main_chapters(
-            list(source_nums.keys()), collapse_splits=collapse_splits
-        )
-        diagnostics[site_name] = {
+        overlap = len([n for n in source_nums if n in anchor_index])
+        compatibility = overlap / len(source_nums)
+        merge_orphans = compatibility >= compatibility_threshold
+        per_source_meta[site_name] = {
+            "overlap": overlap,
+            "compatibility": compatibility,
             "role": "alternative",
-            "total_chapters": len(source_nums),
-            "unique_main_chapters": unique_main,
-            "effective_chapters": effective,
-            "matched_with_anchor": overlap,
-            "compatibility": round(compatibility, 3),
+            "skipped_reason": (
+                None if merge_orphans else (
+                    f"compatibility {compatibility:.0%} below "
+                    f"{compatibility_threshold:.0%} threshold; only "
+                    "overlapping chapters merged"
+                )
+            ),
         }
 
-        # Always merge the overlapping chapters — they're definitionally a
-        # safe match per number. Non-overlapping chapters from this source are
-        # added as orphan entries ONLY if compatibility is high enough,
-        # signaling the source is using the same numbering scheme.
-        merge_orphans = compatibility >= compatibility_threshold
-        if not merge_orphans:
-            diagnostics[site_name]["skipped_reason"] = (
-                f"compatibility {compatibility:.0%} below {compatibility_threshold:.0%} "
-                "threshold; only overlapping chapters merged"
-            )
-
+        # Always merge overlapping chapters — definitionally a safe match
+        # per number. Non-overlapping chapters are added as orphan entries
+        # ONLY if compatibility is above threshold, signaling the source
+        # uses the same numbering scheme.
         for num, ch in source_nums.items():
             if num in anchor_index:
                 anchor_index[num].sources.append((site_name, ch))
@@ -407,6 +600,49 @@ def align_chapter_lists(
                     chapter_label=label,
                     sources=[(site_name, ch)],
                 )
+
+    # Compute cross-source consensus from the fully-populated anchor_index.
+    # A chapter number is "in consensus" iff ≥2 sources contributed it.
+    # Used by _classify_main_chapters / _classify_chapter_breakdown (display
+    # side) AND group_chapters_for_download (download side) to identify
+    # source-only fragment-shaped decimals for duplicate detection. See
+    # plan: ~/.claude/plans/ultrathink-mangafire-and-some-flickering-sparkle.md.
+    source_counts: Dict[float, int] = {}
+    for entry in anchor_index.values():
+        source_counts[entry.chapter_num] = len(entry.sources)
+    consensus_set: Set[float] = {n for n, c in source_counts.items() if c >= 2}
+    consensus_max: Optional[float] = max(consensus_set) if consensus_set else None
+
+    # Now compute per-source diagnostics with consensus in hand. The
+    # _classify_main_chapters call mirrors the consensus-refined drops in
+    # group_chapters_for_download, so the displayed "X main / Y entries"
+    # always matches what the download path emits when collapse is on.
+    diagnostics: Dict[str, Dict] = {}
+    for site_name, meta in per_source_meta.items():
+        source_nums = per_source_nums[site_name]
+        unique_main, effective = _classify_main_chapters(
+            list(source_nums.keys()),
+            collapse_splits=collapse_splits,
+            consensus_set=consensus_set,
+        )
+        breakdown = _classify_chapter_breakdown(
+            list(source_nums.values()),
+            consensus_set=consensus_set,
+            consensus_max=consensus_max,
+        )
+        diag: Dict = {
+            "role": meta["role"],
+            "total_chapters": len(source_nums),
+            "unique_main_chapters": unique_main,
+            "effective_chapters": effective,
+            "matched_with_anchor": meta["overlap"],
+            "compatibility": round(meta["compatibility"], 3),
+            "breakdown": asdict(breakdown),
+            "consensus_threshold_sources": 2,
+        }
+        if meta["skipped_reason"]:
+            diag["skipped_reason"] = meta["skipped_reason"]
+        diagnostics[site_name] = diag
 
     # Within each chapter row, prefer official-tagged sources. Stable sort
     # preserves the orchestrator's quality ranking for ties (both within
@@ -430,6 +666,8 @@ def align_chapter_lists(
         chapter_map=chapter_map,
         merge_diagnostics=diagnostics,
         collapse_splits_applied=collapse_splits,
+        consensus_set=consensus_set,
+        consensus_max=consensus_max,
     )
 
 
@@ -466,6 +704,7 @@ def group_chapters_for_download(
     chapters: List[Dict],
     *,
     collapse_splits: bool = True,
+    consensus_set: Optional[Set[float]] = None,
 ) -> List[ChapterGroup]:
     """Apply the cluster rule (snappy-forging-waffle.md item 8) to produce
     download-ready groups.
@@ -480,6 +719,13 @@ def group_chapters_for_download(
               → 2 groups: ChapterGroup(label="X", parts=[X])
                           ChapterGroup(label="X.k", parts=[X.k])
                 (true partial preserved)
+                Refinement (consensus_set): if k ∈ {.1,.2,.3,.4} AND X.k is
+                NOT in consensus_set AND consensus_set is non-empty, drop
+                X.k as a source-only fragment. Catches the user's
+                Shangri-La Frontier case where mangafire emits {52, 52.1}
+                but peers only have {52} — the .1 is an upload fragment,
+                not a real "Chapter 52.5: Side Story"-style sub-chapter.
+                See ~/.claude/plans/ultrathink-mangafire-and-some-flickering-sparkle.md.
         Rule 3. Integer X + ≥2 decimals — sub-classified:
               3a (sequential .1/.2/.3...): e.g. {1, 1.1, 1.2, 1.3}
                 → 1 group: ChapterGroup(label="X", parts=[X])
@@ -490,6 +736,11 @@ def group_chapters_for_download(
                   (the highest decimal is a canonical sub-chapter like
                   MangaFire's "X.5: Side Story"; intermediate .1/.2/etc. are
                   partial-upload fragments and dropped)
+                  Refinement (consensus_set): if the kept "highest" is
+                  itself a source-only fragment-shape (.1/.2/.3/.4), drop
+                  it too — peer evidence says it's noise. In practice
+                  this is rare since "scattered" means there ARE
+                  intermediate decimals, so the highest is usually .5+.
         Rule 4. No integer X, 1 decimal X.k
               → 1 group: ChapterGroup(label="X.k", parts=[X.k])
         Rule 5. No integer X, decimals form .1, .2, .3, ... starting at .1
@@ -502,6 +753,14 @@ def group_chapters_for_download(
                 Label uses the actual decimal value rather than the integer
                 floor so the on-disk tdir doesn't collide with a real
                 Chapter X from another source on resume.)
+                Refinement (consensus_set): if highest is source-only
+                fragment-shape AND the integer floor IS in consensus
+                (peer source has the canonical chapter X), drop the
+                whole cluster — it's fragment noise relative to the
+                peer-confirmed integer. If floor is NOT in consensus,
+                keep current behavior — we have no peer signal that
+                floor is the canonical chapter, so the cluster might be
+                its own legitimate sub-chapter.
 
     Why "highest decimal" in Rules 3b and 6:
         MangaFire (and similar aggregators) sometimes emit a chapter as
@@ -515,6 +774,8 @@ def group_chapters_for_download(
 
     When `collapse_splits=False`, returns one group per chapter with its
     original label preserved (passthrough — no merging, no dropping).
+    The ``consensus_set`` argument is also ignored in this mode — no
+    drops happen regardless.
 
     Unparseable chapters (label has no numeric token) are emitted unchanged
     at the end of the list as singleton groups — they can't be bucketed but
@@ -523,7 +784,12 @@ def group_chapters_for_download(
     Cross-file: caller is aio-dl.py's chapter download loop. For groups
     where `len(parts) > 1` (rule 5 only), the caller synthesizes a combined
     chapter dict by concatenating `get_chapter_images(part)` across parts
-    and uses `group.label` for the output filename.
+    and uses `group.label` for the output filename. ``consensus_set`` is
+    plumbed in from align_chapter_lists via the multi-source-prefetched
+    payload (aio_search_cli.py builds it; aio-dl.py reads it on the way
+    into this function). When peer data is unavailable (direct URL mode,
+    single-source run), ``consensus_set=None`` falls through to the
+    original in-source-only heuristics — no regressions.
     """
     if not chapters:
         return []
@@ -570,31 +836,52 @@ def group_chapters_for_download(
                         label=str(floor), parts=[integer_ch],
                     ))
                 else:
-                    # Rule 3b: scattered — keep integer X AND the highest
-                    # decimal (canonical sub-chapter). Highest is the
-                    # last after ascending sort.
+                    # Rule 3b refined: keep integer X always; keep highest
+                    # decimal UNLESS it's itself a source-only fragment-
+                    # shape (.1-.4). The intermediate decimals are always
+                    # dropped (existing behavior). When consensus_set is
+                    # None, _is_source_only_fragment returns False so the
+                    # behavior matches the original "always keep highest".
                     groups.append(ChapterGroup(
                         label=str(floor), parts=[integer_ch],
                     ))
                     highest_num, highest_ch = decimal_entries[-1]
-                    groups.append(ChapterGroup(
-                        label=_format_chapter_label(highest_num),
-                        parts=[highest_ch],
-                    ))
+                    if not _is_source_only_fragment(
+                        highest_num, floor, consensus_set,
+                    ):
+                        groups.append(ChapterGroup(
+                            label=_format_chapter_label(highest_num),
+                            parts=[highest_ch],
+                        ))
+                    # else: highest is a source-only fragment — dropped.
             elif len(decimal_entries) == 1:
-                # Rule 2: emit both X and the partial.
+                # Rule 2 refined: emit X always; emit the decimal UNLESS
+                # it's a source-only fragment-shape (.1-.4). This is the
+                # critical fix for mangafire's {52, 52.1} / {75, 75.1}
+                # etc. on Shangri-La Frontier where peers only have
+                # {52}, {75} (no peer .1). When consensus_set is None or
+                # empty, _is_source_only_fragment returns False so behavior
+                # matches the original "always emit both". Single .5+
+                # decimals are NEVER dropped here — they're overwhelmingly
+                # real "X.5: Side Story"-style canonical sub-chapters,
+                # so we treat them conservatively as content.
                 groups.append(ChapterGroup(label=str(floor), parts=[integer_ch]))
                 num, ch = decimal_entries[0]
-                groups.append(ChapterGroup(
-                    label=_format_chapter_label(num), parts=[ch],
-                ))
+                if not _is_source_only_fragment(num, floor, consensus_set):
+                    groups.append(ChapterGroup(
+                        label=_format_chapter_label(num), parts=[ch],
+                    ))
+                # else: lone source-only fragment — dropped.
             else:
                 # Rule 1: just X.
                 groups.append(ChapterGroup(label=str(floor), parts=[integer_ch]))
         else:
             # No integer X.
             if len(decimal_entries) == 1:
-                # Rule 4: singleton partial.
+                # Rule 4: singleton partial. Always kept — the only entry
+                # at this floor, dropping it would lose content with no
+                # signal that it's a duplicate. Left untouched by the
+                # consensus refinement.
                 num, ch = decimal_entries[0]
                 groups.append(ChapterGroup(
                     label=_format_chapter_label(num), parts=[ch],
@@ -611,21 +898,37 @@ def group_chapters_for_download(
                         parts=[e[1] for e in decimal_entries],
                     ))
                 else:
-                    # Rule 6: scattered decimals. Keep the HIGHEST (the
-                    # canonical "X.5"-style sub-chapter); drop the rest
-                    # as duplicate partial uploads. Label uses the actual
-                    # decimal value rather than the integer floor so the
-                    # on-disk tdir doesn't collide with a real Chapter X
-                    # from another source on resume — with label="X",
-                    # `main_tmp_dir/ch_X` would match both the rule-6
-                    # group and a real X from a separate source on
-                    # subsequent runs, falsely treating one as the resume
-                    # target for the other.
+                    # Rule 6 refined: keep the HIGHEST decimal UNLESS it's
+                    # a source-only fragment-shape AND the implied integer
+                    # parent (floor) is in consensus. The parent-in-
+                    # consensus guard distinguishes "fragment noise around
+                    # a peer-confirmed canonical chapter" (drop) from
+                    # "scattered decimals at a floor no peer has either"
+                    # (keep — it might be its own legitimate sub-chapter
+                    # with no integer counterpart).
+                    #
+                    # The on-disk-tdir-collision rationale for using the
+                    # decimal as the label (not the floor) still applies:
+                    # main_tmp_dir/ch_<floor> would match both this rule-6
+                    # group and a real X from a separate source on resume.
                     highest_num, highest_ch = decimal_entries[-1]  # ascending sort
-                    groups.append(ChapterGroup(
-                        label=_format_chapter_label(highest_num),
-                        parts=[highest_ch],
-                    ))
+                    parent_in_consensus = (
+                        consensus_set is not None
+                        and float(floor) in consensus_set
+                    )
+                    drop_as_fragment_noise = (
+                        parent_in_consensus
+                        and _is_source_only_fragment(
+                            highest_num, floor, consensus_set,
+                        )
+                    )
+                    if not drop_as_fragment_noise:
+                        groups.append(ChapterGroup(
+                            label=_format_chapter_label(highest_num),
+                            parts=[highest_ch],
+                        ))
+                    # else: peer-confirmed parent exists; this scattered
+                    # cluster of source-only fragments is noise — dropped.
 
     # Pass unparseable chapters through as singletons rather than dropping
     # them — these are typically "Oneshot" / "Omake" / non-numeric labels
@@ -642,6 +945,7 @@ def group_chapters_for_download(
 __all__ = [
     "ChapterMapEntry",
     "AlignmentResult",
+    "ChapterBreakdown",
     "align_chapter_lists",
     "DEFAULT_COMPATIBILITY_THRESHOLD",
     "ChapterGroup",

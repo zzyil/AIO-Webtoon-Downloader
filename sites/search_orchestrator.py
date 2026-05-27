@@ -5060,8 +5060,18 @@ def search_all(
     for h in handlers:
         host = (h.domains[0] if getattr(h, "domains", None) else "") or ""
         if h.name in seeded_sites:
-            if on_status:
-                on_status(f"  skipping {h.name} (seeded from URL)")
+            # Skip silently — mangafire (or whichever site the URL maps to)
+            # is already represented by a seed_hit that goes into
+            # candidates. The seed_hit gets probed for image quality just
+            # like any other source (the probe loop keys on src.site, not
+            # on whether the source came from seed_hits vs. parallel
+            # search), so this 'continue' only skips the redundant
+            # typeahead re-query. Logging "skipping mangafire" used to
+            # appear here, but it was misleading: users read it as
+            # "mangafire is excluded from the run," when in fact mangafire
+            # IS in the candidate list, IS probed, IS ranked, and IS the
+            # primary download target. Removed 2026-05-27 in the cleanup
+            # round after reverting the search-mode probe-skip experiment.
             continue
         if cache and host and cache.is_blocked(host):
             if on_status:
