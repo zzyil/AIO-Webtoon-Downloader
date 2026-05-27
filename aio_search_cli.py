@@ -940,11 +940,32 @@ def build_alternatives_from_prefetched(
     # for ranking — just for the parallel chapter-list fetch.
     from sites.search_orchestrator import SeriesCandidate, SourceEntry
 
+    # SKIP_MULTI_SOURCE filter: mirrors _filter_and_rank_alt_sources's check
+    # (see ~line 647). Required at THIS entry point too because the prefetched
+    # JSON path bypasses _filter_and_rank_alt_sources entirely — that filter
+    # only runs on the direct-URL multi-source path
+    # (find_alternatives_for_direct_url, above). Without this hook, comix gets
+    # queued for a chapter-list fetch despite SKIP_MULTI_SOURCE=True and the
+    # user pays a ~25 s Patchright bridge scrape per multi-source download
+    # AND a ~5-minute canvas scrape per chapter when comix is hit as a
+    # fallback alt — see sites/comix.py:99 for the why-not-multi-source
+    # rationale.
+    # Cross-file: SKIP_MULTI_SOURCE is set in sites/comix.py (the only handler
+    # using it today). _filter_and_rank_alt_sources in this file does the same
+    # check; both filters must agree for SKIP_MULTI_SOURCE to be honored
+    # consistently across the direct-URL and prefetched-JSON paths.
     alt_sources = []
+    skipped_skip_multi: list = []
     for alt in alternatives:
         site = (alt.get("site") or "").strip()
         url = (alt.get("url") or "").strip()
         if not site or not url:
+            continue
+        handler_for_alt = get_handler_by_name(site)
+        if handler_for_alt is not None and getattr(
+            handler_for_alt, "SKIP_MULTI_SOURCE", False,
+        ):
+            skipped_skip_multi.append(site)
             continue
         alt_sources.append(
             SourceEntry(
@@ -958,6 +979,13 @@ def build_alternatives_from_prefetched(
                 seed_quality=0.0,
                 composite_score=1.0,
             )
+        )
+
+    if skipped_skip_multi and on_status:
+        on_status(
+            f"[*] Multi-source: dropping {len(skipped_skip_multi)} prefetched "
+            f"alternative(s) marked SKIP_MULTI_SOURCE: "
+            f"{', '.join(sorted(set(skipped_skip_multi)))}"
         )
 
     if not alt_sources:

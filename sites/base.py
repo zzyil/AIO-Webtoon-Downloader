@@ -277,7 +277,7 @@ class BaseSiteHandler:
         concurrency: int = 8,
         timeout: float = 30.0,
         is_cancelled: Optional[Callable[[], bool]] = None,
-        record_host_failure: Optional[Callable[[str, str], None]] = None,
+        record_host_failure: Optional[Callable[..., None]] = None,
         scraper: Any = None,
     ) -> List[Tuple[int, Optional[str]]]:
         """Bulk-download chapter images via curl_cffi async + HTTP/2.
@@ -305,7 +305,14 @@ class BaseSiteHandler:
                           checks before sending the next request and bails.
           record_host_failure: Optional callback fired when a URL hard-fails.
                           Updates aio-dl.py's _HOST_FAIL_COUNT so the chapter
-                          watchdog can poison-detect a flaky CDN.
+                          watchdog can poison-detect a flaky CDN. Forward-
+                          compatible kwarg signature: callers may pass
+                          (host, url) or (host, url, status=..., body_size=...)
+                          — the latter feeds the ghost-chapter signature
+                          accumulator. Older overrides that pass only
+                          (host, url) keep working; new code should forward
+                          status + body_size when the response object is in
+                          scope.
           scraper:        Optional cloudscraper session. When supplied, the
                           curl_cffi AsyncSession is constructed with cookies
                           forwarded from the scraper that match the host of
@@ -401,15 +408,23 @@ class BaseSiteHandler:
                             continue
                         if record_host_failure is not None:
                             try:
+                                # No response object (request itself raised),
+                                # so no status/body_size to forward. The
+                                # callback's kwargs default to None and the
+                                # ghost-detector treats absent signatures
+                                # as zero-bucket — exceptions that all share
+                                # the same cls also register as uniform if
+                                # they all hit this path identically.
                                 record_host_failure(host, url)
                             except Exception:
                                 pass
                         return page_idx, None
                 if r.status_code != 200 or not r.content or len(r.content) < 256:
                     import sys
+                    body_len = len(r.content) if r.content else 0
                     print(
                         f"[-] curl_cffi status={r.status_code} "
-                        f"size={len(r.content) if r.content else 0} for URL: {url}",
+                        f"size={body_len} for URL: {url}",
                         file=sys.stderr,
                     )
                     if attempt < 1:
@@ -417,7 +432,18 @@ class BaseSiteHandler:
                         continue
                     if record_host_failure is not None:
                         try:
-                            record_host_failure(host, url)
+                            # Forward status + body_size so aio-dl.py's
+                            # _record_failure can feed the ghost-chapter
+                            # signature accumulator. Uniform (status,
+                            # body_bucket) across every page of a chapter
+                            # is the signal that distinguishes a fake/
+                            # placeholder chapter from a transient CDN
+                            # issue. See aio-dl.py:_is_ghost_chapter_signature.
+                            record_host_failure(
+                                host, url,
+                                status=r.status_code,
+                                body_size=body_len,
+                            )
                         except Exception:
                             pass
                     return page_idx, None
