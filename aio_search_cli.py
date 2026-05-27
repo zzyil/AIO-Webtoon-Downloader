@@ -362,17 +362,15 @@ def run_search_mode(
         probe_failure_cache=cache,
         img_quality_cache=img_cache,
         seed_hits=seed_hits or None,
-        # When the user passed a URL via --search, the seed_hit's site
-        # is the source we're already committed to surfacing as the
-        # primary — its quality_probe result has no bearing on whether
-        # we'll use it, only on ranking. Skipping the probe matches the
-        # user's intent ("I gave you this URL, don't waste cycles
-        # second-guessing it") and avoids the round-trip cost on
-        # handlers that are slow to probe (MangaFire VRF can be 3-5 s
-        # per chapter × 8 chapters = ~30 s on the seeded host alone).
-        skip_probe_sites=(
-            {h.site for h in seed_hits} if seed_hits else None
-        ),
+        # Search mode always probes ALL sources (including the seed
+        # source, when --search was given a URL) so the JSON output
+        # surfaces a real comparable img_quality_score for every
+        # candidate. Quality skip is reserved for direct-URL
+        # --multi-source (find_alternatives_for_direct_url below),
+        # where the primary is already committed and probing it is
+        # waste. SKIP_QUALITY_PROBE class-attr handlers (currently
+        # comix) opt out unconditionally via search_orchestrator's
+        # per-source loop — no plumbing needed here.
         on_status=_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
     )

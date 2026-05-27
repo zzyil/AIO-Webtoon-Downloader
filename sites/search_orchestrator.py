@@ -4983,17 +4983,21 @@ def search_all(
         rapidfuzz scoring + union-find merge as parallel-search results, so
         they end up in the right candidate cluster.
       skip_probe_sites: optional set of site names whose candidates should
-        be excluded from the image-quality probe loop. Used when the caller
-        already knows it's going to download from this site regardless of
-        what the probe says — direct-URL mode (aio-dl.py URL) treats the
-        URL's host as the committed primary, and the --search URL mode
-        treats every seed_hits[i].site the same way. Skipped sources read
-        the persistent cache (free) but never get enqueued for a fresh
-        probe; their img_quality_score stays None and the comparator falls
+        be excluded from the image-quality probe loop. Reserved for the
+        direct-URL --multi-source path (aio_search_cli.find_alternatives_
+        for_direct_url, called from aio-dl.py main() at the multi-source
+        alternatives-lookup site) where we're going to download from the
+        URL's primary host regardless of what the probe says, so scoring
+        it is pure waste. Search mode (--search) intentionally passes
+        None here so the seed source IS probed — the JSON output is
+        informational and the user expects a comparable score for every
+        candidate including any URL they handed in. Skipped sources stay
+        out of both the persistent-cache read and the probe-worker
+        enqueue: img_quality_score stays None and the comparator falls
         back to seed_quality. Skipping is per-site (not per-URL) because
-        once the user has committed to a host we don't care about scoring
-        any OTHER candidates from that host either — they wouldn't be
-        used for the download.
+        once we've committed to a host we don't care about scoring any
+        OTHER candidates from that host either — they wouldn't be used
+        for the download.
       on_status: optional progress callback for human output (e.g., the
         "[*] Probing image quality across N sources..." line in Phase 2).
 
