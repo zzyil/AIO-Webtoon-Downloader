@@ -48,12 +48,16 @@ export function useDownloader() {
     workingDir: "",
     defaults: {},
     verboseAlways: true,
-    // Global toggle: collapse split-cluster chapters at download time AND in
-    // search-display diagnostic counts. Default ON. The Python side reads
-    // args.collapse_splits; the UI emits --no-collapse-splits when this is
-    // explicitly false. See sites/chapter_merger.py:group_chapters_for_download
-    // for the cluster rule.
-    collapseSplits: true,
+    // Global toggle: collapse split-cluster chapters + cross-source duplicate
+    // fragments at download time AND in search-display diagnostic counts.
+    // Default OFF as of 2026-05-27 (opt-in flip). The new refinement drops
+    // source-only .1/.2/.3/.4 fragments under --multi-source, which is more
+    // aggressive than the old behavior — explicit user buy-in is required.
+    // The Python side reads args.collapse_splits; the UI emits the positive
+    // --collapse-splits flag (downloader.js / searcher.js) when this is
+    // explicitly true. See sites/chapter_merger.py:group_chapters_for_download
+    // for the full Rule 2 / 3b / 6 refinement.
+    collapseSplits: false,
     // Inter-chapter image prefetch worker count (Phase G7, 2026-05-08).
     // While chapter N is encoding/processing on the main thread, a
     // background thread downloads chapter N+1's images using this many
@@ -622,12 +626,14 @@ export function useDownloader() {
 
     // Merge the global collapseSplits setting into opts so SearchTab's inline
     // toggle (which writes settings.collapseSplits via onSaveSettings) is
-    // honored even when the caller passes opts that omit the field. The
-    // searcher.js buildSearchArgs only emits --no-collapse-splits when this
-    // is explicitly false. Caller-passed opts win on conflict (...opts at end).
+    // honored even when the caller passes opts that omit the field.
+    // Post 2026-05-27 opt-in flip: `=== true` is required (undefined/null
+    // default to OFF). searcher.js buildSearchArgs only emits the positive
+    // --collapse-splits flag when this is explicitly true. Caller-passed
+    // opts win on conflict (...opts at end).
     const s = settingsRef.current;
     const finalOpts = {
-      collapseSplits: s?.collapseSplits !== false,
+      collapseSplits: s?.collapseSplits === true,
       ...opts,
     };
 

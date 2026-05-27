@@ -433,19 +433,24 @@ export default function SearchTab({
               behavior too. SettingsTab → "Default Chapter Behavior" mirrors
               this same toggle; the global state stays in sync regardless of
               which surface the user changes it from. Always visible (not
-              gated on multi-source) since downloads are affected too. */}
+              gated on multi-source) since downloads are affected too.
+              2026-05-27: flipped to OPT-IN — checked = strictly true.
+              `=== true` (not `!== false`) so undefined/null defaults to OFF;
+              old users who set it true stay opted in. */}
           <div className="flex items-center justify-between gap-3">
             <div>
               <Label htmlFor="opt-collapse-splits" className="text-xs font-medium block">
                 Collapse split chapters
               </Label>
               <p className="text-[10px] text-muted-foreground mt-0.5">
-                Merge X.1/X.2/X.3 splits; drop duplicate uploads. Affects downloads.
+                Merge X.1/X.2/X.3 splits and drop source-only .1/.2/.3/.4
+                fragment uploads (multi-source only). Default off — opt in if
+                aggregators inflate your chapter counts.
               </p>
             </div>
             <Switch
               id="opt-collapse-splits"
-              checked={settings?.collapseSplits !== false}
+              checked={settings?.collapseSplits === true}
               onCheckedChange={(v) => onSaveSettings?.({ collapseSplits: v })}
               disabled={isRunning}
             />

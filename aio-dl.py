@@ -18,13 +18,32 @@ import re
 import shutil
 import subprocess
 import sys
+
+# Force UTF-8 on stdio before anything prints. When Electron spawns this
+# script (UI-source/electron/downloader.js:585, searcher.js:160,
+# main.js:195/878), stdio is a pipe, not a TTY, so Python falls back to
+# locale.getpreferredencoding(False) → cp1252 on default Western Windows
+# (ACP=1252). Many log lines use → ─ — × ≥ which cp1252 can't encode,
+# crashing the run with UnicodeEncodeError mid-listing. errors='replace'
+# keeps it crash-proof for any future char. No-op on UTF-8-ACP boxes
+# (Win11 Beta UTF-8 mode) and real terminals (PEP 528 WriteConsoleW).
+# Grep target: UnicodeEncodeError reconfigure
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import threading
 import time
 import textwrap
 import xml.sax.saxutils
 import zipfile
 import zlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, unquote_to_bytes
 
 from aio_config import (
@@ -5154,21 +5173,38 @@ def main():
              "sequential download → process → next-download.",
     )
     p.add_argument(
+        "--collapse-splits",
+        dest="collapse_splits",
+        action="store_true",
+        default=False,
+        help="Enable split-fragment + cross-source-duplicate chapter collapse. "
+             "Default OFF (2026-05-27 opt-in flip — see "
+             "~/.claude/plans/ultrathink-mangafire-and-some-flickering-sparkle.md). "
+             "When ON, the following are merged or dropped: "
+             "(a) sequential X.1/X.2/X.3 splits with no integer X "
+             "(MangaDex-style upload fragments) → merged into one chapter X; "
+             "(b) integer X + scattered decimals like {X, X.1, X.5} → X kept, "
+             ".5 kept as side story, .1 dropped as fragment; "
+             "(c) integer X + single fragment-shaped decimal "
+             "(.1/.2/.3/.4) with no peer source confirming it → "
+             "the decimal is dropped as a duplicate upload of X. "
+             "Decimals at .5 or higher, peer-confirmed decimals of any "
+             "shape, chapter 0 / prologues, and source-only integer "
+             "chapters are ALWAYS kept. The cross-source duplicate "
+             "signal only fires under --multi-source / "
+             "--multi-source-prefetched; direct-URL runs fall back to "
+             "the in-source heuristics (current Rule 3a / 3b / 6 "
+             "behavior with no consensus refinement).",
+    )
+    # Hidden deprecated alias — old --no-collapse-splits is now a no-op
+    # (the new default IS "no collapse"), but keep parsing it so any script
+    # pinned to the old flag continues to launch. Suppressed from --help to
+    # avoid confusing new users with both flag forms.
+    p.add_argument(
         "--no-collapse-splits",
         dest="collapse_splits",
         action="store_false",
-        default=True,
-        help="Disable split-cluster collapse in --multi-source coverage "
-             "diagnostics. By default (collapse ON), decimal sub-chapters "
-             "X.1/X.2/X.3 with no integer X are reported as ONE main "
-             "chapter for the per-source 'effective' count — fixes the "
-             "misleading 362-vs-119 display where one aggregator splits "
-             "each chapter into 4 decimal entries. Pass this flag if your "
-             "series legitimately uses decimal numbering (some webnovel "
-             "adaptations / episodic releases) and you want each decimal "
-             "counted as its own chapter. Affects only the displayed "
-             "counts; the per-chapter download alternatives in the "
-             "chapter_map are unchanged either way.",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--multi-source-prefetched",
@@ -5825,6 +5861,12 @@ def main():
     # _process_chapter_strict for per-chapter fallback. Empty/None means
     # single-source mode (existing behavior unchanged).
     _multi_source_alternatives: Dict[float, List[Dict[str, Any]]] = {}
+    # consensus_set for the refined collapse-splits Rule 2 / 3b / 6 drops at
+    # group_chapters_for_download (2026-05-27). Populated alongside
+    # _multi_source_alternatives from the same three carriers (auto-pick,
+    # prefetched JSON, direct-URL discovery). None = no peer signal; the
+    # group helper falls through to original in-source-only heuristics.
+    _multi_source_consensus_set: Optional[Set[float]] = None
 
     if getattr(args, "search", None):
         from aio_search_cli import run_search_mode, take_latest_multi_source_state
@@ -5842,6 +5884,7 @@ def main():
         _ms_state = take_latest_multi_source_state()
         if _ms_state and _ms_state.get("alternatives_by_chap_num"):
             _multi_source_alternatives = _ms_state["alternatives_by_chap_num"]
+            _multi_source_consensus_set = _ms_state.get("consensus_set")
             n_alts = sum(len(v) for v in _multi_source_alternatives.values())
             n_chapters_with_alts = len(_multi_source_alternatives)
             print(
@@ -6386,7 +6429,7 @@ def main():
         try:
             if prefetched_path:
                 from aio_search_cli import build_alternatives_from_prefetched
-                _ms_alts = build_alternatives_from_prefetched(
+                _ms_result = build_alternatives_from_prefetched(
                     prefetched_path=prefetched_path,
                     primary_handler=handler,
                     primary_context=context,
@@ -6397,7 +6440,7 @@ def main():
                 )
             else:
                 from aio_search_cli import find_alternatives_for_direct_url
-                _ms_alts = find_alternatives_for_direct_url(
+                _ms_result = find_alternatives_for_direct_url(
                     primary_url=args.comic_url,
                     primary_handler=handler,
                     primary_context=context,
@@ -6407,8 +6450,19 @@ def main():
                     record_rate_limit=_record_rate_limit,
                     on_status=lambda m: print(m, file=sys.stderr),
                 )
+            # New return shape (2026-05-27): both helpers now return a dict
+            # with alts + consensus. Tolerate the legacy bare-dict shape too
+            # in case some downstream call path bypassed the update.
+            if isinstance(_ms_result, dict) and "alternatives_by_chap_num" in _ms_result:
+                _ms_alts = _ms_result.get("alternatives_by_chap_num") or {}
+                _ms_consensus = _ms_result.get("consensus_set")
+            else:
+                # Legacy / unexpected shape — treat the whole thing as the alts dict.
+                _ms_alts = _ms_result if isinstance(_ms_result, dict) else {}
+                _ms_consensus = None
             if _ms_alts:
                 _multi_source_alternatives = _ms_alts
+                _multi_source_consensus_set = _ms_consensus
                 n_alts = sum(len(v) for v in _multi_source_alternatives.values())
                 n_chapters_with_alts = len(_multi_source_alternatives)
                 print(
@@ -6538,8 +6592,23 @@ def main():
     # carrying `_merged_parts`; _process_chapter_impl detects this and
     # fetches each part's images in order. Output filename uses
     # group.label so the user sees "Title Ch 1.pdf".
-    collapse_splits_enabled = bool(getattr(args, "collapse_splits", True))
-    groups = group_chapters_for_download(chapters, collapse_splits=collapse_splits_enabled)
+    # Default flipped to False (opt-in) as of 2026-05-27. The new collapse
+    # logic drops source-only .1/.2/.3/.4 fragments under --multi-source,
+    # which is more aggressive than the old behavior — explicit user buy-in
+    # is required to avoid surprise drops. Both --collapse-splits and the
+    # deprecated --no-collapse-splits set this same dest.
+    collapse_splits_enabled = bool(getattr(args, "collapse_splits", False))
+    # consensus_set is sourced from whichever multi-source path populated it
+    # (auto-pick search, prefetched JSON, or direct-URL discovery). None when
+    # no peer data is available — group_chapters_for_download then falls
+    # through to the original in-source-only Rule 2 / 3b / 6 behavior.
+    # When non-None, Rule 2's lone source-only .1 fragment gets dropped
+    # (the user's Shangri-La Frontier 52.1 / 75.1 / etc. case).
+    groups = group_chapters_for_download(
+        chapters,
+        collapse_splits=collapse_splits_enabled,
+        consensus_set=_multi_source_consensus_set,
+    )
     grouped_chapters: List[Dict[str, Any]] = []
     for group in groups:
         if len(group.parts) == 1:

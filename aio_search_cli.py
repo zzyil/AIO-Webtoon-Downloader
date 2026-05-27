@@ -26,6 +26,23 @@ from __future__ import annotations
 
 import json
 import sys
+
+# Force UTF-8 on stdio before anything prints. When Electron spawns this
+# script (UI-source/electron/searcher.js:160), stdio is a pipe, not a TTY,
+# so Python falls back to locale.getpreferredencoding(False) → cp1252 on
+# default Western Windows (ACP=1252). Log decoration uses → ─ — × ≥ which
+# cp1252 can't encode, crashing the run with UnicodeEncodeError.
+# errors='replace' keeps it crash-proof for any future char.
+# Mirrors aio-dl.py top-of-file block. Grep: UnicodeEncodeError reconfigure
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+try:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import time
 from typing import Any, Callable, Optional
 
@@ -409,12 +426,12 @@ def run_search_mode(
             )
             # Alignment input is the older tuple shape; project the richer
             # records down for align_chapter_lists.
-            # collapse_splits flows from --no-collapse-splits CLI flag (default
-            # True). Affects only the per-source diagnostic counts in the
-            # winner_chapter_map JSON; the chapter_map structure is identical
-            # regardless. UI reads `collapse_splits_applied` to label which
-            # interpretation the displayed counts reflect.
-            collapse_splits = bool(getattr(args, "collapse_splits", True))
+            # collapse_splits flows from the --collapse-splits CLI flag
+            # (default False as of 2026-05-27 opt-in flip). Affects per-
+            # source `effective_chapters` AND, when consensus is present,
+            # the actual download list. UI reads `collapse_splits_applied`
+            # to label which interpretation the displayed counts reflect.
+            collapse_splits = bool(getattr(args, "collapse_splits", False))
             alignment = align_chapter_lists(
                 [(rec["site"], rec["chapters"]) for rec in source_records],
                 collapse_splits=collapse_splits,
@@ -424,17 +441,33 @@ def run_search_mode(
             # aligned" the UI surfaces alongside the raw entry count. We need
             # to count each chapter_map entry's chapter_num — the union of
             # everything any source contributed (anchor + orphans).
+            # consensus_set passed through so the aggregate matches per-source
+            # `effective_chapters` (post-refinement), e.g. for Shangri-La
+            # Frontier the aggregate drops from 290 to 283 = 305 - 22
+            # source-only .1 fragments. Without the consensus arg here, the
+            # aggregate would still report 290 while per-source mangafire
+            # reports 283 — inconsistent. (2026-05-27 cross-source duplicate
+            # detection; see ~/.claude/plans/ultrathink-mangafire-and-some-flickering-sparkle.md)
             all_aligned_nums = [
                 e.chapter_num for e in alignment.chapter_map
             ]
             _, effective_aligned = _classify_main_chapters(
-                all_aligned_nums, collapse_splits=collapse_splits
+                all_aligned_nums,
+                collapse_splits=collapse_splits,
+                consensus_set=alignment.consensus_set,
             )
             winner_chapter_map = {
                 "canonical_title": winner.canonical_title,
                 "merge_diagnostics": alignment.merge_diagnostics,
                 "collapse_splits_applied": alignment.collapse_splits_applied,
                 "effective_chapters_aligned": effective_aligned,
+                # consensus_set serialized as a sorted list — sets aren't
+                # JSON-serializable. Consumers (downstream aio-dl.py via
+                # --multi-source-prefetched, and the UI if it ever needs to
+                # render which chapters are peer-confirmed) rebuild the set
+                # via `set(consensus_set)`.
+                "consensus_set": sorted(alignment.consensus_set),
+                "consensus_max": alignment.consensus_max,
                 "chapters": [
                     {
                         "chapter_num": entry.chapter_num,
@@ -496,6 +529,15 @@ def run_search_mode(
                 "anchor_site": anchor_site,
                 "alternatives_by_chap_num": alternatives_by_chap_num,
                 "source_records": source_records,  # holds live scraper/handler/context refs
+                # consensus_set passed in-memory (real set, not list) so
+                # aio-dl.py's group_chapters_for_download call can refine
+                # Rule 2 / 3b / 6 with peer-source confirmation. None when
+                # alignment.consensus_set is empty (single source / no peer
+                # overlap), to keep downstream's "no peer data" check simple.
+                "consensus_set": (
+                    alignment.consensus_set if alignment.consensus_set else None
+                ),
+                "consensus_max": alignment.consensus_max,
             }
 
     if json_output and not auto_pick:
@@ -701,12 +743,26 @@ def find_alternatives_for_direct_url(
       5. Run alignment with primary's chapters as anchor (since primary
          is what the user picked — its chapter set is canonical for the
          download).
-      6. Return alternatives_by_chap_num dict.
+      6. Return a dict with alternatives_by_chap_num AND the consensus_set
+         from alignment so the download path can refine its collapse rules
+         with cross-source duplicate detection (2026-05-27).
 
-    Returns {} when search yields nothing, when no alternatives have
-    chapters, or on any failure. The user's direct-URL download still
-    proceeds; multi-source just provides no fallback in that case.
+    Return shape:
+      {
+        "alternatives_by_chap_num": Dict[float, List[alt]],
+        "consensus_set": Set[float] | None,    # None when single source / no overlap
+        "consensus_max": float | None,
+      }
+    Returns {"alternatives_by_chap_num": {}, ...} when search yields nothing,
+    when no alternatives have chapters, or on any failure. The user's direct-
+    URL download still proceeds; multi-source just provides no fallback in
+    that case.
     """
+    _empty_result = {
+        "alternatives_by_chap_num": {},
+        "consensus_set": None,
+        "consensus_max": None,
+    }
     # Step 1: title.
     title = (
         getattr(primary_context, "title", None)
@@ -729,7 +785,7 @@ def find_alternatives_for_direct_url(
     if not title:
         if on_status:
             on_status("[!] Multi-source: couldn't determine title from URL; skipping alternatives discovery")
-        return {}
+        return _empty_result
 
     if on_status:
         on_status(f"[*] Multi-source: searching for alternatives to '{title}'...")
@@ -776,7 +832,7 @@ def find_alternatives_for_direct_url(
     if not candidates:
         if on_status:
             on_status("[!] Multi-source: no search candidates found; no alternatives available")
-        return {}
+        return _empty_result
 
     # Step 3: pick the top candidate, drop sources on the same host as primary,
     # and filter out unknown-quality (default seed=0.50) sources that are
@@ -802,7 +858,7 @@ def find_alternatives_for_direct_url(
                 f"(quality_min={quality_min:.2f}; lower with "
                 f"--multi-source-quality-min if you want broader fallback)"
             )
-        return {}
+        return _empty_result
 
     # Step 4: pre-fetch chapter lists from alternatives.
     # Build a synthetic candidate exposing just the alt sources to reuse
@@ -827,7 +883,7 @@ def find_alternatives_for_direct_url(
 
     alignment = align_chapter_lists(
         sources_with_chapters,
-        collapse_splits=bool(getattr(args, "collapse_splits", True)),
+        collapse_splits=bool(getattr(args, "collapse_splits", False)),
     )
 
     # Step 6: build alternatives_by_chap_num.
@@ -852,7 +908,18 @@ def find_alternatives_for_direct_url(
         if alts:
             alternatives_by_chap_num[entry.chapter_num] = alts
 
-    return alternatives_by_chap_num
+    # consensus_set surfaced so the download path (group_chapters_for_download
+    # at aio-dl.py:6541) can refine Rule 2 / 3b / 6 with peer confirmation.
+    # None when alignment found no peer overlap (single eligible alt or all
+    # alts diverged via compatibility threshold) — downstream falls through
+    # to in-source-only heuristics.
+    return {
+        "alternatives_by_chap_num": alternatives_by_chap_num,
+        "consensus_set": (
+            alignment.consensus_set if alignment.consensus_set else None
+        ),
+        "consensus_max": alignment.consensus_max,
+    }
 
 
 def build_alternatives_from_prefetched(
@@ -882,12 +949,19 @@ def build_alternatives_from_prefetched(
         downloader.js spawn-close handler. Same place ImageQualityCache
         and ProbeFailureCache snapshots live.
 
-    Failure modes — all yield {} so multi-source quietly degrades to
-    single-source rather than blocking the download:
+    Failure modes — all yield the empty-result dict so multi-source quietly
+    degrades to single-source rather than blocking the download:
       - File missing / unreadable
       - Malformed JSON (no `alternatives` key, etc.)
       - Every alt's handler is unknown (renamed sites, etc.)
       - Every alt's chapter-list fetch throws
+
+    Return shape — same as find_alternatives_for_direct_url (2026-05-27):
+      {
+        "alternatives_by_chap_num": Dict[float, List[alt]],
+        "consensus_set": Set[float] | None,
+        "consensus_max": float | None,
+      }
 
     Cross-file:
       - Path passed via aio-dl.py's --multi-source-prefetched flag
@@ -898,13 +972,19 @@ def build_alternatives_from_prefetched(
     import json as _json
     import os as _os
 
+    _empty_result = {
+        "alternatives_by_chap_num": {},
+        "consensus_set": None,
+        "consensus_max": None,
+    }
+
     if not prefetched_path or not _os.path.exists(prefetched_path):
         if on_status:
             on_status(
                 f"[!] Multi-source: prefetched alts file missing ({prefetched_path}); "
                 f"skipping discovery"
             )
-        return {}
+        return _empty_result
 
     try:
         with open(prefetched_path, "r", encoding="utf-8") as f:
@@ -915,7 +995,7 @@ def build_alternatives_from_prefetched(
                 f"[!] Multi-source: failed to read prefetched alts: "
                 f"{type(exc).__name__}: {exc}"
             )
-        return {}
+        return _empty_result
 
     alternatives = payload.get("alternatives") or []
     if not isinstance(alternatives, list) or not alternatives:
@@ -924,7 +1004,7 @@ def build_alternatives_from_prefetched(
                 f"[!] Multi-source: prefetched payload had no alternatives; "
                 f"skipping discovery"
             )
-        return {}
+        return _empty_result
 
     title = (payload.get("title") or "").strip() or "<prefetched>"
     if on_status:
@@ -994,7 +1074,7 @@ def build_alternatives_from_prefetched(
                 "[!] Multi-source: prefetched alternatives had no usable (site, url) "
                 "entries; skipping discovery"
             )
-        return {}
+        return _empty_result
 
     alt_candidate = SeriesCandidate(
         canonical_title=title,
@@ -1015,7 +1095,7 @@ def build_alternatives_from_prefetched(
 
     alignment = align_chapter_lists(
         sources_with_chapters,
-        collapse_splits=bool(getattr(args, "collapse_splits", True)),
+        collapse_splits=bool(getattr(args, "collapse_splits", False)),
     )
 
     records_by_site = {rec["site"]: rec for rec in source_records}
@@ -1039,7 +1119,15 @@ def build_alternatives_from_prefetched(
         if alts:
             alternatives_by_chap_num[entry.chapter_num] = alts
 
-    return alternatives_by_chap_num
+    # Same consensus surfacing as find_alternatives_for_direct_url; consumed
+    # by aio-dl.py at the group_chapters_for_download call site.
+    return {
+        "alternatives_by_chap_num": alternatives_by_chap_num,
+        "consensus_set": (
+            alignment.consensus_set if alignment.consensus_set else None
+        ),
+        "consensus_max": alignment.consensus_max,
+    }
 
 
 __all__ = [
