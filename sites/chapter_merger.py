@@ -464,18 +464,33 @@ def align_chapter_lists(
         Source order is the orchestrator's quality ranking (best first), but
         we pick the anchor as the source with the MOST chapters since the
         top-ranked source can be incomplete (DMCA-affected MangaDex with 1
-        chapter, or get_chapters parse failures returning 0 entries).
+        chapter, or get_chapters parse failures returning 0 entries). When
+        ``collapse_splits=True``, "most chapters" means most post-collapse
+        groups (so a 290-raw-row source dominated by sequential splits
+        doesn't outrank a 119-row source with cleanly numbered integers
+        covering the same canonical chapters).
       compatibility_threshold: minimum fraction of source's chapters that
         must overlap with the anchor's chapter-number set for a full merge.
         Sources below this threshold are partially merged (they appear in
         the map ONLY for chapter numbers that match anchor entries).
-      collapse_splits: controls how the diagnostic counts are reported.
-        When True (default), per-source `effective_chapters` collapses
-        split-cluster decimals (X.1/X.2/X.3 with no X) to ONE main chapter
-        each. When False, `effective_chapters == total_chapters`. See
-        `_classify_main_chapters` for the full rules. The chapter_map's
-        structure does NOT depend on this flag — collapse only affects the
-        displayed counts, not the per-chapter download alternatives.
+        Measured against post-collapse groups when ``collapse_splits=True``.
+      collapse_splits: when True (default), each source's chapter list is
+        pre-collapsed via ``_collapse_source_for_alignment`` BEFORE the
+        chapter_map is built — so a Rule-5 split-cluster {X.1, X.2, X.3}
+        on one source aligns with an integer {X} on another at the group's
+        floor X. The ``chapter_map`` ChapterMapEntry's ``chapter_num`` is
+        the post-collapse group key; the ``sources`` list carries the
+        synthesized chapter dict (with ``_merged_parts`` set on Rule-5
+        clusters) so a downstream alt-fetch via
+        ``_process_chapter_strict`` → ``_process_chapter_impl`` iterates
+        the parts and concatenates image streams.
+
+        When False, alignment keys are the raw chapter numbers from each
+        source's handler.get_chapters output — same shape as pre-2026-05-29.
+
+        Diagnostics (``total_chapters``, ``breakdown``) are ALWAYS computed
+        from the raw per-source counts regardless of this flag, so the UI's
+        "total entries" vs "effective chapters" gap remains visible.
 
     Returns:
       AlignmentResult with chapter_map (list of ChapterMapEntry sorted by
@@ -489,6 +504,8 @@ def align_chapter_lists(
     if the source's overall compatibility is above threshold).
 
     See snappy-forging-waffle.md for the design rationale (Phase 4 plan).
+    Collapse-aware alignment landed 2026-05-29 — see
+    ``_collapse_source_for_alignment`` for the motivating case.
     """
     if not sources_with_chapters:
         return AlignmentResult(
@@ -499,46 +516,73 @@ def align_chapter_lists(
             consensus_max=None,
         )
 
-    # Pick anchor by largest chapter set, breaking ties by orchestrator order
-    # (lower index = higher quality rank). A source returning 0 chapters
-    # (handler parse failure, DMCA hollowing) cannot be a useful anchor.
+    # Build BOTH a raw and a (possibly collapsed) per-source map upfront:
+    #   per_source_raw_nums  — raw {chap_num → chapter_dict}; used for
+    #     diagnostics (total_chapters, breakdown, _classify_main_chapters
+    #     input). Stable across collapse_splits so the UI's headline
+    #     entry-vs-main gap stays visible.
+    #   per_source_groups   — alignment view. When collapse_splits=True,
+    #     each source is run through _collapse_source_for_alignment so a
+    #     Rule-5 split-cluster {X.1, X.2, X.3} reduces to a single floor-X
+    #     entry whose dict carries _merged_parts. This is what feeds
+    #     anchor pick + anchor_index + consensus_set, so cross-source
+    #     matches happen at the user-facing chapter granularity.
+    # When collapse_splits=False, per_source_groups is literally identical
+    # to per_source_raw_nums (no work skipped, no behavior change).
+    per_source_raw_nums: Dict[str, Dict[float, Dict]] = {}
+    per_source_groups: Dict[str, Dict[float, Dict]] = {}
+    for site_name, chapters in sources_with_chapters:
+        # Raw view: every numeric chap once, dedup by first occurrence.
+        # Mirrors the original behavior — multiple entries with the same
+        # number on the same site (different scanlator versions on
+        # MangaDex, etc.) collapse to the first.
+        raw_nums: Dict[float, Dict] = {}
+        for ch in (chapters or []):
+            num = _extract_chapter_num(ch.get("chap"))
+            if num is None:
+                continue
+            if num in raw_nums:
+                continue
+            raw_nums[num] = ch
+        per_source_raw_nums[site_name] = raw_nums
+
+        if collapse_splits:
+            group_nums: Dict[float, Dict] = {}
+            for ch in _collapse_source_for_alignment(chapters or []):
+                num = _extract_chapter_num(ch.get("chap"))
+                if num is None or num in group_nums:
+                    continue
+                group_nums[num] = ch
+            per_source_groups[site_name] = group_nums
+        else:
+            per_source_groups[site_name] = raw_nums
+
+    # Pick anchor by largest GROUP set (post-collapse when collapse=True;
+    # raw otherwise — same as per_source_groups in that case). Breaks ties
+    # by orchestrator order (lower index = higher quality rank). A source
+    # returning 0 chapters (handler parse failure, DMCA hollowing) cannot
+    # be a useful anchor.
     def _anchor_priority(idx_and_pair):
-        idx, (_, chs) = idx_and_pair
-        return (-len(chs or []), idx)
+        idx, (site, _) = idx_and_pair
+        return (-len(per_source_groups.get(site, {})), idx)
 
     indexed = list(enumerate(sources_with_chapters))
     indexed.sort(key=_anchor_priority)
-    anchor_idx, (anchor_site, anchor_chapters) = indexed[0]
+    anchor_idx, (anchor_site, _) = indexed[0]
 
     # Reorder so anchor is first; the rest stay in original orchestrator order.
     reordered = [sources_with_chapters[anchor_idx]] + [
         sources_with_chapters[i] for i in range(len(sources_with_chapters)) if i != anchor_idx
     ]
     sources_with_chapters = reordered
-    anchor_site, anchor_chapters = sources_with_chapters[0]
+    anchor_site, _ = sources_with_chapters[0]
 
-    # Build per-source {chapter_num → chapter_dict} maps in a single upfront
-    # pass. Per-site dedup (keep first occurrence) matches the original loop
-    # behavior — multiple chapter entries with the same number on the same
-    # site (e.g. different scanlator versions on MangaDex) collapse to the
-    # first. Doing this upfront lets us compute consensus_set AFTER the
-    # cross-source merge but BEFORE writing diagnostics, so each source's
-    # breakdown is graded against the full peer set.
-    per_source_nums: Dict[str, Dict[float, Dict]] = {}
-    for site_name, chapters in sources_with_chapters:
-        source_nums: Dict[float, Dict] = {}
-        for ch in (chapters or []):
-            num = _extract_chapter_num(ch.get("chap"))
-            if num is None:
-                continue
-            if num in source_nums:
-                continue
-            source_nums[num] = ch
-        per_source_nums[site_name] = source_nums
-
-    # Seed anchor_index from the anchor's per-source map.
+    # Seed anchor_index from the anchor's GROUP map. When collapse_splits=True
+    # and the anchor has a Rule-5 cluster, ch here is the synthesized
+    # {chap=label, _merged_parts=[…]} dict so downstream alt selection feeds
+    # _process_chapter_impl's _merged_parts iterator with the right shape.
     anchor_index: Dict[float, ChapterMapEntry] = {}
-    for num, ch in per_source_nums[anchor_site].items():
+    for num, ch in per_source_groups[anchor_site].items():
         label = str(ch.get("chap") or "").strip() or f"{num:g}"
         anchor_index[num] = ChapterMapEntry(
             chapter_num=num,
@@ -549,6 +593,9 @@ def align_chapter_lists(
     # Track per-source overlap / compatibility / skipped_reason now;
     # _classify_main_chapters + breakdown computation is deferred until
     # AFTER consensus is known so the diagnostic counts incorporate it.
+    # Overlap + compatibility are measured against per_source_groups (the
+    # alignment view) — denominator is collapsed groups when collapse=True,
+    # matching the merge decision's granularity.
     per_source_meta: Dict[str, Dict] = {
         anchor_site: {
             "overlap": len(anchor_index),
@@ -560,8 +607,8 @@ def align_chapter_lists(
 
     # Process remaining sources: compute overlap, merge into anchor_index.
     for site_name, _chapters in sources_with_chapters[1:]:
-        source_nums = per_source_nums[site_name]
-        if not source_nums:
+        source_groups = per_source_groups[site_name]
+        if not source_groups:
             per_source_meta[site_name] = {
                 "overlap": 0,
                 "compatibility": 0.0,
@@ -570,8 +617,8 @@ def align_chapter_lists(
             }
             continue
 
-        overlap = len([n for n in source_nums if n in anchor_index])
-        compatibility = overlap / len(source_nums)
+        overlap = len([n for n in source_groups if n in anchor_index])
+        compatibility = overlap / len(source_groups)
         merge_orphans = compatibility >= compatibility_threshold
         per_source_meta[site_name] = {
             "overlap": overlap,
@@ -590,7 +637,7 @@ def align_chapter_lists(
         # per number. Non-overlapping chapters are added as orphan entries
         # ONLY if compatibility is above threshold, signaling the source
         # uses the same numbering scheme.
-        for num, ch in source_nums.items():
+        for num, ch in source_groups.items():
             if num in anchor_index:
                 anchor_index[num].sources.append((site_name, ch))
             elif merge_orphans:
@@ -607,32 +654,46 @@ def align_chapter_lists(
     # side) AND group_chapters_for_download (download side) to identify
     # source-only fragment-shaped decimals for duplicate detection. See
     # plan: ~/.claude/plans/ultrathink-mangafire-and-some-flickering-sparkle.md.
+    #
+    # With collapse_splits=True, consensus_set is keyed at post-collapse
+    # floors. Downstream group_chapters_for_download still queries this set
+    # with the raw chap_num (e.g. 52.1 not in {52.0} → fragment → drop),
+    # which is the same answer as the pre-fix consensus_set produced for
+    # Rule 2 fragments — the consensus shape only changes for Rule 3a/5
+    # (sequential splits), and those rules don't consult consensus_set.
     source_counts: Dict[float, int] = {}
     for entry in anchor_index.values():
         source_counts[entry.chapter_num] = len(entry.sources)
     consensus_set: Set[float] = {n for n, c in source_counts.items() if c >= 2}
     consensus_max: Optional[float] = max(consensus_set) if consensus_set else None
 
-    # Now compute per-source diagnostics with consensus in hand. The
-    # _classify_main_chapters call mirrors the consensus-refined drops in
-    # group_chapters_for_download, so the displayed "X main / Y entries"
-    # always matches what the download path emits when collapse is on.
+    # Per-source diagnostics: compute from per_source_raw_nums (RAW) so the
+    # UI's "total entries" vs "effective chapters" gap stays meaningful
+    # regardless of collapse_splits. The breakdown buckets use consensus_set
+    # to classify fragment-shaped source-only decimals; consensus_set is in
+    # collapsed-floor units when collapse=True, but the per-decimal `num in
+    # consensus_set` check still works because fragment decimals are never
+    # in a collapsed-floor consensus_set (52.1 never equals 52.0). For Rule
+    # 2 (X + X.k where peer also has X.k as a true side story), peer's X.k
+    # is preserved through collapse via Rule 2's "keep both when no
+    # consensus drop" path, so X.k still lands in consensus_set when peers
+    # confirm it.
     diagnostics: Dict[str, Dict] = {}
     for site_name, meta in per_source_meta.items():
-        source_nums = per_source_nums[site_name]
+        raw_nums = per_source_raw_nums[site_name]
         unique_main, effective = _classify_main_chapters(
-            list(source_nums.keys()),
+            list(raw_nums.keys()),
             collapse_splits=collapse_splits,
             consensus_set=consensus_set,
         )
         breakdown = _classify_chapter_breakdown(
-            list(source_nums.values()),
+            list(raw_nums.values()),
             consensus_set=consensus_set,
             consensus_max=consensus_max,
         )
         diag: Dict = {
             "role": meta["role"],
-            "total_chapters": len(source_nums),
+            "total_chapters": len(raw_nums),
             "unique_main_chapters": unique_main,
             "effective_chapters": effective,
             "matched_with_anchor": meta["overlap"],
@@ -940,6 +1001,72 @@ def group_chapters_for_download(
         ))
 
     return groups
+
+
+def _collapse_source_for_alignment(chapters: List[Dict]) -> List[Dict]:
+    """Pre-process a single source's chapter list into the same shape the
+    aio-dl.py download loop produces from ``group_chapters_for_download``.
+
+    Used by ``align_chapter_lists`` when ``collapse_splits=True`` so cross-
+    source matches happen at the GROUP LABEL's chapter number rather than at
+    each part's raw chapter number. Motivating case: mangafire emits chapter
+    29 as three rows {29.1, 29.2, 29.3} with no integer 29; peers
+    (atsumaru/weebcentral/etc.) emit it as a single integer 29. Without this
+    pre-collapse, alignment keys mangafire's parts at 29.1/29.2/29.3 and the
+    peer's chapter at 29.0 — they never match, so ``_process_chapter_strict``
+    looks up alts at chap_float=29.0 (the merged-group label) and finds
+    nothing. With pre-collapse, mangafire's Rule-5 cluster becomes a
+    synthesized dict labeled "29" keyed at 29.0, matching peers regardless of
+    whether the peer also splits or uses an integer.
+
+    Each output dict matches a shape downstream code already handles:
+      - Rule 1/2/3a/3b/4/6 (``len(parts) == 1``): the original chapter dict
+        with ``chap`` overridden to the group label when they differ (Rule 6
+        scattered-decimals case; everything else has matching labels by
+        construction).
+      - Rule 5 (sequential split-cluster, ``len(parts) > 1``): a synthesized
+        ``{**parts[0], "chap": group.label, "_merged_parts": parts}`` so
+        ``_process_chapter_impl`` iterates ``_merged_parts`` and concatenates
+        the per-part image streams. Mirrors aio-dl.py:7024-7028 which
+        produces the same shape for the primary's download list.
+
+    Always called with ``consensus_set=None``: the consensus IS what the
+    surrounding alignment is computing — chicken-and-egg. The download path
+    re-collapses the primary's list with the proper consensus_set returned
+    from alignment, which is where Rule 2 / 3b / 6 fragment drops actually
+    fire. This pre-collapse only needs to homogenize the keying across
+    sources for cross-source match — Rule 5 (sequential splits) does that
+    without needing consensus.
+
+    Cross-file:
+      - aio-dl.py:7003-7028 builds the same synthesized dicts for the
+        primary's download list; this helper mirrors that synthesis for each
+        alt source so alignment can match by post-collapse key.
+      - _process_chapter_impl reads ``ch.get("_merged_parts")`` at ~7488 and
+        iterates per-part. The alt's chapter dict in the alts payload feeds
+        directly into that path via _process_chapter_strict's alt loop.
+    """
+    if not chapters:
+        return []
+    groups = group_chapters_for_download(
+        chapters,
+        collapse_splits=True,
+        consensus_set=None,
+    )
+    collapsed: List[Dict] = []
+    for group in groups:
+        if len(group.parts) == 1:
+            ch = group.parts[0]
+            if str(ch.get("chap")) != group.label:
+                ch = {**ch, "chap": group.label}
+            collapsed.append(ch)
+        else:
+            collapsed.append({
+                **group.parts[0],
+                "chap": group.label,
+                "_merged_parts": group.parts,
+            })
+    return collapsed
 
 
 __all__ = [
