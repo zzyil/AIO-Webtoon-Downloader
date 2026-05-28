@@ -551,6 +551,16 @@ export default function SettingsTab({ settings, onSave }) {
       searchOpts: { ...prev.searchOpts, [key]: value },
     }));
 
+  // Whether the default --webtoon-recompress toggle is valid for the current
+  // default format. aio-dl.py rejects recompress with --format pdf/none (no
+  // archive to write into); --komikku coerces format→cbz first, so it's
+  // allowed then. Mirrors DownloadTab's recompressAllowed. Drives the default
+  // toggle's disabled state + the format-select auto-clear below.
+  const recompressAllowedDefault =
+    local.defaults.komikku ||
+    local.defaults.format === "cbz" ||
+    local.defaults.format === "epub";
+
   // Dirty count drives the SaveSettingsButton's pre-click visual
   // ("Save Settings · N changed" + amber ring/dot when > 0, "Up to date"
   // when 0). Recomputed cheaply on any local-state change; the diff
@@ -811,6 +821,13 @@ export default function SettingsTab({ settings, onSave }) {
                     ...prev.defaults,
                     format: next,
                     ...(next === "none" ? { keepImages: true } : {}),
+                    // PDF/None can't carry --webtoon-recompress (no archive to
+                    // write into; aio-dl.py hard-errors). Auto-clear the
+                    // default so we never save a contradictory combo. Skip
+                    // when Komikku is on — it coerces format→cbz.
+                    ...((next === "pdf" || next === "none") && !prev.defaults.komikku
+                      ? { webtoonRecompress: false }
+                      : {}),
                   },
                 }));
               }}
@@ -1406,21 +1423,30 @@ export default function SettingsTab({ settings, onSave }) {
         <div className="space-y-3">
           <div className="flex items-start gap-3">
             <Switch
-              checked={!!local.defaults.webtoonRecompress}
-              onCheckedChange={(v) => setDefault("webtoonRecompress", v)}
+              checked={!!local.defaults.webtoonRecompress && recompressAllowedDefault}
+              onCheckedChange={(v) => recompressAllowedDefault && setDefault("webtoonRecompress", v)}
+              disabled={!recompressAllowedDefault}
               className="mt-0.5"
             />
             <div className="flex-1">
-              <Label className="text-xs cursor-pointer">
+              <Label className={cn("text-xs cursor-pointer", !recompressAllowedDefault && "opacity-40")}>
                 Recompress webtoons.com pages to WebP
               </Label>
               <p className="text-[10px] text-muted-foreground mt-0.5">
                 Applies to every webtoons.com download — direct URL, search-
                 initiated, and library re-downloads.
               </p>
+              {!recompressAllowedDefault && (
+                <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug">
+                  Unavailable while the default format is{" "}
+                  <span className="font-mono">{(local.defaults.format || "").toUpperCase()}</span>{" "}
+                  — recompression needs CBZ or EPUB output. Change the default
+                  format above (or enable Komikku) to use it.
+                </p>
+              )}
             </div>
           </div>
-          {local.defaults.webtoonRecompress && (
+          {local.defaults.webtoonRecompress && recompressAllowedDefault && (
             <div className="pl-12 animate-slide-up grid grid-cols-2 gap-x-6 gap-y-3">
               <div>
                 <div className="flex items-center justify-between mb-1">
