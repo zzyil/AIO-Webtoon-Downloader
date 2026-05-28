@@ -38,6 +38,11 @@ const DEFAULT_SEARCH_OPTS = {
   searchTimeout: 20,
   searchMinMatch: 0.55,
   searchParallelism: 6,
+  // Mirror of SearchTab.jsx DEFAULT_OPTS.enableMlRating. The UI control is
+  // in SearchTab's "Advanced search options" Collapsible (not surfaced here)
+  // so the shared settings.searchOpts namespace stays schema-aligned across
+  // both surfaces. See SearchTab.jsx for the WMI-hang rationale.
+  enableMlRating: false,
 };
 
 // ── DEFAULT VALUES ──

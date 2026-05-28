@@ -6514,6 +6514,19 @@ def main():
         sys.exit(0)
 
     # Output goes into a per-title folder under ./manga (title, with hid only on collision)
+    # Capture the user-facing ROOT before mutating args.output_dir / args.epub_dir to the
+    # per-series folder. Downstream chapter writes, final-file writes, cover writes etc.
+    # expect the per-series value (grep `getattr(args, "output_dir"`), so the mutation is
+    # intentional for the rest of the current run; but get_resumable_params (grep that name)
+    # reads args.output_dir to persist run_params.json, and on resume the restore block
+    # (grep `if args.restore_parameters:`) setattr's it back onto args BEFORE this line
+    # runs again, which would feed the per-series path back into allocate_series_output_dir
+    # and nest (manga/Tekyuu → manga/Tekyuu/Tekyuu). The override after get_resumable_params
+    # restores the root in the saved dict. Cross-file: UI-source/electron/downloader.js
+    # builds the resume CLI without --output-dir, so the persisted root is the only source
+    # of truth on resume.
+    _output_dir_root_for_resume = args.output_dir
+    _epub_dir_root_for_resume = getattr(args, "epub_dir", None)
     out_dir = allocate_series_output_dir(title, hid, root=args.output_dir)
     setattr(args, "output_dir", out_dir)
     epub_dir_base = getattr(args, "epub_dir", None)
@@ -6694,6 +6707,15 @@ def main():
     resume_mode = False
     params_path = os.path.join(main_tmp_dir, "run_params.json")
     current_params = get_resumable_params(args, p, width, aspect_ratio_str)
+    # Persist the user-facing ROOT (captured pre-mutation; grep `_output_dir_root_for_resume`),
+    # not the per-series folder args.output_dir / args.epub_dir hold by now. Without this,
+    # the resumed run restores the per-series value and the allocate_series_output_dir call
+    # at the top of this section nests one level deeper every resume (manga/Tekyuu →
+    # manga/Tekyuu/Tekyuu → manga/Tekyuu/Tekyuu/Tekyuu…). Neither dest is in
+    # _RESUME_GATING_DESTS, so gating_hash is unaffected by this override.
+    current_params["output_dir"] = _output_dir_root_for_resume
+    if "epub_dir" in current_params:
+        current_params["epub_dir"] = _epub_dir_root_for_resume
     current_hash = gating_hash(current_params)
 
     if os.path.isdir(main_tmp_dir):

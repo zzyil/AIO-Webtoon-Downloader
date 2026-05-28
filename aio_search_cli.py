@@ -338,6 +338,19 @@ def run_search_mode(
     if not query:
         sys.exit("--search requires a non-empty title.")
 
+    # Set the ML-rating gate BEFORE the orchestrator imports torch-backed
+    # modules. When False (the default), all torch/pyiqa/torchmetrics
+    # imports stay deferred — search startup never loads torch. This
+    # avoids the Python 3.13 + Windows WMI hang that bricked --search
+    # before the 2026-05-20 lazy-import refactor. set_ml_rating_enabled
+    # is idempotent so direct-URL multi-source paths can also call it.
+    # Cross-file: aio-dl.py argparse defines --enable-ml-rating;
+    # UI-source/src/components/SearchTab.jsx writes enableMlRating to
+    # settings.searchOpts; UI-source/electron/searcher.js translates that
+    # back to --enable-ml-rating on the spawn line — grep enableMlRating.
+    from sites.search_orchestrator import set_ml_rating_enabled
+    set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
+
     # URL-mode: if the user supplied a MangaFire URL instead of a title text,
     # scrape the series page once via Playwright and turn it into a seed hit.
     # The orchestrator then runs the normal cross-site search using the
@@ -789,6 +802,12 @@ def find_alternatives_for_direct_url(
 
     if on_status:
         on_status(f"[*] Multi-source: searching for alternatives to '{title}'...")
+
+    # Direct-URL multi-source enters here, separate from run_search_mode. Set
+    # the ML-rating gate here too so the orchestrator's lazy torch checks see
+    # the right state. Idempotent — calling twice in the same process is fine.
+    from sites.search_orchestrator import set_ml_rating_enabled
+    set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
 
     # Step 2: search.
     timeout = float(getattr(args, "search_timeout", DEFAULT_PER_SITE_TIMEOUT_S) or DEFAULT_PER_SITE_TIMEOUT_S)
