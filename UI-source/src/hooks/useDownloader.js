@@ -463,6 +463,29 @@ export function useDownloader() {
           ? { imagePrefetchParallel: s.imagePrefetchParallel }
           : {}),
         ...(s?.noFastDownload === true ? { noFastDownload: true } : {}),
+        // ── External metadata enrichment (--metadata-source family) ──
+        // Top-level global setting from SettingsTab → Metadata Enrichment.
+        // Same "skip when at Python default" pattern as imageConcurrency
+        // above: only emit on spawn when the user explicitly turned it
+        // on AND when the valued sub-options differ from argparse defaults
+        // (50 for tag rank, false for refresh). Keeps the spawn line clean
+        // for the default-off case so the LogPanel's `$ python aio-dl.py
+        // ...` line doesn't carry three metadata flags on every download.
+        // Python side: aio-dl.py near --enable-ml-rating registers the
+        // flags; sites/external_metadata.py runs the GraphQL client.
+        // The valued knobs are gated on metadataSource so they're never
+        // emitted in isolation — pointless without the master toggle.
+        ...(s?.metadataSource && s.metadataSource !== "none"
+          ? { metadataSource: s.metadataSource }
+          : {}),
+        ...(s?.metadataSource && s.metadataSource !== "none"
+            && s?.metadataTagMinRank != null && s.metadataTagMinRank !== 50
+          ? { metadataTagMinRank: s.metadataTagMinRank }
+          : {}),
+        ...(s?.metadataSource && s.metadataSource !== "none"
+            && s?.metadataRefresh === true
+          ? { metadataRefresh: true }
+          : {}),
         ...args,
       };
 

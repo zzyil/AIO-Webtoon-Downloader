@@ -132,6 +132,19 @@ export default function SettingsTab({ settings, onSave }) {
     // When true, update checks scan actual files on disk instead of
     // trusting .aio_series.json. Saved as a top-level setting.
     useFileBasedChapterCheck: false,
+    // ── External metadata enrichment (--metadata-source family) ──
+    // Top-level "global setting" semantic: applies to EVERY download
+    // regardless of which tab spawned it (New / Search / Library / queue).
+    // useDownloader.queueDownload injects these into args for every
+    // electronAPI.startDownload, so it's a true app-wide preference rather
+    // than a per-download form value. Defaults match the Python argparse
+    // defaults so a Save with the section untouched is a no-op for the
+    // spawn line. Python side: aio-dl.py near --enable-ml-rating (flag
+    // registration) + sites/external_metadata.py (the AniList GraphQL
+    // client). Grep cross-file: metadataSource, metadata-source.
+    metadataSource: "none",
+    metadataTagMinRank: 50,
+    metadataRefresh: false,
     // Whether the app is running from an installed .exe (bundled mode)
     // or from source (dev mode). Set by main.js, read-only here.
     isPackaged: false,
@@ -333,6 +346,12 @@ export default function SettingsTab({ settings, onSave }) {
       noFastDownload: false,
       logUpdateInterval: 100,
       useFileBasedChapterCheck: false,
+      // Metadata enrichment defaults — mirror the initial-state block above.
+      // Off/default values match the Python argparse defaults so Reset
+      // produces a clean "no spawn-line metadata flags" state.
+      metadataSource: "none",
+      metadataTagMinRank: 50,
+      metadataRefresh: false,
       defaults: {
         format: "pdf",
         language: "en",
@@ -671,6 +690,118 @@ export default function SettingsTab({ settings, onSave }) {
             checked={!!local.defaults.komikku}
             onCheckedChange={(v) => setDefault("komikku", v)}
           />
+        </div>
+
+        {/* Metadata Enrichment ────────────────────────────────────
+            Opt-in global setting — when on, every download spawn injects
+            --metadata-source anilist into the CLI args. useDownloader.
+            queueDownload reads from settingsRef.current and adds the
+            flag for every electronAPI.startDownload, so the toggle
+            applies app-wide (New / Search / Library / queue). The two
+            sub-options (tag rank floor, force-refresh) only emit on
+            spawn when source !== "none" AND the value differs from
+            Python argparse defaults, keeping the spawn line clean.
+            Python side: aio-dl.py near --enable-ml-rating registers the
+            three flags; sites/external_metadata.py runs the AniList
+            GraphQL client. Cross-file: useDownloader.queueDownload
+            injection + electron/downloader.js:buildCliArgs:flagMap+boolMap
+            CLI translation. */}
+        <SectionHeader>Metadata Enrichment</SectionHeader>
+        <p className="text-[10px] text-muted-foreground -mt-1 mb-2 leading-snug">
+          Pull normalized tags, descriptions, and country/format from the free{" "}
+          <a
+            href="https://anilist.co"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-mono underline decoration-dotted underline-offset-2 hover:text-foreground"
+          >
+            AniList GraphQL API
+          </a>{" "}
+          (90 req/min, no auth, no account). Results merge into{" "}
+          <span className="font-mono">ComicInfo.xml</span> and{" "}
+          <span className="font-mono">.aio_series.json</span> on every download —
+          ID-cached so resume / update runs do a single fetch-by-id instead of
+          re-searching. Off by default; opt in if you want filterable, ranked,
+          spoiler-aware tags in your reader.
+        </p>
+        <div className="space-y-3">
+          <div className="flex items-start gap-3">
+            <Switch
+              checked={local.metadataSource === "anilist"}
+              onCheckedChange={(v) => set("metadataSource", v ? "anilist" : "none")}
+              className="mt-0.5"
+            />
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">
+                Enable AniList enrichment
+              </Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Adds 1 GraphQL round-trip per series (first download) or 1
+                fetch-by-id (cached afterwards). Failures are non-fatal — the
+                download continues with site-only metadata and logs a single
+                warning line.
+              </p>
+            </div>
+          </div>
+          {local.metadataSource === "anilist" && (
+            <div className="pl-12 animate-slide-up space-y-3">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Tag relevance threshold</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {local.metadataTagMinRank ?? 50}
+                  </Badge>
+                </div>
+                <Slider
+                  value={local.metadataTagMinRank ?? 50}
+                  onValueChange={(v) => set("metadataTagMinRank", v)}
+                  min={0}
+                  max={100}
+                  step={5}
+                />
+                <div className="flex justify-between mt-1 px-0.5">
+                  <span className="text-[10px] text-muted-foreground">
+                    0 — every tag
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    50 — default
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    100 — only top-rank
+                  </span>
+                </div>
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  AniList scores each tag <span className="font-mono">0–100</span> by
+                  relevance. Tags below this floor are dropped from{" "}
+                  <span className="font-mono">{"<Tags>"}</span> /{" "}
+                  <span className="font-mono">{"<SpoilerTags>"}</span> /{" "}
+                  <span className="font-mono">{"<TagsExtended>"}</span> in the
+                  ComicInfo.xml. At <span className="font-mono">50</span> a typical
+                  manga has ~15–25 tags; at <span className="font-mono">80</span>{" "}
+                  ~3–6 tags.
+                </p>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1">
+                  <Label className="text-xs cursor-pointer">
+                    Always re-fetch (skip the AniList ID cache)
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground mt-0.5">
+                    Force a fresh AniList lookup on every download — even when
+                    an AniList ID is already cached in{" "}
+                    <span className="font-mono">.aio_series.json</span>. Useful
+                    when backfilling a library or after AniList re-tags a
+                    series upstream. Costs one extra round-trip per download;
+                    leave off unless you specifically need fresh data.
+                  </p>
+                </div>
+                <Switch
+                  checked={!!local.metadataRefresh}
+                  onCheckedChange={(v) => set("metadataRefresh", v)}
+                />
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Default Toggles */}

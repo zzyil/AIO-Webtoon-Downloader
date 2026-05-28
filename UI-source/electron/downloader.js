@@ -134,6 +134,16 @@ function buildCliArgs(args) {
     jobRetries: "--job-retries",
     jobSpawnGap: "--job-spawn-gap",
     coordDir: "--coord-dir",
+    // External metadata enrichment (--metadata-source family).
+    // Surfaced as top-level settings in SettingsTab → Metadata Enrichment;
+    // useDownloader.queueDownload only injects metadataSource when the user
+    // turned the master toggle on (i.e. value != "none"), so the natural
+    // "skip empty/null/undefined" filter below already keeps the
+    // default-off spawn clean. metadataTagMinRank is similarly only
+    // injected when it differs from the Python argparse default (50).
+    // Python side: aio-dl.py near --enable-ml-rating + sites/external_metadata.py.
+    metadataSource: "--metadata-source",
+    metadataTagMinRank: "--metadata-tag-min-rank",
   };
 
   // ── Boolean flags (no value, just present or absent) ──
@@ -180,6 +190,13 @@ function buildCliArgs(args) {
     // of their per-handler SUPPORTS_FAST_DOWNLOAD flag. Useful for
     // curl_cffi version bugs or CDN-vs-impersonation issues.
     noFastDownload: "--no-fast-download",
+    // External metadata force-refresh — companion to the valued
+    // metadataSource flag above. Only injected by queueDownload when
+    // metadataSource !== "none" AND the user explicitly turned the
+    // refresh switch on in Settings → Metadata Enrichment. Python-side
+    // bypasses the cached-AniList-ID fast path and re-runs the fuzzy
+    // title-match search on every download. See sites/external_metadata.py.
+    metadataRefresh: "--metadata-refresh",
   };
 
   // Add valued arguments
