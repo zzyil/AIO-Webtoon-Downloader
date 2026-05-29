@@ -1,8 +1,12 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Button, Input, Label, Select, Checkbox, Card, SectionHeader, Slider, Badge, Switch,
 } from "@/components/ui/primitives";
-import { Save, RotateCcw, FolderOpen, FileText, Package, Terminal, RefreshCw } from "lucide-react";
+import {
+  Save, RotateCcw, FolderOpen, FileText, Package, Terminal, RefreshCw,
+  Check, AlertTriangle,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
 
 // Same language list as DownloadTab/SearchTab. Duplicated rather than
 // importing to avoid pulling unrelated module deps; one row to add when
@@ -76,6 +80,202 @@ const DEV_DEFAULTS = {
   scriptPath: "",
   workingDir: "",
 };
+
+// ── Dirty diff for the Save Settings button ──
+// Compares the local in-memory settings draft against the most recently
+// hydrated `settings` prop (mirrors what's on disk via get-settings IPC).
+// Counts every key that differs across the top level + the two known
+// nested namespaces (defaults, searchOpts). `isPackaged` is excluded —
+// it's read-only from main.js and never persisted (see handleSave below).
+// Returns 0 when `settings` is nullish so the button doesn't blink an
+// inflated count during the ~50ms before the first get-settings IPC
+// resolves on mount.
+//
+// IMPORTANT: walks ONLY local's keys, not the union of local + settings.
+// history.js:saveSettings does a defensive merge (`{...this._settings,
+// ...filtered}`) so legacy or obsolete keys on disk (e.g. the
+// pre-2026-05-13 `mangafireImageConcurrency` left over after the rename
+// migration) survive every save indefinitely. Counting those in the
+// dirty diff would produce a phantom count the user can't act on —
+// the UI doesn't surface those fields, so there's no control to flip,
+// and clicking Save wouldn't bring the count down. By walking only
+// local's keys we count exactly the keys the user CAN influence via the
+// UI, which is the contract "Save Settings · N changed" implies.
+//
+// New-feature defaults backfilling missing keys (a new field added in
+// the UI's initial useState that older settings.json files don't have
+// yet) still surface as dirty — local has the key, settings doesn't,
+// `local[k] !== settings[k]` → counted. Saving flushes them to disk
+// and the count drops to 0 on the next render. That's correct: those
+// one-time inflations represent genuine on-disk work.
+// Cross-file: matches the shape of the initial useState below + the
+// migration logic in the settings-hydration useEffect + the merge in
+// electron/history.js:saveSettings.
+function countDirtySettings(local, settings) {
+  if (!settings) return 0;
+  const SKIP_TOP = new Set(["isPackaged"]);
+  const NESTED = ["defaults", "searchOpts"];
+  let count = 0;
+
+  for (const k of Object.keys(local)) {
+    if (SKIP_TOP.has(k) || NESTED.includes(k)) continue;
+    if (local[k] !== settings[k]) count++;
+  }
+
+  for (const ns of NESTED) {
+    const a = local[ns] || {};
+    const b = settings[ns] || {};
+    for (const k of Object.keys(a)) {
+      if (a[k] !== b[k]) count++;
+    }
+  }
+
+  return count;
+}
+
+// ── Save Settings button with dirty-state + confirmation sweep ──
+// Replaces the bare <Button> the footer used to render. Visual states:
+//   - idle/clean:   muted primary (bg-primary/60), Check icon, "Up to date"
+//   - idle/dirty:   full primary + amber ring + amber dot, Save icon,
+//                   "Save Settings · N changed"
+//   - in:           emerald-500 fill grows L→R from a pseudo-overlay span
+//                   over 280ms; label flips to "Saved" + Check icon
+//   - hold:         emerald fill held at scaleX(1) for ~900ms (driven
+//                   by the timer gap, not a separate phase)
+//   - out:          emerald fill shrinks scaleX(1)→scaleX(0) with the
+//                   origin flipped to right; takes 320ms then → idle
+//   - error:        bg-destructive, AlertTriangle icon, "Save failed";
+//                   auto-dismisses after 2500ms back to idle (which then
+//                   renders dirty because the hydration round-trip
+//                   never happened — dirty count stayed > 0)
+//
+// The L→R origin flip when entering 'out' is invisible: transform-origin
+// is NOT in the transition-property list, so it snaps instantly while
+// scaleX is still 1 (visually identical regardless of origin at scale 1),
+// then the scaleX(1)→scaleX(0) shrink runs against the new right origin.
+//
+// Cross-file coupling: `cn` from @/lib/utils (clsx + tailwind-merge).
+// Async onSave threads through SettingsTab.handleSave → useDownloader.
+// saveSettings (await window.electronAPI.saveSettings + setSettings) →
+// preload.js → electron/main.js's "save-settings" IPC handler →
+// history.js:saveSettings (volatile-path filter + atomic file write).
+// IPC currently resolves in <50ms locally, so the sweep is the dominant
+// duration the user actually perceives — any "loading" spinner state
+// would flash by too fast to register and isn't worth wiring up.
+function SaveSettingsButton({ dirty, onSave }) {
+  const [phase, setPhase] = useState("idle"); // 'idle' | 'in' | 'out' | 'error'
+  const timers = useRef([]);
+
+  useEffect(() => () => timers.current.forEach(clearTimeout), []);
+
+  const cancelTimers = () => {
+    timers.current.forEach(clearTimeout);
+    timers.current = [];
+  };
+
+  const handleClick = async () => {
+    if (phase !== "idle") return;
+
+    try {
+      await onSave();
+    } catch {
+      cancelTimers();
+      setPhase("error");
+      timers.current.push(setTimeout(() => setPhase("idle"), 2500));
+      return;
+    }
+
+    cancelTimers();
+    setPhase("in");
+    // 280ms sweep-in + 900ms hold + 320ms sweep-out ≈ 1500ms total. Two
+    // timers fire at the in→out boundary (1180ms) and the final reset
+    // to idle (1500ms); the sweep visual itself is driven by CSS
+    // transitions off the phase-derived className below.
+    timers.current.push(setTimeout(() => setPhase("out"), 1180));
+    timers.current.push(setTimeout(() => setPhase("idle"), 1500));
+  };
+
+  const isAnimating = phase === "in" || phase === "out";
+  const isErrored = phase === "error";
+  const isClean = dirty === 0;
+
+  const sweepScale = phase === "in" ? "scale-x-100" : "scale-x-0";
+  const sweepOrigin = phase === "out" ? "origin-right" : "origin-left";
+  const sweepDuration =
+    phase === "in" ? "duration-[280ms]" :
+    phase === "out" ? "duration-[320ms]" :
+    "duration-0";
+
+  let icon, label, baseColor, showAmberDot, ring;
+  if (isErrored) {
+    icon = <AlertTriangle className="w-4 h-4" />;
+    label = "Save failed";
+    baseColor = "bg-destructive text-destructive-foreground";
+    showAmberDot = false;
+    ring = "";
+  } else if (isAnimating) {
+    icon = <Check className="w-4 h-4" />;
+    label = "Saved";
+    // text-white reads cleanly over both bg-primary (under-sweep) and
+    // bg-emerald-500 (over-sweep) in both light + dark themes.
+    baseColor = "bg-primary text-white";
+    showAmberDot = false;
+    ring = "";
+  } else if (isClean) {
+    icon = <Check className="w-4 h-4" />;
+    label = "Up to date";
+    baseColor = "bg-primary/60 text-primary-foreground/90 hover:bg-primary/70";
+    showAmberDot = false;
+    ring = "";
+  } else {
+    icon = <Save className="w-4 h-4" />;
+    label = `Save Settings · ${dirty} changed`;
+    baseColor = "bg-primary text-primary-foreground hover:bg-primary/90";
+    showAmberDot = true;
+    ring = "ring-2 ring-amber-500/30";
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      disabled={isAnimating || isErrored}
+      aria-busy={isAnimating}
+      aria-live="polite"
+      className={cn(
+        "relative overflow-hidden inline-flex flex-1 items-center justify-center gap-2",
+        "h-9 px-4 py-2 text-sm rounded-md font-medium shadow-sm",
+        "transition-colors duration-200",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        baseColor,
+        ring,
+      )}
+    >
+      {/* Sweep overlay — emerald fill driven by phase-derived classes.
+          Sits absolutely inside overflow-hidden so the rounded corners
+          clip the sweep; z-0 (implicit) keeps it behind the label span. */}
+      <span
+        aria-hidden="true"
+        className={cn(
+          "absolute inset-0 bg-emerald-500 transition-transform ease-out",
+          sweepScale,
+          sweepOrigin,
+          sweepDuration,
+        )}
+      />
+      <span className="relative z-10 inline-flex items-center gap-2">
+        {showAmberDot && (
+          <span
+            aria-hidden="true"
+            className="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_4px_rgba(245,158,11,0.7)]"
+          />
+        )}
+        {icon}
+        {label}
+      </span>
+    </button>
+  );
+}
 
 export default function SettingsTab({ settings, onSave }) {
   // Local copy of settings so changes don't apply until you click Save
@@ -351,10 +551,32 @@ export default function SettingsTab({ settings, onSave }) {
       searchOpts: { ...prev.searchOpts, [key]: value },
     }));
 
-  const handleSave = () => {
-    // Don't save isPackaged — it's read-only from main.js
+  // Whether the default --webtoon-recompress toggle is valid for the current
+  // default format. aio-dl.py rejects recompress with --format pdf/none (no
+  // archive to write into); --komikku coerces format→cbz first, so it's
+  // allowed then. Mirrors DownloadTab's recompressAllowed. Drives the default
+  // toggle's disabled state + the format-select auto-clear below.
+  const recompressAllowedDefault =
+    local.defaults.komikku ||
+    local.defaults.format === "cbz" ||
+    local.defaults.format === "epub";
+
+  // Dirty count drives the SaveSettingsButton's pre-click visual
+  // ("Save Settings · N changed" + amber ring/dot when > 0, "Up to date"
+  // when 0). Recomputed cheaply on any local-state change; the diff
+  // walks ~30 top-level keys + ~25 nested keys, well under a frame.
+  // See countDirtySettings above for the migration-edge-case rationale.
+  const dirty = useMemo(() => countDirtySettings(local, settings), [local, settings]);
+
+  // Awaited (not fire-and-forget) so SaveSettingsButton can chain its
+  // sweep-in only after the IPC round-trip resolves successfully — and
+  // route to the 'error' branch if history.saveSettings throws (disk
+  // full, EACCES, etc.). Pre-change behavior dropped the promise; the
+  // failure was an unhandled rejection. `await onSave(saveable)`
+  // preserves the rejection so the button's try/catch sees it.
+  const handleSave = async () => {
     const { isPackaged, ...saveable } = local;
-    onSave(saveable);
+    await onSave(saveable);
   };
 
   const handleReset = () => {
@@ -599,6 +821,13 @@ export default function SettingsTab({ settings, onSave }) {
                     ...prev.defaults,
                     format: next,
                     ...(next === "none" ? { keepImages: true } : {}),
+                    // PDF/None can't carry --webtoon-recompress (no archive to
+                    // write into; aio-dl.py hard-errors). Auto-clear the
+                    // default so we never save a contradictory combo. Skip
+                    // when Komikku is on — it coerces format→cbz.
+                    ...((next === "pdf" || next === "none") && !prev.defaults.komikku
+                      ? { webtoonRecompress: false }
+                      : {}),
                   },
                 }));
               }}
@@ -1194,21 +1423,30 @@ export default function SettingsTab({ settings, onSave }) {
         <div className="space-y-3">
           <div className="flex items-start gap-3">
             <Switch
-              checked={!!local.defaults.webtoonRecompress}
-              onCheckedChange={(v) => setDefault("webtoonRecompress", v)}
+              checked={!!local.defaults.webtoonRecompress && recompressAllowedDefault}
+              onCheckedChange={(v) => recompressAllowedDefault && setDefault("webtoonRecompress", v)}
+              disabled={!recompressAllowedDefault}
               className="mt-0.5"
             />
             <div className="flex-1">
-              <Label className="text-xs cursor-pointer">
+              <Label className={cn("text-xs cursor-pointer", !recompressAllowedDefault && "opacity-40")}>
                 Recompress webtoons.com pages to WebP
               </Label>
               <p className="text-[10px] text-muted-foreground mt-0.5">
                 Applies to every webtoons.com download — direct URL, search-
                 initiated, and library re-downloads.
               </p>
+              {!recompressAllowedDefault && (
+                <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug">
+                  Unavailable while the default format is{" "}
+                  <span className="font-mono">{(local.defaults.format || "").toUpperCase()}</span>{" "}
+                  — recompression needs CBZ or EPUB output. Change the default
+                  format above (or enable Komikku) to use it.
+                </p>
+              )}
             </div>
           </div>
-          {local.defaults.webtoonRecompress && (
+          {local.defaults.webtoonRecompress && recompressAllowedDefault && (
             <div className="pl-12 animate-slide-up grid grid-cols-2 gap-x-6 gap-y-3">
               <div>
                 <div className="flex items-center justify-between mb-1">
@@ -1494,12 +1732,11 @@ export default function SettingsTab({ settings, onSave }) {
         </div>
       </div>
 
-      {/* Save/Reset buttons */}
+      {/* Save/Reset buttons. SaveSettingsButton (defined above) carries
+          its own dirty-state visual + post-save sweep + error branch;
+          the Reset stays a plain outline Button. */}
       <div className="flex-shrink-0 p-4 border-t bg-background/80 backdrop-blur-sm flex gap-2">
-        <Button onClick={handleSave} className="flex-1 gap-2">
-          <Save className="w-4 h-4" />
-          Save Settings
-        </Button>
+        <SaveSettingsButton dirty={dirty} onSave={handleSave} />
         <Button variant="outline" onClick={handleReset}>
           <RotateCcw className="w-4 h-4" />
         </Button>

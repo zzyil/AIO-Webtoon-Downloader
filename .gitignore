@@ -64,3 +64,24 @@ settings-full.png
 probe_*.py
 aio_config.json
 test_downloads.py
+
+# Per-session diagnostic probe scripts + their outputs. Kept locally for
+# reference but never shipped — these are ad-hoc, NOT part of the tests/
+# suite (committing them under tests/ would pollute pytest collection).
+# Root-anchored (leading /) so underscore-prefixed SOURCE modules like
+# sites/_image_io.py / sites/_publishers.py are never accidentally matched.
+/investigate_*.py
+/_diag_*.py
+/_test_*.py
+/_verify_*.py
+/_build_*.py
+/_calib_*.log
+/_slf_search.*
+
+# Local Electron build output (the runnable app staged by npm run dist:*,
+# distinct from the gitignored UI-source/dist bundle) + Claude tooling state
+# + bench scratch. Build dirs can be hundreds of MB; .claude/ holds
+# per-machine scheduler locks, not source.
+/UI/
+/bench/
+.claude/

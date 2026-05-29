@@ -155,6 +155,15 @@ export default function DownloadTab({
   // Helper to update one form field
   const set = (key, value) => updateForm((prev) => ({ ...prev, [key]: value }));
 
+  // --webtoon-recompress needs an archive to write the converted pages into,
+  // so aio-dl.py rejects it for --format pdf/none (hard error at startup,
+  // see the --webtoon-recompress validation block ~aio-dl.py:6028). --komikku
+  // coerces format→cbz BEFORE that check (~aio-dl.py:5999), so recompress
+  // stays valid when Komikku is on regardless of the selected format button.
+  // Drives the toggle's disabled state + the handleStart emit guard below.
+  const recompressAllowed =
+    form.komikku || form.format === "cbz" || form.format === "epub";
+
   // Build CLI args from form state and trigger download
   const handleStart = () => {
     const urls = form.urls.split("\n").map((u) => u.trim()).filter(Boolean);
@@ -202,7 +211,10 @@ export default function DownloadTab({
     // through too so buildCliArgs can decide whether to forward them
     // (it only does when the master toggle is on AND the value differs
     // from the Python-side default, to keep the spawn line clean).
-    if (form.webtoonRecompress) {
+    // Guard on recompressAllowed so an incompatible combo (pdf/none without
+    // komikku) never reaches the CLI even if form.webtoonRecompress is stale-
+    // true from a saved default — aio-dl.py would hard-error on it otherwise.
+    if (form.webtoonRecompress && recompressAllowed) {
       args.webtoonRecompress = true;
       args.webtoonRecompressQuality = form.webtoonRecompressQuality;
       args.webtoonRecompressMethod = form.webtoonRecompressMethod;
@@ -291,6 +303,14 @@ export default function DownloadTab({
                   ...prev,
                   format: f.value,
                   ...(f.value === "none" ? { keepImages: true } : {}),
+                  // Picking PDF or None makes --webtoon-recompress invalid
+                  // (no archive to write the converted pages into), so auto-
+                  // clear it — the user can't launch the rejected combo. Skip
+                  // when Komikku is on: it coerces format→cbz, keeping
+                  // recompress valid (mirror of recompressAllowed).
+                  ...((f.value === "pdf" || f.value === "none") && !prev.komikku
+                    ? { webtoonRecompress: false }
+                    : {}),
                 }));
               }}
               className={cn(
@@ -485,12 +505,13 @@ export default function DownloadTab({
           <div className="flex items-start gap-3">
             <Switch
               id="webtoonRecompress"
-              checked={form.webtoonRecompress}
-              onCheckedChange={(v) => set("webtoonRecompress", v)}
+              checked={form.webtoonRecompress && recompressAllowed}
+              onCheckedChange={(v) => recompressAllowed && set("webtoonRecompress", v)}
+              disabled={!recompressAllowed}
               className="mt-0.5"
             />
             <div className="flex-1">
-              <Label htmlFor="webtoonRecompress" className="text-xs cursor-pointer">
+              <Label htmlFor="webtoonRecompress" className={cn("text-xs cursor-pointer", !recompressAllowed && "opacity-40")}>
                 Recompress lossless PNG pages to WebP (webtoons.com only)
               </Label>
               <p className="text-[10px] text-muted-foreground mt-0.5">
@@ -501,9 +522,16 @@ export default function DownloadTab({
                 files at q85 with no visible quality loss on phone-screen
                 viewing of color webtoons. Requires CBZ or EPUB output.
               </p>
+              {!recompressAllowed && (
+                <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug animate-slide-up">
+                  Unavailable with <span className="font-mono">{form.format.toUpperCase()}</span>{" "}
+                  output — recompression needs a CBZ or EPUB archive to write
+                  into. Switch to CBZ/EPUB (or enable Komikku) to use it.
+                </p>
+              )}
             </div>
           </div>
-          {form.webtoonRecompress && (
+          {form.webtoonRecompress && recompressAllowed && (
             <div className="pl-12 animate-slide-up grid grid-cols-2 gap-x-6 gap-y-3">
               <div>
                 <div className="flex items-center justify-between mb-1">

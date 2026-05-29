@@ -25,6 +25,16 @@
 //           0001.jpg ...
 //     One Piece/
 //       One Piece.epub
+//     Tower of God/            ← --format none (images only, NO archive)
+//       .aio_series.json       ← still written (format:"none", cover, chapters)
+//       images/                ← always present for --format none
+//         Chapter_1/
+//           0001.webp ...
+//
+// IMAGE-ONLY SERIES: a --format none download produces no pdf/epub/cbz, only
+// the images/ tree above. The scanner treats such a folder as a first-class
+// series (isImageOnly entry) instead of skipping it for having no archive.
+// See the IMAGE-ONLY SERIES helper block + the gate in scanLibrary().
 // ============================================================
 
 const fs = require("fs");
@@ -33,6 +43,13 @@ const crypto = require("crypto");
 
 // File extensions we care about (the final output files)
 const OUTPUT_EXTENSIONS = new Set(["pdf", "epub", "cbz"]);
+
+// Image file extensions written into images/<Chapter_n>/ by aio-dl.py's
+// --keep-images copytree. `--format none` forces keep_images on and writes
+// NO archive, so for those series this is the ONLY payload on disk. Phase A
+// (2026-05-07) made downloads keep their real extension, so this must cover
+// webp/avif/png/gif, not just jpg. Cross-file: grep _IMG_EXTS in aio-dl.py.
+const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "avif", "gif"]);
 
 // ── CONFIGURABLE ──
 // Width of generated thumbnails in pixels.
@@ -217,6 +234,158 @@ function getChaptersOnDevice(files, siteChapters) {
 }
 
 // ============================================================
+// IMAGE-ONLY SERIES (--format none)
+//
+// A --format none download writes no pdf/epub/cbz — only raw pages under
+// <Title>/images/Chapter_<n>/ (aio-dl.py forces keep_images=True for none;
+// grep 'keep_images = True' + 'Chapter_{n}'). These helpers let the scanner
+// treat such a folder as a first-class series: count chapters cheaply for
+// the grid badge (countImageChapterDirs), recover size/cover/rows for the
+// detail view (scanImagesTree — a DEEP per-page statSync walk, so callers
+// MUST gate it to image-only folders or big archive+keep-images libraries
+// pay the walk on every scan), and recover the on-device chapter set for the
+// file-based update check (getImageChaptersOnDevice). The legacy 'ch_' dir
+// prefix is accepted alongside the current 'Chapter_' one.
+// ============================================================
+
+// Parse the chapter number token out of an images/ subfolder name.
+// Returns "5" / "5.5" (raw token) or null for non-numeric / non-chapter dirs.
+function _imageChapterToken(dirName) {
+  const m = dirName.match(/^(?:Chapter_|ch_)(-?\d+(?:\.\d+)?)/i);
+  return m ? m[1] : null;
+}
+
+// Cheap chapter-dir count (no per-file stat). Drives the "N ch" grid badge
+// for EVERY series (archive + image-only), mirroring the historical behavior.
+function countImageChapterDirs(imagesDir) {
+  try {
+    return fs
+      .readdirSync(imagesDir, { withFileTypes: true })
+      .filter(
+        (d) =>
+          d.isDirectory() &&
+          (d.name.startsWith("Chapter_") || d.name.startsWith("ch_"))
+      ).length;
+  } catch {
+    return 0;
+  }
+}
+
+// Deep walk of images/: per-chapter image counts + byte sizes, the first page
+// (cover fallback), total bytes, and the freshest mtime. Stats every page, so
+// callers MUST gate this to image-only folders.
+function scanImagesTree(imagesDir) {
+  const result = {
+    chapters: [],          // [{ name, path, imageCount, size, mtime }]
+    chapterCount: 0,
+    imageCount: 0,
+    imageBytes: 0,
+    firstImagePath: null,  // first page of the lowest-numbered chapter
+    latestMtime: "",
+  };
+
+  let dirEntries;
+  try {
+    dirEntries = fs.readdirSync(imagesDir, { withFileTypes: true });
+  } catch {
+    return result;
+  }
+
+  // Sort chapter folders by parsed number so the cover comes from the first
+  // chapter and detail-view rows read in chapter order. Numeric-aware
+  // localeCompare is the tiebreaker for non-parseable / named chapters.
+  const chapterDirs = dirEntries
+    .filter(
+      (d) =>
+        d.isDirectory() &&
+        (d.name.startsWith("Chapter_") || d.name.startsWith("ch_"))
+    )
+    .map((d) => d.name)
+    .sort((a, b) => {
+      const na = parseFloat(_imageChapterToken(a));
+      const nb = parseFloat(_imageChapterToken(b));
+      if (!isNaN(na) && !isNaN(nb) && na !== nb) return na - nb;
+      return a.localeCompare(b, undefined, { numeric: true });
+    });
+
+  for (const name of chapterDirs) {
+    const chapterPath = path.join(imagesDir, name);
+    let inner;
+    try {
+      inner = fs.readdirSync(chapterPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const images = inner
+      .filter(
+        (f) =>
+          f.isFile() &&
+          IMAGE_EXTENSIONS.has(path.extname(f.name).toLowerCase().slice(1))
+      )
+      .map((f) => f.name)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (images.length === 0) continue;
+
+    let size = 0;
+    let mtime = "";
+    for (const img of images) {
+      try {
+        const st = fs.statSync(path.join(chapterPath, img));
+        size += st.size;
+        const iso = st.mtime.toISOString();
+        if (iso > mtime) mtime = iso;
+      } catch {}
+    }
+
+    if (!result.firstImagePath) {
+      result.firstImagePath = path.join(chapterPath, images[0]);
+    }
+    result.chapters.push({
+      name,
+      path: chapterPath,
+      imageCount: images.length,
+      size,
+      mtime,
+    });
+    result.chapterCount += 1;
+    result.imageCount += images.length;
+    result.imageBytes += size;
+    if (mtime > result.latestMtime) result.latestMtime = mtime;
+  }
+
+  return result;
+}
+
+/**
+ * On-device chapter NUMBERS for an image-only series, parsed from the
+ * images/Chapter_<n>/ tree. Mirrors getChaptersOnDevice's return contract
+ * (Set<string> of normalized number tokens like "5" / "5.5") so main.js's
+ * file-based update check can union them in. Non-numeric chapter folders are
+ * skipped — they can't be diffed against the numeric --list-chapters output.
+ *
+ * @param {string} folderPath - the series folder (NOT the images/ subdir)
+ * @returns {Set<string>}
+ */
+function getImageChaptersOnDevice(folderPath) {
+  const out = new Set();
+  const imagesDir = path.join(folderPath, "images");
+  let dirEntries;
+  try {
+    dirEntries = fs.readdirSync(imagesDir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const d of dirEntries) {
+    if (!d.isDirectory()) continue;
+    const token = _imageChapterToken(d.name);
+    if (token == null) continue;
+    const num = parseFloat(token);
+    if (!isNaN(num)) out.add(String(num));
+  }
+  return out;
+}
+
+// ============================================================
 // SCAN LIBRARY
 // ============================================================
 
@@ -284,30 +453,42 @@ function scanLibrary(mangasDir, thumbCacheDir) {
       }
     }
 
-    // Skip empty folders (no output files)
-    if (files.length === 0) continue;
-
-    // ── Count chapters (if images/ exists from --keep-images) ──
-    let chapterCount = 0;
+    // ── Recognize the series + gather its stats ──
+    // Two shapes: archive series (≥1 pdf/epub/cbz) and image-only series
+    // (--format none → no archive, only images/Chapter_<n>/). For archive
+    // series we keep the historical cheap path (size from the archive files,
+    // chapter count from a dir-count). For image-only series we deep-walk
+    // images/ to recover the size/cover/rows that would otherwise come from
+    // the absent archive. Payload-required gate: a folder with neither an
+    // archive nor any image chapter isn't a real series — skip it (covers
+    // failed/empty downloads and metadata-only folders).
     const imagesDir = path.join(folderPath, "images");
-    if (fs.existsSync(imagesDir)) {
-      try {
-        chapterCount = fs
-          .readdirSync(imagesDir, { withFileTypes: true })
-          .filter(
-            (d) =>
-              d.isDirectory() &&
-              (d.name.startsWith("ch_") || d.name.startsWith("Chapter_"))
-          ).length;
-      } catch {}
-    }
+    const isImageOnly = files.length === 0;
 
-    // ── Compute totals ──
-    const totalSize = files.reduce((sum, f) => sum + f.size, 0);
-    const lastModified = files.reduce(
-      (latest, f) => (f.modifiedAt > latest ? f.modifiedAt : latest),
-      ""
-    );
+    let chapterCount = 0;
+    let totalSize = 0;
+    let lastModified = "";
+    let imageCount = 0;
+    let coverImagePath = null;
+    let imageChapters = null;
+
+    if (isImageOnly) {
+      const tree = scanImagesTree(imagesDir);
+      if (tree.chapterCount === 0) continue; // no payload → not a series
+      chapterCount = tree.chapterCount;
+      imageCount = tree.imageCount;
+      totalSize = tree.imageBytes;
+      coverImagePath = tree.firstImagePath;
+      imageChapters = tree.chapters;
+      lastModified = tree.latestMtime; // metadata-stamp fallback applied below
+    } else {
+      chapterCount = countImageChapterDirs(imagesDir);
+      totalSize = files.reduce((sum, f) => sum + f.size, 0);
+      lastModified = files.reduce(
+        (latest, f) => (f.modifiedAt > latest ? f.modifiedAt : latest),
+        ""
+      );
+    }
 
     // ── Check for series metadata (written by aio-dl.py) ──
     // .aio_series.json contains the source URL, downloaded chapters,
@@ -319,6 +500,12 @@ function scanLibrary(mangasDir, thumbCacheDir) {
       try {
         seriesMeta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
       } catch {}
+    }
+
+    // Image-only series can have undatable pages (rare). Fall back to the
+    // metadata download stamp so sort-by-date and "Modified …" still work.
+    if (isImageOnly && !lastModified && seriesMeta?.last_downloaded_at) {
+      lastModified = seriesMeta.last_downloaded_at;
     }
 
     // ── Check for cached thumbnail ──
@@ -363,6 +550,13 @@ function scanLibrary(mangasDir, thumbCacheDir) {
       totalSize,
       lastModified,
       seriesMeta,
+      // Image-only (--format none) extras. For archive series: false/0/null.
+      // coverImagePath = first page on disk (cover fallback when no web cover
+      // or PDF thumb). imageChapters = per-chapter rows for the detail view.
+      isImageOnly,
+      imageCount,
+      coverImagePath,
+      imageChapters,
     });
   }
 
@@ -666,4 +860,4 @@ function cleanupOrphanCovers(entries, thumbCacheDir) {
   return removed;
 }
 
-module.exports = { scanLibrary, saveThumbnail, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, extractChaptersFromFiles, getChaptersOnDevice };
+module.exports = { scanLibrary, saveThumbnail, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, extractChaptersFromFiles, getChaptersOnDevice, getImageChaptersOnDevice };

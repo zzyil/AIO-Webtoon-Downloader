@@ -220,9 +220,20 @@ function buildCliArgs(args) {
     cliArgs.push(flag, String(value));
   }
 
+  // --webtoon-recompress requires an archive output. aio-dl.py hard-errors on
+  // --format pdf/none for it; --komikku coerces format→cbz BEFORE that check
+  // (~aio-dl.py:5999 then ~6028), so it stays valid then. This buildCliArgs is
+  // the single chokepoint for every spawn path (manual, search-, library-
+  // initiated, resume), so strip the flag + its valued knobs here whenever the
+  // effective format is incompatible — defense-in-depth behind the
+  // DownloadTab / SettingsTab UI guards, covering any path that didn't clear it.
+  const recompressIncompatible =
+    (args.format === "none" || args.format === "pdf") && args.komikku !== true;
+
   // Add boolean flags
   for (const [key, flag] of Object.entries(boolMap)) {
     if (args[key] === true) {
+      if (key === "webtoonRecompress" && recompressIncompatible) continue;
       cliArgs.push(flag);
     }
   }
@@ -259,7 +270,7 @@ function buildCliArgs(args) {
   // valued flags when --webtoon-recompress is absent — they're argparse
   // metadata for the helper function, gated independently in
   // _process_chapter_impl — so this is purely about spawn-line cleanliness.
-  if (args.webtoonRecompress === true) {
+  if (args.webtoonRecompress === true && !recompressIncompatible) {
     if (args.webtoonRecompressQuality != null && args.webtoonRecompressQuality !== 85) {
       cliArgs.push("--webtoon-recompress-quality", String(args.webtoonRecompressQuality));
     }

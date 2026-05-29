@@ -18,6 +18,7 @@
 //   amber  = side stories       (X.5+ kept as content)
 //   cyan   = prologue           (chapter 0 / negatives)
 //   emerald = source-only latest (above peer max — fresh releases)
+//   sky    = merged split parts (X.1/X.2/X.3 with no integer X → one chapter)
 //   orange = source-only orphans (mid-range, suspicious but kept)
 //   rose   = fragments dropped  (.1/.2/.3/.4 source-only duplicates)
 // Grep target: buildBuckets in this file; classifier source in
@@ -82,6 +83,21 @@ function buildBuckets(breakdown, collapseApplied) {
       label: "orph",
       color: "text-orange-400/80",
       tooltip: `${breakdown.source_only_orphans} mid-range chapter${breakdown.source_only_orphans === 1 ? "" : "s"} peers don't have. Suspicious (possible re-released duplicates) but kept — could also be legit content.`,
+    });
+  }
+  if (breakdown.merged_split_fragments > 0) {
+    out.push({
+      key: "merged",
+      count: breakdown.merged_split_fragments,
+      sign: "+",
+      label: "merged",
+      color: "text-sky-400/75",
+      // Distinct from "drop": these are the extra rows of a no-integer
+      // split-cluster (X.1/X.2/X.3 → one chapter). The download path
+      // concatenates them into the parent — kept content, not duplicates.
+      // Sits right before the drop chip so "+N merged −M drop" reads as
+      // the two possible fates of fractional rows.
+      tooltip: `${breakdown.merged_split_fragments} split-upload part${breakdown.merged_split_fragments === 1 ? "" : "s"} concatenated into their parent chapter (an X.1/X.2/X.3 cluster with no plain integer X — joined into one downloaded chapter). Kept, not dropped.`,
     });
   }
   if (breakdown.fragments_dropped > 0) {
@@ -336,6 +352,10 @@ export default function SearchChapterMap({ chapterMap }) {
               <span className="inline-flex items-center gap-1">
                 <span className="inline-block w-1.5 h-1.5 rounded-sm bg-emerald-400/70" />
                 <span>ahead of peers</span>
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block w-1.5 h-1.5 rounded-sm bg-sky-400/70" />
+                <span>merged splits</span>
               </span>
               <span className="inline-flex items-center gap-1">
                 <span className="inline-block w-1.5 h-1.5 rounded-sm bg-orange-400/70" />

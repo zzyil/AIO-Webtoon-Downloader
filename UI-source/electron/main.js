@@ -24,7 +24,7 @@ const { Downloader } = require("./downloader");
 const { Searcher } = require("./searcher");
 const { HistoryManager } = require("./history");
 const { PythonSetup, isSetupComplete, deleteEnv, PYTHON_VERSION } = require("./setup");
-const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice } = require("./library");
+const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice, getImageChaptersOnDevice } = require("./library");
 
 // ── DEV MODE DEFAULTS ──
 // When running from source (npm run electron:dev), the app uses
@@ -1012,6 +1012,17 @@ function setupIPC() {
           diskFiles,
           (result.chapters || []).map(String)
         );
+        // --format none (image-only) series have no archive files for
+        // getChaptersOnDevice to read, so the diff above would mark every
+        // chapter "new". Recover the on-device set from the
+        // images/Chapter_<n>/ tree and union it in. (JSON mode below is
+        // unaffected — it reads chapters_downloaded, which aio-dl.py writes
+        // for every format including none.) grep getImageChaptersOnDevice.
+        if (diskFiles.length === 0) {
+          for (const c of getImageChaptersOnDevice(folderPath)) {
+            downloadedChapters.add(c);
+          }
+        }
         checkMode = "files";
       } else {
         // Use the JSON metadata list (what aio-dl.py recorded as downloaded)

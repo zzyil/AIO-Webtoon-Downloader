@@ -9,12 +9,15 @@ into _process_chapter_impl's part-by-part fetch path.
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
 from sites.chapter_merger import (
     AlignmentResult,
     ChapterBreakdown,
     ChapterGroup,
     _classify_chapter_breakdown,
     _classify_main_chapters,
+    _collapse_source_for_alignment,
     _format_chapter_label,
     _extract_chapter_num,
     _is_fragment_shaped_decimal,
@@ -542,8 +545,8 @@ def test_breakdown_empty_input():
     assert isinstance(bd, ChapterBreakdown)
     assert all(getattr(bd, f) == 0 for f in [
         "consensus_main", "source_only_latest", "consensus_side_stories",
-        "safe_decimals", "prologue_count", "source_only_orphans",
-        "fragments_dropped", "unparseable_passthrough",
+        "safe_decimals", "prologue_count", "merged_split_fragments",
+        "source_only_orphans", "fragments_dropped", "unparseable_passthrough",
     ])
 
 
@@ -591,6 +594,79 @@ def test_breakdown_no_consensus_treats_everything_as_main_or_safe():
     assert bd.source_only_orphans == 0
 
 
+def test_breakdown_rule5_no_integer_cluster_is_merged_not_dropped():
+    """Regression for the collapsed-consensus miscount (2026-05-29 review):
+    a no-integer sequential split-cluster {29.1, 29.2, 29.3} whose FLOOR is
+    peer-confirmed (consensus keyed at 29.0) must NOT be reported as dropped
+    fragments. group_chapters_for_download Rule 5 concatenates the parts into
+    one downloaded chapter, so the floor counts once (consensus_main) and the
+    remaining two parts land in merged_split_fragments. Pre-fix this dumped
+    all three into fragments_dropped, which the UI renders as lost content."""
+    bd = _classify_chapter_breakdown(
+        [_ch("29.1"), _ch("29.2"), _ch("29.3")],
+        consensus_set={29.0},          # collapsed-floor consensus (peer has ch 29)
+        consensus_max=29.0,
+    )
+    assert bd.consensus_main == 1
+    assert bd.merged_split_fragments == 2
+    assert bd.fragments_dropped == 0
+    assert bd.safe_decimals == 0
+    assert bd.consensus_side_stories == 0
+    # Sum still equals the 3 raw entries.
+    assert sum(asdict(bd).values()) == 3
+
+
+def test_breakdown_rule5_source_only_cluster_counts_floor_once():
+    """A no-integer split-cluster the peers don't have at all: still merged
+    (Rule 5 collapses unconditionally), floor counted once by its position
+    relative to consensus_max — here 29 > max 10 so it's source_only_latest,
+    NOT dropped."""
+    bd = _classify_chapter_breakdown(
+        [_ch("29.1"), _ch("29.2"), _ch("29.3")],
+        consensus_set={10.0},          # peers top out at 10
+        consensus_max=10.0,
+    )
+    assert bd.source_only_latest == 1
+    assert bd.merged_split_fragments == 2
+    assert bd.fragments_dropped == 0
+    assert sum(asdict(bd).values()) == 3
+
+
+def test_breakdown_rule3a_integer_plus_sequential_still_drops():
+    """Guard the other side: {8, 8.1, 8.2, 8.3} (integer PRESENT + sequential
+    decimals) is Rule 3a — the download path keeps only the integer and DROPS
+    the decimals. So those three really are fragments_dropped, NOT merged.
+    Confirms the Rule-5 special-case is gated on the no-integer shape."""
+    bd = _classify_chapter_breakdown(
+        [_ch("8"), _ch("8.1"), _ch("8.2"), _ch("8.3")],
+        consensus_set={8.0},
+        consensus_max=8.0,
+    )
+    assert bd.consensus_main == 1       # the integer 8
+    assert bd.fragments_dropped == 3    # 8.1/8.2/8.3 dropped by Rule 3a
+    assert bd.merged_split_fragments == 0
+    assert sum(asdict(bd).values()) == 4
+
+
+def test_breakdown_collapse_off_keeps_rule5_parts_per_entry():
+    """collapse_splits=False (2026-05-29 review): group_chapters_for_download
+    runs in passthrough mode — 29.1/29.2/29.3 each download as their own
+    chapter, nothing is merged — so the breakdown must NOT use the Rule-5
+    merged bucket. It classifies each part per-entry against the raw
+    consensus_set instead. Here peers carry the same raw parts, so all three
+    are confirmed side entries; merged_split_fragments stays 0."""
+    bd = _classify_chapter_breakdown(
+        [_ch("29.1"), _ch("29.2"), _ch("29.3")],
+        consensus_set={29.1, 29.2, 29.3},   # raw consensus keys when collapse off
+        consensus_max=29.3,
+        collapse_splits=False,
+    )
+    assert bd.merged_split_fragments == 0
+    assert bd.consensus_side_stories == 3
+    assert bd.fragments_dropped == 0
+    assert sum(asdict(bd).values()) == 3
+
+
 def test_breakdown_shangri_la_frontier_dataset():
     """End-to-end test on the exact mangafire chapter list from the user's
     Shangri-La Frontier example (305 entries). Expected per the design
@@ -636,12 +712,14 @@ def test_breakdown_shangri_la_frontier_dataset():
     assert bd.consensus_side_stories == 0  # peers don't carry the .5s
     assert bd.source_only_latest == 0
     assert bd.source_only_orphans == 0
+    assert bd.merged_split_fragments == 0  # every .1 here has its integer (Rule 2/3b, not Rule 5)
     assert bd.unparseable_passthrough == 0
     # Sanity: bucket sum must equal input length.
     total = (
         bd.consensus_main + bd.source_only_latest + bd.consensus_side_stories
-        + bd.safe_decimals + bd.prologue_count + bd.source_only_orphans
-        + bd.fragments_dropped + bd.unparseable_passthrough
+        + bd.safe_decimals + bd.prologue_count + bd.merged_split_fragments
+        + bd.source_only_orphans + bd.fragments_dropped
+        + bd.unparseable_passthrough
     )
     assert total == 305
 
@@ -741,3 +819,362 @@ def test_align_classifies_source_only_dot_one_as_fragment():
     bd_b = result.merge_diagnostics["b"]["breakdown"]
     assert bd_b["consensus_main"] == 1
     assert bd_b["fragments_dropped"] == 0
+
+
+# ────────────────────────────────────────────────────────────────────────
+# _collapse_source_for_alignment  (2026-05-29)
+#
+# Pre-collapse helper used by align_chapter_lists when collapse_splits=True
+# so cross-source matches happen at the post-collapse group label rather
+# than at each part's raw chapter number. Each test checks the helper's
+# output shape mirrors what aio-dl.py:7003-7028 produces for the primary's
+# download list — same labels, same _merged_parts on Rule-5 clusters.
+# ────────────────────────────────────────────────────────────────────────
+
+
+def test_collapse_helper_rule_5_synthesizes_merged_parts():
+    """Rule 5 (sequential split-cluster, no integer parent): output is a
+    single synthesized dict with chap=floor label and _merged_parts holding
+    the original part dicts in ascending order. This is the shape
+    _process_chapter_impl iterates when an alt is picked for a primary's
+    Rule-5 chapter (the angel-next-door ch 29 case)."""
+    parts = [_ch("29.2"), _ch("29.1"), _ch("29.3")]  # unsorted input
+    out = _collapse_source_for_alignment(parts)
+    assert len(out) == 1
+    assert out[0]["chap"] == "29"
+    mp = out[0].get("_merged_parts")
+    assert mp is not None
+    assert [p["chap"] for p in mp] == ["29.1", "29.2", "29.3"]
+
+
+def test_collapse_helper_rule_1_passthrough():
+    """Rule 1 (integer only, no decimals): chapter dict passes through
+    with chap unchanged; no _merged_parts."""
+    out = _collapse_source_for_alignment([_ch("29")])
+    assert len(out) == 1
+    assert out[0]["chap"] == "29"
+    assert "_merged_parts" not in out[0]
+
+
+def test_collapse_helper_rule_4_singleton_partial_keeps_label():
+    """Rule 4 (no integer, lone decimal like 29.5): keeps the decimal
+    label, no _merged_parts. Aligns with peer sources that also have a
+    standalone 29.5 — not with a peer's integer 29."""
+    out = _collapse_source_for_alignment([_ch("29.5")])
+    assert len(out) == 1
+    assert out[0]["chap"] == "29.5"
+    assert "_merged_parts" not in out[0]
+
+
+def test_collapse_helper_rule_3a_drops_decimals():
+    """Rule 3a (integer + sequential decimals): only the integer survives
+    — decimals are treated as upload fragments of the integer chapter.
+    The post-collapse view should be a single dict at the integer."""
+    out = _collapse_source_for_alignment(
+        [_ch("1"), _ch("1.1"), _ch("1.2"), _ch("1.3")],
+    )
+    assert len(out) == 1
+    assert out[0]["chap"] == "1"
+    assert "_merged_parts" not in out[0]
+
+
+def test_collapse_helper_empty_input():
+    assert _collapse_source_for_alignment([]) == []
+
+
+def test_collapse_helper_preserves_non_chap_fields():
+    """The synthesized dict for Rule 5 carries forward the original
+    fields from parts[0] (url, hid, etc.) — handlers downstream depend on
+    these to fetch images."""
+    parts = [
+        {"chap": "1.1", "url": "https://x/1.1", "hid": "abc"},
+        {"chap": "1.2", "url": "https://x/1.2", "hid": "def"},
+    ]
+    out = _collapse_source_for_alignment(parts)
+    assert len(out) == 1
+    # parts[0] (after sort) is the 1.1 dict
+    assert out[0]["url"] == "https://x/1.1"
+    assert out[0]["hid"] == "abc"
+    # And _merged_parts holds the originals untouched.
+    assert out[0]["_merged_parts"][0] is parts[0] or out[0]["_merged_parts"][0]["chap"] == "1.1"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Collapse-aware align_chapter_lists  (2026-05-29)
+#
+# The chapter_map's keys depend on collapse_splits when True. This is the
+# fix for the bug where mangafire's {29.1, 29.2, 29.3} cluster never
+# matched peers' integer 29 (or peers' identical Rule-5 cluster) at the
+# strict-wrapper's chap_float=29.0 lookup. See git log for context and
+# the diagnostic script _diag_ch29_alts.py.
+# ────────────────────────────────────────────────────────────────────────
+
+
+def test_align_collapse_rule_5_both_sides_match_at_floor():
+    """Same-shape case: both sources emit chapter 29 as {29.1, 29.2, 29.3}
+    with no integer 29. With collapse_splits=True, alignment keys them at
+    the floor (29.0) so the strict-wrapper's lookup finds the alt; without
+    the fix it would key at 29.1/29.2/29.3 separately and the wrapper's
+    chap_float=29.0 lookup would miss."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=True,
+    )
+    nums = sorted(e.chapter_num for e in result.chapter_map)
+    assert nums == [29.0]
+    entry = result.chapter_map[0]
+    assert entry.chapter_label == "29"
+    sites = {s for s, _ in entry.sources}
+    assert sites == {"primary", "alt"}
+    # Alt's stored chapter dict carries _merged_parts so a downstream
+    # alt-fetch via _process_chapter_impl iterates the parts.
+    for site, ch_dict in entry.sources:
+        assert ch_dict.get("chap") == "29"
+        assert [p["chap"] for p in ch_dict["_merged_parts"]] == [
+            "29.1", "29.2", "29.3",
+        ]
+
+
+def test_align_collapse_rule_5_cross_shape_matches_integer_peer():
+    """Cross-shape case (the canonical reason for the fix): primary emits
+    chapter 29 as Rule-5 splits {29.1, 29.2, 29.3}; alt emits integer 29.
+    Both must align at floor 29.0 so the strict-wrapper finds the alt.
+    Primary's stored dict carries _merged_parts (for primary-side
+    download); alt's stored dict is the integer (no _merged_parts)."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=True,
+    )
+    nums = sorted(e.chapter_num for e in result.chapter_map)
+    assert nums == [29.0]
+    entry = result.chapter_map[0]
+    sites = {s for s, _ in entry.sources}
+    assert sites == {"primary", "alt"}
+    # Primary's stored dict has the synthesized merged-parts shape;
+    # alt's stored dict is the raw integer (no _merged_parts).
+    for site, ch_dict in entry.sources:
+        assert ch_dict.get("chap") == "29"
+        if site == "primary":
+            assert "_merged_parts" in ch_dict
+            assert [p["chap"] for p in ch_dict["_merged_parts"]] == [
+                "29.1", "29.2", "29.3",
+            ]
+        else:
+            assert "_merged_parts" not in ch_dict
+
+
+def test_align_collapse_off_preserves_raw_keying():
+    """When collapse_splits=False, the chapter_map keys are the raw
+    per-source chapter numbers — same as pre-fix behavior. The Rule-5
+    cluster on the primary stays as three separate entries; alt's
+    integer 29 lands at 29.0 IFF its compatibility with the anchor
+    passes the merge-orphans threshold. Here primary is anchor (3 vs 1
+    entries) and alt has 0 overlap with primary's {29.1, 29.2, 29.3},
+    so compatibility=0 and alt's 29.0 is NOT added as orphan. This is
+    the canonical pre-fix shape that motivated collapse-aware alignment."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=False,
+    )
+    nums = sorted(e.chapter_num for e in result.chapter_map)
+    # Only the primary's raw entries — alt's 29.0 dropped by compatibility
+    # threshold. The whole point of the collapse-aware fix is that with
+    # collapse_splits=True these collapse to a single 29.0 entry that
+    # picks up the alt naturally (see test_align_collapse_rule_5_*).
+    assert nums == [29.1, 29.2, 29.3]
+    by_num = {e.chapter_num: e for e in result.chapter_map}
+    assert {s for s, _ in by_num[29.1].sources} == {"primary"}
+    assert {s for s, _ in by_num[29.2].sources} == {"primary"}
+    assert {s for s, _ in by_num[29.3].sources} == {"primary"}
+
+
+def test_align_collapse_off_with_high_compatibility_keeps_alt_orphan():
+    """When collapse_splits=False AND the alt's overall overlap with the
+    anchor is high enough (≥50%), an integer-29 alt CAN appear as an
+    orphan at 29.0 even though mangafire's split shape didn't match.
+    This is the historical 'mangafire as anchor, atsumaru's overlap on
+    integer chapters carries' shape — but the strict-wrapper lookup at
+    chap_float=29.0 (post-merged-group label) still misses because the
+    primary's per-source-nums view doesn't have 29.0 either. That bug
+    is exactly what collapse_splits=True now fixes."""
+    primary = [_ch(str(n)) for n in range(1, 29)] + [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch(str(n)) for n in range(1, 30)]  # integers 1..29
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=False,
+    )
+    nums = sorted(e.chapter_num for e in result.chapter_map)
+    # 29.0 IS in the map (alt orphan, compatibility ~96%).
+    assert 29.0 in nums
+    assert 29.1 in nums
+    assert 29.2 in nums
+    assert 29.3 in nums
+    by_num = {e.chapter_num: e for e in result.chapter_map}
+    assert {s for s, _ in by_num[29.0].sources} == {"alt"}
+    assert {s for s, _ in by_num[29.1].sources} == {"primary"}
+
+
+def test_align_collapse_anchor_pick_uses_collapsed_counts():
+    """Anchor pick uses post-collapse group counts so a source with many
+    raw split entries doesn't outrank a source with fewer entries but
+    more user-facing chapters. Source A has 5 raw entries collapsing to
+    2 groups; source B has 3 raw entries that are 3 distinct chapters.
+    Anchor should be B (3 collapsed groups > 2)."""
+    a = [_ch("1.1"), _ch("1.2"), _ch("1.3"), _ch("2.1"), _ch("2.2")]
+    b = [_ch("1"), _ch("2"), _ch("3")]
+    result = align_chapter_lists(
+        [("a", a), ("b", b)],
+        collapse_splits=True,
+    )
+    # b becomes anchor because it has 3 groups vs a's 2.
+    anchor_site = next(
+        site for site, d in result.merge_diagnostics.items()
+        if d.get("role") == "anchor"
+    )
+    assert anchor_site == "b"
+
+
+def test_align_collapse_diagnostics_use_raw_counts():
+    """total_chapters and breakdown remain raw-counted regardless of
+    collapse_splits, so the UI's "X entries vs Y main" gap stays visible.
+    Source A has 5 raw entries that collapse to 2 groups — total_chapters
+    must still be 5, and the breakdown must still sum to 5."""
+    a = [_ch("1.1"), _ch("1.2"), _ch("1.3"), _ch("2.1"), _ch("2.2")]
+    b = [_ch("1"), _ch("2")]
+    result = align_chapter_lists(
+        [("a", a), ("b", b)],
+        collapse_splits=True,
+    )
+    diag_a = result.merge_diagnostics["a"]
+    assert diag_a["total_chapters"] == 5
+    # Breakdown should sum to total (every raw chapter lands in exactly
+    # one bucket).
+    bd = diag_a["breakdown"]
+    assert sum(bd.values()) == 5
+
+
+def test_align_collapse_orphan_path_uses_collapsed_keys():
+    """Source B is anchor; source A's collapsed cluster {1.1, 1.2, 1.3} →
+    floor 1 should land in anchor_index via the orphan path (because A
+    has high compatibility with B for the other chapters), keyed at 1.0
+    not 1.1/1.2/1.3. Critical for the case where primary doesn't have
+    chapter X but an alt does as a Rule-5 cluster — the alt's cluster
+    contributes to the chapter_map at the floor."""
+    a = [_ch("1.1"), _ch("1.2"), _ch("1.3"), _ch("2"), _ch("3")]
+    b = [_ch("2"), _ch("3"), _ch("4"), _ch("5")]
+    result = align_chapter_lists(
+        [("a", a), ("b", b)],
+        collapse_splits=True,
+    )
+    nums = sorted(e.chapter_num for e in result.chapter_map)
+    # b is anchor (4 groups vs a's 3). a's 1 → orphan at floor.
+    # Expected: 1, 2, 3, 4, 5 — five floors, no fractional splits.
+    assert nums == [1.0, 2.0, 3.0, 4.0, 5.0]
+
+
+def test_align_collapse_consensus_set_uses_collapsed_floors():
+    """consensus_set is keyed at collapsed floors when collapse_splits=True.
+    For the canonical case ({29.1, .2, .3} on both sources), consensus is
+    {29.0}, not {29.1, 29.2, 29.3}. Critical: downstream
+    group_chapters_for_download still checks `num in consensus_set` per
+    decimal — fragment decimals (52.1) are never in a collapsed-floor
+    consensus_set ({52.0}), which is the correct answer for Rule 2's
+    fragment drop, so the consensus shape change doesn't regress that
+    rule's behavior."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=True,
+    )
+    assert result.consensus_set == {29.0}
+    assert result.consensus_max == 29.0
+
+
+def test_align_collapse_rule5_breakdown_not_reported_as_dropped():
+    """End-to-end regression (2026-05-29 review, Codex P2 'avoid marking
+    merged split parts as dropped'): cross-shape Rule-5 case — primary emits
+    chapter 29 as {29.1, 29.2, 29.3}, alt emits integer 29. The parts collapse
+    to one downloaded chapter 29 (peer-confirmed at floor 29.0), so primary's
+    diagnostics must show ONE main chapter + two merged split parts, never
+    three dropped fragments. Pre-fix the collapsed consensus_set ({29.0}) made
+    each raw .k miss consensus and inflate fragments_dropped, which
+    SearchChapterMap renders to the user as lost content."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=True,
+    )
+    bd = result.merge_diagnostics["primary"]["breakdown"]
+    assert bd["fragments_dropped"] == 0
+    assert bd["merged_split_fragments"] == 2
+    assert bd["consensus_main"] == 1   # floor 29 confirmed by alt's integer
+    # total_chapters stays raw (3) and the breakdown still sums to it.
+    assert result.merge_diagnostics["primary"]["total_chapters"] == 3
+    assert sum(bd.values()) == 3
+
+
+def test_align_collapse_off_breakdown_has_no_merged_bucket():
+    """Complementary guard (2026-05-29 review, Codex P2 'keep split
+    diagnostics raw when collapse is off'): with collapse_splits=False the
+    chapter_map keeps 29.1/29.2/29.3 as three separate entries (passthrough
+    download) and consensus_set is keyed at the raw parts. The per-source
+    breakdown must therefore classify them per-entry — merged_split_fragments
+    stays 0 — so the UI never claims a concatenation the download didn't do."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=False,
+    )
+    bd = result.merge_diagnostics["primary"]["breakdown"]
+    assert bd["merged_split_fragments"] == 0
+    assert bd["consensus_side_stories"] == 3   # raw parts peer-confirmed
+    assert bd["fragments_dropped"] == 0
+    assert sum(bd.values()) == 3
+
+
+def test_align_collapse_alts_payload_shape_for_strict_wrapper():
+    """End-to-end shape check: when collapse_splits=True and primary has
+    a Rule-5 cluster while an alt has the same cluster, the per-chapter
+    alternatives_by_chap_num shape (as built by find_alternatives_for_direct_url
+    and build_alternatives_from_prefetched) keys at the floor and stores
+    the alt's synthesized merged-parts dict.
+
+    This test mirrors what those callers do — iterating chapter_map
+    entries, filtering out the primary, and packaging the alt's stored
+    chapter dict. _process_chapter_strict's lookup at chap_float=floor
+    should now find this entry."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=True,
+    )
+    alts_by_floor = {}
+    for entry in result.chapter_map:
+        alts = [
+            {"site": site, "chapter": ch_dict}
+            for site, ch_dict in entry.sources
+            if site != "primary"
+        ]
+        if alts:
+            alts_by_floor[entry.chapter_num] = alts
+    # Strict wrapper looks up chap_float=29.0 (from synthesized
+    # primary group label "29"). Pre-fix would miss; post-fix hits.
+    assert 29.0 in alts_by_floor
+    alts_29 = alts_by_floor[29.0]
+    assert len(alts_29) == 1
+    assert alts_29[0]["site"] == "alt"
+    # Alt's chapter dict has _merged_parts so _process_chapter_impl
+    # iterates the parts using the swapped-in alt handler.
+    assert [p["chap"] for p in alts_29[0]["chapter"]["_merged_parts"]] == [
+        "29.1", "29.2", "29.3",
+    ]

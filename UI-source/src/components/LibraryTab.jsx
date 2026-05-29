@@ -37,6 +37,9 @@ const FORMAT_COLORS = {
   pdf: "bg-blue-500/20 text-blue-400 border-blue-500/30",
   epub: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
   cbz: "bg-orange-500/20 text-orange-400 border-orange-500/30",
+  // --format none (image-only) series. Badge text is "images" (see
+  // getEntryFormats); the per-chapter rows in the detail view reuse this too.
+  images: "bg-violet-500/20 text-violet-400 border-violet-500/30",
 };
 
 const STATUS_COLORS = {
@@ -72,8 +75,16 @@ function formatDate(isoString) {
   return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }
 
-function getFormats(files) {
-  return [...new Set(files.map((f) => f.ext))];
+// Format badges for a series. Archive series derive them from their file
+// extensions; an image-only (--format none) series has no archive files, so
+// it gets a single synthetic "images" badge. Returns [] only for the
+// degenerate case of no files and not image-only (shouldn't happen — the
+// scanner's payload-required gate filters those out).
+function getEntryFormats(entry) {
+  const fileFormats = [...new Set((entry.files || []).map((f) => f.ext))];
+  if (fileFormats.length > 0) return fileFormats;
+  if (entry.isImageOnly) return ["images"];
+  return [];
 }
 
 /**
@@ -111,6 +122,21 @@ function PdfCover({ entry }) {
       />
     );
   }
+  // Image-only (--format none) fallback: no PDF to render and maybe no cached
+  // web cover yet, so show the first downloaded page straight from disk.
+  // Chromium decodes webp/avif/png/jpg/gif natively; object-cover crops the
+  // long-strip aspect. If a web cover later downloads, thumbPath wins on the
+  // next render (it's checked first). coverImagePath comes from library.js.
+  if (entry.coverImagePath) {
+    return (
+      <img
+        src={fileToUrl(entry.coverImagePath)}
+        alt={entry.title}
+        className="w-full h-full object-cover rounded"
+        loading="lazy"
+      />
+    );
+  }
   if (entry.coverPdfPath) {
     return <div className="w-full h-full bg-muted animate-pulse rounded" />;
   }
@@ -131,7 +157,7 @@ function PdfCover({ entry }) {
 // MANGA CARD (grid item)
 // ============================================================
 function MangaCard({ entry, newCount, onClick }) {
-  const formats = getFormats(entry.files);
+  const formats = getEntryFormats(entry);
   const status = entry.seriesMeta?.status;
 
   return (
@@ -190,7 +216,11 @@ function MangaCard({ entry, newCount, onClick }) {
         <div className="flex items-center gap-2 text-[10px] text-muted-foreground mt-0.5">
           <span>{formatSize(entry.totalSize)}</span>
           <span>&middot;</span>
-          <span>{entry.files.length} file{entry.files.length !== 1 ? "s" : ""}</span>
+          {entry.isImageOnly ? (
+            <span>{entry.imageCount} image{entry.imageCount !== 1 ? "s" : ""}</span>
+          ) : (
+            <span>{entry.files.length} file{entry.files.length !== 1 ? "s" : ""}</span>
+          )}
           {entry.chapterCount > 0 && (
             <>
               <span>&middot;</span>
@@ -540,6 +570,16 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
     }
   };
 
+  // Open a single chapter's image folder in the OS file explorer. Image-only
+  // (--format none) series have no archive files to "open", so the per-chapter
+  // rows in the Files section call this instead. openFolder → shell.openPath
+  // accepts any path (see main.js "open-folder" handler).
+  const handleOpenChapter = (chapterPath) => {
+    if (window.electronAPI?.openFolder) {
+      window.electronAPI.openFolder(chapterPath);
+    }
+  };
+
   const handleDelete = async () => {
     if (!confirmDelete) {
       // First click — show confirmation
@@ -563,7 +603,7 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
     }
   };
 
-  const formats = getFormats(entry.files);
+  const formats = getEntryFormats(entry);
   const meta = entry.seriesMeta;
 
   return (
@@ -620,7 +660,9 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
             <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
               <div className="flex items-center gap-1">
                 <FileText className="w-3.5 h-3.5" />
-                {entry.files.length} file{entry.files.length !== 1 ? "s" : ""}
+                {entry.isImageOnly
+                  ? `${entry.imageCount} image${entry.imageCount !== 1 ? "s" : ""}`
+                  : `${entry.files.length} file${entry.files.length !== 1 ? "s" : ""}`}
               </div>
               <div>{formatSize(entry.totalSize)}</div>
               {meta?.chapters_downloaded?.length > 0 && (
@@ -661,15 +703,21 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
                   Source
                 </Button>
               )}
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setShowMetadataEditor((value) => !value)}
-                className="gap-1.5 text-xs"
-              >
-                <PencilLine className="w-3.5 h-3.5" />
-                Metadata
-              </Button>
+              {/* Embedded-metadata editing writes into a ComicInfo.xml inside
+                  the archive; image-only (--format none) series have no
+                  archive, so the editor has nothing to act on. Hide it there
+                  (MetadataEditorPanel also self-guards by returning null). */}
+              {entry.files.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setShowMetadataEditor((value) => !value)}
+                  className="gap-1.5 text-xs"
+                >
+                  <PencilLine className="w-3.5 h-3.5" />
+                  Metadata
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
@@ -713,38 +761,70 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
           />
         </div>
 
-        {/* File list */}
+        {/* File list (archives) — or per-chapter image folders for image-only
+            (--format none) series, which have no archive to open. Each chapter
+            row opens its images/Chapter_<n>/ folder in the OS file explorer
+            (handleOpenChapter). imageChapters comes from library.js. */}
         <div className="mt-5">
           <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
-            Files
+            {entry.isImageOnly ? "Chapters" : "Files"}
           </h3>
           <div className="space-y-1">
-            {entry.files.map((file) => (
-              <button
-                key={file.path}
-                onClick={() => handleOpenFile(file.path)}
-                className={cn(
-                  "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left",
-                  "bg-card/40 border border-border/30",
-                  "hover:bg-card/80 hover:border-primary/30",
-                  "transition-all duration-100 group"
-                )}
-              >
-                <span
-                  className={cn(
-                    "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border shrink-0",
-                    FORMAT_COLORS[file.ext] || "bg-muted text-muted-foreground border-border"
-                  )}
-                >
-                  {file.ext}
-                </span>
-                <span className="text-xs font-medium truncate flex-1">{file.name}</span>
-                <span className="text-[10px] text-muted-foreground shrink-0">
-                  {formatSize(file.size)}
-                </span>
-                <ExternalLink className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
-              </button>
-            ))}
+            {entry.isImageOnly
+              ? (entry.imageChapters || []).map((chap) => (
+                  <button
+                    key={chap.path}
+                    onClick={() => handleOpenChapter(chap.path)}
+                    className={cn(
+                      "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left",
+                      "bg-card/40 border border-border/30",
+                      "hover:bg-card/80 hover:border-primary/30",
+                      "transition-all duration-100 group"
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border shrink-0",
+                        FORMAT_COLORS.images
+                      )}
+                    >
+                      IMG
+                    </span>
+                    <span className="text-xs font-medium truncate flex-1">
+                      {chap.name.replace(/_/g, " ")}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground shrink-0">
+                      {chap.imageCount} img &middot; {formatSize(chap.size)}
+                    </span>
+                    <FolderOpen className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
+                  </button>
+                ))
+              : entry.files.map((file) => (
+                  <button
+                    key={file.path}
+                    onClick={() => handleOpenFile(file.path)}
+                    className={cn(
+                      "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left",
+                      "bg-card/40 border border-border/30",
+                      "hover:bg-card/80 hover:border-primary/30",
+                      "transition-all duration-100 group"
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border shrink-0",
+                        FORMAT_COLORS[file.ext] || "bg-muted text-muted-foreground border-border"
+                      )}
+                    >
+                      {file.ext}
+                    </span>
+                    <span className="text-xs font-medium truncate flex-1">{file.name}</span>
+                    <span className="text-[10px] text-muted-foreground shrink-0">
+                      {formatSize(file.size)}
+                    </span>
+                    <ExternalLink className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
+                  </button>
+                ))}
           </div>
         </div>
       </div>
