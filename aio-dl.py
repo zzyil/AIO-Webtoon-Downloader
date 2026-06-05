@@ -5149,6 +5149,7 @@ def _rewrite_cbz_comicinfo(
         )
 
         chap_title = number = volume = translator = web = lang = None
+        writer = penciller = None
         page_count = 0
         uploaded_epoch: Optional[int] = None
         publishers: List[str] = []
@@ -5168,6 +5169,8 @@ def _rewrite_cbz_comicinfo(
                 translator = _gx("Translator")
                 web = _gx("Web")
                 lang = _gx("LanguageISO")
+                writer = _gx("Writer")
+                penciller = _gx("Penciller")
                 pub = _gx("Publisher")
                 if pub:
                     publishers = [pub]
@@ -5186,6 +5189,17 @@ def _rewrite_cbz_comicinfo(
                     except (ValueError, OverflowError):
                         uploaded_epoch = None
 
+        # Preserve the archive's existing Writer/Penciller (authors/artists).
+        # AniList v1 supplies no staff, so the refresh must carry author/artist
+        # metadata through unchanged rather than dropping <Penciller> (Codex
+        # review on PR #47). Prefer the CBZ's own values; fall back to the
+        # series-level comic_data (seeded from details.json in
+        # _refresh_library_metadata).
+        per_cbz: Dict[str, Any] = dict(comic_data)
+        if writer:
+            per_cbz["authors"] = [s.strip() for s in writer.split(",") if s.strip()]
+        if penciller:
+            per_cbz["artists"] = [s.strip() for s in penciller.split(",") if s.strip()]
         new_ci = build_per_chapter_comic_info_xml(
             series_title=series_title,
             chapter_title=chap_title,
@@ -5194,7 +5208,7 @@ def _rewrite_cbz_comicinfo(
             scanlator=translator,
             web_url=web,
             uploaded_epoch=uploaded_epoch,
-            comic_info=comic_data,
+            comic_info=per_cbz,
             publishers=publishers,
             lang=lang or lang_default or "",
             page_count=page_count,
@@ -5326,6 +5340,19 @@ def _refresh_library_metadata(args) -> int:
             existing_details = {}
         if existing_details.get("description"):
             comic_data["desc"] = existing_details["description"]
+        # Seed artists from details.json's preserved `artist` field. AniList
+        # v1 fetches no staff, so without this the CBZ rewrite would emit an
+        # empty <Penciller> and drop artist metadata. _rewrite_cbz_comicinfo
+        # still prefers each archive's own <Penciller> when present; this is
+        # the fallback (and the recovery path for CBZs whose <Penciller> was
+        # already stripped by the pre-fix run). authors come from
+        # .aio_series.json above.
+        if existing_details.get("artist"):
+            comic_data["artists"] = [
+                s.strip()
+                for s in str(existing_details["artist"]).split(",")
+                if s.strip()
+            ]
 
         try:
             enrich_from_anilist(
