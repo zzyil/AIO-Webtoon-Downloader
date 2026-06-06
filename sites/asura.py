@@ -248,7 +248,21 @@ class AsuraSiteHandler(BaseSiteHandler):
 
         comic.setdefault("slug", slug)
         comic.setdefault("name", title)
-        comic.setdefault("hid", str(comic.get("id") or slug))
+        # Stabilize the series hid against Asura's rotating slug hash. Asura
+        # bakes a rotating hex suffix into the slug
+        # ("sss-class-suicide-hunter-46f09241") and the prop-embedded seriesId
+        # is unreliable here (the generic props extractor grabs the nav block,
+        # not the series object — comic.get("id") is almost always None). Using
+        # the raw slug made the hid drift across crashes/resumes/site migrations
+        # (asurascans.com -> asuracomic.net, /comics/ -> /series/), which spawned
+        # duplicate "(hid=...)" folders and broke resume. Strip the trailing hash
+        # so one series maps to one stable folder. NOTE: only the *hid* (folder
+        # marker + resume key) is stabilized — `slug`/`identifier` keep the full
+        # slug because chapter URLs are built as /comics/<full-slug>/chapter/<n>.
+        # Migration: allocate_series_output_dir reuses pre-fix full-slug folders
+        # via its hash-tolerant _marker_matches (same -[0-9a-f]{6,}$ strip).
+        stable_hid = re.sub(r"-[0-9a-f]{6,}$", "", slug) or slug
+        comic.setdefault("hid", stable_hid)
         if comic.get("cover") and not comic.get("thumb"):
             comic["thumb"] = comic["cover"]
         comic["_base_url"] = base_url

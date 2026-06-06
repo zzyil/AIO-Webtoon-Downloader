@@ -391,11 +391,19 @@ def _sanitize_folder_component(name: str) -> str:
 def allocate_series_output_dir(title: str, hid: str, root: str = DEFAULT_OUTPUT_DIR) -> str:
     """Choose a per-series output folder.
 
-    Normally uses: root/<title>
-    If that folder is already claimed by a different hid (or looks non-empty with unknown hid),
-    uses: root/<title> (hid=<hid>)
+    Normally uses: root/<title>. Falls back to root/<title> (hid=<hid>) only on
+    a genuine collision: a DIFFERENT series with the same title that already has
+    downloaded content.
 
-    A hidden marker file stores the hid so multiple runs and multiple processes stay consistent.
+    A hidden marker file (.series_hid) stores the hid so multiple runs and
+    processes stay consistent. Matching is hash-tolerant: a marker is reused
+    when it equals the hid, or equals it after stripping a rotating hash suffix
+    (so the stabilized asura hid maps onto folders downloaded with the old
+    full-slug hid). An EMPTY existing folder is always reclaimed, even when a
+    stale marker points at a different hid — this prevents the empty orphan
+    folders left when a run crashes after allocation but before any chapter is
+    written and the next attempt carries a different hid. See _marker_matches
+    and the reclaim branch below.
     """
     clean_title = re.sub(r"\s*\(hid=[^)]+\)\s*$", "", str(title or "")).strip() or "comic"
     base = _sanitize_folder_component(clean_title)
@@ -416,23 +424,61 @@ def allocate_series_output_dir(title: str, hid: str, root: str = DEFAULT_OUTPUT_
     def _write_marker(folder: str):
         write_hid_marker(folder, str(hid))
 
+    def _strip_rotating_suffix(value: str) -> str:
+        # Asura (and similar) bake a rotating hex hash into the slug they use
+        # as the hid: "sss-class-suicide-hunter-46f09241". The asura handler
+        # now stabilizes the hid by stripping that hash, but folders downloaded
+        # before the fix are still marked with the OLD full-slug hid. Reduce
+        # both to a hash-free base so a stabilized hid maps onto the existing
+        # folder. Non-rotating hids (comick short ids, mangadex UUIDs whose
+        # groups never change) only reach here when existing != want, which
+        # for stable hids never happens — so this is effectively asura-only.
+        return re.sub(r"-[0-9a-f]{6,}$", "", str(value or ""))
+
+    def _marker_matches(existing: "str | None", want: str) -> bool:
+        # True when the folder belongs to this series. Exact match, or equal
+        # once a rotating hash suffix is stripped from both sides (migration
+        # for the stabilized asura hid). Require a non-empty base so two
+        # unrelated markers can't both collapse to "" and false-match.
+        if existing is None:
+            return False
+        if existing == str(want):
+            return True
+        base_existing = _strip_rotating_suffix(existing)
+        return bool(base_existing) and base_existing == _strip_rotating_suffix(str(want))
+
     with _AIOFileLock(lock_path):
         preferred = os.path.join(root, base)
         if os.path.exists(preferred):
             existing = _read_marker(preferred)
-            if existing == str(hid):
+            if _marker_matches(existing, hid):
+                # Converge the marker onto the current (canonical) hid so a
+                # stabilized hid is treated as an exact match next run.
+                if existing != str(hid):
+                    _write_marker(preferred)
                 return preferred
-            # If unclaimed AND empty-ish, claim it.
-            if existing is None and not _folder_nonempty(preferred):
+            # Empty folder: reclaim regardless of any stale marker — there is
+            # no downloaded content to protect. This is what kills the empty
+            # orphan folders left when a run crashes AFTER folder allocation
+            # (which eagerly writes .series_hid) but BEFORE any chapter is
+            # written, and the next attempt carries a different hid (asura
+            # slug rotation, or re-picking the series from another source).
+            # Pre-fix this branch required `existing is None`, so a stale
+            # marker forced a "(hid=...)" sibling and orphaned the empty bare
+            # folder. (grep: orphan bare folders)
+            if not _folder_nonempty(preferred):
                 _write_marker(preferred)
                 return preferred
-            # Otherwise collision: add hid suffix.
+            # Otherwise a genuine collision: a DIFFERENT series with the same
+            # title AND real downloaded content. Disambiguate with a suffix.
             candidate_base = _sanitize_folder_component(f"{clean_title} (hid={hid})")
             candidate = os.path.join(root, candidate_base)
             k = 2
             while os.path.exists(candidate):
                 ex = _read_marker(candidate)
-                if ex == str(hid):
+                if _marker_matches(ex, hid):
+                    if ex != str(hid):
+                        _write_marker(candidate)
                     return candidate
                 candidate = os.path.join(root, f"{candidate_base} ({k})")
                 k += 1
