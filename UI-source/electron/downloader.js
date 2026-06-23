@@ -195,6 +195,16 @@ function buildCliArgs(args) {
     // <Komikku-SAF>/local/ themselves). Search/library-initiated downloads
     // pick this up via App.jsx's settings.defaults spread.
     komikku: "--komikku",
+    // Content-aware JXL/AVIF transcode (--modernize, CBZ-only). Master toggle
+    // only; the valued knobs (--modernize-format / -distance / -quality /
+    // -min-saving) are emitted below the loops so they only appear when
+    // modernize is on AND the fast-path is satisfiable AND the value differs
+    // from the Python default (mirrors the webtoon-recompress knob gating).
+    // aio-dl.py hard-errors on --modernize with ANY fast-path-disabling flag,
+    // so the modernizeBlocked guard below strips the whole family when the
+    // effective args can't ride the CBZ byte-passthrough fast-path. Python
+    // side: grep '--modernize compatibility checks' + recompress_chapter_images_modern.
+    modernize: "--modernize",
     // Escape hatch for curl_cffi fast download path (2026-05-13). When the
     // user toggles this on in Settings, all handlers fall back to the
     // legacy ThreadPoolExecutor + dl_image cloudscraper path regardless
@@ -230,10 +240,30 @@ function buildCliArgs(args) {
   const recompressIncompatible =
     (args.format === "none" || args.format === "pdf") && args.komikku !== true;
 
+  // --modernize rides the CBZ byte-passthrough fast-path and aio-dl.py rejects
+  // it with a HARD error on any fast-path-disabling flag (grep '--modernize
+  // compatibility checks' — the seven conditions). This buildCliArgs is the
+  // single chokepoint for every spawn path, and the search/library paths
+  // spread raw settings.defaults (which can carry modernize:true alongside a
+  // conflicting quality/scaling/preserve), so strip the whole --modernize*
+  // family here whenever the effective args can't satisfy the fast-path —
+  // defense-in-depth behind the SettingsTab/DownloadTab UI guards. komikku
+  // coerces format→cbz BEFORE the Python check, so it keeps modernize valid
+  // regardless of the format value (stricter than webtoon: cbz only, NOT epub).
+  const modernizeBlocked =
+    (args.format !== "cbz" && args.komikku !== true) ||
+    (args.quality != null && Number(args.quality) < 100) ||
+    (args.scaling != null && Number(args.scaling) < 100) ||
+    args.cbzPreserveOriginals === false ||
+    args.noProcessing === true ||
+    (args.width != null && args.width !== "") ||
+    (args.aspectRatio != null && args.aspectRatio !== "");
+
   // Add boolean flags
   for (const [key, flag] of Object.entries(boolMap)) {
     if (args[key] === true) {
       if (key === "webtoonRecompress" && recompressIncompatible) continue;
+      if (key === "modernize" && modernizeBlocked) continue;
       cliArgs.push(flag);
     }
   }
@@ -276,6 +306,27 @@ function buildCliArgs(args) {
     }
     if (args.webtoonRecompressMethod != null && args.webtoonRecompressMethod !== 4) {
       cliArgs.push("--webtoon-recompress-method", String(args.webtoonRecompressMethod));
+    }
+  }
+
+  // --modernize valued knobs. Same gating shape as the webtoon knobs above:
+  // emit only when the master toggle is on, the fast-path is satisfiable
+  // (!modernizeBlocked), and the value differs from aio-dl.py's argparse
+  // default — keeps the spawn line clean (Python applies the defaults when a
+  // flag is absent). Defaults: format=auto, distance=1.0, quality=90,
+  // min-saving=0.92 (grep the '--modernize-*' add_argument calls in aio-dl.py).
+  if (args.modernize === true && !modernizeBlocked) {
+    if (args.modernizeFormat != null && args.modernizeFormat !== "auto") {
+      cliArgs.push("--modernize-format", String(args.modernizeFormat));
+    }
+    if (args.modernizeDistance != null && Number(args.modernizeDistance) !== 1.0) {
+      cliArgs.push("--modernize-distance", String(args.modernizeDistance));
+    }
+    if (args.modernizeQuality != null && Number(args.modernizeQuality) !== 90) {
+      cliArgs.push("--modernize-quality", String(args.modernizeQuality));
+    }
+    if (args.modernizeMinSaving != null && Number(args.modernizeMinSaving) !== 0.92) {
+      cliArgs.push("--modernize-min-saving", String(args.modernizeMinSaving));
     }
   }
 

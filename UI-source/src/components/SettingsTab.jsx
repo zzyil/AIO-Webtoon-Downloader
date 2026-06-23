@@ -448,6 +448,20 @@ export default function SettingsTab({ settings, onSave }) {
       webtoonRecompress: false,
       webtoonRecompressQuality: 85,
       webtoonRecompressMethod: 4,
+      // Content-aware JXL/AVIF transcode (opt-in, CBZ-only). Mirrors the
+      // --modernize* CLI flags (aio-dl.py, grep '--modernize compatibility
+      // checks'). Rides the CBZ byte-passthrough fast-path, so it's only valid
+      // with the fast-path conditions (format cbz/komikku, quality 100,
+      // scaling 100, preserve-originals on, no-processing off); the toggle in
+      // the Modernize section below auto-corrects those on enable, and
+      // downloader.js:buildCliArgs (modernizeBlocked) strips the flag if
+      // they're ever violated. DownloadTab's DEFAULT_FORM spread + App.jsx's
+      // search/library defaults spread propagate these to every download path.
+      modernize: false,
+      modernizeFormat: "auto",      // auto | jxl | avif | jxl+avif
+      modernizeQuality: 90,         // AVIF color quality (1-100)
+      modernizeDistance: 1.0,       // JXL grayscale distance (0.0 = lossless)
+      modernizeMinSaving: 0.92,     // keep transcode only if < orig * this
     },
     // Per-search defaults — read by SearchTab on mount via the same
     // settings.searchOpts namespace. Surfaced here so the user has one
@@ -561,6 +575,30 @@ export default function SettingsTab({ settings, onSave }) {
     local.defaults.format === "cbz" ||
     local.defaults.format === "epub";
 
+  // Whether --modernize is valid for the current default config. Unlike
+  // webtoon-recompress (which also allows epub), modernize is CBZ-ONLY: it
+  // emits .jxl/.avif pages that only survive the CBZ byte-passthrough
+  // fast-path (other formats re-encode them away). komikku coerces format→cbz
+  // so it qualifies too. Drives the toggle's disabled state + the on-enable
+  // auto-correct below; mirrors aio-dl.py's '--modernize compatibility checks'.
+  const modernizeAllowedDefault =
+    local.defaults.komikku || local.defaults.format === "cbz";
+
+  // Fast-path conditions modernize needs beyond the format gate (quality 100,
+  // scaling 100, preserve-originals on, no-processing off). The enable handler
+  // sets these, but the user can still break them afterward via the
+  // sliders/toggles above — surface that as a warning instead of letting
+  // aio-dl.py hard-error mid-spawn. buildCliArgs (modernizeBlocked) also strips
+  // --modernize defensively in that case, so a broken combo just skips
+  // modernize rather than failing the whole download.
+  const modernizeConflicts =
+    !!local.defaults.modernize && modernizeAllowedDefault && (
+      (local.defaults.quality ?? 100) < 100 ||
+      (local.defaults.scaling ?? 100) < 100 ||
+      local.defaults.cbzPreserveOriginals === false ||
+      local.defaults.noProcessing === true
+    );
+
   // Dirty count drives the SaveSettingsButton's pre-click visual
   // ("Save Settings · N changed" + amber ring/dot when > 0, "Up to date"
   // when 0). Recomputed cheaply on any local-state change; the diff
@@ -636,6 +674,12 @@ export default function SettingsTab({ settings, onSave }) {
         webtoonRecompress: false,
         webtoonRecompressQuality: 85,
         webtoonRecompressMethod: 4,
+        // Modernize transcode defaults — mirror the initial-state block above.
+        modernize: false,
+        modernizeFormat: "auto",
+        modernizeQuality: 90,
+        modernizeDistance: 1.0,
+        modernizeMinSaving: 0.92,
         // Komikku-mode default. Reset mirrors initial-state; see the
         // rationale block in the initial useState above.
         komikku: false,
@@ -828,6 +872,14 @@ export default function SettingsTab({ settings, onSave }) {
                     ...((next === "pdf" || next === "none") && !prev.defaults.komikku
                       ? { webtoonRecompress: false }
                       : {}),
+                    // --modernize is CBZ-only (stricter than webtoon, which
+                    // also allows epub): its .jxl/.avif pages only survive CBZ
+                    // output. Clear it whenever the new format isn't cbz and
+                    // komikku isn't coercing to cbz, so we never persist a
+                    // contradictory combo (mirrors modernizeAllowedDefault).
+                    ...(next !== "cbz" && !prev.defaults.komikku
+                      ? { modernize: false }
+                      : {}),
                   },
                 }));
               }}
@@ -956,6 +1008,196 @@ export default function SettingsTab({ settings, onSave }) {
             checked={!!local.defaults.komikku}
             onCheckedChange={(v) => setDefault("komikku", v)}
           />
+        </div>
+
+        {/* Modernize Images (JXL/AVIF) ───────────────────────────────
+            Opt-in content-aware transcode (--modernize family). Placed under
+            Komikku Output because it's CBZ-only and pairs naturally with the
+            per-chapter Komikku CBZs (komikku coerces format→cbz). The master
+            toggle is gated on modernizeAllowedDefault (komikku || format cbz)
+            and, on enable, auto-corrects the fast-path conditions (quality 100
+            / scaling 100 / preserve-originals on / no-processing off) so the
+            saved config can't hard-error at spawn — mirrors the format=none →
+            keepImages auto-enable precedent above. The valued knobs map 1:1 to
+            the CLI: codec routing, JXL distance, AVIF quality, min-saving.
+            DownloadTab's DEFAULT_FORM spread + App.jsx's defaults spread carry
+            these to every download; downloader.js:buildCliArgs maps modernize*
+            → --modernize* and strips them if the fast-path is disabled. Needs
+            pillow-jxl-plugin in the env (bundled via requirements.txt on
+            first-time setup; setup.js logs codec availability). */}
+        <SectionHeader>Modernize Images (JXL/AVIF)</SectionHeader>
+        <p className="text-[10px] text-muted-foreground -mt-1 mb-2 leading-snug">
+          Re-encode JPEG/PNG pages to <span className="font-mono">JXL</span>{" "}
+          (grayscale line art) or <span className="font-mono">AVIF</span>{" "}
+          (color) before packaging — visually-lossless storage savings for a
+          reader that decodes them. Per-page choice; already-efficient
+          WebP/AVIF/JXL pages are left untouched, and a page is only replaced
+          when the new file actually comes out smaller (never bloats). CBZ only
+          — rides the byte-passthrough fast-path, so it pairs with Komikku
+          output and keeps the source resolution.
+        </p>
+        <div className="space-y-3">
+          <div className="flex items-start gap-3">
+            <Switch
+              checked={!!local.defaults.modernize && modernizeAllowedDefault}
+              onCheckedChange={(v) => {
+                if (!modernizeAllowedDefault) return;
+                if (v) {
+                  // Enable + auto-correct the fast-path conditions modernize
+                  // requires (aio-dl.py hard-errors otherwise). The quality /
+                  // scaling sliders are moot under modernize anyway — it
+                  // replaces the page bytes with JXL/AVIF, so a prior re-encode
+                  // would just be wasted generation loss. Mirrors the
+                  // format=none → keepImages auto-enable above.
+                  setLocal((prev) => ({
+                    ...prev,
+                    defaults: {
+                      ...prev.defaults,
+                      modernize: true,
+                      quality: 100,
+                      scaling: 100,
+                      cbzPreserveOriginals: true,
+                      noProcessing: false,
+                    },
+                  }));
+                } else {
+                  setDefault("modernize", false);
+                }
+              }}
+              disabled={!modernizeAllowedDefault}
+              className="mt-0.5"
+            />
+            <div className="flex-1">
+              <Label className={cn("text-xs cursor-pointer", !modernizeAllowedDefault && "opacity-40")}>
+                Transcode pages to JXL / AVIF
+              </Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Applies to every CBZ download — direct URL, search-initiated,
+                and library re-downloads. Idempotent: re-running over an
+                already-modernized series skips pages that are already JXL/AVIF.
+              </p>
+              {!modernizeAllowedDefault && (
+                <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug">
+                  Unavailable while the default format is{" "}
+                  <span className="font-mono">{(local.defaults.format || "").toUpperCase()}</span>{" "}
+                  — modernize writes JXL/AVIF pages that only survive CBZ output.
+                  Switch the default format to CBZ (or enable Komikku) to use it.
+                </p>
+              )}
+            </div>
+          </div>
+          {local.defaults.modernize && modernizeAllowedDefault && (
+            <div className="pl-12 animate-slide-up space-y-3">
+              {modernizeConflicts && (
+                <p className="text-[10px] text-yellow-500 dark:text-yellow-400 leading-snug">
+                  Heads up — modernize needs the CBZ byte-passthrough fast-path,
+                  but your current defaults disable it:
+                  {(local.defaults.quality ?? 100) < 100 && (
+                    <> <span className="font-mono">Quality&nbsp;{local.defaults.quality}</span></>
+                  )}
+                  {(local.defaults.scaling ?? 100) < 100 && (
+                    <> <span className="font-mono">Scaling&nbsp;{local.defaults.scaling}%</span></>
+                  )}
+                  {local.defaults.cbzPreserveOriginals === false && (
+                    <> <span className="font-mono">preserve-originals&nbsp;off</span></>
+                  )}
+                  {local.defaults.noProcessing === true && (
+                    <> <span className="font-mono">no-processing&nbsp;on</span></>
+                  )}
+                  . The downloader will skip modernize until these are reset
+                  (Quality 100, Scaling 100%, CBZ preserve-originals on,
+                  No&nbsp;processing off).
+                </p>
+              )}
+              <div>
+                <Label className="text-xs">Codec routing</Label>
+                <Select
+                  value={local.defaults.modernizeFormat ?? "auto"}
+                  onChange={(e) => setDefault("modernizeFormat", e.target.value)}
+                  className="mt-1"
+                >
+                  <option value="auto">Auto — JXL for B&amp;W, AVIF for color</option>
+                  <option value="jxl">JXL only</option>
+                  <option value="avif">AVIF only</option>
+                  <option value="jxl+avif">JXL + AVIF — encode both, keep smaller</option>
+                </Select>
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  <span className="font-mono">Auto</span> decides per page (the
+                  right call for mixed libraries). Oversized pages
+                  (&gt; 8192&nbsp;px) always use JXL, except under AVIF-only
+                  where they're left untouched.
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-x-6 gap-y-3">
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <Label className="text-xs">JXL distance (B&amp;W)</Label>
+                    <Badge variant="secondary" className="font-mono tabular-nums">
+                      {(local.defaults.modernizeDistance ?? 1.0) === 0
+                        ? "lossless"
+                        : (local.defaults.modernizeDistance ?? 1.0).toFixed(1)}
+                    </Badge>
+                  </div>
+                  <Slider
+                    value={local.defaults.modernizeDistance ?? 1.0}
+                    onValueChange={(v) => setDefault("modernizeDistance", v)}
+                    min={0}
+                    max={3}
+                    step={0.1}
+                  />
+                  <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                    Butteraugli distance for grayscale → JXL.{" "}
+                    <span className="font-mono">1.0</span> = visually lossless
+                    (default); lower = larger/closer to source;{" "}
+                    <span className="font-mono">0.0</span> = mathematically
+                    lossless (much larger; only wins on PNG sources).
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <Label className="text-xs">AVIF quality (color)</Label>
+                    <Badge variant="secondary" className="font-mono tabular-nums">
+                      {local.defaults.modernizeQuality ?? 90}
+                    </Badge>
+                  </div>
+                  <Slider
+                    value={local.defaults.modernizeQuality ?? 90}
+                    onValueChange={(v) => setDefault("modernizeQuality", v)}
+                    min={1}
+                    max={100}
+                  />
+                  <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                    AVIF quality for color pages.{" "}
+                    <span className="font-mono">90</span> = visually lossless
+                    (default); <span className="font-mono">85</span> =
+                    aggressive (smaller; artifacts only under pixel-peeping).
+                  </p>
+                </div>
+              </div>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Minimum saving to replace a page</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    ≥{Math.round((1 - (local.defaults.modernizeMinSaving ?? 0.92)) * 100)}%
+                  </Badge>
+                </div>
+                <Slider
+                  value={local.defaults.modernizeMinSaving ?? 0.92}
+                  onValueChange={(v) => setDefault("modernizeMinSaving", v)}
+                  min={0.5}
+                  max={1}
+                  step={0.01}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  A transcoded page is kept only if it's at least this much
+                  smaller than the original — otherwise the original bytes stay.
+                  Default <span className="font-mono">≥8%</span>{" "}
+                  (<span className="font-mono">min-saving 0.92</span>) skips
+                  already-dense pages so the archive never grows.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Metadata Enrichment ────────────────────────────────────

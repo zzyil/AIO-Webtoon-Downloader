@@ -23,6 +23,14 @@ curl_cffi>=0.7.0  # MangaFire fast image-download path (HTTP/2 + Chrome120 TLS f
 pyvips>=2.2.0
 pyvips-binary>=8.18.0
 
+# --modernize (opt-in) — content-aware JXL/AVIF transcode in
+# aio-dl.py:recompress_chapter_images_modern. pillow-jxl-plugin registers the
+# JXL encoder/decoder in Pillow; AVIF is native in Pillow >= 12 (no extra dep).
+# Only needed when you pass --modernize; the import is lazy and validated at
+# startup, so installs without it still run everything else.
+pillow-jxl-plugin
+# pillow-avif-plugin  # only on Pillow < 12 (12+ has AVIF write support built in)
+
 # === Optional ML-rating extras for search v5.1 ===
 # These are NOT installed by default — install only if you want CLIP-IQA+ /
 # NIQE / DISTS image-quality ranking in cross-site search results. Triggered

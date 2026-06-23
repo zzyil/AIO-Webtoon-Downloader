@@ -83,6 +83,16 @@ const DEFAULT_FORM = {
   webtoonRecompress: false,
   webtoonRecompressQuality: 85,
   webtoonRecompressMethod: 4,
+  // Content-aware JXL/AVIF transcode (--modernize, CBZ-only). Master toggle +
+  // knobs; settings.defaults spreads these onto the form via formDefaults()
+  // (line ~123). handleStart emits them when modernizeAllowed; downloader.js
+  // :buildCliArgs maps modernize* → --modernize* and strips the family if the
+  // CBZ fast-path is disabled. aio-dl.py: grep '--modernize compatibility checks'.
+  modernize: false,
+  modernizeFormat: "auto",
+  modernizeQuality: 90,
+  modernizeDistance: 1.0,
+  modernizeMinSaving: 0.92,
   // Komikku-compatible per-chapter CBZ output (2026-05-12, Komikku LocalSource format).
   // When on, Python force-coerces format=cbz / keep-chapters / no-final-file,
   // writes per-chapter ComicInfo.xml inside each CBZ, plus cover.jpg +
@@ -164,6 +174,13 @@ export default function DownloadTab({
   const recompressAllowed =
     form.komikku || form.format === "cbz" || form.format === "epub";
 
+  // --modernize is CBZ-only (stricter than webtoon's cbz/epub): its .jxl/.avif
+  // pages only survive the CBZ byte-passthrough fast-path. komikku coerces
+  // format→cbz so it qualifies. Gates the handleStart emit below so a stale
+  // saved default can't push --modernize onto a pdf/none/epub job.
+  const modernizeAllowed =
+    form.komikku || form.format === "cbz";
+
   // Build CLI args from form state and trigger download
   const handleStart = () => {
     const urls = form.urls.split("\n").map((u) => u.trim()).filter(Boolean);
@@ -224,6 +241,19 @@ export default function DownloadTab({
     // this is true.
     if (form.komikku) {
       args.komikku = true;
+    }
+    // Content-aware JXL/AVIF transcode (--modernize, CBZ-only). Emit the master
+    // toggle + valued knobs; downloader.js:buildCliArgs maps them and strips the
+    // whole family if the effective args can't ride the CBZ fast-path (quality
+    // 100 / scaling 100 / preserve-on / no-processing-off / no width-aspect
+    // override), so we don't re-check those here. modernizeAllowed gates on
+    // format like webtoon so a stale saved default never reaches a pdf/none/epub job.
+    if (form.modernize && modernizeAllowed) {
+      args.modernize = true;
+      args.modernizeFormat = form.modernizeFormat;
+      args.modernizeDistance = form.modernizeDistance;
+      args.modernizeQuality = form.modernizeQuality;
+      args.modernizeMinSaving = form.modernizeMinSaving;
     }
     if (form.splitMode === "size" && form.splitValue) args.split = form.splitValue;
     if (form.splitMode === "chapters" && form.splitValue) args.split = `${form.splitValue}ch`;
@@ -310,6 +340,12 @@ export default function DownloadTab({
                   // recompress valid (mirror of recompressAllowed).
                   ...((f.value === "pdf" || f.value === "none") && !prev.komikku
                     ? { webtoonRecompress: false }
+                    : {}),
+                  // --modernize is CBZ-only (stricter than webtoon): clear it
+                  // whenever the picked format isn't cbz and komikku isn't
+                  // coercing to cbz, so an incompatible combo can't be launched.
+                  ...(f.value !== "cbz" && !prev.komikku
+                    ? { modernize: false }
                     : {}),
                 }));
               }}

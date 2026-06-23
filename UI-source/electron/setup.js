@@ -796,6 +796,31 @@ class PythonSetup {
     }
     this._onLog("All runtime imports verified ✓");
 
+    // ── Optional image-modernize codec probe (non-fatal) ──
+    // pillow-jxl-plugin (in requirements.txt → installed above) registers the
+    // JXL encoder used by the opt-in --modernize transcode stage; AVIF is
+    // native in Pillow >= 12. This is deliberately NOT in REQUIRED_IMPORTS:
+    // like pyvips it's an optional accelerator, so a user who never passes
+    // --modernize doesn't need it and we don't want to brick setup over it on
+    // some exotic platform without a JXL wheel. We just surface availability
+    // in the setup log so the codecs are visibly bundled on first-time setup,
+    // and catch the "installed but native extension won't load" case early
+    // (aio-dl.py also hard-errors at --modernize time with an install hint).
+    this._onLog("Checking image-modernize codecs (JXL/AVIF, optional)…");
+    try {
+      const codecOut = await this._runPython([
+        "-c",
+        "import pillow_jxl; from PIL import Image; Image.init(); " +
+          "print('JXL', 'JXL' in Image.SAVE, '| AVIF', 'AVIF' in Image.SAVE)",
+      ]);
+      this._onLog(`  modernize codecs: ${codecOut.trim()} ✓`);
+    } catch (err) {
+      this._onLog(
+        "  modernize codecs unavailable — --modernize will be rejected until " +
+          `'pip install pillow-jxl-plugin' succeeds. Detail: ${err.message}`
+      );
+    }
+
     // ── End-to-end bundle verification ──
     // Verify aio-dl.py's entire dependency tree loads — including all
     // 40+ handlers in sites/__init__.py and the deferred-import target
