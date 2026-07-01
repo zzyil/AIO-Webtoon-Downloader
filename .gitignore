@@ -84,4 +84,7 @@ test_downloads.py
 # per-machine scheduler locks, not source.
 /UI/
 /bench/
+# Local dev tooling (regression-test scripts, library audit/convert scripts)
+# — not shipped, same policy as /bench/.
+/tools/
 .claude/

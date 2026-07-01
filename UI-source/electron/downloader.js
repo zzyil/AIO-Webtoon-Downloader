@@ -179,6 +179,9 @@ function buildCliArgs(args) {
     // in aio_search_cli.find_alternatives_for_direct_url which passes
     // img_quality_cache=None into search_all when set.
     seededRatingOnly: "--seeded-rating-only",
+    // multiSourceLazy is deliberately NOT here — it's default-ON whenever
+    // multi-source is on (absent-means-on), which boolMap's `=== true`
+    // test can't express. See the dedicated chokepoint below the loops.
     // LINE Webtoon WebP recompression master toggle (Phase 1, 2026-05-11).
     // Python-side gates the actual encode pass on handler.name match, so
     // emitting this flag for non-webtoons.com downloads is a safe no-op.
@@ -279,6 +282,23 @@ function buildCliArgs(args) {
     cliArgs.push("--no-cbz-preserve-originals");
   }
 
+  // --multi-source-lazy: opt-out nested inside the multi-source opt-in
+  // (2026-07-02). Default-ON for every multi-source download — defer the
+  // ~30-80 s cross-site alternatives discovery until a chapter actually
+  // fails (aio-dl.py's _ms_lazy_pending hook in _process_chapter_strict).
+  // Absent-means-on like cbzPreserveOriginals above: library/search spawn
+  // paths spread saved settings.defaults, and dicts saved before the
+  // multiSourceLazy field existed must not silently revert to the eager
+  // discovery — only an explicit false (user unticked the nested toggle in
+  // Settings → Default Multi-source Fallback or the New tab) suppresses
+  // the flag. Gated on multiSource so defaults-spread paths without
+  // multi-source keep a clean spawn line (the flag would be a Python-side
+  // no-op anyway). Prefetched search downloads emit it too — harmless,
+  // Python's lazy arming excludes --multi-source-prefetched mode.
+  if (args.multiSource === true && args.multiSourceLazy !== false) {
+    cliArgs.push("--multi-source-lazy");
+  }
+
   // Global collapse-splits toggle (item 8 in snappy-forging-waffle.md,
   // updated 2026-05-27 for the opt-in flip). aio-dl.py now defaults
   // collapse=False; we emit the positive --collapse-splits flag only
@@ -327,6 +347,15 @@ function buildCliArgs(args) {
     }
     if (args.modernizeMinSaving != null && Number(args.modernizeMinSaving) !== 0.92) {
       cliArgs.push("--modernize-min-saving", String(args.modernizeMinSaving));
+    }
+    // CPU<->size encoder knobs. Same value-differs gating; Python defaults are
+    // effort=7 (JXL, 1-9) and avif-speed=6 (AVIF, 0-10). Note speed=0 is a
+    // valid non-default (slowest/smallest), so the !== 6 test emits it.
+    if (args.modernizeEffort != null && Number(args.modernizeEffort) !== 7) {
+      cliArgs.push("--modernize-effort", String(args.modernizeEffort));
+    }
+    if (args.modernizeAvifSpeed != null && Number(args.modernizeAvifSpeed) !== 6) {
+      cliArgs.push("--modernize-avif-speed", String(args.modernizeAvifSpeed));
     }
   }
 
