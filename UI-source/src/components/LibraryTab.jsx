@@ -288,6 +288,11 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
     if (d.imageWorkers && d.imageWorkers !== 3) args.imageWorkers = d.imageWorkers;
     if (d.httpTimeout && d.httpTimeout !== 30) args.httpTimeout = d.httpTimeout;
     if (d.httpMaxRetries && d.httpMaxRetries !== 6) args.httpMaxRetries = d.httpMaxRetries;
+    // Multi-source lazy discovery needs no injection here: the App.jsx
+    // wrapper spreads settings.defaults (which carries multiSource +
+    // multiSourceLazy) under these args, and downloader.js's chokepoint
+    // emits --multi-source-lazy whenever multiSource is on and
+    // multiSourceLazy isn't an explicit false.
 
     onStartDownload(meta.url, args);
     onSwitchTab("queue");
@@ -1149,6 +1154,11 @@ export default function LibraryTab({
     if (settings?.updateChecksUseSeededRating !== false) {
       args.seededRatingOnly = true;
     }
+    // Multi-source lazy discovery (--multi-source-lazy) needs no injection
+    // here: App.jsx's wrapper spreads settings.defaults (multiSource +
+    // multiSourceLazy) under these args, and downloader.js's chokepoint
+    // emits the flag whenever multiSource is on and multiSourceLazy isn't
+    // an explicit false — update downloads inherit the global default.
     return { url: meta.url, args };
   }, [settings]);
 

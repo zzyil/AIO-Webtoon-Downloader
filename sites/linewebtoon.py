@@ -15,6 +15,10 @@ What this module owns:
     parsed with two regexes (Mihon's approach) and each layer image is
     surfaced as a separate page in the URL list. PIL alpha-compositing is
     deferred to v2; static layers are intact / lossless.
+  - Background-music archival — standard episodes flagged `hasBgm` have their
+    audio resolved through Naver AudioCloud (audioId → signed .m4a) and embedded
+    INSIDE the chapter CBZ under _aio/ for the user's reader (grep
+    _resolve_bgm_specs). Motion-toons archive their own sounds from the manifest.
   - Cross-site search via the public HTML endpoint
     (`/en/search?keyword=…`). Combined originals + canvas results.
   - is_official=True / publisher="LINE Webtoon" annotation on every
@@ -57,6 +61,8 @@ C:\\Users\\legoc\\.claude\\plans\\explore-the-codebase-and-crystalline-pinwheel-
 
 from __future__ import annotations
 
+import base64
+import json
 import re
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
@@ -64,6 +70,7 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 from bs4 import BeautifulSoup, FeatureNotFound
 
 from .base import (
+    AssetSpec,
     BaseSiteHandler,
     IncompleteChapterError,
     SearchHit,
@@ -111,6 +118,30 @@ _MOTIONTOON_PATH_RE = re.compile(r"jpg\s*:\s*['\"]([^'\"\{]+)\{")
 # title_no extraction fallback (when canonical link is absent or malformed).
 # Accepts both modern (title_no=) and legacy (titleNo=) param names.
 _TITLE_NO_RE = re.compile(r"\b(?:title_no|titleNo)=(\d+)", re.IGNORECASE)
+
+# Background-music (BGM) resolution for standard (non-motion) episodes. The
+# desktop viewer embeds `window.__audioProperties__ = { …, episodeBgmList:
+# [{audioId, filePath, …}] }`. filePath is a LEGACY path that 404s on every
+# phinf CDN — the audioId is the real key. It resolves through Naver's
+# AudioCloud gateway: GET the token endpoint (the session's www.webtoons.com
+# Referer from configure_session satisfies its anti-hotlink check; NO
+# login/OAuth for public episodes) → the JSON `result.playToken` is base64
+# JSON whose `audioInfo.url` is a short-lived (~1h) signed .m4a on
+# global*-st-audiop.pstatic.net. Verified live 2026-07-01 against a real
+# hasBgm episode (token → signed URL → ftypM4A bytes). Param casing is STRICT:
+# quality=MIDDLE, acceptCodecs=AAC,MP3 (uppercase) — wrong casing → HTTP 400
+# {"message":"Invalid request."}. Grep _resolve_bgm_specs /
+# _resolve_audiocloud_url; the resolved specs ride the same aux pipeline as
+# motion sounds — embedded INSIDE the chapter CBZ under _aio/ (see the "Sidecar
+# auxiliary assets" invariant in CLAUDE.md). The delivered stream is AAC even
+# though filePath says .mp3.
+_AUDIOCLOUD_TOKEN_URL = (
+    "https://apis.naver.com/audiocweb/audiocplayogwweb/play/audio/"
+    "{audio_id}/audio/token?quality=MIDDLE&acceptCodecs=AAC,MP3"
+)
+# AudioCloud codec name → sidecar file extension. AAC is delivered in an MP4
+# container (objectType mp4a.40.2) → .m4a; MP3 stays .mp3. Default .m4a.
+_AUDIOCLOUD_CODEC_EXT = {"AAC": ".m4a", "MP3": ".mp3"}
 
 
 # ---------------------------------------------------------------- the handler
@@ -577,6 +608,14 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                     "publisher": publisher_label,
                     "group_name": publisher_label,
                     "thumbnail": thumb,
+                    # Audio-archival hint (faithful-archival feature). The
+                    # mobile API exposes only a boolean — NOT the BGM blob URL
+                    # (that lives in the desktop viewer's JS, a follow-up). A
+                    # non-motion episode with has_bgm gets an audio_reference
+                    # (presence marker) in get_chapter_images; motion episodes
+                    # carry real .mp3s from the manifest instead. Grep
+                    # _stash_normal_audio + _extract_motion_toon_pages.
+                    "has_bgm": bool(ep.get("hasBgm")),
                 }
             )
         return chapters
@@ -640,7 +679,7 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
         # in an inline script's `documentURL` + `jpg` template literals.
         if soup.select_one("#ozViewer") is not None:
             return self._extract_motion_toon_pages(
-                response.text, scraper, make_request
+                response.text, scraper, make_request, chapter
             )
 
         image_urls: List[str] = []
@@ -669,27 +708,175 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                 host=urlparse(chapter_url).netloc or "webtoons.com",
                 reason="no_images_found",
             )
+
+        # Normal (non-motion) episode with a background-music flag: resolve the
+        # real BGM track(s) to signed .m4a sidecars (falls back to a presence
+        # marker if resolution fails). response.text is the viewer HTML that
+        # carries the episodeBgmList blob.
+        self._stash_normal_audio(chapter, response.text, scraper)
         return image_urls
+
+    def _stash_normal_audio(self, chapter: Dict, html: str, scraper) -> None:
+        """For a standard episode flagged has_bgm, resolve the real background
+        track(s) to downloadable signed URLs and stash them as audio_download
+        aux so they ride the sidecar pipeline (→ a real .m4a embedded INSIDE the
+        chapter CBZ under _aio/, exactly like motion sounds). Falls back to the
+        old presence-only audio_reference marker when resolution yields nothing (no
+        episodeBgmList on the page, or every AudioCloud lookup failed) so the
+        reader still learns BGM exists.
+
+        Motion episodes DON'T call this — they get their sounds from
+        assets.sound in the motion manifest (grep _extract_motion_toon_pages).
+        Known follow-up: a motion-toon that ALSO carries a separate episode BGM
+        (hasBgm on an #ozViewer page) is not handled — the motion branch returns
+        before here, and it's unverified without a live motion+BGM episode."""
+        if not chapter.get("has_bgm"):
+            return
+        specs = self._resolve_bgm_specs(html, scraper)
+        if not specs:
+            specs = [
+                AssetSpec(
+                    type="audio_reference",
+                    source_url=chapter.get("url"),
+                    meta={"provider": "webtoons_bgm", "has_bgm": True},
+                )
+            ]
+        chapter["_aux_assets"] = specs
+
+    def _resolve_bgm_specs(self, html: str, scraper) -> List[AssetSpec]:
+        """Parse episodeBgmList from the viewer HTML and resolve each entry's
+        audioId to a signed audio URL. Returns audio_download AssetSpecs (empty
+        on any miss/failure — the caller then falls back to a presence marker).
+        Each spec carries meta has_bgm=True so the aux writer flags the chapter
+        as having BGM even if the later byte-download fails (grep the
+        audio_download branch in _materialize_chapter_aux)."""
+        specs: List[AssetSpec] = []
+        for i, entry in enumerate(self._extract_episode_bgm_list(html)):
+            if not isinstance(entry, dict):
+                continue
+            audio_id = str(entry.get("audioId") or "").strip()
+            if not audio_id:
+                continue
+            resolved = self._resolve_audiocloud_url(audio_id, scraper)
+            if not resolved:
+                continue
+            url, codec = resolved
+            ext = _AUDIOCLOUD_CODEC_EXT.get(str(codec or "").upper(), ".m4a")
+            ep = entry.get("episodeNo")
+            order = entry.get("sortOrder") or (i + 1)
+            fname = f"bgm_{ep}_{order}{ext}" if ep else f"bgm_{order}{ext}"
+            specs.append(
+                AssetSpec(
+                    type="audio_download",
+                    source_url=url,
+                    filename=fname,
+                    mime="audio/mp4" if ext == ".m4a" else "audio/mpeg",
+                    meta={
+                        "provider": "webtoons_bgm",
+                        "has_bgm": True,
+                        "audio_id": audio_id,
+                        "codec": codec,
+                    },
+                )
+            )
+        return specs
+
+    @staticmethod
+    def _extract_episode_bgm_list(html: str) -> List[Dict]:
+        """Balanced-bracket-extract the episodeBgmList JSON array from the
+        inline window.__audioProperties__ block. The array value is valid JSON
+        (quoted keys), so we slice from episodeBgmList's `[` to the matching `]`
+        and json.loads it. Returns [] on any miss — non-BGM episodes have no
+        such block, so [] is the silent common case."""
+        if not html:
+            return []
+        i = html.find("episodeBgmList")
+        if i < 0:
+            return []
+        start = html.find("[", i)
+        if start < 0:
+            return []
+        depth = 0
+        for j in range(start, len(html)):
+            c = html[j]
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        data = json.loads(html[start : j + 1])
+                    except ValueError:
+                        return []
+                    return data if isinstance(data, list) else []
+        return []
+
+    @staticmethod
+    def _resolve_audiocloud_url(audio_id: str, scraper):
+        """audioId → (signed_url, codec) via the AudioCloud PD token endpoint.
+        Returns None on any failure (caller degrades to a presence marker).
+
+        Uses a direct scraper.get, NOT make_request, on purpose: make_request
+        raises + does 6 backoff retries on any non-2xx, which for a best-effort
+        aux lookup would stall every has_bgm chapter for ~a minute if Naver ever
+        changed the API. The session already carries the www.webtoons.com
+        Referer the endpoint needs (configure_session), so a bare GET suffices
+        (verified: session-default headers alone → HTTP 200)."""
+        token_url = _AUDIOCLOUD_TOKEN_URL.format(audio_id=quote_plus(audio_id))
+        try:
+            resp = scraper.get(token_url, timeout=15)
+            if getattr(resp, "status_code", 0) != 200:
+                return None
+            payload = resp.json()
+        except Exception:
+            return None
+        token = ((payload or {}).get("result") or {}).get("playToken")
+        if not isinstance(token, str) or not token:
+            return None
+        try:
+            decoded = json.loads(base64.b64decode(token + "=" * (-len(token) % 4)))
+        except Exception:
+            return None
+        info = decoded.get("audioInfo") if isinstance(decoded, dict) else None
+        if not isinstance(info, dict):
+            return None
+        url = info.get("url")
+        if not isinstance(url, str) or not url:
+            return None
+        return url, info.get("codec")
 
     def _extract_motion_toon_pages(
         self,
         html: str,
         scraper,
         make_request,
+        chapter: Optional[Dict] = None,
     ) -> List[str]:
-        """Mihon-style motion-toon support: each layer becomes a separate
-        page in the URL list.
+        """Motion-toon support: each rendered layer becomes a separate page in
+        the URL list, AND the full motion payload (raw manifest/timeline JSON +
+        every .mp3 sound + the layer->page map) is captured as aux on the
+        chapter dict for faithful archival (the user's reader replays the
+        animation; we don't render it here). See sites.base.AssetSpec +
+        aio-dl.py _materialize_chapter_aux (embeds them into the CBZ under _aio/).
 
         The viewer page embeds inline JS:
             documentURL: '<full URL to JSON manifest>'
             jpg: '<URL template prefix>{=filename}'
-        The manifest's `assets.images` map keys filenames; keys containing
-        `layer` are the rendered panel layers (other keys are masks/sounds).
+        The manifest maps image keys -> relative paths. Per the BDCoMa
+        motiontoonJson reference (verified 2026-07-01) the map is
+        `assets.image` (SINGULAR); older code here read `assets.images`
+        (plural), so we accept EITHER. Keys are `"NNNN-<procedural-name>"`
+        (e.g. "0000-layer<id>", "0001-<id>") — the zero-padded index
+        prefix gives render order via a plain key sort, and NOT every key
+        contains "layer" (the old `if "layer" not in key` filter silently
+        dropped the "0001-<id>"-style pages — the bug this fixes). Every
+        `assets.image` entry IS a rendered page, so we use them all. Sounds live
+        in `assets.sound` ({filename.mp3: relpath}); both image and sound paths
+        share the one base (`template_path`), confirmed by the reference.
 
-        Trade-off: animation is lost (we don't run the canvas timeline);
-        static layer images are intact and lossless. PIL alpha-composite is
-        deferred to v2 — the layer-as-page approach is what Mihon ships in
-        production.
+        Trade-off unchanged for the PAGES: we surface layers as static pages
+        (no canvas timeline execution); the animation data is preserved in the
+        sidecar manifest for the reader to replay.
         """
         doc_match = _MOTIONTOON_DOC_RE.search(html or "")
         path_match = _MOTIONTOON_PATH_RE.search(html or "")
@@ -706,6 +893,7 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
         try:
             response = make_request(manifest_url, scraper)
             manifest = response.json()
+            raw_manifest_bytes = response.content  # verbatim archival copy
         except Exception as exc:
             raise IncompleteChapterError(
                 pages_ok=0,
@@ -714,26 +902,31 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                 reason=f"motion_toon_manifest_fetch_failed:{type(exc).__name__}",
             ) from exc
 
-        images = (manifest.get("assets") or {}).get("images") or {}
-        if not isinstance(images, dict):
+        assets = manifest.get("assets") or {}
+        # Singular `image` (BDCoMa reference) OR legacy plural `images`.
+        image_map = assets.get("image") or assets.get("images") or {}
+        if not isinstance(image_map, dict) or not image_map:
             raise IncompleteChapterError(
                 pages_ok=0,
                 pages_total=0,
                 host="webtoons.com",
                 reason="motion_toon_manifest_malformed",
             )
-        # Stable order: sort layer keys so successive runs produce identical
-        # page sequences. Webtoons motion-toon manifests use lexicographic
-        # layer keys (e.g. layer_001, layer_002) — sorted() on the keys
-        # gives the natural rendering order.
+        # Stable order: the "NNNN-" zero-padded index prefix means a plain key
+        # sort yields the natural render order. Use EVERY image entry — the map
+        # is the full rendered page set (see docstring: filtering on "layer"
+        # dropped the "0001-<id>"-style keys).
+        keys = sorted(image_map.keys())
+
         page_urls: List[str] = []
-        for key in sorted(images.keys()):
-            if "layer" not in key.lower():
-                continue
-            filename = images[key]
+        layer_map: List[Dict] = []
+        for key in keys:
+            filename = image_map[key]
             if not filename or not isinstance(filename, str):
                 continue
+            page_index = len(page_urls)
             page_urls.append(template_path + filename)
+            layer_map.append({"key": key, "file": filename, "page": page_index})
 
         if not page_urls:
             raise IncompleteChapterError(
@@ -742,9 +935,60 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                 host="webtoons.com",
                 reason="motion_toon_no_layers",
             )
+
+        # Capture the full motion payload as sidecar aux on the chapter dict.
+        if chapter is not None:
+            self._stash_motion_aux(
+                chapter, raw_manifest_bytes, assets, template_path, layer_map
+            )
+
         # No phinf rewrite / quality strip — motion-toon URLs use a different
         # CDN template that may not honor those query knobs.
         return page_urls
+
+    @staticmethod
+    def _stash_motion_aux(
+        chapter: Dict,
+        raw_manifest_bytes: bytes,
+        assets: Dict,
+        template_path: str,
+        layer_map: List[Dict],
+    ) -> None:
+        """Build the AssetSpec list for a motion-toon: the raw manifest JSON,
+        one audio_download per `assets.sound` entry, and the layer->page map.
+        The raw manifest is the source of truth — even if a sound URL guess
+        404s (best-effort download), the reader can reconstruct paths from it.
+        Sound URL follows the same `template_path + relpath` base the layer
+        images use (the one live-verification point flagged in the plan); if it
+        proves wrong on a real motion-toon the manifest still carries the
+        canonical paths."""
+        specs: List[AssetSpec] = [
+            AssetSpec(
+                type="motion_manifest",
+                data=raw_manifest_bytes,
+                filename="motion.json",
+                mime="application/json",
+                meta={"template_path": template_path},
+            ),
+            AssetSpec(type="motion_layer", meta={"layers": layer_map}),
+        ]
+
+        sound_map = assets.get("sound") or {}
+        if isinstance(sound_map, dict):
+            for name, relpath in sound_map.items():
+                if not relpath or not isinstance(relpath, str):
+                    continue
+                specs.append(
+                    AssetSpec(
+                        type="audio_download",
+                        source_url=template_path + relpath,
+                        filename=str(name),
+                        mime="audio/mpeg",
+                        meta={"kind": "motion_sound", "manifest_key": str(name)},
+                    )
+                )
+
+        chapter["_aux_assets"] = specs
 
     # ------------------------------------------------------------- search
 

@@ -45,6 +45,7 @@ from .tecnoxmoon import TecnoxmoonSiteHandler
 from .violetscans import VioletScansSiteHandler
 from .boratscans import BoratScansSiteHandler
 from .linewebtoon import LineWebtoonSiteHandler
+from .tapas import TapasSiteHandler
 from .kappabeast import KappabeastSiteHandler
 
 # MangaThemesia sites - unified handler
@@ -94,6 +95,7 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     VioletScansSiteHandler(),
     BoratScansSiteHandler(),
     LineWebtoonSiteHandler(),
+    TapasSiteHandler(),
     ManhwaReadHandler(),
     KappabeastSiteHandler(),
 )

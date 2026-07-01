@@ -167,6 +167,59 @@ class SearchHit:
     is_official: Optional[bool] = None
 
 
+@dataclass
+class AssetSpec:
+    """A non-page auxiliary asset a handler discovered while scraping a
+    chapter — audio to download, a motion-toon manifest/timeline to archive,
+    or an external audio reference (SoundCloud) to record without downloading.
+
+    WHY this exists (faithful-archival feature, local branch — see
+    ~/.claude/plans/i-want-to-add-rustling-penguin.md): webtoons.com motion
+    toons and tapas.io episodes carry `.mp3` clips, a proprietary motion
+    timeline, and SoundCloud embeds that the static-image pipeline throws
+    away. A handler stashes a list of these on the MUTABLE chapter dict as
+    `chapter["_aux_assets"]` during get_chapter_images; the packaging loop in
+    aio-dl.py fetches them into in-memory members embedded INSIDE the chapter
+    CBZ under the reserved `_aio/` prefix (audio bytes + motion manifest).
+    `_aio/` members are renumber-EXEMPT: build_cbz_from_content skips + preserves
+    them (else the combined-archive renumber would turn an in-CBZ .m4a into a
+    bogus {idx:04d}.m4a page). The user's own reader reads them out of the CBZ.
+
+    Cross-file coupling (grep targets):
+      - Producers: sites/tapas.py (audio_reference), sites/linewebtoon.py
+        (_extract_motion_toon_pages: motion_manifest + audio_download +
+        motion_layer; get_chapters has_bgm -> _resolve_bgm_specs audio_download).
+      - Consumer: aio-dl.py `_materialize_chapter_aux` (fetches bytes), embedded
+        into the per-chapter CBZ at build time (grep 'cached_cbz_path' /
+        '_aux_members'). The record flows to the per-chapter ComicInfo.xml
+        <AioChapterResources> (grep 'aux_records') + a series has_audio/
+        has_motion rollup in details.json (grep '_scan_chapter_cbz_aux').
+
+    Field semantics:
+      - type:       one of "audio_download" | "motion_manifest" |
+                    "motion_layer" | "audio_reference". The consumer switches
+                    on this. Unknown types are ignored (forward-compatible).
+      - source_url: the URL to download (audio_download) OR the reference URL
+                    to record without downloading (audio_reference). None for
+                    inline-data specs (motion_manifest carries `data`).
+      - data:       inline bytes the handler already fetched (motion_manifest
+                    holds the raw manifest JSON — no second HTTP round trip).
+      - filename:   preferred on-disk name; the consumer sanitizes + de-dupes.
+      - mime:       "audio/mpeg" | "application/json" | "text/uri-list" etc.
+                    Advisory only.
+      - meta:       free-form dict — motion layer->page map, timeline cues,
+                    provider ("soundcloud"), has_bgm flags, etc. Serialized
+                    verbatim into the per-chapter ComicInfo <AioChapterResources>
+                    blob (embedded in the CBZ).
+    """
+    type: str
+    source_url: Optional[str] = None
+    data: Optional[bytes] = None
+    filename: Optional[str] = None
+    mime: Optional[str] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
 class BaseSiteHandler:
     """Base class for site-specific handlers."""
 

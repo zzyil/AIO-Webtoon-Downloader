@@ -65,6 +65,14 @@ const DEFAULT_FORM = {
   // gates which alternatives qualify (mirror of --multi-source-quality-min).
   multiSource: false,
   multiSourceQualityMin: 0.65,
+  // Lazy-discovery modifier (--multi-source-lazy, 2026-07-02): defer the
+  // cross-site discovery until a chapter fails. Opt-out nested in the
+  // multi-source opt-in — the multiSource switch below force-resets it to
+  // true on enable, and consumers treat absent as on (`!== false`) so
+  // settings dicts saved before the field existed stay lazy. handleStart
+  // forwards only an explicit false; downloader.js's chokepoint emits the
+  // flag whenever multiSource is on and this isn't false.
+  multiSourceLazy: true,
   // CBZ byte-preservation (Phase F, 2026-05-07). True = use original wire
   // bytes when --format cbz with --scaling 100 and no --width/--quality
   // override. False emits --no-cbz-preserve-originals and forces the
@@ -93,6 +101,10 @@ const DEFAULT_FORM = {
   modernizeQuality: 90,
   modernizeDistance: 1.0,
   modernizeMinSaving: 0.92,
+  // CPU<->size encoder knobs (no pixel change). INVERSE axes: higher JXL effort
+  // = slower/smaller; higher AVIF speed = faster/larger. Defaults = sweet spot.
+  modernizeEffort: 7,           // JXL effort 1-9 → --modernize-effort
+  modernizeAvifSpeed: 6,        // AVIF speed 0-10 → --modernize-avif-speed
   // Komikku-compatible per-chapter CBZ output (2026-05-12, Komikku LocalSource format).
   // When on, Python force-coerces format=cbz / keep-chapters / no-final-file,
   // writes per-chapter ComicInfo.xml inside each CBZ, plus cover.jpg +
@@ -214,6 +226,12 @@ export default function DownloadTab({
       if (form.multiSourceQualityMin !== 0.65) {
         args.multiSourceQualityMin = form.multiSourceQualityMin;
       }
+      // Lazy discovery is absent-means-on: downloader.js's chokepoint emits
+      // --multi-source-lazy whenever multiSource is on UNLESS the key is an
+      // explicit false, so only the opt-out needs forwarding.
+      if (form.multiSourceLazy === false) {
+        args.multiSourceLazy = false;
+      }
     }
     // Phase F (2026-05-07): forward the CBZ byte-preservation toggle. Only
     // emit when the user has it OFF — buildCliArgs's negative-form handler
@@ -254,6 +272,8 @@ export default function DownloadTab({
       args.modernizeDistance = form.modernizeDistance;
       args.modernizeQuality = form.modernizeQuality;
       args.modernizeMinSaving = form.modernizeMinSaving;
+      args.modernizeEffort = form.modernizeEffort;
+      args.modernizeAvifSpeed = form.modernizeAvifSpeed;
     }
     if (form.splitMode === "size" && form.splitValue) args.split = form.splitValue;
     if (form.splitMode === "chapters" && form.splitValue) args.split = `${form.splitValue}ch`;
@@ -621,7 +641,17 @@ export default function DownloadTab({
             <Switch
               id="multiSource"
               checked={form.multiSource}
-              onCheckedChange={(v) => set("multiSource", v)}
+              onCheckedChange={(v) =>
+                // Enabling multi-source force-resets the nested lazy toggle
+                // to ON (opt-out inside the opt-in), mirroring the Settings
+                // master switch. One updateForm pass so both fields land in
+                // the same render.
+                updateForm((prev) => ({
+                  ...prev,
+                  multiSource: v,
+                  ...(v ? { multiSourceLazy: true } : {}),
+                }))
+              }
               className="mt-0.5"
             />
             <div className="flex-1">
@@ -629,31 +659,55 @@ export default function DownloadTab({
                 Use alternate sources for chapters the primary fails to fetch
               </Label>
               <p className="text-[10px] text-muted-foreground mt-0.5">
-                Adds ~30-60s of cross-site discovery before downloading.
                 When the primary CDN throttles or 404s a page, the chapter
                 falls over to the next source automatically.
               </p>
             </div>
           </div>
           {form.multiSource && (
-            <div className="pl-12 animate-slide-up">
-              <div className="flex items-center justify-between mb-1">
-                <Label className="text-xs">Alternative quality floor</Label>
-                <Badge variant="secondary" className="font-mono tabular-nums">
-                  {form.multiSourceQualityMin.toFixed(2)}
-                </Badge>
+            <div className="pl-12 animate-slide-up space-y-3">
+              {/* Lazy discovery — opt-out nested in the opt-in. Mirrors the
+                  Settings → Default Multi-source Fallback nested toggle;
+                  this is the per-job override surface (doesn't save back). */}
+              <div className="flex items-start gap-3">
+                <Switch
+                  id="multiSourceLazy"
+                  checked={form.multiSourceLazy !== false}
+                  onCheckedChange={(v) => set("multiSourceLazy", v)}
+                  className="mt-0.5"
+                />
+                <div className="flex-1">
+                  <Label htmlFor="multiSourceLazy" className="text-xs cursor-pointer">
+                    Only search alternatives after a chapter fails (recommended)
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground mt-0.5">
+                    <strong>On:</strong> start downloading immediately; the ~30-80s
+                    cross-site discovery only runs if a chapter actually needs a
+                    fallback. <strong>Off:</strong> discover up front — slower
+                    start, but split-collapse gets cross-source consensus and
+                    ghost detection has alignment data from chapter one.
+                  </p>
+                </div>
               </div>
-              <Slider
-                value={form.multiSourceQualityMin}
-                onValueChange={(v) => set("multiSourceQualityMin", v)}
-                min={0.3}
-                max={0.95}
-                step={0.05}
-              />
-              <p className="text-[10px] text-muted-foreground mt-1">
-                Sources below this seed/measured quality won't be used as
-                fallbacks. Default 0.65 keeps unknown-language Madara extras out.
-              </p>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Alternative quality floor</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {form.multiSourceQualityMin.toFixed(2)}
+                  </Badge>
+                </div>
+                <Slider
+                  value={form.multiSourceQualityMin}
+                  onValueChange={(v) => set("multiSourceQualityMin", v)}
+                  min={0.3}
+                  max={0.95}
+                  step={0.05}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1">
+                  Sources below this seed/measured quality won't be used as
+                  fallbacks. Default 0.65 keeps unknown-language Madara extras out.
+                </p>
+              </div>
             </div>
           )}
         </div>
