@@ -399,7 +399,11 @@ class SourceEntry:
     back to seed_quality. A measured 0.0 (e.g., aggregate probe got 0/5
     successful samples — CDN-poisoned site like rizzchoros.cloud during a
     bad period) is distinct from un-measured and IS used by the comparator,
-    so the broken-CDN signal isn't camouflaged by a high seed prior.
+    so the broken-CDN signal isn't camouflaged by a high seed prior. v5.2: a
+    probe where EVERY sampled chapter timed out (a slow-but-healthy site whose
+    budget expired, measuring nothing) now returns None → seed fallback, so
+    slowness no longer masquerades as a measured 0.0; a genuine per-page 0.0 is
+    still used. See sites/base.py:_probe_chapter_aggregate (per_chapter_is_timeout).
     """
     site: str
     url: str

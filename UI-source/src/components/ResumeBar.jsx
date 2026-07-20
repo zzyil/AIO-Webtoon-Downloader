@@ -86,6 +86,10 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
       tmpDir: item.tmpDir,
       format,
       epubLayout: format === "epub" ? getEpubLayout(item) : undefined,
+      // Threaded so a queued resume card shows a name + cached-chapter count.
+      // (useDownloader falls back to params?.title, but callers don't pass params.)
+      title: item.params?.title || item.title,
+      cachedChapters: item.cachedChapters,
     });
 
     // Clean up state for this item

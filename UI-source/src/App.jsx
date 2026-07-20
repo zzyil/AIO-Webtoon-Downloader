@@ -202,7 +202,15 @@ export default function App() {
               settings={dl.settings}
               onSaveSettings={dl.saveSettings}
               resumable={dl.resumable}
-              onResumeDownload={dl.resumeDownload}
+              onResumeDownload={async (item) => {
+                // Resume now routes through the serial queue; jump to the Queue
+                // tab so the user sees it land (running or queued). Skip the jump
+                // on a dedupe no-op / missing-API result.
+                const r = await dl.resumeDownload(item);
+                if (r && r.status !== "duplicate" && r.status !== "noop") {
+                  setActiveTab("queue");
+                }
+              }}
               searchSiteHealth={dl.searchSiteHealth}
               onManageSources={() => {
                 setSettingsCategory("search");
@@ -229,6 +237,7 @@ export default function App() {
               currentDownloadId={dl.currentDownloadId}
               onCancel={dl.cancelDownload}
               onRemoveFromQueue={dl.removeFromQueue}
+              onStartQueuedNow={dl.startQueuedNow}
               onClearCompleted={dl.clearCompleted}
             />
           )}
@@ -253,7 +262,14 @@ export default function App() {
         {/* Resume bar — pinned at the bottom, visible when unfinished downloads exist */}
         <ResumeBar
           resumable={dl.resumable}
-          onResume={dl.resumeDownload}
+          onResume={async (item) => {
+            // Serial-queue the resume (bug fix) and surface it: jump to the Queue
+            // tab on accept. Skip on a dedupe no-op / missing-API result.
+            const r = await dl.resumeDownload(item);
+            if (r && r.status !== "duplicate" && r.status !== "noop") {
+              setActiveTab("queue");
+            }
+          }}
           onDelete={dl.deleteTemp}
           onRefresh={dl.refreshResumable}
         />

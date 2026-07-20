@@ -481,6 +481,9 @@ export default function SearchTab({
                   tmpDir: matchedResumable.tmpDir,
                   format: matchedResumable.format,
                   epubLayout: matchedResumable.params?.epubLayout,
+                  // Name + cached count for the queued resume card.
+                  title: matchedResumable.title || matchedResumable.params?.title,
+                  cachedChapters: matchedResumable.cachedChapters,
                 });
               }}
             >

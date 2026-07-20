@@ -1,6 +1,6 @@
 import React from "react";
 import { Button, Card, Badge } from "@/components/ui/primitives";
-import { X, Trash2, Clock, Loader2 } from "lucide-react";
+import { X, Trash2, Clock, Loader2, RotateCw, Zap } from "lucide-react";
 import { cn, formatDuration } from "@/lib/utils";
 
 function ProgressBar({ value, max, indeterminate, className }) {
@@ -40,6 +40,7 @@ export default function QueueTab({
   currentDownloadId,
   onCancel,
   onRemoveFromQueue,
+  onStartQueuedNow,
   onClearCompleted,
 }) {
   const running = [];
@@ -140,23 +141,56 @@ export default function QueueTab({
           <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-3">
             Queued ({(queue || []).length})
           </h3>
-          {(queue || []).map((item, index) => (
-            <Card key={index} className="p-3 mb-2 opacity-70">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 min-w-0">
-                  <Clock className="w-4 h-4 text-muted-foreground shrink-0" />
-                  <span className="text-sm truncate">{item.displayUrl || item.url}</span>
+          {(queue || []).map((item) => {
+            // Resume jobs (type:"resume") and fresh downloads share the queue;
+            // distinguish them at a glance with icon + a "Resume" badge.
+            const isResume = item.type === "resume";
+            const TypeIcon = isResume ? RotateCw : Clock;
+            return (
+              <Card key={item.id} className="p-3 mb-2 border-dashed animate-slide-up">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <TypeIcon className="w-4 h-4 text-muted-foreground shrink-0" />
+                    <span className="text-sm truncate text-muted-foreground">
+                      {item.displayUrl || item.url}
+                    </span>
+                  </div>
+                  {/* Right cluster: promote-to-parallel ("start alongside") + remove */}
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-xs gap-1 transition-all active:scale-[0.97]"
+                      onClick={() => onStartQueuedNow?.(item.id)}
+                      title="Start now, in parallel with the current download"
+                    >
+                      <Zap className="w-3 h-3" />
+                      Start alongside
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7"
+                      onClick={() => onRemoveFromQueue(item.id)}
+                      title="Remove from queue"
+                    >
+                      <X className="w-4 h-4" />
+                    </Button>
+                  </div>
                 </div>
-                <Button variant="ghost" size="icon" onClick={() => onRemoveFromQueue(index)}>
-                  <X className="w-4 h-4" />
-                </Button>
-              </div>
-              <div className="flex gap-1.5 mt-1.5 ml-6 flex-wrap">
-                {item.args?.format && <Badge variant="secondary">{item.args.format.toUpperCase()}</Badge>}
-                {item.args?.quality && <Badge variant="secondary">Q{item.args.quality}</Badge>}
-              </div>
-            </Card>
-          ))}
+                <div className="flex gap-1.5 mt-1.5 ml-6 flex-wrap">
+                  {isResume && <Badge variant="default">Resume</Badge>}
+                  {isResume && item.cachedChapters > 0 && (
+                    <Badge variant="secondary">{item.cachedChapters} ch cached</Badge>
+                  )}
+                  {isResume
+                    ? item.format && <Badge variant="secondary">{item.format.toUpperCase()}</Badge>
+                    : item.args?.format && <Badge variant="secondary">{item.args.format.toUpperCase()}</Badge>}
+                  {item.args?.quality && <Badge variant="secondary">Q{item.args.quality}</Badge>}
+                </div>
+              </Card>
+            );
+          })}
         </div>
       )}
 

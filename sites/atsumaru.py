@@ -13,6 +13,20 @@ class AtsumaruSiteHandler(BaseSiteHandler):
     _BASE_URL = "https://atsu.moe"
     _SEARCH_URL = "/collections/manga/documents/search"
 
+    # Probe atsumaru's 8 breadth-sample chapters in ONE wave, not 2. Each sample
+    # is a full-res color WebP CDN download (atsu.moe is WebP-native), so at the
+    # base width of 4 the 8-chapter image-quality probe needs 2 waves and
+    # routinely blew PROBE_SOURCE_BUDGET_S, timing out half the samples and
+    # (pre-v5.2) scoring them 0.0 → a ~0.8 source read as ~0.10. atsu.moe is a
+    # plain JSON API + CDN and real downloads already run ~8-wide image workers,
+    # so 8 concurrent probe fetches is within its normal load. Combined with the
+    # v5.2 timeout-exclusion in base._probe_chapter_aggregate this keeps the
+    # probe measuring real quality; it does NOT (and is not meant to) drop the
+    # probe under the 30s slow_probe threshold — atsumaru stays honestly flagged
+    # "slow" in the search-health system (user decision). Grep
+    # PROBE_BREADTH_CONCURRENCY.
+    PROBE_BREADTH_CONCURRENCY = 8
+
     def __init__(self) -> None:
         super().__init__()
         self._api_headers = {

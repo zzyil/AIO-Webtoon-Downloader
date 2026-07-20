@@ -4,6 +4,7 @@ import datetime as dt
 import os
 import queue
 import re
+import socket
 import statistics
 import threading
 import time
@@ -40,6 +41,23 @@ try:
 except Exception:  # ImportError or any sub-dep failure
     _CurlCffiAsyncSession = None  # type: ignore[assignment]
     _CURL_CFFI_AVAILABLE = False
+
+# Exceptions from a probe fetch that mean "we couldn't MEASURE this page in time"
+# (slowness), NOT "the page/CDN is definitively broken". The image-quality probe
+# (_probe_chapter_aggregate) EXCLUDES these from the quality aggregate instead of
+# scoring them 0.0, so a merely-slow-to-probe site (e.g. atsumaru: WebP-native,
+# fast to download but slow to breadth-probe 8 full-res color chapters) isn't
+# mislabeled as broken. requests.exceptions.Timeout already covers BOTH
+# ConnectTimeout and ReadTimeout. Base requests.exceptions.ConnectionError
+# (refused / reset / DNS) is DELIBERATELY NOT here — that's a genuine
+# reachability failure and must stay a scored 0.0 (it's what keeps rizzcomic's
+# connection-poison detection working). Grep _PROBE_TIMEOUT_EXCEPTIONS:
+# _fetch_probe_item_bytes_ex + _probe_one_pick.
+try:
+    import requests as _requests
+    _PROBE_TIMEOUT_EXCEPTIONS = (_requests.exceptions.Timeout, socket.timeout)
+except Exception:
+    _PROBE_TIMEOUT_EXCEPTIONS = (socket.timeout,)
 
 
 class IncompleteChapterError(Exception):
@@ -242,12 +260,20 @@ class _ProbeSample:
     ``blob`` (whatever it had computed before failing), exactly mirroring the
     per-branch field population of the former serial loop so the re-score pass
     and throttle tail see identical state.
+
+    ``is_timeout`` marks a sample that could not be MEASURED in time (a network
+    timeout in get_chapter_images / the image fetch, or a budget-miss slot swept
+    after PROBE_SOURCE_BUDGET_S expired) — as opposed to a genuine content/CDN
+    failure. Timeouts are EXCLUDED from the score aggregate (a slow site is not a
+    broken one); genuine failures keep their 0.0. Default False so the existing
+    positional constructors (successes + genuine failures) are unchanged.
     """
     score: float
     metadata: Optional[Dict]
     image_items: Optional[List]
     picked_page_idx: Optional[int]
     blob: Optional[bytes]
+    is_timeout: bool = False
 
 
 class BaseSiteHandler:
@@ -1181,8 +1207,15 @@ class BaseSiteHandler:
             raw = list(range(n))
         return sorted(set(raw))
 
-    def _fetch_probe_item_bytes(self, item, scraper) -> Optional[bytes]:
-        """Fetch image bytes for a single probe item.
+    def _fetch_probe_item_bytes_ex(self, item, scraper) -> Tuple[Optional[bytes], bool]:
+        """Fetch image bytes for a single probe item, reporting timeout-vs-not.
+
+        Returns ``(bytes_or_None, timed_out)``. ``timed_out`` is True ONLY when a
+        network timeout (``_PROBE_TIMEOUT_EXCEPTIONS``) was raised — the caller
+        EXCLUDES those from the quality aggregate (slowness, not a quality
+        signal). A definitive failure (non-image dict, HTTP >= 400, non-image
+        bytes, or any non-timeout exception) returns ``(None, False)`` so it
+        still scores as a genuine 0.0.
 
         Handles both `get_chapter_images` return shapes:
           - `str` (most handlers): URL — fetched via scraper.get
@@ -1192,20 +1225,28 @@ class BaseSiteHandler:
             if item.get("type") == "binary_image":
                 blob = item.get("data")
                 if isinstance(blob, (bytes, bytearray)) and looks_like_real_image(blob):
-                    return bytes(blob)
-            return None
+                    return bytes(blob), False
+            return None, False
         if isinstance(item, str) and item:
             try:
                 response = scraper.get(item, timeout=15)
                 if response.status_code >= 400:
-                    return None
-                data = response.content
+                    return None, False
+                data = response.content  # can itself time out on a chunked read
                 if not looks_like_real_image(data):
-                    return None
-                return data
+                    return None, False
+                return data, False
+            except _PROBE_TIMEOUT_EXCEPTIONS:
+                return None, True
             except Exception:
-                return None
-        return None
+                return None, False
+        return None, False
+
+    def _fetch_probe_item_bytes(self, item, scraper) -> Optional[bytes]:
+        """Bytes-only wrapper over _fetch_probe_item_bytes_ex for callers that
+        don't need to know WHY a fetch failed (the throttle tail). Keeps the
+        tail's cdn_reliability accounting unchanged."""
+        return self._fetch_probe_item_bytes_ex(item, scraper)[0]
 
     def _probe_one_pick(
         self, abs_idx, chapter, hit, scraper, make_request, score_fn,
@@ -1229,6 +1270,10 @@ class BaseSiteHandler:
         """
         try:
             image_items = self.get_chapter_images(chapter, scraper, make_request)
+        except _PROBE_TIMEOUT_EXCEPTIONS:
+            # Slow/timeout, not a content failure — mark not-measured so the
+            # aggregate excludes it instead of scoring a broken-CDN 0.0.
+            return _ProbeSample(0.0, None, None, None, None, is_timeout=True)
         except Exception:
             image_items = None
         if not image_items:
@@ -1238,9 +1283,9 @@ class BaseSiteHandler:
         )
         if page_idx is None:
             return _ProbeSample(0.0, None, image_items, None, None)
-        blob = self._fetch_probe_item_bytes(image_items[page_idx], scraper)
+        blob, timed_out = self._fetch_probe_item_bytes_ex(image_items[page_idx], scraper)
         if not blob:
-            return _ProbeSample(0.0, None, image_items, page_idx, None)
+            return _ProbeSample(0.0, None, image_items, page_idx, None, is_timeout=timed_out)
         result = score_fn(blob)
         if result is None:
             # keep blob in case re-score works (mirrors the serial base path)
@@ -1478,10 +1523,18 @@ class BaseSiteHandler:
         per_chapter_image_lists: List[Optional[List]] = []  # for throttle tail
         per_chapter_picked_page_idx: List[Optional[int]] = []
         per_chapter_blobs: List[Optional[bytes]] = []  # v5.1: kept for re-score pass
+        # Pick-aligned "was this sample NOT measured (timeout / budget-miss)?"
+        # flags. A surviving None slot = a budget miss = a timeout (never
+        # fetched). Timeouts keep a 0.0 in per_chapter_scores for POSITIONAL
+        # alignment (the throttle tail + re-score pass index into it by slot),
+        # but are excluded from the score AGGREGATE below so a slow site isn't
+        # penalized as broken. Grep per_chapter_is_timeout.
+        per_chapter_is_timeout: List[bool] = []
         for r in sample_results:
             if r is None:
-                r = _ProbeSample(0.0, None, None, None, None)
+                r = _ProbeSample(0.0, None, None, None, None, is_timeout=True)
             per_chapter_scores.append(r.score)
+            per_chapter_is_timeout.append(r.is_timeout)
             per_chapter_image_lists.append(r.image_items)
             per_chapter_picked_page_idx.append(r.picked_page_idx)
             per_chapter_blobs.append(r.blob)
@@ -1564,6 +1617,17 @@ class BaseSiteHandler:
         # the measured failure rather than camouflaging it via cover-probe
         # fallback (rizzchoros.cloud lesson from 2026-05-07).
         if not per_chapter_metas:
+            # No chapter yielded a scoreable page. Distinguish "couldn't measure
+            # anything IN TIME" from "measured, and it's broken":
+            if all(per_chapter_is_timeout):
+                # Every pick timed out / was budget-missed — we measured NOTHING.
+                # Don't fabricate a 0.0 "broken" verdict for a merely-slow site;
+                # return None so the orchestrator falls back to the cover probe /
+                # seed prior (quality_basis becomes "seed"/"cover" → red triangle).
+                return None
+            # At least one GENUINE failure (empty list / 4xx / non-image /
+            # unscoreable) and zero successes → honest broken-CDN 0.0, unchanged
+            # (rizzchoros contract; rizzcomic's None→0.0 override relies on this).
             return 0.0, {
                 "width": 0,
                 "height": 0,
@@ -1571,19 +1635,29 @@ class BaseSiteHandler:
                 "size_bytes": 0,
                 "samples_attempted": len(chapter_picks),
                 "samples_succeeded": 0,
+                "samples_measured": sum(1 for to in per_chapter_is_timeout if not to),
+                "samples_timed_out": sum(1 for to in per_chapter_is_timeout if to),
                 "cdn_reliability": 0.0,
                 "probe_budget_exhausted": budget_exhausted,
             }
 
         # Hybrid median/mean aggregation across chapters (was: across pages
-        # within one chapter). Same rule as v4: median when all chapters
-        # succeed (suppresses content variance across chapters — e.g. a
-        # color splash chapter vs a B&W content chapter), mean when any
-        # failed (preserves the throttle/failure signal).
-        if all(s > 0.0 for s in per_chapter_scores):
-            aggregate_score = statistics.median(per_chapter_scores)
+        # within one chapter), computed over MEASURED samples only (successes +
+        # genuine failures). v5.2: timeouts / budget-misses are EXCLUDED, so a
+        # slow site is scored on what we could actually fetch, not penalized for
+        # pages we never reached. measured_scores is guaranteed non-empty here
+        # (per_chapter_metas is non-empty ⇒ ≥1 success). Same hybrid rule as v4:
+        # median when every measured sample succeeded (suppresses cross-chapter
+        # content variance — e.g. a color splash chapter vs a B&W one), mean when
+        # any measured sample was a GENUINE failure (preserves the throttle/
+        # failure signal). Grep per_chapter_is_timeout.
+        measured_scores = [
+            s for s, to in zip(per_chapter_scores, per_chapter_is_timeout) if not to
+        ]
+        if all(s > 0.0 for s in measured_scores):
+            aggregate_score = statistics.median(measured_scores)
         else:
-            aggregate_score = sum(per_chapter_scores) / len(per_chapter_scores)
+            aggregate_score = sum(measured_scores) / len(measured_scores)
 
         # Throttle-probe tail: pick the highest-scoring chapter index from
         # the breadth pass and sequentially fetch THROTTLE_TAIL_PAGES more
@@ -1702,6 +1776,13 @@ class BaseSiteHandler:
             "size_bytes": int(avg_size),
             "samples_attempted": len(chapter_picks),
             "samples_succeeded": len(per_chapter_metas),
+            # v5.2 (2026-07-14): samples that could not be MEASURED in time
+            # (network timeout or budget-miss) — EXCLUDED from the score
+            # aggregate above (slow != broken). samples_measured = attempted -
+            # timed_out = successes + genuine failures. Drives the UI partial-
+            # probe Clock hint (SearchSourceCard.jsx keys on samples_timed_out).
+            "samples_measured": sum(1 for to in per_chapter_is_timeout if not to),
+            "samples_timed_out": sum(1 for to in per_chapter_is_timeout if to),
             # Numeric T1 components (mean across successful samples).
             "bpp": _mean_field("bpp"),
             "decode_quality": _mean_field("decode_quality"),

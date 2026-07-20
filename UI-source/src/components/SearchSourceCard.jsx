@@ -12,7 +12,7 @@
 
 import React, { useEffect, useState } from "react";
 import { Button, Badge } from "@/components/ui/primitives";
-import { Download, Image as ImageIcon, AlertTriangle } from "lucide-react";
+import { Download, Image as ImageIcon, AlertTriangle, Clock } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Map a 0..1 quality score to one of 4 visual tiers. Returns Tailwind
@@ -281,7 +281,8 @@ export default function SearchSourceCard({
             (m?.decode_quality != null ? ` · decode=${m.decode_quality.toFixed(2)}` : "") +
             (m?.outlier ? ` · outlier=${m.outlier}` : "") +
             (m?.samples_attempted != null
-              ? ` · ${m.samples_succeeded ?? 0}/${m.samples_attempted} samples`
+              ? ` · ${m.samples_succeeded ?? 0}/${m.samples_attempted} samples` +
+                ((m?.samples_timed_out ?? 0) > 0 ? ` (${m.samples_timed_out} timed out)` : "")
               : "") +
             (source.dmca_likely ? " · DMCA-flagged" : "")
           }
@@ -297,6 +298,28 @@ export default function SearchSourceCard({
             user can spot a degenerate score at a glance without hovering for
             the tooltip. yellow-500 is the existing warning palette. */}
         <div className="flex items-center justify-end gap-1">
+          {/* Partial-probe hint (2026-07-14): some breadth-sample chapters timed
+              out, so the score was measured on fewer chapters than usual. Muted
+              Clock — distinct from the red basis triangle (rating not from
+              chapter pages) and the yellow outlier triangle (measured-but-
+              suspect); the score itself is FAIR, this just flags it's partial.
+              Keyed on samples_timed_out (covers budget-miss AND per-fetch
+              timeout); older JSON lacks the field → ?? 0 → no icon. Wrapped in a
+              title span because lucide SVGs don't surface native tooltips
+              reliably (see the site-name icons above). Data:
+              sites/base.py:_probe_chapter_aggregate metadata
+              samples_timed_out / samples_measured. */}
+          {(m?.samples_timed_out ?? 0) > 0 && (
+            <span
+              className="shrink-0 inline-flex items-center"
+              title={`Partial probe — ${m.samples_succeeded ?? 0}/${m.samples_attempted} sample chapters measured; ${m.samples_timed_out} timed out (site is slow to probe). Score reflects the chapters we could fetch.`}
+            >
+              <Clock
+                className="w-3 h-3 text-muted-foreground"
+                aria-label={`partial probe: ${m.samples_timed_out} of ${m.samples_attempted} sample chapters timed out`}
+              />
+            </span>
+          )}
           {m?.outlier && (
             <AlertTriangle
               className="w-3 h-3 text-yellow-500 shrink-0"

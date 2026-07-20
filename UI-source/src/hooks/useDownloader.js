@@ -4,15 +4,18 @@
 // This connects to the Electron main process via window.electronAPI
 // (exposed by preload.js) and manages:
 //   - Active downloads and their progress
-//   - A queue system (one download at a time, auto-advances)
+//   - A queue system: auto-advances ONE at a time (currentDownloadId = the
+//     serial "anchor"), but a queued item can be launched in PARALLEL with the
+//     anchor via startQueuedNow ("start alongside")
 //   - Log lines from each download (flat array)
 //   - Resumable downloads found on disk (tmp_* folders)
 //   - App settings
 //
 // STATE SHAPES (what each component expects):
-//   activeDownloads: { [downloadId]: { url, args, status, progress, logs } }
+//   activeDownloads: { [downloadId]: { url, args, status, progress, logs, tmpDir? } }
 //   logs: [ { downloadId, line, level, timestamp }, ... ]
-//   queue: [ { url, args, queuedAt }, ... ]
+//   queue: [ { id, type:"download"|"resume", url, displayUrl, queuedAt,
+//             args? (download) | tmpDir?/format?/epubLayout?/title?/cachedChapters? (resume) }, ... ]
 //   resumable: [ { hid, tmpDir, params, cachedChapters }, ... ]
 //   settings: { pythonCmd, scriptPath, workingDir, defaults, verboseAlways }
 // ============================================================
@@ -30,6 +33,50 @@ import { formatDuration } from "@/lib/utils";
 // window.electronAPI won't exist. We return mock data so the UI
 // still renders without crashing.
 const hasAPI = () => typeof window !== "undefined" && !!window.electronAPI;
+
+// ── Queue-item spawn/adopt helpers ──
+// Module-level (NOT useCallback) on purpose: they read only their `item` arg +
+// window.electronAPI + Date.now, so the useCallback closures below can reference
+// them WITHOUT dep-array churn. A queue item is either a fresh download
+// ({type:"download", url, displayUrl, args}) or a resume job
+// ({type:"resume", url, tmpDir, format, epubLayout, title}). Both drain through
+// the SAME path (_startNextInQueue / startQueuedNow) via these two helpers, so
+// resume and download queue and replay identically.
+
+// Spawn a queue item via the right IPC. Returns main's { downloadId }. The
+// resume branch mirrors resumeDownload's original payload; the download branch
+// mirrors queueDownload's. grep _spawnQueueItem for the call sites.
+async function _spawnQueueItem(item) {
+  if (item.type === "resume") {
+    return window.electronAPI.resumeDownload({
+      url: item.url,
+      tmpDir: item.tmpDir,
+      format: item.format,          // optional format override from the resume UI
+      epubLayout: item.epubLayout,  // optional epub layout when format is epub
+    });
+  }
+  return window.electronAPI.startDownload({ url: item.url, args: item.args });
+}
+
+// Build the activeDownloads entry for a just-spawned queue item. `tmpDir` is
+// carried onto the active entry ONLY so resumeDownload's dedupe can spot an
+// in-flight resume for the same folder (grep dupActive in resumeDownload).
+function _activeEntryForQueueItem(item) {
+  return {
+    url: item.url,
+    displayUrl: item.displayUrl,
+    args: item.args,          // undefined for resume items — harmless
+    tmpDir: item.tmpDir,      // undefined for download items — harmless
+    status: "running",
+    progress:
+      item.type === "resume"
+        ? { phase: "resuming", title: item.title || "" }
+        : { phase: "starting" },
+    logs: [],
+    queuedAt: item.queuedAt,
+    startedAt: Date.now(),
+  };
+}
 
 export function useDownloader() {
   // ── State ──
@@ -122,6 +169,12 @@ export function useDownloader() {
   // Refs so callbacks always see the latest state without re-subscribing
   const queueRef = useRef(queue);
   queueRef.current = queue;
+  // Monotonic id source for queue items — the React key AND the stable handle
+  // removeFromQueue / startQueuedNow operate on (indices shift under the auto-
+  // drain, so id, not index). A counter (not Date.now) so rapid enqueues never
+  // collide. Refs are exempt from exhaustive-deps, so the useCallback closures
+  // below mint ids inline via `q${++queueIdRef.current}`.
+  const queueIdRef = useRef(0);
   const currentIdRef = useRef(currentDownloadId);
   currentIdRef.current = currentDownloadId;
   // activeDownloadsRef gives the IPC complete-handler synchronous read access
@@ -402,10 +455,9 @@ export function useDownloader() {
     if (!hasAPI()) return;
     startingRef.current = true;
     try {
-      const { downloadId } = await window.electronAPI.startDownload({
-        url: next.url,
-        args: next.args,
-      });
+      // _spawnQueueItem branches resume vs download — the head item becomes the
+      // new serial "anchor" regardless of type.
+      const { downloadId } = await _spawnQueueItem(next);
 
       // UIR-1: only dequeue AFTER a successful spawn, so a throw leaves the
       // item in place to be retried (the startingRef guard above prevents a
@@ -418,15 +470,7 @@ export function useDownloader() {
 
       setActiveDownloads((prev) => ({
         ...prev,
-        [downloadId]: {
-          url: next.url,
-          args: next.args,
-          status: "running",
-          progress: { phase: "starting" },
-          logs: [],
-          queuedAt: next.queuedAt,
-          startedAt: Date.now(),
-        },
+        [downloadId]: _activeEntryForQueueItem(next),
       }));
 
       setCurrentDownloadId(downloadId);
@@ -567,8 +611,13 @@ export function useDownloader() {
         }
       }
 
-      // Otherwise add to queue
-      setQueue((prev) => [...prev, { url, displayUrl, args: finalArgs, queuedAt: Date.now() }]);
+      // Otherwise add to queue. type:"download" discriminates from resume jobs
+      // (which _spawnQueueItem replays via the resume IPC); id is the React key
+      // + the handle removeFromQueue / startQueuedNow operate on.
+      setQueue((prev) => [
+        ...prev,
+        { id: `q${++queueIdRef.current}`, type: "download", url, displayUrl, args: finalArgs, queuedAt: Date.now() },
+      ]);
     },
     []
   );
@@ -592,33 +641,70 @@ export function useDownloader() {
   }, [_startNextInQueue]);
 
   // ── Public: resume from a tmp folder ──
-  // item: { url, tmpDir, format?, epubLayout?, params? }
+  // item: { url, tmpDir, format?, epubLayout?, title?, cachedChapters?, params? }
+  //
+  // Mirrors queueDownload's serialization: resume now routes through the SAME
+  // single-anchor gate instead of spawning immediately (the pre-2026-07-15 bug
+  // — clicking Resume on N series spawned N concurrent processes, each clobbering
+  // currentDownloadId). Returns { status } so App.jsx can react (jump to Queue):
+  //   "started"   — nothing was running; spawned now as the serial anchor
+  //   "queued"    — a download was running; parked in the queue
+  //   "duplicate" — a resume for this tmpDir is already queued/running (dedupe)
+  //   "noop"      — no API / no url
   const resumeDownload = useCallback(async (item) => {
-    if (!hasAPI() || !item.url) return;
+    if (!hasAPI() || !item.url) return { status: "noop" };
 
-    try {
-      const { downloadId } = await window.electronAPI.resumeDownload({
-        url: item.url,
-        tmpDir: item.tmpDir,
-        format: item.format,         // optional format override from dropdown
-        epubLayout: item.epubLayout,  // optional epub layout when format is epub
-      });
+    const title = item.title || item.params?.title || "";
+    const resumeItem = {
+      id: `q${++queueIdRef.current}`,
+      type: "resume",
+      url: item.url,
+      tmpDir: item.tmpDir,
+      format: item.format,          // optional format override from the resume UI
+      epubLayout: item.epubLayout,  // optional epub layout when format is epub
+      title,
+      cachedChapters: item.cachedChapters,
+      displayUrl: title || item.url,
+      queuedAt: Date.now(),
+    };
 
-      setActiveDownloads((prev) => ({
-        ...prev,
-        [downloadId]: {
-          url: item.url,
-          status: "running",
-          progress: { phase: "resuming", title: item.params?.title || "" },
-          logs: [],
-          startedAt: Date.now(),
-        },
-      }));
-
-      setCurrentDownloadId(downloadId);
-    } catch (err) {
-      console.error("Failed to resume download:", err);
+    // Dedupe by tmpDir: two processes writing one tmp_ folder corrupts the
+    // resume state — a real risk now that "start alongside" can run resumes in
+    // PARALLEL. Bail if the same folder is already queued or actively running.
+    // Guarded on a truthy tmpDir so undefined can't collide with other
+    // tmpDir-less entries (resumable items always carry tmpDir — it's the scan key).
+    if (item.tmpDir) {
+      const dupInQueue = queueRef.current.some(
+        (q) => q.type === "resume" && q.tmpDir === item.tmpDir
+      );
+      const dupActive = Object.values(activeDownloadsRef.current).some(
+        (d) => d.status === "running" && d.tmpDir === item.tmpDir
+      );
+      if (dupInQueue || dupActive) return { status: "duplicate" };
     }
+
+    // Same gate as queueDownload (grep currentIdRef.current in this file): run
+    // now only if the serial slot is free AND no spawn is mid-flight; else queue.
+    if (!currentIdRef.current && !startingRef.current) {
+      startingRef.current = true;
+      try {
+        const { downloadId } = await _spawnQueueItem(resumeItem);
+        setActiveDownloads((prev) => ({
+          ...prev,
+          [downloadId]: _activeEntryForQueueItem(resumeItem),
+        }));
+        setCurrentDownloadId(downloadId);
+        return { status: "started" };
+      } catch (err) {
+        console.error("Failed to resume download:", err);
+        // Fall through to enqueue so the user's intent is preserved.
+      } finally {
+        startingRef.current = false;
+      }
+    }
+
+    setQueue((prev) => [...prev, resumeItem]);
+    return { status: "queued" };
   }, []);
 
   // ── Public: delete a tmp folder ──
@@ -629,9 +715,49 @@ export function useDownloader() {
     if (Array.isArray(r)) setResumable(r);
   }, []);
 
+  // ── Public: start a queued item NOW, in parallel with the current download ──
+  // ("start alongside", the QueueTab ⚡ button). The promoted item is spawned as
+  // a NON-anchor extra: it does NOT take over currentDownloadId, so the auto-
+  // queue keeps draining off the existing anchor and this extra's completion is
+  // a no-op for queue advancement (completion handler / cancelDownload only
+  // advance when currentIdRef.current === downloadId). EXCEPTION: if nothing is
+  // running it becomes the anchor (becomesPrimary) so the chain still advances.
+  // Concurrency model: ~/.claude/plans/there-s-a-weird-bug-intended-purring-lecun.md
+  const startQueuedNow = useCallback(async (id) => {
+    const item = queueRef.current.find((q) => q.id === id);
+    if (!item || !hasAPI()) return;
+
+    const becomesPrimary = !currentIdRef.current && !startingRef.current;
+
+    // Remove optimistically so the card (and its button) vanish before a second
+    // click can double-spawn. Restored below if the spawn throws.
+    setQueue((prev) => prev.filter((q) => q.id !== id));
+
+    // Only claim the serial-slot mutex when this launch is the anchor; parallel
+    // extras are independent and must NOT block each other on one startingRef.
+    if (becomesPrimary) startingRef.current = true;
+    try {
+      const { downloadId } = await _spawnQueueItem(item);
+      setActiveDownloads((prev) => ({
+        ...prev,
+        [downloadId]: _activeEntryForQueueItem(item),
+      }));
+      if (becomesPrimary) setCurrentDownloadId(downloadId);
+    } catch (err) {
+      console.error("Failed to start queued item now:", err);
+      // Restore the item so the user's intent isn't silently lost.
+      setQueue((prev) => [item, ...prev]);
+      if (becomesPrimary) setTimeout(() => _startNextInQueue(), 1000);
+    } finally {
+      if (becomesPrimary) startingRef.current = false;
+    }
+  }, [_startNextInQueue]);
+
   // ── Public: remove a queued (not yet started) download ──
-  const removeFromQueue = useCallback((index) => {
-    setQueue((prev) => prev.filter((_, i) => i !== index));
+  // By id, not index: startQueuedNow / removeFromQueue race against the auto-
+  // drain and each other, and indices shift under them — id is stable.
+  const removeFromQueue = useCallback((id) => {
+    setQueue((prev) => prev.filter((q) => q.id !== id));
   }, []);
 
   // ── Public: clear completed/failed/cancelled from the active list ──
@@ -824,6 +950,7 @@ export function useDownloader() {
     resumeDownload,
     deleteTemp,
     removeFromQueue,
+    startQueuedNow,
     clearCompleted,
     clearLogs,
     saveSettings,

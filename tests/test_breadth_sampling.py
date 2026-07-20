@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 from PIL import Image
 
 from sites.base import BaseSiteHandler, SearchHit
@@ -238,7 +239,10 @@ class _MockHandler(BaseSiteHandler):
                  page_blob: Optional[bytes] = None,
                  fail_chapters: Optional[set] = None,
                  fail_get_images: bool = False,
-                 fail_throttle_tail: bool = False):
+                 fail_throttle_tail: bool = False,
+                 timeout_chapters: Optional[set] = None,
+                 timeout_all_get_images: bool = False,
+                 timeout_fetch_chapters: Optional[set] = None):
         super().__init__()
         self._chapters = chapters
         self._pages_per_chapter = pages_per_chapter
@@ -246,6 +250,15 @@ class _MockHandler(BaseSiteHandler):
         self._fail_chapters = fail_chapters or set()
         self._fail_get_images = fail_get_images
         self._fail_throttle_tail = fail_throttle_tail
+        # v5.2: chapters whose get_chapter_images raises a TIMEOUT (slowness) —
+        # distinct from _fail_chapters, which raise a RuntimeError (a genuine
+        # content failure). The probe EXCLUDES timeouts from the score aggregate
+        # but keeps genuine failures as a scored 0.0.
+        self._timeout_chapters = timeout_chapters or set()
+        self._timeout_all_get_images = timeout_all_get_images
+        # chapters whose single image FETCH times out (the _ex (None, True)
+        # path), distinct from a get_chapter_images-level timeout.
+        self._timeout_fetch_chapters = timeout_fetch_chapters or set()
         self.fetch_image_calls: List[str] = []
 
     def fetch_comic_context(self, url, scraper, make_request):
@@ -257,6 +270,12 @@ class _MockHandler(BaseSiteHandler):
 
     def get_chapter_images(self, chapter, scraper, make_request):
         chap_label = chapter.get("label") or chapter.get("chap")
+        if self._timeout_all_get_images or chap_label in self._timeout_chapters:
+            # A network timeout (slowness), NOT a RuntimeError — the probe marks
+            # this is_timeout=True and drops it from the aggregate.
+            raise requests.exceptions.ReadTimeout(
+                f"mock: get_chapter_images timed out for {chap_label}"
+            )
         if self._fail_get_images or chap_label in self._fail_chapters:
             raise RuntimeError(f"mock: get_chapter_images failed for {chap_label}")
         return [
@@ -264,19 +283,26 @@ class _MockHandler(BaseSiteHandler):
             for i in range(self._pages_per_chapter)
         ]
 
-    def _fetch_probe_item_bytes(self, item, scraper):
-        # Track every fetch call so tests can count them.
+    def _fetch_probe_item_bytes_ex(self, item, scraper):
+        # v5.2: the probe calls _fetch_probe_item_bytes_ex (returns
+        # (bytes_or_None, timed_out)); the base _fetch_probe_item_bytes wrapper
+        # (used by the throttle tail) delegates HERE, so BOTH the breadth pass
+        # and the tail route through this override and fetch_image_calls still
+        # captures every fetch.
         self.fetch_image_calls.append(item)
-        # _fail_throttle_tail: succeed for first BREADTH_FETCH_COUNT fetches
-        # (one per chapter the orchestrator probes), then fail. The probe
-        # samples at most 8 chapters by default (or max_samples), so by the
-        # time we've answered _breadth_fetch_budget successful calls every
-        # subsequent fetch fails. Simulates a CDN that throttles after N
-        # first-request hits.
+        # Fetch-level timeout for chapters flagged via timeout_fetch_chapters
+        # (item URLs embed the chapter label as `chap-<label>`).
+        for label in self._timeout_fetch_chapters:
+            if f"/chap-{label}/" in item:
+                return None, True
+        # _fail_throttle_tail: succeed for the first _breadth_fetch_budget
+        # fetches (one per breadth chapter), then fail every subsequent (tail)
+        # fetch as a GENUINE (non-timeout) failure — a CDN that throttles after
+        # N first-request hits.
         if self._fail_throttle_tail:
             if len(self.fetch_image_calls) > self._breadth_fetch_budget:
-                return None
-        return self._page_blob
+                return None, False
+        return self._page_blob, False
 
     # How many "breadth phase" fetches succeed before the simulated CDN
     # starts throttling (used by _fail_throttle_tail). Default = 8 (one
@@ -402,4 +428,90 @@ def test_probe_chapter_aggregate_v5_throttle_tail_skipped_when_no_success():
     hit = SearchHit(site="mock", title="Mock", url="https://mock/series")
     result = handler._probe_chapter_aggregate(hit, MagicMock(), MagicMock())
     _, metadata = result
+    assert metadata["cdn_reliability"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# v5.2 — timeouts (slowness) are EXCLUDED from the score; genuine failures kept
+# ---------------------------------------------------------------------------
+# The bug: a slow-but-healthy site (atsumaru) whose breadth-probe budget expired
+# had its un-reached chapters scored 0.0, dragging an ~0.8 source down to ~0.10.
+# The fix distinguishes "couldn't measure in time" (timeout / budget-miss →
+# EXCLUDED) from "measured and broken" (empty list / 4xx / non-image → 0.0).
+# _mk_chapters(10) samples chapters 2..9 exactly (see the picker output), so
+# timing out a known label subset is deterministic.
+
+def test_probe_aggregate_timeouts_excluded_from_score():
+    """Chapters whose get_chapter_images TIMES OUT are dropped from the
+    aggregate, not scored 0.0 — the score reflects only the measured pages."""
+    handler = _MockHandler(_mk_chapters(10), timeout_chapters={"2", "4", "6"})
+    hit = SearchHit(site="mock", title="Mock", url="https://mock/series")
+    result = handler._probe_chapter_aggregate(hit, MagicMock(), MagicMock())
+    assert result is not None
+    score, metadata = result
+    # 3 of the 8 sampled chapters (2, 4, 6) timed out; 5 succeeded.
+    assert metadata["samples_attempted"] == 8
+    assert metadata["samples_timed_out"] == 3
+    assert metadata["samples_succeeded"] == 5
+    assert metadata["samples_measured"] == 5
+    # Score is the healthy median of the 5 successes — NOT dragged toward 0.
+    # (The pre-fix mean over 8 with three 0.0s would sit in the red band.)
+    assert 0.3 < score < 1.0
+
+
+def test_probe_aggregate_fetch_level_timeout_excluded():
+    """A timeout in the single-image FETCH (not get_chapter_images) is also
+    treated as not-measured via the _ex (None, True) path."""
+    handler = _MockHandler(_mk_chapters(10), timeout_fetch_chapters={"3", "5"})
+    hit = SearchHit(site="mock", title="Mock", url="https://mock/series")
+    result = handler._probe_chapter_aggregate(hit, MagicMock(), MagicMock())
+    assert result is not None
+    score, metadata = result
+    assert metadata["samples_timed_out"] == 2
+    assert metadata["samples_succeeded"] == 6
+    assert 0.3 < score < 1.0
+
+
+def test_probe_aggregate_all_timeouts_returns_none():
+    """When EVERY sampled chapter times out we measured nothing — return None
+    (→ orchestrator falls back to cover/seed), NOT a fake 0.0 broken verdict."""
+    handler = _MockHandler(_mk_chapters(10), timeout_all_get_images=True)
+    hit = SearchHit(site="mock", title="Mock", url="https://mock/series")
+    result = handler._probe_chapter_aggregate(hit, MagicMock(), MagicMock())
+    assert result is None
+
+
+def test_probe_aggregate_mixed_genuine_failure_and_timeout():
+    """Genuine failures (RuntimeError) stay a scored 0.0 (pulling the mean down —
+    the broken-CDN signal), while timeouts are excluded. Verifies the two are
+    NOT conflated."""
+    handler = _MockHandler(
+        _mk_chapters(10),
+        fail_chapters={"3"},          # genuine failure -> 0.0, KEPT in the mean
+        timeout_chapters={"5", "7"},  # timeouts -> EXCLUDED
+    )
+    hit = SearchHit(site="mock", title="Mock", url="https://mock/series")
+    result = handler._probe_chapter_aggregate(hit, MagicMock(), MagicMock())
+    assert result is not None
+    score, metadata = result
+    assert metadata["samples_timed_out"] == 2      # chapters 5, 7
+    assert metadata["samples_succeeded"] == 5      # 2, 4, 6, 8, 9
+    # measured = 5 successes + 1 genuine failure (chapter 3) = 6; timeouts excluded.
+    assert metadata["samples_measured"] == 6
+    # The genuine failure forces the MEAN branch, so the single 0.0 drags the
+    # score below the all-success median but keeps it > 0.
+    assert 0.0 < score < 1.0
+
+
+def test_probe_aggregate_genuine_failures_still_return_zero_not_none():
+    """All-GENUINE-failure (no timeouts) still returns a measured 0.0 (the
+    rizzchoros / rizzcomic contract), NOT None — only all-TIMEOUT returns None."""
+    handler = _MockHandler(_mk_chapters(10), fail_get_images=True)
+    hit = SearchHit(site="mock", title="Mock", url="https://mock/series")
+    result = handler._probe_chapter_aggregate(hit, MagicMock(), MagicMock())
+    assert result is not None
+    score, metadata = result
+    assert score == 0.0
+    assert metadata["samples_succeeded"] == 0
+    assert metadata["samples_timed_out"] == 0
     assert metadata["cdn_reliability"] == 0.0
