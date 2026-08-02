@@ -80,6 +80,13 @@ _SIGN_TIMEOUT_S = 90.0
 _BOOTSTRAP_TIMEOUT_S = 120.0
 
 
+# Why the signer is unusable, if it is. Written by the worker thread when it
+# reaches a sticky verdict, read by sign_api_query on the caller thread so the
+# raised error names the actual cause (missing browser binary, disabled by env,
+# …) instead of a generic "unavailable". Plain str assignment — no lock needed.
+_LAST_UNAVAILABLE_REASON: Optional[str] = None
+
+
 class MangaFireSigningError(RuntimeError):
     """Raised when a vrf could not be produced. Callers in sites/mangafire.py
     let this propagate on download paths (a chapter that can't be signed must
@@ -235,6 +242,14 @@ class _SignerSession:
         # serve stale tokens.
         self._namespace: Optional[str] = None
         self._signer_desc: str = ""
+        # Sticky "there is no usable browser here" verdict, set once per
+        # process. WHY: without it every _api_get retries the whole Chromium
+        # launch — a 13-page chapter list on a machine with patchright
+        # installed but no browser downloaded pays 13 failed launches and
+        # prints the Patchright install banner 13 times. The verdict covers
+        # import/launch failure only; a browser that dies mid-run still gets
+        # relaunched (see _start's health check).
+        self._unavailable: Optional[str] = None
         self._cache: Dict[str, Dict[str, str]] = {}
         self._cache_loaded = False
         self._cache_dirty = False
@@ -309,7 +324,34 @@ class _SignerSession:
 
     # ----------------------------- browser -----------------------------
 
+    def _mark_unavailable(self, reason: str) -> None:
+        """Record the sticky no-browser verdict in both places at once: on the
+        session (so _start fails fast) and in the module global (so the caller
+        thread's exception can name the cause).
+
+        Collapsed to one short line: Playwright's launch error embeds a
+        multi-line ASCII banner, and this string ends up inside an exception
+        message and in test output.
+        """
+        global _LAST_UNAVAILABLE_REASON
+        flat = " ".join(str(reason).split())
+        if len(flat) > 200:
+            flat = flat[:197] + "…"
+        self._unavailable = flat
+        _LAST_UNAVAILABLE_REASON = flat
+
     def _start(self) -> bool:
+        # Already decided there's no browser here — don't re-pay the launch.
+        if self._unavailable:
+            return False
+        # Hard opt-out. Set by tests/conftest.py so a unit test can never
+        # silently launch Chromium (and reach the network) just by calling a
+        # handler method; also useful on a headless box with no browser, where
+        # the launch attempt is pure latency. Checked inside _start rather than
+        # in sign() on purpose: cached tokens must still serve with it set.
+        if (os.environ.get("AIO_MANGAFIRE_NO_SIGNER") or "").strip() == "1":
+            self._mark_unavailable("disabled via AIO_MANGAFIRE_NO_SIGNER")
+            return False
         if self._page is not None:
             try:
                 if not self._page.is_closed():
@@ -324,6 +366,7 @@ class _SignerSession:
             try:
                 from playwright.sync_api import sync_playwright  # type: ignore
             except ImportError:
+                self._mark_unavailable("patchright/playwright not installed")
                 print(
                     "[!] MangaFire: patchright/playwright not installed — cannot "
                     "sign API requests. Install with: pip install patchright && "
@@ -333,6 +376,7 @@ class _SignerSession:
         try:
             self._pw = sync_playwright().start()
         except Exception as e:
+            self._mark_unavailable(f"Playwright start failed: {e}")
             print(f"[!] MangaFire: Playwright start failed: {e}")
             return False
         try:
@@ -347,6 +391,10 @@ class _SignerSession:
             existing = list(getattr(self._context, "pages", None) or [])
             self._page = existing[0] if existing else self._context.new_page()
         except Exception as e:
+            # Most common real-world cause: patchright is installed but the
+            # browser binary was never downloaded (`patchright install
+            # chromium`). Sticky, so we say it once and fail fast after.
+            self._mark_unavailable(f"browser launch failed: {e}")
             print(f"[!] MangaFire: Playwright launch failed: {e}")
             self._cleanup()
             return False
@@ -585,9 +633,10 @@ def sign_api_query(path: str, pairs: Sequence[Tuple[str, Any]] = ()) -> Dict[str
     out = sign_api_queries([(path, list(pairs))])
     signed = out[0] if out else None
     if not signed or not signed.get("vrf"):
+        why = _LAST_UNAVAILABLE_REASON or "browser-backed signer unavailable"
         raise MangaFireSigningError(
             f"could not sign MangaFire API request for {path} — the site requires "
-            "a per-request vrf token and the browser-backed signer is unavailable"
+            f"a per-request vrf token ({why})"
         )
     return signed
 

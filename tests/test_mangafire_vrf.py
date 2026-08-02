@@ -247,3 +247,62 @@ def test_sign_api_query_raises_when_signer_returns_nothing(monkeypatch):
     monkeypatch.setattr(mangafire_vrf, "sign_api_queries", lambda specs: [None])
     with pytest.raises(mangafire_vrf.MangaFireSigningError):
         mangafire_vrf.sign_api_query("/titles/x")
+
+
+# ────────────────────────────────────────────────────────────────────────
+# No-browser handling
+#
+# CI has no Chromium. Before these landed, every _api_get retried the whole
+# launch, so a 13-page chapter list paid 13 failed launches and printed
+# Playwright's install banner 13 times.
+# ────────────────────────────────────────────────────────────────────────
+
+def test_env_kill_switch_blocks_launch(monkeypatch):
+    """tests/conftest.py sets this for the whole suite so no unit test can
+    silently boot a browser (and reach the network) via a handler call."""
+    monkeypatch.setenv("AIO_MANGAFIRE_NO_SIGNER", "1")
+    session = mangafire_vrf._SignerSession()
+    assert session._start() is False
+    assert "AIO_MANGAFIRE_NO_SIGNER" in (session._unavailable or "")
+
+
+def test_unavailable_verdict_is_sticky(monkeypatch):
+    """Once we know there's no usable browser, later calls must not re-attempt
+    the launch. Proven by removing the env var that caused the first refusal:
+    a non-sticky implementation would happily try again."""
+    monkeypatch.setenv("AIO_MANGAFIRE_NO_SIGNER", "1")
+    session = mangafire_vrf._SignerSession()
+    assert session._start() is False
+
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    monkeypatch.setattr(
+        session,
+        "_cleanup",
+        lambda: (_ for _ in ()).throw(AssertionError("relaunch attempted")),
+    )
+    assert session._start() is False
+
+
+def test_unavailable_reason_is_collapsed_to_one_line():
+    """Playwright's launch error embeds a multi-line ASCII banner; this string
+    ends up inside an exception message, so it must stay short and flat."""
+    session = mangafire_vrf._SignerSession()
+    session._mark_unavailable("launch failed:\n\n  ╔═══╗\n  ║ x ║\n" + "y" * 500)
+    reason = session._unavailable or ""
+    assert "\n" not in reason
+    assert len(reason) <= 200
+    assert reason.startswith("launch failed:")
+
+
+def test_cached_tokens_still_serve_with_signer_disabled(monkeypatch, tmp_path):
+    """The kill-switch is checked in _start, not in sign(), so a disk cache
+    populated by an earlier run keeps working on a browser-less machine."""
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+    monkeypatch.setenv("AIO_MANGAFIRE_NO_SIGNER", "1")
+    session = mangafire_vrf._SignerSession()
+    session._namespace = "ns"
+    key = mangafire_vrf._cache_key("/titles/x", [])
+    session._remember(key, {"vrf": "CACHED", "query": "vrf=CACHED"})
+
+    out = session.sign([("/titles/x", [])])
+    assert out == [{"vrf": "CACHED", "query": "vrf=CACHED"}]
