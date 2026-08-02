@@ -8,33 +8,42 @@ import re
 import sys
 import time
 from typing import Dict, List, Optional
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 # _CURL_CFFI_AVAILABLE gates SUPPORTS_FAST_DOWNLOAD (curl_cffi async image path
 # lives on BaseSiteHandler.fast_download_images). Re-exported for back-compat
 # with anything that grepped this symbol on mangafire.py historically.
 from .base import _CURL_CFFI_AVAILABLE  # noqa: F401
+from . import mangafire_vrf
 
 
 # ---------------------------------------------------------------------------
-# MangaFire handler — 2026 relaunch (plain Laravel REST API).
+# MangaFire handler — 2026 relaunch (Laravel REST API, signed since 2026-08).
 #
 # What this module owns: the mangafire.to site handler. It is a THIN JSON
-# client over MangaFire's public `/api/*` endpoints. There is no VRF, no
-# Cloudflare JS challenge on the API, no browser automation, and no image
-# hotlink protection — a plain `make_request` (cloudscraper) reaches every
-# endpoint, and images download via the inherited curl_cffi fast path.
+# client over MangaFire's `/api/*` endpoints. Response bodies are plain JSON
+# (never encrypted, unlike comix.to) and images have no hotlink protection, so
+# every fetch here still runs through plain `make_request` (cloudscraper) and
+# images download via the inherited curl_cffi fast path.
+#
+# THE ONE THING THAT NEEDS A BROWSER: every `/api/*` call must carry a `vrf=`
+# query parameter or the server answers `403 {"message":"Missing token."}`
+# (and `"Invalid token."` if the token doesn't match the params sent). Minting
+# that token is delegated to sites/mangafire_vrf.py — read its header for why
+# the cipher is not reimplementable and why the browser cost is a one-time
+# boot rather than comix's per-series page render. Nothing else in this file
+# needs to know about it: `_api_get` signs, everything downstream is unchanged.
 #
 # History: MangaFire relaunched as a Vite/Rolldown SPA on a Laravel API,
-# retiring the old `/ajax/read/*` HTML-fragment endpoints and the obfuscated
-# `vrf=` token that used to require a headless Patchright capture. The entire
-# `mangafire_vrf_simple` / `mangafire_vrf_async_batch` stack + the aio-dl.py
-# VRF-prefetch machinery + the `--mangafire-vrf-*` flags were deleted with this
-# rewrite. If you're reintroducing browser automation here, you almost
-# certainly don't need to — the endpoints below are unauthenticated JSON.
+# retiring the old `/ajax/read/*` HTML-fragment endpoints. Its old obfuscated
+# `vrf=` token briefly disappeared with that relaunch — the whole
+# `mangafire_vrf_simple` / `mangafire_vrf_async_batch` stack, the aio-dl.py
+# VRF-prefetch machinery and the `--mangafire-vrf-*` flags were deleted then,
+# and they stay deleted: the new signer needs no CLI surface and no prefetch
+# pipeline. Signing is transparent and cached.
 #
-# Endpoints (all GET, all return JSON):
+# Endpoints (all GET, all return JSON, all require `vrf`):
 #   search        /api/titles?keyword={q}&limit={n}          -> {items[], meta{}}
 #   detail        /api/titles/{hid}                          -> {data{…}}
 #   chapter list  /api/titles/{hid}/chapters?language=&sort=number&order=asc
@@ -129,6 +138,10 @@ class MangaFireSiteHandler(BaseSiteHandler):
     _BASE_URL = "https://mangafire.to"
     _API = "https://mangafire.to/api"
 
+    # Set once by _warn_signing_unavailable_once; class-level so the suppression
+    # spans every handler instance the search fan-out creates.
+    _signing_warned = False
+
     # When both an "official" and an "unofficial" scan exist for the same
     # chapter number (common), keep this one; fall back to the other when the
     # preferred type is absent (e.g. newest chapters often only have
@@ -197,25 +210,87 @@ class MangaFireSiteHandler(BaseSiteHandler):
             return path.split(".")[-1].split("/")[0]
         return ""
 
-    def _api_get(self, url: str, scraper, make_request, *, label: str) -> Optional[Dict]:
-        """GET a JSON endpoint. Returns the parsed dict, or None on a clean
-        non-200 / non-JSON response. Retryable/rate-limit failures raised by
-        make_request propagate (per its contract — it already retries and the
-        orchestrator/chapter loop classify the exception)."""
-        _mf_throttle()
-        resp = make_request(url, scraper)
-        status = getattr(resp, "status_code", None)
-        if status != 200:
-            print(f"[!] {label}: HTTP {status} for {url}")
-            print(f"    {self._resp_diag(resp)}")
-            return None
+    def _warn_signing_unavailable_once(self, exc: Exception) -> None:
+        """One warning per process. Search fan-out probes several candidates and
+        the orchestrator may retry, so an un-suppressed message would repeat
+        dozens of times for a single missing dependency."""
+        if getattr(type(self), "_signing_warned", False):
+            return
+        type(self)._signing_warned = True
+        print(f"[!] MangaFire: skipping search — {exc}")
+
+    @staticmethod
+    def _is_token_rejection(resp) -> bool:
+        """True for the site's two signature errors: `Missing token.` (we sent
+        no vrf) and `Invalid token.` (the vrf didn't match the params). Both are
+        403s, and both are DETERMINISTIC — retrying the identical request can
+        never help, which is also why sites/hardening.py must not treat them as
+        rate limiting."""
+        if getattr(resp, "status_code", None) != 403:
+            return False
         try:
-            data = resp.json()
-        except Exception as e:
-            print(f"[!] {label}: JSON decode failed for {url}: {e}")
-            print(f"    {self._resp_diag(resp)}")
-            return None
-        return data if isinstance(data, dict) else None
+            msg = str((resp.json() or {}).get("message") or "")
+        except Exception:
+            return False
+        return "token" in msg.lower()
+
+    def _api_get(
+        self,
+        path: str,
+        pairs: List[tuple],
+        scraper,
+        make_request,
+        *,
+        label: str,
+    ) -> Optional[Dict]:
+        """GET a signed JSON endpoint. `path` is the API path WITHOUT the `/api`
+        prefix; `pairs` is the ordered query params (order matters — it is what
+        the vrf cipher covers, see sites/mangafire_vrf.py:_cache_key).
+
+        Returns the parsed dict, or None on a clean non-200 / non-JSON response.
+        Retryable/rate-limit failures raised by make_request propagate (per its
+        contract). A signing failure raises MangaFireSigningError, which callers
+        on download paths deliberately let through.
+
+        On a token rejection we re-sign ONCE against a freshly bootstrapped
+        bundle: that is the site having redeployed mid-run, rotating the key our
+        cached token was minted under.
+        """
+        for attempt in (0, 1):
+            signed = mangafire_vrf.sign_api_query(path, pairs)
+            url = f"{self._API}{path}"
+            query = signed.get("query") or ""
+            if query:
+                url = f"{url}?{query}"
+
+            _mf_throttle()
+            resp = make_request(url, scraper)
+            status = getattr(resp, "status_code", None)
+
+            if self._is_token_rejection(resp):
+                if attempt == 0:
+                    print(
+                        f"[!] {label}: MangaFire rejected the vrf token; "
+                        "re-signing against the current bundle."
+                    )
+                    mangafire_vrf.invalidate()
+                    continue
+                print(f"[!] {label}: MangaFire still rejects the vrf token after re-signing.")
+                print(f"    {self._resp_diag(resp)}")
+                return None
+
+            if status != 200:
+                print(f"[!] {label}: HTTP {status} for {url}")
+                print(f"    {self._resp_diag(resp)}")
+                return None
+            try:
+                data = resp.json()
+            except Exception as e:
+                print(f"[!] {label}: JSON decode failed for {url}: {e}")
+                print(f"    {self._resp_diag(resp)}")
+                return None
+            return data if isinstance(data, dict) else None
+        return None
 
     def _map_status(self, raw) -> Optional[str]:
         if not raw:
@@ -266,7 +341,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
             raise RuntimeError(f"MangaFire: could not extract series id from URL: {url}")
 
         data = self._api_get(
-            f"{self._API}/titles/{hid}", scraper, make_request, label="detail"
+            f"/titles/{hid}", [], scraper, make_request, label="detail"
         )
         payload = data.get("data") if isinstance(data, dict) else None
         if not isinstance(payload, dict) or not payload:
@@ -319,11 +394,19 @@ class MangaFireSiteHandler(BaseSiteHandler):
         page = 1
         _MAX_PAGES = 500  # defensive backstop (≈50k chapters)
         while page <= _MAX_PAGES:
-            url = (
-                f"{self._API}/titles/{hid}/chapters?language={quote(lang)}"
-                f"&sort=number&order=asc&page={page}&limit=100"
+            data = self._api_get(
+                f"/titles/{hid}/chapters",
+                [
+                    ("language", lang),
+                    ("sort", "number"),
+                    ("order", "asc"),
+                    ("page", page),
+                    ("limit", 100),
+                ],
+                scraper,
+                make_request,
+                label=f"chapters p{page}",
             )
-            data = self._api_get(url, scraper, make_request, label=f"chapters p{page}")
             if not isinstance(data, dict):
                 break
             items = data.get("items") or []
@@ -370,7 +453,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
             print("[!] Chapter missing id; cannot fetch images.")
             return []
         data = self._api_get(
-            f"{self._API}/chapters/{cid}", scraper, make_request, label=f"pages {cid}"
+            f"/chapters/{cid}", [], scraper, make_request, label=f"pages {cid}"
         )
         payload = data.get("data") if isinstance(data, dict) else None
         if not isinstance(payload, dict):
@@ -401,12 +484,25 @@ class MangaFireSiteHandler(BaseSiteHandler):
         except (TypeError, ValueError):
             n_limit = 20
 
-        data = self._api_get(
-            f"{self._API}/titles?keyword={quote(clean)}&limit={n_limit}",
-            scraper,
-            make_request,
-            label="search",
-        )
+        # Signing failures degrade to "no hits", never an exception. WHY: the
+        # orchestrator's persistent ProbeFailureCache (sites/search_orchestrator.py
+        # :_run_one -> record_failure, threshold 2, TTL 1h) would blocklist
+        # mangafire.to for an hour after two raised searches — and if the user
+        # then installs the browser dependency they'd still be locked out. Same
+        # deliberate override of base.py:search's "let errors propagate" rule
+        # that sites/comix.py:search makes, for the same reason. Genuine HTTP
+        # errors from make_request still propagate.
+        try:
+            data = self._api_get(
+                "/titles",
+                [("keyword", clean), ("limit", n_limit)],
+                scraper,
+                make_request,
+                label="search",
+            )
+        except mangafire_vrf.MangaFireSigningError as e:
+            self._warn_signing_unavailable_once(e)
+            return []
         items = data.get("items") if isinstance(data, dict) else None
         if not isinstance(items, list) or not items:
             return []
