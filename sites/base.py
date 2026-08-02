@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 import queue
 import re
@@ -9,12 +10,14 @@ import statistics
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
 from ._image_io import finalize_pending_image, looks_like_real_image
+from .group_quality import MTL_CONFIRMED, MTL_NONE, classify_mtl, mtl_rank
 
 # Preferred BeautifulSoup parser, detected once at import. lxml is faster and
 # more lenient than the stdlib parser; handlers used to copy this probe into
@@ -220,6 +223,185 @@ class AssetSpec:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class GroupInfo:
+    """One scanlation group credited on a chapter version.
+
+    THE canonical group representation. Handlers stash a list of these on the
+    chapter dict as ``chapter["_groups"]``; everything that reasons about
+    groups reads them back through ``BaseSiteHandler.get_group_infos``.
+
+    WHY a structured list instead of the old per-site string: every handler
+    invented its own key (``group_name`` / ``group`` / ``scanlator``) and its
+    own near-identical ``get_group_name`` override, and a single string cannot
+    express (a) a chapter co-released by two groups — mangadex and kagane both
+    used to keep only the FIRST of a multi-group list, dynasty comma-joined
+    them into one unmatchable blob — or (b) the trust signals the ranker needs
+    (official / verified / inactive / description).
+
+    ``chapter["group_name"]`` SURVIVES as the human-readable ``", ".join(names)``
+    because five call sites read it as a plain string: aio_search_cli's
+    per-source JSON, sites/chapter_merger.py, the ComicInfo ``<Translator>``
+    writer, and the missed-chapter replay (grep ``grp_name`` in aio-dl.py).
+
+    Field semantics:
+      - name:        display name, RAW from the site. The MTL classifier's
+                     case-sensitive "AI" guard depends on original casing.
+      - group_id:    site-native stable id (MangaDex group UUID, atsumaru
+                     scanlationMangaId). Preferred over name for catalog
+                     lookups — names drift across rebrands, ids don't.
+      - is_official: licensed publisher or site-operated release. Feeds the
+                     ranker's official tier AND `--group official`.
+      - verified:    the site's own verified badge (MangaDex only today).
+      - inactive:    the site says the group is dead. Demotes, never excludes.
+      - description: group self-description, where exposed (MangaDex only).
+                     Second input to sites/group_quality.classify_mtl.
+    """
+    name: Optional[str] = None
+    group_id: Optional[str] = None
+    is_official: bool = False
+    verified: bool = False
+    inactive: bool = False
+    description: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class GroupSelectionPolicy:
+    """Run-level inputs to select_best_chapter_version that aren't per-chapter.
+
+    Built ONCE per series in aio-dl.py (grep ``build_group_census``) and passed
+    into every per-chapter selector call. Deliberately NOT stashed on chapter
+    dicts (they get copied by _annotate_selection and again by the
+    collapse-splits merge, so a stashed field would have three lifetimes) and
+    NOT cached on the handler (a module global keyed by series leaks across the
+    --jobs orchestrator's in-process handler reuse and across --update-all).
+
+      - census:        group match_key -> number of DISTINCT chapter numbers
+                       that group supplies for THIS series. The strongest
+                       zero-cost "is this the real TL or a filler dump" signal.
+      - census_total:  distinct chapter numbers in the series, the denominator.
+      - mtl:           "avoid" (default: rank last, still use when it's the only
+                       version) | "allow" (ignore MTL entirely) | "exclude"
+                       (skip chapters whose every version is CONFIRMED MTL).
+      - excluded_keys: match_keys from --exclude-group.
+    """
+    census: Optional[Dict[str, int]] = None
+    census_total: int = 0
+    mtl: str = "avoid"
+    excluded_keys: FrozenSet[str] = frozenset()
+
+
+# `--group <one of these>` selects by the GroupInfo.is_official FLAG rather than
+# by name. These are match keys (get_group_match_key output: casefolded,
+# non-alphanumerics stripped), so "Official Release" arrives as
+# "officialrelease". Grep target: group_matches_filter.
+_OFFICIAL_ALIAS_KEYS = frozenset({
+    "official", "officialrelease", "licensed", "publisher",
+})
+
+# --- Chapter-version ranking tuning ----------------------------------------
+# Page count is a PLACEHOLDER detector, never a "more pages is better" signal:
+# webtoon groups slice the same complete chapter differently (Solo Leveling
+# ch.1 on atsumaru is Alpha 22p / Asura 22p / Flame 19p / Dusk 14p, all four
+# complete). The band below flags only genuine stubs.
+#   _PAGE_BAND_MIN_MEDIAN — below this a median can't distinguish a stub from a
+#     legitimately short chapter (4-koma, omake), so the tier goes inert.
+#   _PAGE_BAND_RATIO — 0.35 not 0.5, because re-slicing at 2x tile height
+#     legitimately halves a count; 0.35 still catches the 3-of-20 class.
+#   _PAGE_BAND_ABS_FLOOR — stops the ratio firing on tiny chapters at all
+#     (0.35 * 6 = 2.1 would bless a 2-page entry).
+_PAGE_BAND_MIN_MEDIAN = 8
+_PAGE_BAND_RATIO = 0.35
+_PAGE_BAND_ABS_FLOOR = 3
+
+# Per-series track record, as a fraction of the series' distinct chapter count.
+# Banded rather than raw so 198-vs-201 is a tie (noise) while 201-vs-12 is not.
+_CENSUS_BANDS = ((0.60, 3), (0.25, 2), (0.05, 1))
+
+# Index-aligned with the tuple built by BaseSiteHandler._rank_version. Used to
+# name the tier that actually decided a pick, for the selection log.
+_RANK_TIER_NAMES = (
+    "exclusion", "downloadability", "MTL", "page-count", "official",
+    "track-record", "verified", "upvotes", "recency", "pages", "source-order",
+)
+
+
+@lru_cache(maxsize=4096)
+def _classify_group_mtl(
+    name: Optional[str], description: Optional[str]
+) -> Tuple[str, str]:
+    """Memoized classify_mtl. A long series re-classifies the same handful of
+    groups once per chapter otherwise (1000 chapters x 4 versions)."""
+    return classify_mtl(name, description=description)
+
+
+def _census_band(count: int, total: int) -> int:
+    """Map a group's chapter count for THIS series onto a track-record tier."""
+    if not total or count <= 0:
+        return 0
+    frac = count / total
+    for threshold, band in _CENSUS_BANDS:
+        if frac >= threshold:
+            return band
+    return 0
+
+
+def _coerce_epoch(value: Any) -> Optional[int]:
+    """Epoch seconds from a chapter's `uploaded`, or None.
+
+    Strings are REJECTED on purpose: mangago stores a display string ("2 days
+    ago"), and a wrong parse would silently reorder selections with no error.
+    None keeps the recency tier inert for that handler instead.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if value > 0 else None
+
+
+def _coerce_pages(version: Dict) -> Optional[int]:
+    """Page count from a chapter dict, or None when the site doesn't report it.
+
+    `_pages` is the established internal key (kagane, mangadex, atsumaru);
+    `pages` is accepted for anything that surfaces it raw.
+    """
+    for key in ("_pages", "pages"):
+        value = version.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def build_group_census(
+    handler: "BaseSiteHandler", chapters_by_num: Dict[str, List[Dict]]
+) -> Tuple[Dict[str, int], int]:
+    """Count how many DISTINCT chapter numbers each group supplies for a series.
+
+    Distinct NUMBERS, not rows: a group that re-uploaded ch.5 three times must
+    not earn 3x credit. Returns (match_key -> count, distinct chapter total).
+
+    This is the ranker's strongest zero-cost signal — an MTL/filler group dumps
+    a handful of chapters into a gap while the real TL has the long run — and it
+    is the one fact a per-chapter selector cannot see for itself. Built once per
+    series in aio-dl.py and passed down via GroupSelectionPolicy.
+
+    Runtime-only: never persisted, never an argparse dest, never in
+    gating_hash, so it cannot desync a resume.
+    """
+    census: Dict[str, int] = {}
+    for versions in chapters_by_num.values():
+        seen_here: set = set()
+        for version in versions:
+            for info in handler.get_group_infos(version):
+                key = handler.get_group_match_key(info.name)
+                if key:
+                    seen_here.add(key)
+        for key in seen_here:
+            census[key] = census.get(key, 0) + 1
+    return census, len(chapters_by_num)
+
+
 # --- Search image-quality probe: breadth-sample concurrency -----------------
 # How many of a source's breadth-sample chapters BaseSiteHandler.
 # _probe_chapter_aggregate probes CONCURRENTLY. The breadth pass fetches 1 page
@@ -308,6 +490,27 @@ class BaseSiteHandler:
     # sites/search_orchestrator.py:search_all sorts `eligible` on this
     # before enqueue — grep SEARCH_COST_HINT.
     SEARCH_COST_HINT: str = "normal"
+
+    # ADVISORY lower bound on the chapter numbers this run actually wants, set
+    # per-INSTANCE by aio-dl.py just before get_chapters (grep
+    # chapter_floor_hint there). Purely an optimization: a handler may ignore
+    # it, and every handler that does still returns the full list, so
+    # correctness never depends on it. The caller applies the real --chapters
+    # filter afterwards either way.
+    #
+    # Exists for handlers whose chapter listing is paginated and expensive.
+    # comix is the motivating case: its list is a browser DOM scrape over a
+    # pager whose rows are per (chapter x group), so a long multi-group series
+    # runs to ~360 page loads — while a routine update run only needs the
+    # newest one or two pages. comix sorts newest-first, so it stops as soon as
+    # a whole page falls below this value.
+    #
+    # None = no floor (full download); handlers must treat it as "walk
+    # everything". Not a class-level policy knob — it changes per run, so it is
+    # assigned on the instance, and it is NOT part of _RESUME_GATING_DESTS
+    # (it can't change which bytes land on disk, only how much listing work we
+    # do to find them).
+    chapter_floor_hint: Optional[float] = None
 
     # When True, the search orchestrator treats this handler as the canonical
     # source for any series it returns — winning the per-candidate tiebreaker
@@ -833,10 +1036,57 @@ class BaseSiteHandler:
     ) -> List[Dict]:
         return []
 
+    def get_group_infos(self, chapter_version: Dict) -> List[GroupInfo]:
+        """Read a chapter's scanlation groups. THE canonical accessor.
+
+        Precedence:
+          1. ``chapter["_groups"]`` — a list of GroupInfo. The modern path;
+             the only one that can express multi-group releases and trust
+             signals.
+          2. Legacy string keys, FIRST hit wins: group_name, group, scanlator,
+             publisher. Wrapped as a single unadorned GroupInfo.
+
+        The legacy string is deliberately NOT comma-split: a real group name
+        can contain a comma, and multi-group releases are what `_groups` is
+        for. (dynasty used to comma-join its scanlators here, which made
+        `--group "X"` unable to match a chapter tagged "X, Y" — it now emits
+        `_groups` instead.)
+
+        Handlers should NOT override this. Ten of them used to override
+        get_group_name with the same three-line "read my key, return it" body;
+        the fallback chain above subsumes every one of them.
+        """
+        groups = chapter_version.get("_groups")
+        if isinstance(groups, (list, tuple)):
+            resolved = [g for g in groups if isinstance(g, GroupInfo)]
+            if resolved:
+                return resolved
+        for key in ("group_name", "group", "scanlator", "publisher"):
+            value = chapter_version.get(key)
+            if isinstance(value, str) and value.strip():
+                return [GroupInfo(name=value.strip())]
+        return []
+
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        return None
+        """Human-readable group credit, or None. Multi-group chapters join with
+        ", " — this is display/metadata only (ComicInfo <Translator>, logs, the
+        search JSON). Matching and ranking go through get_group_infos."""
+        names = [g.name.strip() for g in self.get_group_infos(chapter_version)
+                 if isinstance(g.name, str) and g.name.strip()]
+        return ", ".join(names) if names else None
 
     def normalize_group_name(self, group_name: Optional[str]) -> Optional[str]:
+        """Casefold + collapse separators. PURE text normalization.
+
+        It used to also rewrite any name matching \\b(official|webtoons?|naver)\\b
+        to the literal "official". That was destructive: it merged LINE Webtoon
+        Originals with Canvas (defeating the distinction sites/linewebtoon.py
+        builds on purpose), merged unrelated real groups ("Webtoon Scans",
+        "Naver fan TL") into one bucket, and made all of them matchable by
+        `--group official`. The official-alias capability now lives in
+        group_matches_filter, keyed on the GroupInfo.is_official FLAG rather
+        than on a substring of the name.
+        """
         if not isinstance(group_name, str):
             return None
         cleaned = group_name.strip().casefold()
@@ -844,9 +1094,7 @@ class BaseSiteHandler:
             return None
         cleaned = re.sub(r"[_./-]+", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        if re.search(r"\b(?:official|webtoons?|naver)\b", cleaned):
-            return "official"
-        return cleaned
+        return cleaned or None
 
     def get_group_match_key(self, group_name: Optional[str]) -> Optional[str]:
         normalized = self.normalize_group_name(group_name)
@@ -855,6 +1103,210 @@ class BaseSiteHandler:
         squashed = re.sub(r"[^0-9a-z]+", "", normalized)
         return squashed or normalized
 
+    def group_matches_filter(
+        self, infos: List[GroupInfo], filter_key: Optional[str]
+    ) -> bool:
+        """Does any of a chapter's groups satisfy one --group / --exclude-group
+        entry (already reduced to a match key)?
+
+        `--group official` (and its aliases) matches on the is_official FLAG,
+        not on the name — so it catches MangaPlus, Viz, LINE Originals, and
+        mangago's /br_chapter- releases, while leaving a fan group merely
+        NAMED "Webtoon Scans" alone. See normalize_group_name for why this
+        moved out of the normalizer.
+        """
+        if not filter_key:
+            return False
+        if filter_key in _OFFICIAL_ALIAS_KEYS:
+            return any(info.is_official for info in infos)
+        return any(
+            self.get_group_match_key(info.name) == filter_key for info in infos
+        )
+
+    # --- Chapter-version ranking -------------------------------------------
+    def _version_signals(
+        self, version: Dict, policy: GroupSelectionPolicy
+    ) -> Dict[str, Any]:
+        """Per-version facts the rank tuple needs, folded across the version's
+        groups. Multi-group folding rules, and why each is what it is:
+
+          - mtl: take the BEST verdict across groups. A chapter co-credited to
+            a human group and an MTL shop had a human in the loop; taking the
+            worst would demote a legitimate joint release and, on a site where
+            the main TL sometimes co-credits, would fight the census tier.
+          - is_official / verified: any group qualifies the chapter.
+          - inactive: only when EVERY credited group is flagged inactive.
+          - census band: max — a co-release inherits the main group's standing.
+          - excluded: any — `--exclude-group X` means "not this group's work",
+            and a co-credit is still that group's work.
+        """
+        infos = self.get_group_infos(version)
+        mtl_verdict = MTL_NONE
+        best_mtl = -1
+        for info in infos:
+            verdict, reason = _classify_group_mtl(info.name, info.description)
+            rank = mtl_rank(verdict)
+            if rank > best_mtl:
+                best_mtl, mtl_verdict = rank, verdict
+        if best_mtl < 0:
+            best_mtl = mtl_rank(MTL_NONE)
+
+        census = policy.census or {}
+        band = 0
+        for info in infos:
+            key = self.get_group_match_key(info.name)
+            if not key:
+                continue
+            band = max(band, _census_band(census.get(key, 0), policy.census_total))
+
+        excluded = any(
+            self.group_matches_filter([info], key)
+            for info in infos
+            for key in policy.excluded_keys
+        ) if policy.excluded_keys else False
+
+        return {
+            "infos": infos,
+            "mtl_verdict": mtl_verdict,
+            "mtl_rank": best_mtl,
+            "is_official": any(i.is_official for i in infos),
+            "verified": any(i.verified for i in infos),
+            "all_inactive": bool(infos) and all(i.inactive for i in infos),
+            "census_band": band,
+            "excluded": excluded,
+        }
+
+    def _build_rank_context(
+        self, versions: List[Dict], policy: GroupSelectionPolicy
+    ) -> Dict[str, Any]:
+        """Cross-version facts computed ONCE, so a tier can go inert.
+
+        THE core rule: a MISSING signal must never read as a LOSING signal. The
+        old ranker's `v.get("up_count", 0)` treated "this site doesn't report
+        votes" as "zero votes", which is why 8 of 11 group-bearing handlers
+        collapsed to `max()`-returns-the-first-element, i.e. arbitrary API
+        order. Every tier below is enabled only when it can actually
+        discriminate, and returns a constant for every version otherwise.
+        """
+        upvote_values = [
+            v.get("up_count") for v in versions
+            if isinstance(v.get("up_count"), int) and not isinstance(v.get("up_count"), bool)
+        ]
+        # Needs >= 2 reporters AND a non-zero max: mangago hardcodes 0 for
+        # every chapter, which is data-shaped but carries no information.
+        upvotes_live = len(upvote_values) >= 2 and max(upvote_values) > 0
+
+        epochs = [_coerce_epoch(v.get("uploaded")) for v in versions]
+        recency_live = len(versions) > 1 and all(e is not None for e in epochs)
+
+        page_counts = [_coerce_pages(v) for v in versions]
+        known_pages = [p for p in page_counts if p is not None]
+        pages_live = len(known_pages) == len(versions) and len(versions) > 1
+
+        # Placeholder floor. Only meaningful with >=2 reported counts and a
+        # median big enough to tell a stub from a genuinely short chapter.
+        page_floor: Optional[float] = None
+        if len(known_pages) >= 2:
+            median_pages = statistics.median(known_pages)
+            if median_pages >= _PAGE_BAND_MIN_MEDIAN:
+                page_floor = max(
+                    _PAGE_BAND_ABS_FLOOR, median_pages * _PAGE_BAND_RATIO
+                )
+
+        return {
+            "policy": policy,
+            "upvotes_live": upvotes_live,
+            "recency_live": recency_live,
+            "pages_live": pages_live,
+            "page_floor": page_floor,
+            # `--mtl allow` means "treat a machine translation like any other
+            # version", so the tier must go inert rather than merely stop
+            # excluding — otherwise allow and avoid rank identically.
+            "mtl_live": policy.mtl != "allow",
+            "signals": [self._version_signals(v, policy) for v in versions],
+        }
+
+    def _rank_version(self, index: int, version: Dict, ctx: Dict[str, Any]) -> Tuple:
+        """The composite rank key. Higher wins; consumed by max().
+
+        Tiers, most significant first. Each line states WHY it sits where it
+        does — mirrors the documented tuple in
+        sites/external_metadata.py:_pick_best_candidate.
+
+         0 not_excluded    A hard user veto (--exclude-group / --mtl exclude)
+                           dominates everything. Kept IN the tuple rather than
+                           pre-filtered so an excluded-but-only version still
+                           obeys the allow_group_fallback contract instead of
+                           silently vanishing.
+         1 downloadable    A MangaDex external chapter (pages:0 + externalUrl)
+                           is metadata, not a chapter — ranking it first trades
+                           a working download for a guaranteed abort. This tier
+                           is what makes the official tier safe at all. Set
+                           ONLY from an explicit handler flag, never inferred
+                           from a missing field.
+         2 mtl_rank        The headline fix. Above official because an
+                           official-looking MTL doesn't exist, but a
+                           high-upvote MTL demonstrably does.
+         3 not_placeholder A 3-page stub beside 22-page siblings is a broken
+                           upload, not a translation choice.
+         4 official_rank   Licensed beats fan TL when both are downloadable.
+                           Mirrors chapter_merger.py's cross-source
+                           official-first row sort, so within-source and
+                           cross-source selection finally agree.
+         5 census_band     The group at 201/201 is the series' TL; the one that
+                           dropped 12 chapters into a gap is filler. Banded so
+                           198-vs-201 ties instead of shadowing everything
+                           below.
+         6 verified        The site's own curation badge. Free where it exists
+                           (MangaDex only), absent everywhere else, so it can't
+                           sit higher.
+         7 upvote_band     Demoted from being THE ENTIRE metric to a weak
+                           tiebreak. This is the fix for "an MTL with more
+                           likes beats a real TL". log2 banding makes 412-vs-408
+                           a tie while 1000-vs-5 still decides.
+         8 recency         A later upload of the same chapter is usually a
+                           redo/fix. Below upvotes because necro-uploads of bad
+                           rips are common.
+         9 pages           Usually more complete, but webtoon slicing makes it
+                           near-noise (Solo Leveling ch.1 is 22p and 14p from
+                           two groups, both complete), so it only breaks ties
+                           nothing else could.
+        10 -index          Deterministic last resort. Replaces the old
+                           ACCIDENTAL versions[0] with a documented one.
+        """
+        sig = ctx["signals"][index]
+        floor = ctx["page_floor"]
+        pages = _coerce_pages(version)
+
+        not_placeholder = 1
+        if floor is not None and pages is not None:
+            not_placeholder = int(pages >= floor)
+
+        official_rank = 2 if sig["is_official"] else (0 if sig["all_inactive"] else 1)
+
+        upvote_band = 0
+        if ctx["upvotes_live"]:
+            count = version.get("up_count")
+            if isinstance(count, int) and count > 0:
+                upvote_band = int(math.log2(count + 1))
+
+        recency = (_coerce_epoch(version.get("uploaded")) or 0) if ctx["recency_live"] else 0
+        pages_tier = pages if (ctx["pages_live"] and pages is not None) else 0
+
+        return (
+            0 if sig["excluded"] else 1,
+            0 if version.get("_undownloadable") is True else 1,
+            sig["mtl_rank"] if ctx["mtl_live"] else 2,
+            not_placeholder,
+            official_rank,
+            sig["census_band"],
+            1 if sig["verified"] else 0,
+            upvote_band,
+            recency,
+            pages_tier,
+            -index,
+        )
+
     def select_best_chapter_version(
         self,
         versions: List[Dict],
@@ -862,20 +1314,65 @@ class BaseSiteHandler:
         mix_by_upvote: bool,
         allow_group_fallback: bool = True,
         log_debug_fn=None,
+        *,
+        selection_policy: Optional[GroupSelectionPolicy] = None,
     ) -> Optional[Dict]:
+        """Collapse every version of ONE chapter number down to the best one.
+
+        Called once per chapter-number bucket from aio-dl.py (grep
+        `select_best_chapter_version`). NO handler overrides this — per-site
+        behavior comes from what the handler puts in `_groups`, not from
+        reimplementing the policy.
+
+        Control flow is unchanged from the original: no --group → rank
+        everything; --group + --mix-by-upvote → rank within the union of
+        preferred groups; --group alone → first preferred group that has any
+        version wins, ranked within it; nothing matched → fall back (or skip
+        under --no-group-fallback). Only the METRIC changed, from
+        `max(key=up_count)` to the composite `_rank_version` tuple.
+
+        `selection_policy` carries the per-series census + MTL/exclude policy.
+        Keyword-only with a default so the positional signature is unchanged.
+        """
         if not versions:
             return None
 
-        def upvotes(v: Dict) -> int:
-            return v.get("up_count", 0)
+        policy = selection_policy or GroupSelectionPolicy()
 
         def _debug(msg):
             if log_debug_fn:
                 log_debug_fn(msg)
 
+        # --mtl exclude: drop CONFIRMED machine translations outright. Never
+        # `suspect` — hard-dropping real chapters on a heuristic is not a
+        # trade the flag is allowed to make.
+        pool = versions
+        excluded_mtl = 0
+        if policy.mtl == "exclude":
+            probe_ctx = self._build_rank_context(versions, policy)
+            keep = [
+                v for i, v in enumerate(versions)
+                if probe_ctx["signals"][i]["mtl_verdict"] != MTL_CONFIRMED
+            ]
+            excluded_mtl = len(versions) - len(keep)
+            if not keep:
+                _debug(
+                    f"    Ch {versions[0].get('chap', '?')}: every version is "
+                    f"machine-translated and --mtl exclude is set. Skipping."
+                )
+                return None
+            pool = keep
+
+        ctx = self._build_rank_context(pool, policy)
+        chap_label = pool[0].get("chap", "?")
+        # IDENTITY-keyed, not pool.index(): list.index compares by equality, so
+        # two byte-identical duplicate rows would both resolve to the first
+        # one's slot and corrupt the -index stable tiebreak.
+        slot_of = {id(v): i for i, v in enumerate(pool)}
+
         def _available_groups() -> str:
             groups: List[str] = []
-            for version in versions:
+            for version in pool:
                 group_name = self.get_group_name(version)
                 if not isinstance(group_name, str):
                     continue
@@ -884,26 +1381,83 @@ class BaseSiteHandler:
                     groups.append(cleaned)
             return ", ".join(groups) if groups else "none"
 
+        def _describe(version: Dict) -> str:
+            """'Alpha' [201/201 ch, MTL] — the log's evidence line."""
+            name = self.get_group_name(version) or "No Group"
+            bits: List[str] = []
+            sig = ctx["signals"][slot_of[id(version)]]
+            census = policy.census or {}
+            if census:
+                best = 0
+                for info in sig["infos"]:
+                    key = self.get_group_match_key(info.name)
+                    if key:
+                        best = max(best, census.get(key, 0))
+                if best:
+                    bits.append(f"{best}/{policy.census_total} ch")
+            if sig["mtl_verdict"] != MTL_NONE:
+                bits.append(sig["mtl_verdict"] + " MTL")
+            if sig["is_official"]:
+                bits.append("official")
+            if version.get("_undownloadable") is True:
+                bits.append("no pages")
+            return f"'{name}'" + (f" [{', '.join(bits)}]" if bits else "")
+
+        def _pick(candidates: List[Dict]) -> Tuple[Dict, Optional[str]]:
+            """Best candidate + the name of the tier that actually decided it."""
+            ranked = sorted(
+                ((self._rank_version(slot_of[id(v)], v, ctx), v) for v in candidates),
+                key=lambda pair: pair[0],
+                reverse=True,
+            )
+            winner_key, winner = ranked[0]
+            why = None
+            if len(ranked) > 1:
+                runner_key = ranked[1][0]
+                for tier, (a, b) in enumerate(zip(winner_key, runner_key)):
+                    if a != b:
+                        why = _RANK_TIER_NAMES[tier]
+                        break
+            return winner, why
+
         def _annotate_selection(
             version: Dict,
             *,
             selection_kind: str,
             requested_group: Optional[str] = None,
+            why: Optional[str] = None,
         ) -> Dict:
             annotated = dict(version)
-            annotated["_selection_kind"] = selection_kind
-            annotated["_requested_group"] = requested_group
-            annotated["_available_groups"] = _available_groups()
+            # ONE reserved key replacing the three write-only ones
+            # (_selection_kind / _requested_group / _available_groups) that
+            # nothing ever read. Consumed by aio-dl.py's per-chapter log and
+            # the --list-chapters JSON.
+            annotated["_group_selection"] = {
+                "kind": selection_kind,
+                "requested": requested_group,
+                "available": _available_groups(),
+                "winner": self.get_group_name(version),
+                "why": why,
+                "excluded_mtl": excluded_mtl,
+            }
             return annotated
 
-        chap_label = versions[0].get("chap", "?")
-        best_by_upvote = max(versions, key=upvotes)
+        def _log_pick(prefix: str, winner: Dict, why: Optional[str]) -> None:
+            losers = [v for v in pool if v is not winner]
+            tail = ""
+            if losers:
+                shown = ", ".join(_describe(v) for v in losers[:3])
+                more = f" +{len(losers) - 3} more" if len(losers) > 3 else ""
+                tail = f" over {shown}{more}"
+            reason = f" [on {why}]" if why else ""
+            _debug(f"    Ch {chap_label}: {prefix}{_describe(winner)}{tail}{reason}.")
 
         if not preferred_groups:
-            _debug(
-                f"    Ch {chap_label}: No group specified. Selected by upvotes ({best_by_upvote.get('up_count', 0)})."
+            winner, why = _pick(pool)
+            _log_pick("picked ", winner, why)
+            return _annotate_selection(
+                winner, selection_kind="ranked_no_group", why=why
             )
-            return _annotate_selection(best_by_upvote, selection_kind="upvote_no_group")
 
         preferred_entries = [
             (group_name, self.get_group_match_key(group_name))
@@ -915,70 +1469,68 @@ class BaseSiteHandler:
             if match_key
         ]
         if not preferred_entries:
-            _debug(
-                f"    Ch {chap_label}: Group filter contained no usable names. Selected by upvotes ({best_by_upvote.get('up_count', 0)})."
-            )
+            winner, why = _pick(pool)
+            _log_pick("group filter had no usable names; picked ", winner, why)
             return _annotate_selection(
-                best_by_upvote,
-                selection_kind="upvote_invalid_group_filter",
+                winner, selection_kind="ranked_invalid_group_filter", why=why
             )
 
+        preferred_keys = {match_key for _, match_key in preferred_entries}
         if mix_by_upvote:
+            # Historical flag name. Since upvotes were demoted to a weak
+            # tiebreak this means "rank across the union of my preferred
+            # groups" rather than "walk them in priority order".
             preferred = [
-                v
-                for v in versions
-                if self.get_group_match_key(self.get_group_name(v))
-                in {match_key for _, match_key in preferred_entries}
+                v for v in pool
+                if any(
+                    self.group_matches_filter(self.get_group_infos(v), key)
+                    for key in preferred_keys
+                )
             ]
             if preferred:
-                best = max(preferred, key=upvotes)
-                _debug(
-                    f"    Ch {chap_label}: Mix-by-upvote. Selected '{self.get_group_name(best)}' ({best.get('up_count', 0)} upvotes)."
-                )
+                winner, why = _pick(preferred)
+                _log_pick("mixed across preferred groups; picked ", winner, why)
                 return _annotate_selection(
-                    best,
-                    selection_kind="preferred_mix_by_upvote",
+                    winner, selection_kind="preferred_mix_ranked", why=why
                 )
             if not allow_group_fallback:
                 _debug(
-                    f"    Ch {chap_label}: Mix-by-upvote. None of the requested groups were present. Skipping chapter. Available groups: {_available_groups()}."
+                    f"    Ch {chap_label}: none of the requested groups were "
+                    f"present. Skipping. Available: {_available_groups()}."
                 )
                 return None
-            _debug(
-                f"    Ch {chap_label}: Mix-by-upvote. None of the requested groups were present. Falling back to upvotes with '{self.get_group_name(best_by_upvote)}'. Available groups: {_available_groups()}."
-            )
+            winner, why = _pick(pool)
+            _log_pick("no requested group present; fell back to ", winner, why)
             return _annotate_selection(
-                best_by_upvote,
-                selection_kind="fallback_missing_group",
+                winner, selection_kind="fallback_missing_group", why=why
             )
 
         for group_name, match_key in preferred_entries:
             candidates = [
-                v
-                for v in versions
-                if self.get_group_match_key(self.get_group_name(v)) == match_key
+                v for v in pool
+                if self.group_matches_filter(self.get_group_infos(v), match_key)
             ]
             if candidates:
-                best = max(candidates, key=upvotes)
-                _debug(
-                    f"    Ch {chap_label}: Found in priority group '{group_name}'. Selected '{self.get_group_name(best)}'."
+                winner, why = _pick(candidates)
+                _log_pick(
+                    f"priority group '{group_name}'; picked ", winner, why
                 )
                 return _annotate_selection(
-                    best,
+                    winner,
                     selection_kind="preferred_priority",
                     requested_group=group_name,
+                    why=why,
                 )
         if not allow_group_fallback:
             _debug(
-                f"    Ch {chap_label}: None of the requested groups were present. Skipping chapter. Available groups: {_available_groups()}."
+                f"    Ch {chap_label}: none of the requested groups were "
+                f"present. Skipping. Available: {_available_groups()}."
             )
             return None
-        _debug(
-            f"    Ch {chap_label}: None of the requested groups were present. Falling back to upvotes with '{self.get_group_name(best_by_upvote)}'. Available groups: {_available_groups()}."
-        )
+        winner, why = _pick(pool)
+        _log_pick("no requested group present; fell back to ", winner, why)
         return _annotate_selection(
-            best_by_upvote,
-            selection_kind="fallback_missing_group",
+            winner, selection_kind="fallback_missing_group", why=why
         )
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:

@@ -2,7 +2,7 @@
 // APP SELF-UPDATE (electron-updater) — NOT the manga chapter
 // "check-for-updates" IPC family, which lives in main.js and
 // checks series for new chapters. This module owns the app's
-// own opt-in silent update flow:
+// own opt-OUT silent update flow:
 //
 //   check GitHub Releases in the background → download silently
 //   → install on app exit (autoInstallOnAppQuit). No dialogs,
@@ -25,9 +25,13 @@
 // Consumed by main.js only (grep initAppUpdater). Renderer
 // surface: push channel "app-update-status" + invoke handlers
 // "app-update:get-status" / ":check-now" / ":apply-now" (all
-// registered in main.js, exposed via preload.js). The opt-in
-// lives at settings.appAutoUpdate (SettingsTab.jsx owns the
-// default; main.js's save-settings handler calls applySettings).
+// registered in main.js, exposed via preload.js). The pref lives
+// at settings.appAutoUpdate and is OPT-OUT — but the polarity is
+// NOT decided here: every read below is `opts.enabled === true`,
+// and main.js (this module's only caller) resolves the
+// absent-means-ON default with `!== false` before calling
+// initAppUpdater / applySettings. Changing the default is a
+// main.js edit, not an edit to this file.
 //
 // Cross-file couplings:
 //   - .github/workflows/release.yml — "Stamp date-based app
@@ -245,7 +249,8 @@ function _start() {
 
 /**
  * Wire the updater once at startup (main.js, after createWindow).
- * opts.enabled   — settings.appAutoUpdate === true at launch.
+ * opts.enabled   — the RESOLVED settings.appAutoUpdate at launch (main.js
+ *                  applies the opt-out default; absent → true).
  * opts.delayDays — settings.appUpdateDelayDays (clamped here).
  * opts.onStatus  — push callback; main.js forwards to the renderer.
  * When enabled and supported, the first check is deferred

@@ -4,17 +4,18 @@ import atexit
 import builtins as _builtins
 import concurrent.futures as _futures
 import json
+import os
 import queue
 import re
 import sys
 import threading
 import time
 from typing import Dict, List, Optional, Any, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SearchHit, SiteComicContext
+from .base import BaseSiteHandler, GroupInfo, SearchHit, SiteComicContext
 
 # Optional zendriver-backed Cloudflare fallback. comix.to added CF
 # protection in upstream's 2026-05 release; direct-HTTP API calls (the
@@ -60,6 +61,215 @@ print = _stderr_print  # noqa: A001 — intentional shadow of builtins.print
 # instead of one early page. The download path (get_chapter_images) passes no
 # cap → all pages.
 _COMIX_PROBE_PAGE_CAP = 8
+
+
+# ---------------------------------------------------------------------------
+# comix's FIRST-PARTY WAF interstitial (2026-08-02)
+# ---------------------------------------------------------------------------
+# comix.to runs TWO independent bot layers and they need different handling:
+#
+#   1. Cloudflare — /cdn-cgi/challenge-platform/…, handled by is_cf_challenge +
+#      the zendriver cookie capture in sites/crawlee_utils.py. Machine-solvable.
+#   2. comix's OWN WAF — a 302 to /@waf/challenge?return=<original-path> serving
+#      an INTERACTIVE CAPTCHA ("Verify you're human — drag to rotate the circle
+#      until the picture lines up"). A human has to drag it. Verified 2026-08-02:
+#      the string "@waf" appears in ZERO client bundles (main/vendor/secure/env,
+#      727 KB scanned), so it is entirely server-issued — there is no in-page JS
+#      routine to invoke and nothing to replicate. We never attempt to solve it;
+#      we detect it, keep a solved session alive so it is rarely hit, and hand
+#      the browser to the user when it does fire.
+#
+# Before this existed the WAF page was INVISIBLE to the handler and surfaced as
+# three different lies: "chapter had 0 .rpage-page divs", "no typeahead results",
+# and — worst — a silently truncated chapter list (see fetch_chapters_via_dom).
+# On the HTTP path it 200s with challenge HTML, so _extract_initial_data_manga
+# returned None and fetch_comic_context fell through to its slug-derived title
+# fallback, writing junk metadata. Grep _looks_like_waf_challenge for the wiring.
+_WAF_PATH_MARKER = "/@waf/"
+# Quoted in the user-facing remediation message. The site's own homepage is the
+# right destination: hitting /@waf/challenge directly works but reads like an
+# error page, and the challenge is issued from whatever route you land on.
+_WAF_CHALLENGE_HINT_URL = "https://comix.to/"
+_WAF_TEXT_MARKERS = (
+    "verify you're human",
+    "verify you&#039;re human",
+    "drag to rotate",
+)
+# Debug seam: forces the detector to fire once so the headed-handoff branch can
+# be exercised without waiting for the site to actually challenge us (it is
+# behavioral, so it can't be summoned on demand). Consumed — not just read — so
+# a single run tests exactly one challenge.
+_FORCE_WAF_ENV = "AIO_COMIX_FORCE_WAF"
+
+# Interactive-handoff knobs. The handoff opens a VISIBLE browser window on the
+# downloader's own profile and waits for the user to complete the check; it
+# never touches the widget. Set AIO_COMIX_NO_INTERACTIVE_WAF=1 for unattended
+# runs (cron, CI, headless servers) so a challenge fails fast instead of
+# blocking on a window nobody will see.
+_WAF_NO_INTERACTIVE_ENV = "AIO_COMIX_NO_INTERACTIVE_WAF"
+_WAF_SOLVE_TIMEOUT_ENV = "AIO_COMIX_WAF_SOLVE_TIMEOUT"
+_WAF_DEFAULT_SOLVE_TIMEOUT_S = 180.0
+# One handoff per process. Without this a series whose every chapter trips the
+# WAF would pop a window per chapter; after the first failure we want the run to
+# end with a clear error, not to keep interrupting.
+_COMIX_WAF_HANDOFF_ATTEMPTED = False
+_COMIX_WAF_HANDOFF_LOCK = threading.Lock()
+
+# Sanity bound on the pager-reported page count. Real worst case observed is
+# 360 (Magic Emperor, ~890 chapters x ~8 groups at 20 rows/page); this only
+# exists so a malformed pager can't turn into an unbounded walk, and it doubles
+# as the outer-timeout basis in _ComixBrowserBridge.fetch_chapters_via_dom.
+_MAX_CHAPTER_SCRAPE_PAGES = 800
+
+
+def _looks_like_waf_challenge(url: Optional[str], text: Optional[str] = None) -> bool:
+    """True when comix's first-party interactive CAPTCHA is in front of us.
+
+    Deliberately NOT merged with sites/crawlee_utils.py:is_cf_challenge — comix
+    runs Cloudflare AND this, only this one needs a human, and conflating them
+    would send a solvable CF challenge down the "ask the user" path.
+
+    ``url`` is the authoritative signal (the landed/final URL contains
+    ``/@waf/``). ``text`` is the fallback for the HTTP path, where the redirect
+    may already have been followed and some callers only hold the body. The
+    generic word "challenge" is deliberately NOT a marker — it appears in
+    ordinary comic synopses.
+    """
+    if os.environ.pop(_FORCE_WAF_ENV, None):
+        return True
+    if url and _WAF_PATH_MARKER in url:
+        return True
+    if text:
+        lowered = text.lower()
+        # Bound the scan: a challenge page is ~160 KB of mostly inline script,
+        # but the markers are visible copy near the top. A full-body lower() on
+        # every chapter page would be wasted work on the hot path.
+        if len(lowered) > 200_000:
+            lowered = lowered[:200_000]
+        for marker in _WAF_TEXT_MARKERS:
+            if marker in lowered:
+                return True
+        # "security check" is the <title>; on its own it is too generic to
+        # trust, so require it to co-occur with the interstitial's noindex meta.
+        if "security check" in lowered and "noindex" in lowered:
+            return True
+    return False
+
+
+class ComixWafChallengeError(RuntimeError):
+    """comix served its interactive human-verification CAPTCHA and we could not
+    get past it (no handoff possible, the user didn't finish in time, or the
+    retry landed on it again).
+
+    Raised — never swallowed into a partial result — because every alternative
+    is worse: a truncated chapter list gets persisted to .aio_series.json as if
+    it were the whole series, and a half-scraped chapter yields a short CBZ.
+    aio-dl.py catches it at the top level and prints the remediation.
+    """
+
+    def __init__(self, message: str, challenge_url: Optional[str] = None):
+        super().__init__(message)
+        self.challenge_url = challenge_url
+
+
+class ComixChapterScrapeError(RuntimeError):
+    """The chapter-list scrape could not be completed to the end of pagination.
+
+    Exists so a truncated list can NEVER be mistaken for a short series. The
+    2026-08-02 bug this closes: `if not rows: break` treated an empty render as
+    end-of-list, so a 890-chapter series scraped 4 of its 360 pager pages and
+    the download started at chapter 871.
+    """
+
+
+def _comix_profile_dir() -> str:
+    """Absolute path to the app-owned Chromium user-data dir for comix.
+
+    WHY a persistent profile: the old code launched a virgin headless context in
+    every process, which is the most bot-like possible fingerprint and is the
+    main reason the WAF fires "sometimes". Persisting the whole PROFILE (rather
+    than picking cookies out of it) means we never hardcode a cookie name the
+    site can rename — cookies, localStorage, and the reader `preload=all`
+    setting all survive across runs, and one human solve covers days.
+
+    Deliberately app-owned and NOT the user's real Chrome profile (considered
+    and rejected 2026-08-02): Chromium locks a user-data dir, so pointing at the
+    real one would fail whenever Chrome is open, and it would mean the
+    downloader reads the user's actual browsing data.
+
+    Override with AIO_COMIX_PROFILE_DIR. Delete the directory to force a fresh
+    session (the next challenge then needs another manual solve).
+    """
+    override = (os.environ.get("AIO_COMIX_PROFILE_DIR") or "").strip()
+    if override:
+        return os.path.abspath(override)
+    if sys.platform == "win32":
+        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        root = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        root = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cache"
+        )
+    return os.path.join(root, "AIO-Webtoon-Downloader", "comix-profile")
+
+
+def _extract_group_id(url: Optional[str]) -> Optional[str]:
+    """Return the ``group_id`` query value from a comix title URL, or None.
+
+    The user pasting /title/<hid>-<slug>?group_id=4856 is asking for ONE
+    scanlation group, and comix honors that filter server-side. Honoring it is
+    worth a lot: on Magic Emperor it collapses the chapter list from 360 pager
+    pages (rows are per chapter × group) to 59 with one row per chapter.
+
+    Cross-file: consumed in get_chapters; captured in fetch_comic_context
+    because that method overwrites comic["url"] with the canonical
+    query-less URL from the #initial-data blob, so the caller's URL is the only
+    place the filter survives. Grep _group_id.
+    """
+    if not url:
+        return None
+    try:
+        query = urlparse(url).query
+    except Exception:
+        return None
+    if not query:
+        return None
+    values = parse_qs(query).get("group_id") or []
+    for value in values:
+        value = (value or "").strip()
+        # Digits only — the value is interpolated back into a URL we navigate.
+        if value and value.isdigit():
+            return value
+    return None
+
+
+def _coerce_chapter_number(
+    href: Optional[str], label: Optional[str] = None
+) -> Optional[float]:
+    """Best-effort numeric chapter number for a scraped row, or None.
+
+    Only used by the early-stop check in fetch_chapters_via_dom, so a None
+    (an unparseable special/oneshot) simply doesn't vote on whether to stop —
+    it never drops the row itself. Prefers the href because
+    `/title/{slug}/{id}-chapter-{n}` is machine-generated, and falls back to
+    the "Ch.<n>" display label.
+    """
+    if href:
+        m = re.search(r"-chapter-(\d+(?:\.\d+)?)", href)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    if label:
+        m = re.search(r"(\d+(?:\.\d+)?)", label)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    return None
 
 
 class ComixSiteHandler(BaseSiteHandler):
@@ -191,8 +401,16 @@ class ComixSiteHandler(BaseSiteHandler):
 
         Cross-file: same idiom as upstream comix.py's _cf_aware_request;
         ported here on top of the local persistent-browser bridge.
+
+        Also the HTTP-side chokepoint for comix's FIRST-PARTY WAF interstitial
+        (see _looks_like_waf_challenge). That one 200s with challenge HTML, so
+        without this check fetch_comic_context would parse it, find no
+        #initial-data, and silently fall through to its slug-derived-title
+        fallback — writing a junk title/author/cover into the library instead of
+        failing. Grep _waf_recover_once for the handoff.
         """
         response = make_request(url, scraper)
+        response = self._waf_recover_once(response, url, scraper, make_request)
         if _CF_AVAILABLE and response.status_code in (403, 503):
             try:
                 if is_cf_challenge(response.status_code, response.text):
@@ -218,6 +436,75 @@ class ComixSiteHandler(BaseSiteHandler):
                 # response so the caller's own error path runs.
                 pass
         return response
+
+    def _waf_recover_once(self, response, url: str, scraper, make_request):
+        """If *response* is comix's interactive WAF interstitial, hand the
+        browser to the user, adopt the cookies their solve produced, and retry
+        the request ONCE. Returns the (possibly new) response.
+
+        Raises ComixWafChallengeError when the challenge is still in front of us
+        afterwards. Failing loud is deliberate: the caller's next step is to
+        parse this body, and every parser in this module degrades a challenge
+        page into plausible-looking garbage rather than an error.
+
+        The cookie adoption is what makes an HTTP retry meaningful at all — the
+        human solves inside the Patchright profile, so without copying that
+        session across, cloudscraper would just re-fetch the interstitial. Same
+        idea as crawlee_utils.sync_cf_cookies, but sourced from our own
+        persistent context rather than the zendriver cache.
+        """
+        try:
+            final_url = getattr(response, "url", None) or url
+            body = getattr(response, "text", None)
+        except Exception:
+            return response
+        if not _looks_like_waf_challenge(final_url, body):
+            return response
+
+        print(
+            "[!] Comix: hit the site's human-verification check "
+            "(/@waf/challenge) on a metadata request.",
+            flush=True,
+        )
+        result = _COMIX_BROWSER_BRIDGE.solve_waf_interactively(url) or {}
+        if result.get("solved"):
+            for cookie in result.get("cookies") or []:
+                try:
+                    scraper.cookies.set(
+                        cookie["name"],
+                        cookie["value"],
+                        domain=cookie.get("domain") or "comix.to",
+                        path=cookie.get("path") or "/",
+                    )
+                except Exception:
+                    continue
+            user_agent = result.get("user_agent")
+            if user_agent:
+                # CF and most WAFs bind a clearance cookie to the UA that earned
+                # it, so the retry has to present the browser's UA, not
+                # cloudscraper's.
+                try:
+                    scraper.headers["User-Agent"] = user_agent
+                except Exception:
+                    pass
+            retried = make_request(url, scraper)
+            if not _looks_like_waf_challenge(
+                getattr(retried, "url", None) or url,
+                getattr(retried, "text", None),
+            ):
+                print("[*] Comix: verification accepted; continuing.", flush=True)
+                return retried
+            response = retried
+
+        raise ComixWafChallengeError(
+            "comix.to is asking for human verification and it was not completed, "
+            "so the request could not be trusted. Open "
+            f"{_WAF_CHALLENGE_HINT_URL} in a browser, complete the 'Verify "
+            "you're human' check once, then re-run. (The downloader keeps its "
+            f"own browser profile at {_comix_profile_dir()} — solving it in the "
+            "window the downloader opens is what makes the session stick.)",
+            challenge_url=getattr(response, "url", None) or url,
+        )
 
     def _extract_initial_data_manga(self, soup) -> Optional[Dict]:
         """Return the full manga-detail dict from the title page's SSR
@@ -422,6 +709,17 @@ class ComixSiteHandler(BaseSiteHandler):
         elif url and not api_url_value:
             manga_data["url"] = url
 
+        # Preserve the caller's ?group_id= filter. It MUST be captured here:
+        # the branch directly above replaces comic["url"] with #initial-data's
+        # canonical (query-less) path, so this is the last point at which the
+        # user's URL is still visible. get_chapters re-appends it to the URL it
+        # hands the DOM scrape. Worth the plumbing — comix honors the filter
+        # server-side, turning 360 pager pages into 59 on a long multi-group
+        # series (rows are per chapter × group). Grep _group_id.
+        group_id = _extract_group_id(url)
+        if group_id:
+            manga_data["_group_id"] = group_id
+
         list_mappings = {
             "genres": ["genres", "genre"],
             "theme": ["theme"],
@@ -465,6 +763,27 @@ class ComixSiteHandler(BaseSiteHandler):
         # constructed a context manually without a URL.
         title_url = context.comic.get("url") or f"https://comix.to/title/{hash_id}"
 
+        # Re-attach the user's ?group_id= filter (captured in
+        # fetch_comic_context, which strips the query when it adopts
+        # #initial-data's canonical URL). Scoping the list to one group is the
+        # single biggest cost lever on this site — 6x fewer pager pages on a
+        # 4-group series — and it is what the user asked for by pasting that
+        # URL. Trade-off, accepted 2026-08-02: sites/base.py's
+        # select_best_chapter_version then has only one version per chapter to
+        # rank, i.e. the explicit group choice wins over cross-group ranking.
+        # Same escape-hatch philosophy as the `--group <name>` branch (see the
+        # group-selection invariant in CLAUDE.md). Absent group_id → unchanged
+        # full cross-group behavior.
+        group_id = context.comic.get("_group_id")
+        if group_id:
+            separator = "&" if "?" in title_url else "?"
+            title_url = f"{title_url}{separator}group_id={group_id}"
+            print(
+                f"[*] Comix: scoping the chapter list to group_id={group_id} "
+                f"(from the URL you supplied).",
+                flush=True,
+            )
+
         # 2026-07-11: /api/v1/manga/{hid}/chapters is signed + encrypted
         # ({"e":...}) and 403s "Missing token." to cloudscraper, so the chapter
         # list is only obtainable from the rendered DOM. The persistent
@@ -478,7 +797,14 @@ class ComixSiteHandler(BaseSiteHandler):
             "(the JSON API is encrypted/token-gated).",
             flush=True,
         )
-        raw_items = _COMIX_BROWSER_BRIDGE.fetch_chapters_via_dom(title_url) or []
+        # chapter_floor_hint is advisory (sites/base.py): comix lists
+        # newest-first, so an update run that only wants chapters > N can stop
+        # paginating as soon as a whole page falls below N instead of walking
+        # all 360 pages. None (a full download) paginates to the end as before.
+        raw_items = _COMIX_BROWSER_BRIDGE.fetch_chapters_via_dom(
+            title_url,
+            chapter_floor=getattr(self, "chapter_floor_hint", None),
+        ) or []
 
         chapters: List[Dict] = []
         for item in raw_items:
@@ -593,14 +919,21 @@ class ComixSiteHandler(BaseSiteHandler):
                 "chap": chap_str,
                 "title": title,
                 "id": chap_id,
+                "_groups": (
+                    [GroupInfo(
+                        name=group_name,
+                        group_id=group_info.get("id") if group_info else None,
+                    )] if group_name else []
+                ),
                 "group": group_name,
+                # comix is one of only two sites that reports a real vote
+                # count (mangataro's API path is the other), so the ranker's
+                # upvote tier actually engages here — as a weak tiebreak below
+                # MTL/official/track-record, not as the decider it used to be.
                 "up_count": item.get("votes", 0),
             })
 
         return chapters
-
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        return chapter_version.get("group")
 
     # Module-level TTL constant used by _get/_cache_chapter_images.
     # Defined here (class-scope) instead of top-of-file so it stays
@@ -985,11 +1318,31 @@ class _ComixBrowserSession:
         # we synced into _context. Used by _sync_cf_cookies to skip
         # redundant add_cookies calls when the cache hasn't changed.
         self._last_cf_cookie_ts: float = 0.0
+        # Which mode the live context was launched in. The headed WAF handoff
+        # has to tear down and relaunch (headless is fixed at launch time and
+        # Chromium locks the profile dir to one context), so _start compares
+        # against this to decide whether the cached context is reusable.
+        self._headless: bool = True
 
-    def _start(self) -> bool:
+    def _start(self, headless: bool = True) -> bool:
         """Lazy-launch Patchright on first use. Returns True if the browser
         is ready, False if Patchright/Playwright unavailable or launch failed.
-        Subsequent calls are cheap (already-started fast path)."""
+        Subsequent calls are cheap (already-started fast path).
+
+        Launches a PERSISTENT context against the app-owned profile dir
+        (_comix_profile_dir) rather than a throwaway one. That single change is
+        the main defense against comix's WAF: a virgin profile per process is
+        the most bot-like fingerprint available, and persisting the profile
+        means a human solve survives across runs AND across processes (search,
+        download, and the UI's per-series subprocesses all share it).
+
+        ``headless`` is fixed at launch time by Chromium, and the profile dir
+        can only be held by ONE context at a time, so switching modes (the WAF
+        handoff) means a full teardown + relaunch — hence the mode comparison on
+        the fast path.
+        """
+        if self._page is not None and self._headless != headless:
+            self._cleanup()
         if self._page is not None:
             # CX-1: a non-None page is NOT proof of health. A mid-run browser
             # or context crash leaves the dead page object in place; reusing
@@ -1001,6 +1354,10 @@ class _ComixBrowserSession:
             # launch block below on the same call.
             try:
                 page_dead = self._page.is_closed()
+                # With launch_persistent_context there is no Browser handle to
+                # ask (context.browser is documented as None for persistent
+                # contexts), so the page's own liveness is the primary signal
+                # and the browser check only runs when a handle exists.
                 browser_dead = (
                     self._browser is not None and not self._browser.is_connected()
                 )
@@ -1029,21 +1386,33 @@ class _ComixBrowserSession:
             print(f"[!] Comix Playwright start failed: {e}")
             return False
         try:
-            self._browser = self._pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
-            )
-            # Create an explicit context so we can (a) match the UA that
-            # zendriver used to solve CF and (b) inject cookies after the
-            # fact. The cached UA is set at context-creation because it
-            # cannot be changed on an existing context — if no CF solve
-            # has happened yet, Patchright's default stealth UA is used.
+            # Persistent context: cookies, localStorage and the reader's
+            # preload setting live in this directory and survive process exit,
+            # so one human WAF solve keeps working for days. See
+            # _comix_profile_dir for why app-owned rather than the real Chrome
+            # profile. The UA kwarg still matches whatever zendriver used for a
+            # CF solve (CF binds cf_clearance to the UA); it can only be set at
+            # context creation, never on a live context.
+            profile_dir = _comix_profile_dir()
+            os.makedirs(profile_dir, exist_ok=True)
             ctx_kwargs: Dict[str, Any] = {}
             cached_ua = self._cached_cf_user_agent()
             if cached_ua:
                 ctx_kwargs["user_agent"] = cached_ua
-            self._context = self._browser.new_context(**ctx_kwargs)
-            self._page = self._context.new_page()
+            self._context = self._pw.chromium.launch_persistent_context(
+                profile_dir,
+                headless=headless,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+                **ctx_kwargs,
+            )
+            self._headless = headless
+            # A persistent context opens with one about:blank page already;
+            # reuse it so we don't leave an orphan tab holding the profile.
+            existing = list(getattr(self._context, "pages", None) or [])
+            self._page = existing[0] if existing else self._context.new_page()
+            # Documented as None for persistent contexts on some versions;
+            # kept only so the health check can use it when it IS available.
+            self._browser = getattr(self._context, "browser", None)
         except Exception as e:
             print(f"[!] Comix Playwright launch failed: {e}")
             self._cleanup()
@@ -1110,6 +1479,10 @@ class _ComixBrowserSession:
         return True
 
     def _cleanup(self):
+        # context.close() on a persistent context is what FLUSHES cookies and
+        # localStorage to the profile dir. Skipping it (or killing the process
+        # mid-run) can lose a freshly-solved WAF session, so the WAF handoff
+        # always closes through here rather than abandoning the context.
         try:
             if self._context is not None:
                 self._context.close()
@@ -1130,6 +1503,7 @@ class _ComixBrowserSession:
         self._pw = None
         self._page = None
         self._last_cf_cookie_ts = 0.0
+        self._headless = True
 
     def _cached_cf_user_agent(self) -> Optional[str]:
         """Return the User-Agent string from any cached zendriver CF solve
@@ -1208,6 +1582,248 @@ class _ComixBrowserSession:
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
+
+    def _waf_blocked(self, context_label: str) -> bool:
+        """True if the page currently shows comix's human-verification check.
+
+        Called after every navigation and every pager click. Cheap: reads
+        page.url first (the authoritative signal) and only pays for a body read
+        when the URL is inconclusive.
+        """
+        page = self._page
+        if page is None:
+            return False
+        try:
+            current_url = page.url
+        except Exception:
+            return False
+        if _looks_like_waf_challenge(current_url):
+            print(
+                f"[!] Comix: human-verification check hit during "
+                f"{context_label} ({current_url}).",
+                flush=True,
+            )
+            return True
+        # URL didn't say so — sniff the visible copy. Guarded because a
+        # mid-navigation evaluate can throw.
+        try:
+            body_text = page.evaluate(
+                "document.body ? document.body.innerText.slice(0, 2000) : ''"
+            ) or ""
+        except Exception:
+            return False
+        if _looks_like_waf_challenge(None, body_text):
+            print(
+                f"[!] Comix: human-verification check hit during "
+                f"{context_label} (interstitial body).",
+                flush=True,
+            )
+            return True
+        return False
+
+    def _enforce_no_waf(self, stage: str, return_url: Optional[str] = None) -> None:
+        """No-op unless the WAF interstitial is up; otherwise attempt ONE
+        interactive handoff and raise ComixWafChallengeError if it doesn't pass.
+
+        Shared by the chapter-list and chapter-image scrapes so both fail the
+        same way. Search deliberately does NOT use this — see
+        ComixSiteHandler.search for why a raise there would blocklist the host.
+        """
+        if not self._waf_blocked(stage):
+            return
+        challenge_url = None
+        try:
+            challenge_url = self._page.url
+        except Exception:
+            pass
+        if (self.solve_waf_interactively(return_url) or {}).get("solved"):
+            return
+        raise ComixWafChallengeError(
+            "comix.to is asking for human verification and it was not "
+            f"completed, so {stage} could not be read. Re-run and complete the "
+            "check in the window the downloader opens, or visit comix.to in a "
+            "browser and pass it once.",
+            challenge_url=challenge_url,
+        )
+
+    def solve_waf_interactively(self, return_url: Optional[str] = None) -> Dict[str, Any]:
+        """Open the downloader's own browser profile VISIBLY on comix's
+        human-verification page and wait for the user to complete it.
+
+        Returns {"solved": bool, "cookies": [...], "user_agent": str|None,
+        "reason": str}. Never raises — callers decide whether an unsolved
+        challenge is fatal (it is, for chapter lists and metadata).
+
+        What this does NOT do, deliberately: it does not read, score, rotate, or
+        submit the widget, and it sends no synthetic input. It navigates, prints
+        an instruction, and POLLS the URL until the site itself decides the
+        check passed. The solve is the user's.
+
+        Why it works at all: the visible window runs on the SAME persistent
+        profile dir as the headless one (_comix_profile_dir), so the session the
+        user's solve produces is written straight into the profile the rest of
+        the run uses. We relaunch headless afterwards and the caller retries.
+        The returned cookies additionally let the plain-HTTP path
+        (ComixSiteHandler._waf_recover_once) adopt the same session, which it
+        otherwise could not see.
+        """
+        global _COMIX_WAF_HANDOFF_ATTEMPTED
+        result: Dict[str, Any] = {"solved": False, "cookies": [], "user_agent": None}
+
+        if (os.environ.get(_WAF_NO_INTERACTIVE_ENV) or "").strip() not in ("", "0"):
+            result["reason"] = "disabled"
+            print(
+                f"[!] Comix: {_WAF_NO_INTERACTIVE_ENV} is set; not opening a "
+                f"verification window.",
+                flush=True,
+            )
+            return result
+
+        # Headless Linux boxes have nowhere to show the window. Windows/macOS
+        # always have a session available to the desktop app and the CLI.
+        if sys.platform not in ("win32", "darwin") and not (
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        ):
+            result["reason"] = "no_display"
+            print(
+                "[!] Comix: no display available, so the verification window "
+                "cannot be shown.",
+                flush=True,
+            )
+            return result
+
+        with _COMIX_WAF_HANDOFF_LOCK:
+            if _COMIX_WAF_HANDOFF_ATTEMPTED:
+                result["reason"] = "already_attempted"
+                return result
+            _COMIX_WAF_HANDOFF_ATTEMPTED = True
+
+        try:
+            timeout_s = float(
+                os.environ.get(_WAF_SOLVE_TIMEOUT_ENV)
+                or _WAF_DEFAULT_SOLVE_TIMEOUT_S
+            )
+        except (TypeError, ValueError):
+            timeout_s = _WAF_DEFAULT_SOLVE_TIMEOUT_S
+
+        target = return_url or _WAF_CHALLENGE_HINT_URL
+        # Drop the headless context first — Chromium locks the profile dir to a
+        # single context, and closing is also what flushes state to disk.
+        self._cleanup()
+        if not self._start(headless=False):
+            result["reason"] = "launch_failed"
+            print(
+                "[!] Comix: could not open a visible browser for verification.",
+                flush=True,
+            )
+            self._cleanup()
+            self._start(headless=True)
+            return result
+
+        page = self._page
+        try:
+            page.goto(target, wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:
+            print(
+                f"[!] Comix: could not load the verification page "
+                f"({type(exc).__name__}: {exc}).",
+                flush=True,
+            )
+
+        # Every line is [!]-prefixed on purpose. The Electron LogPanel classifies
+        # by line shape (UI-source/electron/log-filter.js:classifyLogLevel):
+        # a leading "[!]" paints the line as an error, while a line starting
+        # with 2+ spaces is demoted to "verbose" — so an indented banner would
+        # render the one instruction the user MUST read as dim filler.
+        print("[!] " + "=" * 68, flush=True)
+        print(
+            "[!] ACTION NEEDED - comix.to is asking for human verification.",
+            flush=True,
+        )
+        print(
+            "[!] A browser window just opened. Complete the check in it: drag",
+            flush=True,
+        )
+        print(
+            "[!] the slider until the picture lines up, then press Verify.",
+            flush=True,
+        )
+        print(
+            f"[!] The download resumes by itself once it passes (waiting up to "
+            f"{int(timeout_s)}s).",
+            flush=True,
+        )
+        print(
+            "[!] The session is saved to disk, so this should be rare.",
+            flush=True,
+        )
+        print("[!] " + "=" * 68, flush=True)
+
+        deadline = time.monotonic() + timeout_s
+        solved = False
+        while time.monotonic() < deadline:
+            try:
+                if page.is_closed():
+                    # User closed the window. Treat as a decision to abort
+                    # rather than waiting out the full timeout.
+                    print(
+                        "[!] Comix: verification window was closed before the "
+                        "check completed.",
+                        flush=True,
+                    )
+                    result["reason"] = "window_closed"
+                    break
+                current = page.url
+            except Exception:
+                result["reason"] = "window_lost"
+                break
+            if current and not _looks_like_waf_challenge(current):
+                # The site routed us off the interstitial — that IS the pass
+                # signal (it redirects back to ?return=). Small settle wait so
+                # the Set-Cookie lands before we read cookies.
+                try:
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+                solved = True
+                break
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                break
+
+        if solved:
+            print("[*] Comix: verification passed - thanks. Resuming.", flush=True)
+            try:
+                result["cookies"] = [
+                    {
+                        "name": c.get("name"),
+                        "value": c.get("value"),
+                        "domain": c.get("domain"),
+                        "path": c.get("path"),
+                    }
+                    for c in (self._context.cookies() or [])
+                    if c.get("name") and c.get("value")
+                ]
+            except Exception:
+                result["cookies"] = []
+            try:
+                result["user_agent"] = self._page.evaluate("navigator.userAgent")
+            except Exception:
+                result["user_agent"] = None
+            result["solved"] = True
+        elif not result.get("reason"):
+            result["reason"] = "timeout"
+            print(
+                f"[!] Comix: verification not completed within {int(timeout_s)}s.",
+                flush=True,
+            )
+
+        # Back to headless for the rest of the run. The close flushes the
+        # solved session into the profile dir, so the relaunch inherits it.
+        self._cleanup()
+        self._start(headless=True)
+        return result
 
     def fetch_search_via_dom(
         self,
@@ -1334,6 +1950,29 @@ class _ComixBrowserSession:
                 body_text = page.evaluate(
                     "document.body ? document.body.innerText.slice(0, 300) : ''"
                 ) or ""
+                # Name the actual cause. Search deliberately does NOT raise or
+                # trigger the interactive handoff (see ComixSiteHandler.search:
+                # a raise would poison the orchestrator's persistent
+                # ProbeFailureCache and blocklist comix.to for an hour, and
+                # popping a window mid-search would interrupt a cross-site
+                # search the user is watching). Reporting it accurately is the
+                # whole win here — this used to read as "no results", which
+                # looks like the series simply isn't on comix.
+                waf_url = ""
+                try:
+                    waf_url = page.url or ""
+                except Exception:
+                    pass
+                if _looks_like_waf_challenge(waf_url, body_text):
+                    print(
+                        f"[!] Comix search: skipped {clean!r} — comix.to is "
+                        f"showing its human-verification check. Run a comix "
+                        f"download (or open comix.to in a browser) and pass it "
+                        f"once; the session is saved and search will work "
+                        f"again.",
+                        flush=True,
+                    )
+                    return []
                 cf_msg = ""
                 if _CF_AVAILABLE:
                     try:
@@ -1397,16 +2036,18 @@ class _ComixBrowserSession:
     def fetch_chapters_via_dom(
         self,
         title_url: str,
-        max_pages: int = 500,
-        time_budget_s: float = 300.0,
+        max_pages: int = 0,
+        time_budget_s: float = 0.0,
+        chapter_floor: Optional[float] = None,
     ) -> List[Dict]:
-        """Paginate the title page (`?page=N`) in the persistent browser and
-        scrape chapter rows from the rendered DOM. Used when the JSON API
-        path returns 0 items because comix.to's `/api/v1/manga/{hid}/chapters`
-        now responds with an encrypted blob (`{"e": "<base64-ish>"}`) that
-        we can't decode in Python — the page's bundle decrypts it via a
-        module-scoped routine that isn't exposed on `window`, so calling it
-        from `page.evaluate` isn't reachable.
+        """Paginate the title page in the persistent browser and scrape chapter
+        rows from the rendered DOM. The JSON API can't be used: it is
+        per-request HMAC-signed AND returns an encrypted body, and the
+        signature covers the query string (verified 2026-08-02: replaying a
+        valid token with `limit=200` instead of `limit=20` → 403 "Invalid
+        token"), so we can neither forge a call nor widen the page size. The
+        chapter rows are also absent from the SSR HTML — `?page=5` returns
+        byte-identical HTML to `?page=1`. The browser is genuinely required.
 
         Returns API-item-shaped dicts so the handler's existing per-item
         processing loop (chap_str normalization, lenient language filter,
@@ -1416,26 +2057,45 @@ class _ComixBrowserSession:
         URL implicitly already filters to whichever language the user
         landed on; the lenient filter treats None as "keep" anyway.
 
-        Pagination strategy:
-          - Iterate page=1,2,3… via `page.goto`. Each navigation is ~1s
-            with `wait_for_selector(".mchap-row__primary", timeout=10s)`
-            instead of a fixed sleep, and the persistent browser keeps
-            warm so subsequent navs reuse the same TCP/TLS session.
-          - Dedupe by chap_id across pages — comix's pagination occasionally
-            overlaps the boundary chapter between adjacent pages, so naive
-            concatenation would double-count.
-          - Print a progress line every 20 pages so the UI / CLI user
-            doesn't think the process is hung during long scrapes.
+        REWRITTEN 2026-08-02 around the site's own pager (`.npager`). The old
+        loop navigated `?page=N` and treated an empty scrape as end-of-list:
 
-        Time budget: default 300s. One Piece is the long-tail outlier
-        (~180 pages * 1s in the warm-browser case = ~3 min); most series
-        fit well under a minute. Truncated runs surface a stderr warning
-        AND return the partial list — better than a hard fail, and the
-        caller's chapter range (`--chapters`) can clip to whatever was
-        scraped.
+            if not rows: break     # silent on every page after the first
 
-        Returns empty list on any error so the caller's None-vs-[] check
-        still works as a sentinel for "API exhausted, scrape exhausted".
+        That cannot distinguish "past the last page" from "the render hadn't
+        finished" or "a WAF interstitial is in front of us", and rows are per
+        (chapter x group) so a 4-group series only yields ~5 distinct chapters
+        per 20-row page. Live failure it caused: Magic Emperor has 360 pager
+        pages; the scrape stopped at page 5, collected 78 rows = 20 distinct
+        chapters, and the download started at chapter 871 instead of 1 — with
+        no warning at all.
+
+        Three rules now hold:
+          1. The pager is GROUND TRUTH. One click on "Last page" reports the
+             real total up front (verified: 360 unfiltered, 59 with
+             ?group_id=), which becomes both the loop bound and the completion
+             test. `.npager__num.is-active` is the freshness signal, replacing
+             the old first-row-href diff that returned instantly on stale DOM
+             during the React swap.
+          2. An empty page is a FAILURE, not an ending, unless the pager says
+             we're on the last page. It retries once, then raises.
+          3. Pagination is CLIENT-SIDE ("Next page" clicks), not a full
+             `page.goto` per page. 360 SPA cold boots per series was both slow
+             and the most bot-like thing this handler did — the WAF fires on
+             behavior, so this directly reduces how often we get challenged.
+
+        Raises ComixChapterScrapeError / ComixWafChallengeError rather than
+        returning a short list. A truncated list is worse than an error: it is
+        persisted to .aio_series.json as though it were the whole series, so
+        every later update run inherits the truncation.
+
+        ``chapter_floor`` is the advisory early-stop from
+        BaseSiteHandler.chapter_floor_hint: comix sorts newest-first, so an
+        update run that only wants chapters above N stops as soon as a whole
+        page falls below N. None = walk to the end.
+
+        ``max_pages`` / ``time_budget_s`` default to 0 = "derive from the
+        pager". Explicit non-zero values still cap, for callers that want one.
         """
         if not self._start():
             return []
@@ -1464,153 +2124,341 @@ class _ComixBrowserSession:
                 };
             });
         }"""
-        # Drop any trailing ?query so we can append our own pagination param
-        # cleanly. comix accepts ?page=N on the title page and the React
-        # router uses that to drive the chapter-list state.
-        base = title_url.split("?", 1)[0]
+        # Preserve any existing query (notably ?group_id= appended by
+        # get_chapters) and add page=N to it. The old code did
+        # `title_url.split("?", 1)[0]`, which silently discarded the user's
+        # group filter — the difference between 59 and 360 pages to walk.
+        base_url, _sep, base_query = title_url.partition("?")
+
+        def _page_url(n: int) -> str:
+            prefix = f"{base_query}&" if base_query else ""
+            return f"{base_url}?{prefix}page={n}"
+
+        # ── Pager helpers. `.npager` is the site's OWN pagination control and
+        # the only trustworthy statement of how many pages exist. Reading it is
+        # what lets an empty row list be treated as a failure rather than as
+        # end-of-list — the conflation that truncated Magic Emperor at page 5
+        # of 360. Shape verified live 2026-08-02: windowed `.npager__num`
+        # buttons, `.is-active` on the current one, and First/Previous/Next/Last
+        # buttons identified by aria-label.
+        pager_js = """() => {
+            const nav = document.querySelector('.npager');
+            if (!nav) return null;
+            const values = [];
+            let active = null;
+            for (const b of nav.querySelectorAll('.npager__num')) {
+                const v = parseInt((b.textContent || '').trim(), 10);
+                if (!Number.isFinite(v)) continue;
+                values.push(v);
+                if (b.classList.contains('is-active')) active = v;
+            }
+            const enabled = (label) => {
+                const b = Array.from(nav.querySelectorAll('button')).find(
+                    x => (x.getAttribute('aria-label') || '').toLowerCase() === label);
+                return !!b && !b.disabled;
+            };
+            return {
+                active: active,
+                max: values.length ? Math.max.apply(null, values) : null,
+                hasNext: enabled('next page'),
+                hasLast: enabled('last page'),
+            };
+        }"""
+
+        def _read_pager() -> Optional[Dict[str, Any]]:
+            try:
+                return self._page.evaluate(pager_js)
+            except Exception:
+                return None
+
+        def _click_pager(aria_label: str) -> bool:
+            """Click a pager button by aria-label. Client-side route change —
+            no document reload, which is both ~5x faster than page.goto and far
+            less bot-like (360 SPA cold boots per series was the most
+            challenge-provoking thing this handler did)."""
+            js = """(label) => {
+                const nav = document.querySelector('.npager');
+                if (!nav) return false;
+                const b = Array.from(nav.querySelectorAll('button')).find(
+                    x => (x.getAttribute('aria-label') || '').toLowerCase() === label);
+                if (!b || b.disabled) return false;
+                b.click();
+                return true;
+            }"""
+            try:
+                return bool(self._page.evaluate(js, aria_label))
+            except Exception:
+                return False
+
+        def _rows_rendered() -> int:
+            try:
+                return int(
+                    self._page.evaluate(
+                        "document.querySelectorAll('.mchap-item').length"
+                    ) or 0
+                )
+            except Exception:
+                return 0
+
+        def _wait_for_pager(check, timeout_s: float = 15.0) -> Optional[Dict[str, Any]]:
+            """Poll the pager until `check(state)` holds; return that state or
+            None on timeout.
+
+            Needed because "rows are on screen" says nothing about WHICH page
+            they belong to — comix swaps row content in place, so the previous
+            page's rows outlive a click. Callers therefore assert on pager
+            state (active number, Next availability) rather than on rows.
+            """
+            end = _time.monotonic() + timeout_s
+            while _time.monotonic() < end:
+                state = _read_pager()
+                if state:
+                    try:
+                        if check(state):
+                            return state
+                    except Exception:
+                        pass
+                try:
+                    self._page.wait_for_timeout(250)
+                except Exception:
+                    break
+            return None
+
+        def _wait_for_page(expected: Optional[int], timeout_s: float = 15.0) -> bool:
+            """Block until rows are rendered AND (when known) the pager reports
+            `expected` as the active page.
+
+            The active-page number replaces the old first-row-href diff. That
+            diff was unreliable in exactly the case that mattered: comix's React
+            list swaps row CONTENT without unmounting, so the previous page's
+            nodes survive the navigation and an href comparison can pass on
+            stale DOM — or, on a slow render, time out and leave the caller
+            scraping an empty list that it then read as end-of-list.
+            """
+            end = _time.monotonic() + timeout_s
+            while _time.monotonic() < end:
+                if _rows_rendered() > 0:
+                    if expected is None:
+                        return True
+                    state = _read_pager()
+                    # No pager at all = single-page series; rows are enough.
+                    # Otherwise demand an EXACT active-page match: accepting a
+                    # transient active=None would let a mid-render read pass on
+                    # the previous page's still-mounted rows, which is the
+                    # stale-DOM failure this whole rewrite exists to kill.
+                    if state is None:
+                        return True
+                    if state.get("active") == expected:
+                        return True
+                try:
+                    self._page.wait_for_timeout(250)
+                except Exception:
+                    break
+            return False
+
+        def _waf_guard(stage: str) -> None:
+            self._enforce_no_waf(stage, _page_url(1))
+
         items: List[Dict] = []
         seen_ids: set = set()
-        deadline = _time.monotonic() + time_budget_s
-        # Track the first row's href from the previous scrape. Critical for
-        # correctness on back-to-back goto: comix's React component swaps
-        # row CONTENT without unmounting, so the OLD page's `.mchap-row__primary`
-        # nodes survive long enough that a naïve `wait_for_selector` returns
-        # instantly on stale DOM, we re-scrape the previous page's chap_ids,
-        # every row is a dup, and the consecutive_dup early-break fires a
-        # false end-of-list. Waiting for the first row's href to differ
-        # from the previous page is the cheapest reliable freshness signal.
-        prev_first_href: Optional[str] = None
-        consecutive_dup_pages = 0
-        for page_n in range(1, max_pages + 1):
-            if _time.monotonic() > deadline:
-                print(
-                    f"[!] Comix DOM scrape time budget ({time_budget_s:.0f}s) "
-                    f"exceeded at page {page_n}; returning {len(items)} chapters "
-                    f"(use --chapters to limit). Series may be truncated.",
-                    flush=True,
-                )
-                break
-            url = f"{base}?page={page_n}"
+
+        # ── Page 1 lands via a real navigation; every later page is a pager
+        # click on the already-loaded SPA.
+        try:
+            self._page.goto(
+                _page_url(1), wait_until="domcontentloaded", timeout=30000
+            )
+        except Exception as e:
+            raise ComixChapterScrapeError(
+                f"comix chapter list: could not load {_page_url(1)} "
+                f"({type(e).__name__}: {e})."
+            ) from e
+        _waf_guard("the chapter list")
+        if not _wait_for_page(None, 20.0):
+            # Retry the navigation once — a cold SPA boot behind a slow network
+            # can exceed 20s, and this is cheap next to failing the run.
             try:
-                self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                # Page 1 has no prior page to diff against — fall back to
-                # the simple "any chapter row exists" signal. Subsequent
-                # pages wait for the React swap to actually happen.
-                if prev_first_href is None:
+                self._page.goto(
+                    _page_url(1), wait_until="domcontentloaded", timeout=30000
+                )
+            except Exception:
+                pass
+            _waf_guard("the chapter list")
+
+        if _rows_rendered() == 0:
+            # Rich diagnostics before failing: a sandboxed Chromium can
+            # masquerade a CF challenge or a renamed selector as an empty
+            # series, and these three facts distinguish them.
+            detail = ""
+            try:
+                page_title = self._page.title() or "(no title)"
+                page_url = self._page.url
+                body_text = self._page.evaluate(
+                    "document.body ? document.body.innerText.slice(0, 500) : ''"
+                ) or ""
+                snippet = body_text.replace("\n", " ").strip()
+                primary_count = self._page.evaluate(
+                    "document.querySelectorAll('.mchap-row__primary').length"
+                )
+                cf_msg = ""
+                if _CF_AVAILABLE:
                     try:
-                        self._page.wait_for_selector(".mchap-row__primary", timeout=10000)
-                    except Exception as wait_exc:
-                        # Surface why the scrape gave up on page 1. The prior
-                        # silent break made "comix returns 0 chapters"
-                        # debugging opaque — sandboxed Chromium can silently
-                        # masquerade a CF challenge or a slow SPA render as
-                        # an empty series. Dump page title/URL/body-text +
-                        # CF-challenge sniff so the user can tell which.
-                        # Diagnostic-only; control flow still breaks after.
-                        # Cross-file: is_cf_challenge in sites/crawlee_utils.py.
-                        try:
-                            page_title = self._page.title() or "(no title)"
-                            page_url = self._page.url
-                            body_text = self._page.evaluate(
-                                "document.body ? document.body.innerText.slice(0, 500) : ''"
-                            ) or ""
-                            snippet = body_text.replace("\n", " ").strip()
-                            cf_msg = ""
-                            if _CF_AVAILABLE:
-                                try:
-                                    if is_cf_challenge(200, body_text):
-                                        cf_msg = " — looks like a Cloudflare challenge"
-                                except Exception:
-                                    pass
-                            print(
-                                f"[!] Comix DOM scrape: page 1 selector "
-                                f"'.mchap-row__primary' did not render "
-                                f"within 10s{cf_msg}. "
-                                f"title={page_title!r} url={page_url!r}",
-                                flush=True,
-                            )
-                            if snippet:
-                                print(
-                                    f"[!] Comix DOM scrape: page 1 visible "
-                                    f"text (first 500 chars): {snippet}",
-                                    flush=True,
-                                )
-                        except Exception as diag_exc:
-                            print(
-                                f"[!] Comix DOM scrape: page 1 selector timed "
-                                f"out ({type(wait_exc).__name__}); diagnostic "
-                                f"dump also failed: {type(diag_exc).__name__}: "
-                                f"{diag_exc}",
-                                flush=True,
-                            )
-                        break
-                else:
-                    # Wait until the first row's href differs from the
-                    # previous page's first href. Times out at 10s either
-                    # because (a) we're past the last page and React kept
-                    # showing the prior content unchanged, or (b) comix
-                    # legitimately took >10s to re-render. (a) is terminal;
-                    # we treat the empty-rows result that follows as the
-                    # end signal naturally. json.dumps escapes any quotes
-                    # in the href so the literal can't break the JS parse.
-                    js_predicate = (
-                        "(() => { const a = document.querySelector('.mchap-row__primary'); "
-                        f"return a && a.getAttribute('href') !== {json.dumps(prev_first_href)}; }})"
-                    )
-                    try:
-                        self._page.wait_for_function(js_predicate, timeout=10000)
+                        if is_cf_challenge(200, body_text):
+                            cf_msg = " Looks like a Cloudflare challenge."
                     except Exception:
-                        # DOM didn't update — either past end of pagination
-                        # or React is being lazy. Either way scrape what we
-                        # have and let the post-scrape dup-detect handle it.
                         pass
+                detail = (
+                    f" title={page_title!r} url={page_url!r} "
+                    f".mchap-row__primary={primary_count}.{cf_msg} "
+                    f"Visible text: {snippet[:300]}"
+                )
+                if primary_count:
+                    detail += (
+                        " NOTE: chapter links exist but no `.mchap-item` rows — "
+                        "comix likely renamed the row container; update the "
+                        "selectors in fetch_chapters_via_dom."
+                    )
+            except Exception:
+                pass
+            raise ComixChapterScrapeError(
+                "comix chapter list: no chapter rows rendered on page 1." + detail
+            )
+
+        # ── Total page count, straight from the pager. One "Last page" click
+        # is the cheapest possible way to learn it (verified: 360 unfiltered /
+        # 59 with group_id on Magic Emperor), and it converts the whole loop
+        # from "walk until something looks like the end" to a bounded,
+        # verifiable traversal.
+        pager = _read_pager()
+        total_pages = 1
+        if pager:
+            # Floor from what's already visible. The pager window only shows a
+            # few numbers, so this is a LOWER bound, never the answer — but it
+            # guarantees we can never conclude "1 page" when the DOM plainly
+            # shows more, which is how the first cut of this code still
+            # truncated the list.
+            total_pages = max(total_pages, int(pager.get("max") or 1))
+            if pager.get("hasLast") and _click_pager("last page"):
+                # Wait for the pager to actually LAND on the last page —
+                # "rows exist" is not enough. comix's React list swaps row
+                # content in place, so page 1's rows survive the click and a
+                # rows-only wait returns instantly on stale DOM reporting
+                # active=1. The last page is the one with no Next.
+                last_state = _wait_for_pager(
+                    lambda s: not s.get("hasNext") and bool(s.get("active")),
+                    20.0,
+                )
+                if last_state and last_state.get("active"):
+                    total_pages = max(total_pages, int(last_state["active"]))
+                else:
+                    print(
+                        "[!] Comix DOM scrape: could not read the last page "
+                        "number from the pager; falling back to the highest "
+                        f"visible page ({total_pages}).",
+                        flush=True,
+                    )
+                # Back to the start. Fall back to a hard navigation if the
+                # First button doesn't take.
+                if not (_click_pager("first page") and _wait_for_page(1, 20.0)):
+                    try:
+                        self._page.goto(
+                            _page_url(1),
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                    except Exception:
+                        pass
+                    _wait_for_page(1, 20.0)
+                _waf_guard("the chapter list")
+        if _rows_rendered() == 0:
+            raise ComixChapterScrapeError(
+                "comix chapter list: rows disappeared after reading the pager; "
+                "the page state is unusable."
+            )
+        if max_pages and max_pages > 0:
+            total_pages = min(total_pages, max_pages)
+        if total_pages > _MAX_CHAPTER_SCRAPE_PAGES:
+            print(
+                f"[!] Comix DOM scrape: pager reports {total_pages} pages, "
+                f"above the {_MAX_CHAPTER_SCRAPE_PAGES}-page sanity bound; "
+                f"clamping.",
+                flush=True,
+            )
+            total_pages = _MAX_CHAPTER_SCRAPE_PAGES
+
+        # Budget scales with the now-KNOWN size instead of being a fixed guess
+        # that a long series silently ran out of. ~1.5s per pager click plus
+        # slack, floored at the historical 300s.
+        budget = (
+            time_budget_s
+            if time_budget_s and time_budget_s > 0
+            else max(300.0, total_pages * 1.5 + 30.0)
+        )
+        started_at = _time.monotonic()
+        deadline = started_at + budget
+        print(
+            f"[*] Comix DOM scrape: {total_pages} page(s) of chapter rows to "
+            f"walk (budget {int(budget)}s).",
+            flush=True,
+        )
+
+        page_n = 0
+        while True:
+            page_n += 1
+            try:
                 rows = self._page.evaluate(scrape_js) or []
             except Exception as e:
-                print(f"[!] Comix DOM scrape failed at page {page_n}: {type(e).__name__}: {e}", flush=True)
-                break
+                raise ComixChapterScrapeError(
+                    f"comix chapter list: DOM scrape failed on page {page_n} "
+                    f"of {total_pages} ({type(e).__name__}: {e})."
+                ) from e
             if not rows:
-                # On page 1 the selector wait already passed (so
-                # `.mchap-row__primary` rendered) — `.mchap-item` returning
-                # 0 here means the DOM scheme changed. On later pages this
-                # is the normal end-of-pagination signal; silent is correct
-                # there. Probe both selectors so the user can see the gap.
-                if prev_first_href is None:
+                # An empty page is NOT end-of-list. This is precisely the bug
+                # that made an 890-chapter series start downloading at chapter
+                # 871: the old code did a bare `break` here, silently, on every
+                # page after the first. The pager knows whether more pages
+                # exist, so ask it instead of guessing.
+                on_last_page = page_n >= total_pages
+                _waf_guard(f"chapter list page {page_n}")
+                if not on_last_page:
+                    # Re-navigate this page directly and try once more; a slow
+                    # SPA render is the common benign cause.
+                    print(
+                        f"[!] Comix DOM scrape: page {page_n} of {total_pages} "
+                        f"rendered no rows; retrying it.",
+                        flush=True,
+                    )
                     try:
-                        primary_count = self._page.evaluate(
-                            "document.querySelectorAll('.mchap-row__primary').length"
+                        self._page.goto(
+                            _page_url(page_n),
+                            wait_until="domcontentloaded",
+                            timeout=30000,
                         )
-                        item_count = self._page.evaluate(
-                            "document.querySelectorAll('.mchap-item').length"
-                        )
-                        print(
-                            f"[!] Comix DOM scrape: page 1 had "
-                            f"{primary_count} `.mchap-row__primary` "
-                            f"element(s) but {item_count} `.mchap-item` "
-                            f"row(s). scrape_js queries `.mchap-item`, so "
-                            f"comix likely renamed the row container — "
-                            f"update the selectors in fetch_chapters_via_dom.",
-                            flush=True,
-                        )
-                    except Exception as diag_exc:
-                        print(
-                            f"[!] Comix DOM scrape: page 1 returned 0 rows "
-                            f"and the diagnostic probe also failed: "
-                            f"{type(diag_exc).__name__}: {diag_exc}",
-                            flush=True,
-                        )
-                break
-            # Update prev_first_href for the next iteration's freshness check.
-            # Use the raw href (not the normalized url) so the JS predicate
-            # comparison stays exact.
-            prev_first_href = rows[0].get("href")
-            # Progress: emit a heartbeat every 20 pages so the UI / CLI
-            # doesn't look stuck during long scrapes (One Piece is ~180
-            # pages = ~3 minutes wall time with a warm browser). stderr
-            # path keeps stdout clean for JSON consumers.
+                    except Exception:
+                        pass
+                    _waf_guard(f"chapter list page {page_n}")
+                    _wait_for_page(page_n, 20.0)
+                    try:
+                        rows = self._page.evaluate(scrape_js) or []
+                    except Exception:
+                        rows = []
+                if not rows:
+                    if on_last_page:
+                        # Genuinely nothing on the final page. Benign.
+                        break
+                    raise ComixChapterScrapeError(
+                        f"comix chapter list: page {page_n} of {total_pages} "
+                        f"rendered no chapter rows even after a retry. The list "
+                        f"would have been truncated at {len(items)} chapter(s) "
+                        f"— refusing to return a partial series (a short list "
+                        f"gets persisted as if it were the whole thing)."
+                    )
+            # Progress heartbeat so a long scrape doesn't look hung. stderr
+            # keeps stdout clean for --search-json consumers.
             if page_n % 20 == 0:
-                elapsed = int(_time.monotonic() - (deadline - time_budget_s))
+                elapsed = int(_time.monotonic() - started_at)
                 print(
-                    f"[*] Comix DOM scrape: page {page_n}, "
+                    f"[*] Comix DOM scrape: page {page_n}/{total_pages}, "
                     f"{len(items)} unique chapters so far ({elapsed}s elapsed).",
                     flush=True,
                 )
@@ -1654,25 +2502,90 @@ class _ComixBrowserSession:
                     "language": None,
                 })
                 page_added += 1
-            if page_added == 0:
-                # Every row was a dup of an earlier page. Could be normal
-                # boundary overlap (1-2 dups) or a sign the pagination is
-                # stuck on the same page. Break after 2 consecutive
-                # zero-add pages to bound the worst case.
-                consecutive_dup_pages += 1
-                if consecutive_dup_pages >= 2:
+
+            # Canary: with pager-driven navigation every page should contribute
+            # new rows. An all-duplicate page means the click didn't actually
+            # advance the list (stale render) — under the OLD code that state
+            # silently ended the scrape, so keep it loud even though the
+            # active-page wait should now prevent it.
+            if page_added == 0 and rows:
+                print(
+                    f"[!] Comix DOM scrape: page {page_n}/{total_pages} "
+                    f"returned {len(rows)} row(s) but none were new — the "
+                    f"pager may not have advanced.",
+                    flush=True,
+                )
+
+            # ── Early stop on the advisory chapter floor. comix sorts
+            # newest-first, so once a whole page sits below the floor every
+            # remaining page does too. Uses the page MAXIMUM (not the minimum)
+            # so a row out of order can't cut the walk short, which makes this
+            # exact rather than heuristic — no grace margin needed.
+            if chapter_floor is not None:
+                page_numbers = [
+                    n for n in (
+                        _coerce_chapter_number(r.get("href"), r.get("chap_label"))
+                        for r in rows
+                    ) if n is not None
+                ]
+                if page_numbers and max(page_numbers) < float(chapter_floor):
+                    print(
+                        f"[*] Comix DOM scrape: page {page_n}/{total_pages} is "
+                        f"entirely below the requested floor "
+                        f"(ch.{float(chapter_floor):g}); stopping early with "
+                        f"{len(items)} chapter(s).",
+                        flush=True,
+                    )
                     break
-            else:
-                consecutive_dup_pages = 0
-        # Always emit a final tally so the caller's "API returned 0
-        # chapters, falling back to DOM scrape" line in get_chapters has
-        # a corresponding "DOM scrape gave us X" line. Without this the
-        # silent-empty path looked identical to the success path from
-        # the get_chapters caller's perspective, and the user only saw
-        # "No chapters selected" with no clue what happened in between.
+
+            # ── Advance. Termination is the PAGER's word, not a heuristic.
+            if page_n >= total_pages:
+                break
+            if _time.monotonic() > deadline:
+                raise ComixChapterScrapeError(
+                    f"comix chapter list: ran out of time ({int(budget)}s) at "
+                    f"page {page_n} of {total_pages} with {len(items)} "
+                    f"chapter(s) collected. Refusing to return a partial "
+                    f"series — narrow the range with --chapters, or pass a "
+                    f"?group_id= URL to cut the list to one scanlation group."
+                )
+            next_page = page_n + 1
+            # The pager click is an OPTIMIZATION (client-side route change, no
+            # document reload), never the only way forward — a mid-render pager
+            # can briefly have no usable Next button, and letting that end the
+            # scrape would resurrect the truncation bug in a new disguise. So:
+            # click, else wait for the button and click, else hard-navigate.
+            advanced = False
+            if _click_pager("next page") or (
+                _wait_for_pager(lambda s: s.get("hasNext"), 5.0)
+                and _click_pager("next page")
+            ):
+                advanced = _wait_for_page(next_page, 20.0)
+            if not advanced:
+                try:
+                    self._page.goto(
+                        _page_url(next_page),
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                except Exception:
+                    pass
+                _waf_guard(f"chapter list page {next_page}")
+                advanced = _wait_for_page(next_page, 20.0)
+            if not advanced:
+                raise ComixChapterScrapeError(
+                    f"comix chapter list: could not reach page {next_page} of "
+                    f"{total_pages} ({len(items)} chapter(s) collected so far) "
+                    f"— neither the pager's Next button nor a direct navigation "
+                    f"landed on it. Refusing to return a partial series."
+                )
+
+        # Final tally, always emitted so the caller's "fetching chapter list"
+        # line has a matching completion line. Now reports pages walked vs the
+        # true total, which is what makes a truncation visible at a glance.
         print(
             f"[*] Comix DOM scrape: complete. {len(items)} chapter(s) "
-            f"collected across {page_n} page(s).",
+            f"collected across {page_n}/{total_pages} page(s).",
             flush=True,
         )
         return items
@@ -1791,6 +2704,12 @@ class _ComixBrowserSession:
             )
             return []
 
+        # The WAF fires on behavior, and a chapter render is the heaviest thing
+        # we do (one navigation plus ~40-80 image loads), so this is where it
+        # most often lands. Without the check the interstitial just produced
+        # "0 .rpage-page divs" below, which reads as a broken chapter.
+        self._enforce_no_waf("the chapter page", chapter_url)
+
         # Wait for the React app to mount and the chapter API to fire,
         # which populates .rpage-page divs. Poll up to 30 s — most
         # chapters mount in 3-8 s but the CF turnstile / slow networks
@@ -1810,6 +2729,9 @@ class _ComixBrowserSession:
             page.wait_for_timeout(500)
 
         if page_count == 0:
+            # Re-check before blaming the render: a WAF redirect can land here
+            # too (it may arrive after the initial navigation settled).
+            self._enforce_no_waf("the chapter page", chapter_url)
             print(
                 f"[!] Comix: chapter had 0 .rpage-page divs in DOM "
                 f"after wait. Either the React app failed to mount or "
@@ -2159,24 +3081,63 @@ class _ComixBrowserBridge:
     def fetch_chapters_via_dom(
         self,
         title_url: str,
-        max_pages: int = 500,
-        time_budget_s: float = 300.0,
+        max_pages: int = 0,
+        time_budget_s: float = 0.0,
+        chapter_floor: Optional[float] = None,
     ) -> List[Dict]:
-        """Bridge facade for the DOM-pagination fallback. Default per-call
-        wall clock is `time_budget_s + 30s` (worker overhead + final goto
-        slack) so the bridge timeout doesn't trip BEFORE the in-method
-        budget logic has a chance to return a partial list — the inner
-        budget is the load-bearing one; this is just the outer safety net.
-        Cross-file: see _ComixBrowserSession.fetch_chapters_via_dom for
-        the actual pagination + DOM-scrape implementation.
+        """Bridge facade for the chapter-list DOM scrape.
+
+        The outer wall clock has to accommodate a scrape whose real size is
+        only known once the pager has been read: a 360-page series at ~1.5s per
+        pager click is ~9 minutes, and the inner method derives its own budget
+        the same way. Passing 0 (the default) means "let the inner method size
+        itself"; the outer cap then mirrors that formula with slack, plus room
+        for an interactive WAF solve (default 180s) which can legitimately
+        happen mid-scrape. The inner budget stays the load-bearing one.
+
+        Cross-file: see _ComixBrowserSession.fetch_chapters_via_dom.
         """
+        if time_budget_s and time_budget_s > 0:
+            outer = time_budget_s + 30.0
+        else:
+            # Worst case the inner method could choose, plus solve headroom.
+            # _MAX_CHAPTER_SCRAPE_PAGES bounds an unbounded pager.
+            outer = _MAX_CHAPTER_SCRAPE_PAGES * 1.5 + 30.0
+        outer += _WAF_DEFAULT_SOLVE_TIMEOUT_S + 60.0
         return _comix_call(
             "fetch_chapters_via_dom",
             title_url,
             max_pages,
             time_budget_s,
-            _timeout_s=time_budget_s + 30.0,
+            chapter_floor,
+            _timeout_s=outer,
         )
+
+    def solve_waf_interactively(self, return_url: Optional[str] = None) -> Dict[str, Any]:
+        """Bridge facade for the interactive WAF handoff.
+
+        Timeout is the solve window plus generous slack for the two browser
+        relaunches (headless → headed → headless) the handoff performs.
+        Never raises: a bridge-level timeout degrades to "not solved" so the
+        caller's own error path (which carries the user-facing remediation)
+        runs instead of a bare TimeoutError.
+        """
+        try:
+            solve_timeout = float(
+                os.environ.get(_WAF_SOLVE_TIMEOUT_ENV)
+                or _WAF_DEFAULT_SOLVE_TIMEOUT_S
+            )
+        except (TypeError, ValueError):
+            solve_timeout = _WAF_DEFAULT_SOLVE_TIMEOUT_S
+        try:
+            return _comix_call(
+                "solve_waf_interactively",
+                return_url,
+                _timeout_s=solve_timeout + 120.0,
+            )
+        except Exception:
+            return {"solved": False, "cookies": [], "user_agent": None,
+                    "reason": "bridge_error"}
 
     def fetch_search_via_dom(
         self,

@@ -46,7 +46,7 @@ import {
   StopCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/primitives";
-import { cn, chaptersToRangeString, getInitials } from "@/lib/utils";
+import { cn, chaptersToRangeString, getInitials, naturalCompare } from "@/lib/utils";
 
 // ── Section state → presentational metadata ──
 // Single source for the per-section accent so the chip, the section header,
@@ -465,9 +465,9 @@ export default function UpdatesCenter({
       if (a.state === b.state) return (a.enqueuedAt || 0) - (b.enqueuedAt || 0);
       return a.state === "running" ? -1 : 1;
     });
-    // Up to date: alphabetical
-    uptodate.sort((a, b) => a.title.localeCompare(b.title));
-    errors.sort((a, b) => a.title.localeCompare(b.title));
+    // Up to date: alphabetical, numeric-aware ("Vol 2" before "Vol 10")
+    uptodate.sort((a, b) => naturalCompare(a.title || "", b.title || ""));
+    errors.sort((a, b) => naturalCompare(a.title || "", b.title || ""));
     return { found, active, uptodate, errors };
   }, [seriesStates]);
 

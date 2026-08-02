@@ -21,10 +21,22 @@ import {
   PencilLine,
   Save,
   X,
+  Filter,
+  FilterX,
+  Sparkles,
 } from "lucide-react";
-import { cn, chaptersToRangeString, getInitials } from "@/lib/utils";
+import { cn, chaptersToRangeString, getInitials, naturalCompare } from "@/lib/utils";
 import { buildLibraryDownloadArgs } from "@/lib/downloadArgs";
 import UpdatesCenter from "./UpdatesCenter";
+import LibraryFilterPanel, {
+  FACET_GROUPS,
+  FACET_GROUP_BY_KEY,
+} from "./LibraryFilterPanel";
+
+// NOTE on the funnel glyph: this repo pins lucide-react 0.263.1, where the
+// funnel icon is still named `Filter` (upstream renamed it to `Funnel` much
+// later). `Funnel` is NOT exported here — importing it renders undefined and
+// crashes React.
 
 // Convert a Windows file path to a localfile:// URL the renderer can load.
 function fileToUrl(filePath) {
@@ -58,6 +70,100 @@ const SORT_OPTIONS = [
   { value: "size", label: "Largest first" },
   { value: "size-asc", label: "Smallest first" },
 ];
+
+// ── Facet filtering ──
+// The four groups map 1:1 onto .aio_series.json fields, which electron/
+// library.js parses whole and hands over untouched as entry.seriesMeta — so no
+// backend change was needed to filter on any of this:
+//   genres → seriesMeta.genres              string[]
+//   tags   → seriesMeta.anilist_tags + .anilist_spoiler_tags
+//            ARRAYS OF OBJECTS {name, category, rank, is_media_spoiler,
+//            is_general_spoiler} — writer aio-dl.py:_serialize_anilist_tag,
+//            grep anilist_tags. A naive .join() renders [object Object], and
+//            the keys are absent on anything downloaded before AniList
+//            enrichment shipped, so every read is guarded.
+//   status → seriesMeta.status              STATUS_COLORS vocabulary
+//   sites  → seriesMeta.site                python handler name ("mangafire")
+// Keys are lowercased (sites disagree on genre casing); the display label is
+// the most common casing observed across the library.
+//
+// Group order/icons/accents + the singleValued flag live in
+// LibraryFilterPanel.jsx:FACET_GROUPS.
+const FACET_KEYS = ["genres", "tags", "status", "sites"];
+
+function makeEmptyFilters() {
+  return {
+    genres: new Set(),
+    tags: new Set(),
+    status: new Set(),
+    sites: new Set(),
+    matchMode: "any",
+    showSpoilerTags: false,
+  };
+}
+
+// settings.libraryOpts.filters ⇄ filter state. Sets serialize as arrays.
+// Every field is re-validated on read: history.json is hand-editable and an
+// older settings dict simply has no `filters` key at all.
+function filtersFromJson(raw) {
+  const out = makeEmptyFilters();
+  if (!raw || typeof raw !== "object") return out;
+  for (const k of FACET_KEYS) {
+    if (Array.isArray(raw[k])) {
+      out[k] = new Set(raw[k].filter((v) => typeof v === "string"));
+    }
+  }
+  if (raw.matchMode === "all" || raw.matchMode === "any") out.matchMode = raw.matchMode;
+  out.showSpoilerTags = raw.showSpoilerTags === true;
+  return out;
+}
+
+function filtersToJson(f) {
+  return {
+    genres: [...f.genres],
+    tags: [...f.tags],
+    status: [...f.status],
+    sites: [...f.sites],
+    matchMode: f.matchMode,
+    showSpoilerTags: f.showSpoilerTags,
+  };
+}
+
+function countActiveFilters(f) {
+  return f.genres.size + f.tags.size + f.status.size + f.sites.size;
+}
+
+// AND across groups; within a group `matchMode` decides.
+// EXCEPT for the single-valued groups (status, source): a series has exactly
+// one of each, so "all" with two selected could never match anything. Those
+// are always OR — matchMode is effectively a genres/tags control, which is the
+// standard faceted-search contract.
+function matchesFacets(entryFacets, filters) {
+  if (!entryFacets) return false;
+  for (const groupKey of FACET_KEYS) {
+    const selected = filters[groupKey];
+    if (selected.size === 0) continue;
+    const have = entryFacets[groupKey];
+    if (filters.matchMode === "all" && !FACET_GROUP_BY_KEY[groupKey].singleValued) {
+      for (const v of selected) if (!have.has(v)) return false;
+    } else {
+      let hit = false;
+      for (const v of selected) {
+        if (have.has(v)) { hit = true; break; }
+      }
+      if (!hit) return false;
+    }
+  }
+  return true;
+}
+
+// Normalize a raw genre/tag/status/site string into its facet key. MUST stay
+// identical to the keying in the facetIndex memo below — DetailView's chips
+// derive keys from raw metadata strings and would otherwise apply a filter
+// that matches nothing.
+function facetKey(raw) {
+  return String(raw ?? "").trim().toLowerCase();
+}
 
 // ── Badge components ──
 // Collapse the repeated FORMAT_COLORS / STATUS_COLORS <span> markup (grid card,
@@ -93,6 +199,77 @@ function StatusBadge({ status, className, fallback = "bg-muted text-muted-foregr
     >
       {status}
     </span>
+  );
+}
+
+// Clickable metadata chip for DetailView's genre + AniList-tag rows. Clicking
+// applies the value as a library filter and drops back to the grid, so there's
+// deliberately no "selected" state — this chip never renders as on.
+// Hand-rolled rather than reusing Badge because Badge (ui/primitives.jsx) does
+// NOT spread props and therefore can't take an onClick.
+function MetaChip({ label, onClick, title }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title || `Filter library by “${label}”`}
+      className={cn(
+        "inline-flex items-center rounded-full border border-border/70 bg-secondary/50",
+        "px-2 py-0.5 text-[10px] leading-tight text-muted-foreground",
+        "hover:border-primary/40 hover:bg-primary/10 hover:text-primary transition-colors"
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
+// AniList tags in the detail view — the first place in the UI that has ever
+// rendered them. Entries are OBJECTS (aio-dl.py:_serialize_anilist_tag), and
+// both keys are absent on pre-enrichment downloads, hence the normalize pass.
+// Spoiler-flagged tags live in their own array and stay behind a click: the
+// is_media_spoiler / is_general_spoiler flags exist precisely so a reader can
+// be spoiler-aware.
+function AnilistTagChips({ meta, onFilterByFacet }) {
+  const [showSpoilers, setShowSpoilers] = useState(false);
+  const normalize = (list) =>
+    (Array.isArray(list) ? list : []).filter(
+      (t) => t && typeof t === "object" && t.name
+    );
+  const tags = normalize(meta?.anilist_tags);
+  const spoilerTags = normalize(meta?.anilist_spoiler_tags);
+  if (tags.length === 0 && spoilerTags.length === 0) return null;
+
+  const chip = (t) => (
+    <MetaChip
+      key={t.name}
+      label={t.name}
+      title={[t.name, t.category, t.rank ? `rank ${t.rank}` : null]
+        .filter(Boolean)
+        .join(" · ")}
+      onClick={() => onFilterByFacet?.("tags", facetKey(t.name))}
+    />
+  );
+
+  return (
+    <div className="flex items-start gap-1.5">
+      <Sparkles className="w-3 h-3 shrink-0 mt-1 text-violet-400" />
+      <div className="flex flex-wrap items-center gap-1">
+        {tags.map(chip)}
+        {spoilerTags.length > 0 &&
+          (showSpoilers ? (
+            spoilerTags.map(chip)
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowSpoilers(true)}
+              className="text-[10px] text-muted-foreground hover:text-foreground underline decoration-dotted underline-offset-2 transition-colors"
+            >
+              {spoilerTags.length} spoiler tag{spoilerTags.length === 1 ? "" : "s"}
+            </button>
+          ))}
+      </div>
+    </div>
   );
 }
 
@@ -544,7 +721,12 @@ function MetadataEditorPanel({ entry, onClose, onSaved }) {
   );
 }
 
-function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, settings }) {
+function DetailView({
+  entry, onBack, onRefresh, onStartDownload, onSwitchTab, settings,
+  // (groupKey, facetKey) → add that value to the grid's facet filter and
+  // navigate back. Supplied by LibraryTab; grep addFacet.
+  onFilterByFacet,
+}) {
   const [deleting, setDeleting] = useState(false);
   // Two-step delete confirmation (avoids window.confirm which breaks
   // Electron's renderer focus/input handling)
@@ -635,11 +817,20 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
                   </div>
                 )}
                 {meta.genres?.length > 0 && (
-                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                    <Tag className="w-3 h-3 shrink-0" />
-                    <span>{meta.genres.join(", ")}</span>
+                  <div className="flex items-start gap-1.5">
+                    <Tag className="w-3 h-3 shrink-0 mt-1 text-muted-foreground" />
+                    <div className="flex flex-wrap gap-1">
+                      {meta.genres.map((g) => (
+                        <MetaChip
+                          key={g}
+                          label={g}
+                          onClick={() => onFilterByFacet?.("genres", facetKey(g))}
+                        />
+                      ))}
+                    </div>
                   </div>
                 )}
+                <AnilistTagChips meta={meta} onFilterByFacet={onFilterByFacet} />
               </div>
             )}
 
@@ -822,6 +1013,31 @@ function EmptyState() {
   );
 }
 
+// Third empty state, distinct from EmptyState (nothing downloaded yet) and the
+// no-search-results line: the library HAS content and the user's own facet
+// selection is what's hiding it, so the fix is one click away.
+function FilteredEmptyState({ searchQuery, onClearFilters }) {
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center text-center py-20 px-8 gap-3">
+      <div className="w-16 h-16 rounded-full bg-muted/50 flex items-center justify-center">
+        <Filter className="w-7 h-7 text-muted-foreground/50" />
+      </div>
+      <div>
+        <h3 className="text-sm font-semibold mb-1">No matches</h3>
+        <p className="text-xs text-muted-foreground max-w-xs">
+          {searchQuery
+            ? <>Nothing matches these filters and &ldquo;{searchQuery}&rdquo;.</>
+            : "Nothing in your library matches every active filter."}
+        </p>
+      </div>
+      <Button variant="outline" size="sm" onClick={onClearFilters} className="gap-1.5 text-xs">
+        <FilterX className="w-3.5 h-3.5" />
+        Clear filters
+      </Button>
+    </div>
+  );
+}
+
 // ============================================================
 // LIBRARY TAB (main export)
 // ============================================================
@@ -859,14 +1075,86 @@ export default function LibraryTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings?.libraryOpts?.sortBy]);
 
-  // Wrap the setter so picking a new sort persists to settings.libraryOpts.
-  // Spread merge preserves any future libraryOpts fields without listing them.
+  // ── Facet filters ──
+  const [filters, setFilters] = useState(() =>
+    filtersFromJson(settings?.libraryOpts?.filters)
+  );
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false);
+  const filterAnchorRef = useRef(null);
+
+  // Hydration is ONE-SHOT, unlike sortBy's above: the persisted value is an
+  // object, so an equality guard would need a deep compare and a plain
+  // identity dep would re-fire on every settings save and clobber the live
+  // selection. Also latched by applyFilters, so a slow disk load can't
+  // overwrite a selection the user already made.
+  const filtersHydratedRef = useRef(false);
+  useEffect(() => {
+    if (filtersHydratedRef.current) return;
+    const persisted = settings?.libraryOpts;
+    if (!persisted) return;
+    filtersHydratedRef.current = true;
+    setFilters(filtersFromJson(persisted.filters));
+  }, [settings?.libraryOpts]);
+
+  // Single writer for settings.libraryOpts, so the sort write and the filter
+  // write can't drop each other's key. Same spread-merge as the original
+  // updateSort, but merging onto a ref instead of the `settings` prop: the
+  // prop only refreshes after saveSettings round-trips through IPC, so two
+  // writes in quick succession would both merge onto the same stale base.
+  const libraryOptsRef = useRef(settings?.libraryOpts || {});
+  useEffect(() => {
+    if (settings?.libraryOpts) libraryOptsRef.current = settings.libraryOpts;
+  }, [settings?.libraryOpts]);
+
+  const persistLibraryOpts = useCallback((patch) => {
+    const next = { ...libraryOptsRef.current, ...patch };
+    libraryOptsRef.current = next;
+    onSaveSettings?.({ libraryOpts: next });
+  }, [onSaveSettings]);
+
   const updateSort = (value) => {
     setSortBy(value);
-    onSaveSettings?.({
-      libraryOpts: { ...(settings?.libraryOpts || {}), sortBy: value },
-    });
+    persistLibraryOpts({ sortBy: value });
   };
+
+  // Every filter mutation funnels through here so persistence can't be
+  // forgotten. Reads `filters` from the closure rather than using a functional
+  // updater: the persist call is a side effect and React StrictMode invokes
+  // updaters twice. Chip clicks are user-paced, so there's no batching hazard.
+  const applyFilters = useCallback((next) => {
+    filtersHydratedRef.current = true;
+    setFilters(next);
+    persistLibraryOpts({ filters: filtersToJson(next) });
+  }, [persistLibraryOpts]);
+
+  const toggleFacet = useCallback((groupKey, valueKey) => {
+    const nextSet = new Set(filters[groupKey]);
+    if (nextSet.has(valueKey)) nextSet.delete(valueKey);
+    else nextSet.add(valueKey);
+    applyFilters({ ...filters, [groupKey]: nextSet });
+  }, [filters, applyFilters]);
+
+  // Additive-only variant for DetailView's chips — clicking a genre there
+  // means "show me more of this", never "turn it off".
+  const addFacet = useCallback((groupKey, valueKey) => {
+    if (!valueKey || filters[groupKey].has(valueKey)) return;
+    applyFilters({ ...filters, [groupKey]: new Set(filters[groupKey]).add(valueKey) });
+  }, [filters, applyFilters]);
+
+  const clearFilters = useCallback(
+    () => applyFilters(makeEmptyFilters()),
+    [applyFilters]
+  );
+  const setMatchMode = useCallback(
+    (mode) => applyFilters({ ...filters, matchMode: mode }),
+    [filters, applyFilters]
+  );
+  const setShowSpoilerTags = useCallback(
+    (value) => applyFilters({ ...filters, showSpoilerTags: value }),
+    [filters, applyFilters]
+  );
+  const closeFilterPanel = useCallback(() => setFilterPanelOpen(false), []);
+
   const [selectedEntry, setSelectedEntry] = useState(null);
 
   // New chapter counts per series (folderPath → count).
@@ -1194,23 +1482,134 @@ export default function LibraryTab({
     () => entries.map((e) => ({ entry: e, lowerTitle: (e.title || "").toLowerCase() })),
     [entries]
   );
+
+  // Per-entry facet Sets + the library-wide facet vocabulary. Same reasoning as
+  // entriesIndexed, one level up: without it every filter evaluation would
+  // re-walk each series' genre/tag arrays and re-lowercase every string.
+  //
+  // `perEntry` is INDEX-PARALLEL to entriesIndexed — both are a plain
+  // `entries.map`, and `filtered` below zips them by index. Keep BOTH memos
+  // keyed on [entries] alone or that invariant breaks.
+  //
+  // Counts are library-wide, NOT contextual (they don't shrink as you select
+  // other facets). Contextual counts would mean rebuilding the whole index on
+  // every click and every number jumping as you go — worse to use, and it
+  // would tie this memo to `filters`.
+  const facetIndex = useMemo(() => {
+    const groups = {
+      genres: new Map(),
+      tags: new Map(),
+      status: new Map(),
+      sites: new Map(),
+    };
+
+    // `seen` is the entry's own key Set: a series listing "Action" twice must
+    // count once. Casing tallies ride the meta so the label we display is the
+    // library's most common spelling, not whichever series scanned first.
+    const bump = (groupKey, rawValue, seen, extra) => {
+      const raw = String(rawValue ?? "").trim();
+      if (!raw) return;
+      const key = raw.toLowerCase();
+      const map = groups[groupKey];
+      let meta = map.get(key);
+      if (!meta) {
+        meta = { label: raw, count: 0, category: "", spoiler: false, casings: new Map() };
+        map.set(key, meta);
+      }
+      if (extra) {
+        // First non-empty category wins; spoiler is sticky — a tag flagged on
+        // any one series stays behind the spoiler switch everywhere.
+        if (extra.category && !meta.category) meta.category = extra.category;
+        if (extra.spoiler) meta.spoiler = true;
+      }
+      meta.casings.set(raw, (meta.casings.get(raw) || 0) + 1);
+      if (seen.has(key)) return;
+      seen.add(key);
+      meta.count += 1;
+    };
+
+    const perEntry = entries.map((e) => {
+      const meta = e.seriesMeta || {};
+      const facets = {
+        genres: new Set(),
+        tags: new Set(),
+        status: new Set(),
+        sites: new Set(),
+      };
+      for (const g of meta.genres || []) bump("genres", g, facets.genres);
+      // anilist_tags / anilist_spoiler_tags are arrays of OBJECTS, and the
+      // split is already spoiler-vs-not on the Python side
+      // (external_metadata.py:_split_tags) — the per-tag flags are re-checked
+      // anyway so a hand-edited or older file can't leak a spoiler.
+      const readTags = (list, fromSpoilerBucket) => {
+        for (const t of Array.isArray(list) ? list : []) {
+          if (!t || typeof t !== "object") continue;
+          bump("tags", t.name, facets.tags, {
+            category: String(t.category || "").trim(),
+            spoiler:
+              fromSpoilerBucket ||
+              t.is_media_spoiler === true ||
+              t.is_general_spoiler === true,
+          });
+        }
+      };
+      readTags(meta.anilist_tags, false);
+      readTags(meta.anilist_spoiler_tags, true);
+      bump("status", meta.status, facets.status);
+      bump("sites", meta.site, facets.sites);
+      return facets;
+    });
+
+    // Resolve display labels + the precomputed lowercase haystack the panel's
+    // filter-the-filters input tests against (so a keystroke doesn't
+    // re-lowercase every facet label in the library).
+    for (const map of Object.values(groups)) {
+      for (const meta of map.values()) {
+        let best = meta.label;
+        let bestN = -1;
+        for (const [text, n] of meta.casings) {
+          if (n > bestN || (n === bestN && text < best)) {
+            best = text;
+            bestN = n;
+          }
+        }
+        meta.label = best;
+        delete meta.casings;
+        meta.search = (meta.category ? `${best} ${meta.category}` : best).toLowerCase();
+      }
+    }
+
+    return { perEntry, groups };
+  }, [entries]);
+
+  const activeFilterCount = countActiveFilters(filters);
+
   const lowerQuery = useMemo(() => searchQuery.toLowerCase(), [searchQuery]);
   const filtered = useMemo(
     () => {
-      if (!lowerQuery) return entries;
-      return entriesIndexed
-        .filter((x) => x.lowerTitle.includes(lowerQuery))
-        .map((x) => x.entry);
+      if (!lowerQuery && activeFilterCount === 0) return entries;
+      const out = [];
+      for (let i = 0; i < entriesIndexed.length; i++) {
+        if (lowerQuery && !entriesIndexed[i].lowerTitle.includes(lowerQuery)) continue;
+        if (activeFilterCount > 0 && !matchesFacets(facetIndex.perEntry[i], filters)) continue;
+        out.push(entriesIndexed[i].entry);
+      }
+      return out;
     },
-    [entriesIndexed, lowerQuery, entries]
+    [entriesIndexed, facetIndex, filters, activeFilterCount, lowerQuery, entries]
   );
 
   const sorted = useMemo(() => {
     const copy = [...filtered];
     copy.sort((a, b) => {
       switch (sortBy) {
-        case "title": return a.title.localeCompare(b.title);
-        case "title-desc": return b.title.localeCompare(a.title);
+        // naturalCompare (@/lib/utils) is numeric-aware: "Vol 2" before
+        // "Vol 10", not after "Vol 100".
+        case "title": return naturalCompare(a.title, b.title);
+        case "title-desc": return naturalCompare(b.title, a.title);
+        // DELIBERATELY plain localeCompare: these are ISO-8601 strings, which
+        // already sort correctly lexicographically. numeric:true would parse
+        // the digit groups across the '-' and ':' separators and break them.
         case "date": return (b.lastModified || "").localeCompare(a.lastModified || "");
         case "date-asc": return (a.lastModified || "").localeCompare(b.lastModified || "");
         case "size": return b.totalSize - a.totalSize;
@@ -1220,6 +1619,21 @@ export default function LibraryTab({
     });
     return copy;
   }, [filtered, sortBy]);
+
+  // Flatten the active selection into removable chips, in FACET_GROUPS order.
+  // A key that no longer exists in the library (series deleted, or a filter
+  // persisted from a previous library) still gets a chip — falling back to the
+  // raw key — so it stays removable instead of silently matching nothing.
+  const activeFilterChips = useMemo(() => {
+    const chips = [];
+    for (const group of FACET_GROUPS) {
+      const map = facetIndex.groups[group.key];
+      for (const key of filters[group.key]) {
+        chips.push({ group, key, label: map?.get(key)?.label || key });
+      }
+    }
+    return chips;
+  }, [filters, facetIndex]);
 
   // Count how many series are eligible for "Check All".
   // Must mirror main.js's checkable filter — see the comment there. When
@@ -1273,6 +1687,10 @@ export default function LibraryTab({
         onStartDownload={onStartDownload}
         onSwitchTab={onSwitchTab}
         settings={settings}
+        onFilterByFacet={(groupKey, valueKey) => {
+          addFacet(groupKey, valueKey);
+          setSelectedEntry(null);
+        }}
       />
     );
   }
@@ -1307,6 +1725,56 @@ export default function LibraryTab({
               <option key={opt.value} value={opt.value}>{opt.label}</option>
             ))}
           </select>
+        </div>
+
+        {/* Faceted filter dropdown. This wrapper is `relative` so the panel
+            positions under the button, AND it is the click-outside boundary —
+            LibraryFilterPanel tests containment against this same ref, which is
+            why the panel must stay a child of it (see that file's header). */}
+        <div className="relative" ref={filterAnchorRef}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setFilterPanelOpen((v) => !v)}
+            disabled={entries.length === 0}
+            aria-expanded={filterPanelOpen}
+            className={cn(
+              "gap-1.5 text-xs",
+              activeFilterCount > 0 && [
+                "border-primary/50 bg-primary/10 text-primary",
+                "hover:bg-primary/15 hover:text-primary hover:border-primary/60",
+              ]
+            )}
+            title={
+              activeFilterCount > 0
+                ? `${activeFilterCount} filter${activeFilterCount !== 1 ? "s" : ""} active`
+                : "Filter by genre, AniList tag, status or source"
+            }
+          >
+            <Filter className="w-3.5 h-3.5" />
+            Filter
+            {activeFilterCount > 0 && (
+              <span className="text-[10px] font-mono tabular-nums px-1 rounded-sm bg-primary/20">
+                {activeFilterCount}
+              </span>
+            )}
+          </Button>
+
+          {filterPanelOpen && (
+            <LibraryFilterPanel
+              anchorRef={filterAnchorRef}
+              onClose={closeFilterPanel}
+              groups={facetIndex.groups}
+              filters={filters}
+              activeCount={activeFilterCount}
+              matchedCount={sorted.length}
+              totalCount={entries.length}
+              onToggleFacet={toggleFacet}
+              onSetMatchMode={setMatchMode}
+              onSetShowSpoilerTags={setShowSpoilerTags}
+              onClearAll={clearFilters}
+            />
+          )}
         </div>
 
         {/* Updates Center button.
@@ -1380,15 +1848,75 @@ export default function LibraryTab({
           <RefreshCw className={cn("w-3.5 h-3.5", loading && "animate-spin")} />
         </Button>
 
-        <Badge variant="secondary" className="text-[10px] ml-auto">
-          {loading ? "…" : `${sorted.length} manga${sorted.length !== 1 ? "s" : ""}`}
+        {/* Reflects the FILTERED count; hints at the library total whenever a
+            filter or search is narrowing it. */}
+        <Badge variant="secondary" className="text-[10px] ml-auto tabular-nums">
+          {loading
+            ? "…"
+            : sorted.length === entries.length
+            ? `${sorted.length} manga${sorted.length !== 1 ? "s" : ""}`
+            : `${sorted.length} of ${entries.length}`}
         </Badge>
       </div>
+
+      {/* ── Active filter chips ──
+          Keeps the current filter legible without opening the panel. Chip
+          markup follows SettingsTab's disabled-search-sources list; the group
+          icon carries the accent so the neutral chip body doesn't turn the row
+          into a wall of blue. Staggered reveal matches SearchTab's rows. */}
+      {activeFilterChips.length > 0 && (
+        <div className="flex items-center flex-wrap gap-1.5 px-4 py-2 border-b bg-card/10">
+          {activeFilterChips.map((chip, i) => {
+            const Icon = chip.group.icon;
+            return (
+              <span
+                key={`${chip.group.key}:${chip.key}`}
+                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-secondary/60 pl-2 pr-1 py-0.5 animate-slide-up"
+                style={{ animationDelay: `${Math.min(i * 40, 240)}ms` }}
+              >
+                <Icon className={cn("w-3 h-3 shrink-0", chip.group.accent)} />
+                <span className="text-[11px] leading-none">{chip.label}</span>
+                <button
+                  type="button"
+                  onClick={() => toggleFacet(chip.group.key, chip.key)}
+                  aria-label={`Remove ${chip.group.label} filter ${chip.label}`}
+                  title="Remove filter"
+                  className="ml-0.5 p-0.5 rounded-full text-muted-foreground hover:text-foreground hover:bg-background transition-colors"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </span>
+            );
+          })}
+          {/* "All" changes what the selection MEANS, and it's otherwise only
+              visible inside the panel. */}
+          {filters.matchMode === "all" && (
+            <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              match all
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={clearFilters}
+            className="ml-1 inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <FilterX className="w-3 h-3" />
+            Clear
+          </button>
+        </div>
+      )}
 
       {/* Grid / Empty */}
       <div className="flex-1 overflow-y-auto">
         {!loading && sorted.length === 0 ? (
-          searchQuery ? (
+          // Order matters: an empty library must never offer "clear filters"
+          // (a filter can outlive the series it was applied to, since it's
+          // persisted in settings.libraryOpts).
+          entries.length === 0 ? (
+            <EmptyState />
+          ) : activeFilterCount > 0 ? (
+            <FilteredEmptyState searchQuery={searchQuery} onClearFilters={clearFilters} />
+          ) : searchQuery ? (
             <div className="flex flex-col items-center justify-center py-20 text-center">
               <Search className="w-8 h-8 text-muted-foreground/30 mb-3" />
               <p className="text-xs text-muted-foreground">

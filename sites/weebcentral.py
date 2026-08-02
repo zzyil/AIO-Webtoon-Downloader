@@ -243,14 +243,15 @@ class WeebCentralSiteHandler(BaseSiteHandler):
             abs_url = urljoin(self._BASE_URL, href)
             time_node = anchor.select_one("time[datetime]")
             uploaded = self._extract_datetime(time_node.get("datetime") if time_node else None)
-            scanlator = None
-            svg = anchor.select_one("svg[stroke]")
-            if svg:
-                stroke = svg.get("stroke")
-                if stroke == "#d8b4fe":
-                    scanlator = "Official"
-                elif stroke == "#4C4D54":
-                    scanlator = "Unknown"
+            # No group/scanlator field: WeebCentral does not credit scanlators
+            # anywhere in the chapter list. It used to derive one from an
+            # inline `svg[stroke]` hex (#d8b4fe -> "Official", #4C4D54 ->
+            # "Unknown"), but the markup is now an <img src=".../
+            # chapter-badge.svg"> with no inline SVG at all, so that selector
+            # matched nothing and every chapter got scanlator=None. Removed
+            # rather than repaired — there is no real name to recover, and the
+            # bogus "Official" string would now be read as a genuine
+            # is_official signal by base.group_matches_filter.
             chapters.append(
                 {
                     "hid": abs_url.rstrip("/"),
@@ -258,14 +259,9 @@ class WeebCentralSiteHandler(BaseSiteHandler):
                     "title": title,
                     "url": abs_url,
                     "uploaded": uploaded,
-                    "scanlator": scanlator,
                 }
             )
         return chapters
-
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        group = chapter_version.get("scanlator")
-        return group if isinstance(group, str) else None
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")

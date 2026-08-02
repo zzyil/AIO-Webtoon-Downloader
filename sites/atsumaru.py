@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus, urljoin, urlparse
 
-from .base import BaseSiteHandler, SearchHit, SiteComicContext
+from .base import BaseSiteHandler, GroupInfo, SearchHit, SiteComicContext
 
 
 class AtsumaruSiteHandler(BaseSiteHandler):
@@ -93,6 +93,17 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             # first batch of chapters regardless of login state.
             "_embedded_chapters": manga.get("chapters") or [],
             "_has_more_chapters": bool(manga.get("hasMoreChapters")),
+            # scanlationMangaId -> scanlator display name. atsu.moe carries
+            # MULTIPLE scanlator versions of the same chapter number (Solo
+            # Leveling: 4 groups, 802 rows over 201 numbers) and every chapter
+            # entry from /allChapters names its group by id only. This map is
+            # the only place the names are exposed, and it rides the mangaPage
+            # payload we already fetch — no extra request. Grep _scanlators.
+            "_scanlators": {
+                s.get("id"): s.get("name")
+                for s in (manga.get("scanlators") or [])
+                if isinstance(s, dict) and s.get("id")
+            },
         }
 
         authors = self._parse_people(manga.get("authors"))
@@ -154,8 +165,21 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             "hasMoreChapters": bool(manga.get("hasMoreChapters")),
         }
 
-    def _parse_chapter_entry(self, slug: str, entry: Dict, fallback_index: int = 0) -> Dict:
-        """Convert a raw chapter dict from either API source into a normalised chapter dict."""
+    def _parse_chapter_entry(
+        self,
+        slug: str,
+        entry: Dict,
+        fallback_index: int = 0,
+        *,
+        scanlators: Optional[Dict[str, str]] = None,
+    ) -> Dict:
+        """Convert a raw chapter dict from either API source into a normalised chapter dict.
+
+        `scanlators` is the mangaPage id->name map (grep _scanlators). Only the
+        /allChapters and embedded-mangaPage entries carry `scanlationMangaId`;
+        the paginated /api/manga/chapters endpoint omits it entirely, so
+        chapters sourced from there have no group and rank on other signals.
+        """
         chapter_id = entry.get("id")
         chap_number = entry.get("number")
         title = entry.get("title")
@@ -185,6 +209,16 @@ class AtsumaruSiteHandler(BaseSiteHandler):
         else:
             chap_str = str(fallback_index)
 
+        scan_id = entry.get("scanlationMangaId")
+        groups = []
+        if scan_id:
+            name = (scanlators or {}).get(scan_id)
+            # Keep the GroupInfo even when the name is unknown: the id alone
+            # still separates two versions into distinct census buckets.
+            groups.append(GroupInfo(name=name or scan_id, group_id=scan_id))
+
+        page_count = entry.get("pageCount")
+
         return {
             "hid": f"{slug}-{chapter_id}",
             "chap": chap_str,
@@ -193,6 +227,9 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             "_slug": slug,
             "_chapter_id": chapter_id,
             "uploaded": uploaded,
+            "_groups": groups,
+            "group_name": groups[0].name if groups else None,
+            "_pages": page_count if isinstance(page_count, int) else None,
         }
 
     def get_chapters(
@@ -203,13 +240,48 @@ class AtsumaruSiteHandler(BaseSiteHandler):
         make_request,
     ) -> List[Dict]:
         slug = context.identifier
-        page = 0
+        scanlators = context.comic.get("_scanlators") or {}
         chapters: List[Dict] = []
+
+        # --- Primary: /api/manga/allChapters -------------------------------
+        # Returns EVERY chapter row in ONE request. Was the adult-content
+        # fallback until 2026-08-02; promoted to primary because the paginated
+        # /api/manga/chapters endpoint it replaced is strictly worse on both
+        # axes (measured on Solo Leveling, slug oZOG5):
+        #   - coverage: allChapters 802 rows vs paginated 601 — the paginated
+        #     view silently drops ~25% of the scanlator versions.
+        #   - groups: allChapters entries carry `scanlationMangaId` (+
+        #     `pageCount`); the paginated entries carry NEITHER, which is why
+        #     atsumaru had no group detection at all and the version winner
+        #     was whatever the server happened to list first.
+        # Also 1 request instead of ceil(rows/50).
+        all_entries = self._fetch_all_chapters(slug, scraper)
+        if all_entries:
+            for entry in all_entries:
+                chapters.append(
+                    self._parse_chapter_entry(
+                        slug, entry,
+                        fallback_index=len(chapters) + 1,
+                        scanlators=scanlators,
+                    )
+                )
+            return chapters
+
+        # --- Fallback: the paginated endpoint ------------------------------
+        # Group-blind and lossy (see above), but it is a different code path on
+        # the server and has historically answered when allChapters didn't.
+        page = 0
         while True:
             batch = self._fetch_chapter_batch(slug, page, scraper)
             entries = batch.get("chapters") or []
             for i, entry in enumerate(entries):
-                chapters.append(self._parse_chapter_entry(slug, entry, fallback_index=len(chapters) + 1))
+                chapters.append(
+                    self._parse_chapter_entry(
+                        slug, entry,
+                        fallback_index=len(chapters) + 1,
+                        scanlators=scanlators,
+                    )
+                )
             pages_total = batch.get("pages")
             current_page = batch.get("page", page)
             has_next = (
@@ -224,25 +296,22 @@ class AtsumaruSiteHandler(BaseSiteHandler):
         if chapters:
             return chapters
 
-        # --- Fallback for adult-content manga ---
-        # /api/manga/chapters returns empty without an authenticated session.
-        # First try /api/manga/allChapters which returns every chapter in one
-        # shot — this avoids the pagination gaps that /api/manga/page has
-        # (it only shows the newest and oldest chapters, hiding the middle
-        # ones behind a "Show All" button on the website).
-        all_entries = self._fetch_all_chapters(slug, scraper)
-        if all_entries:
-            for entry in all_entries:
-                chapters.append(self._parse_chapter_entry(slug, entry, fallback_index=len(chapters) + 1))
-            return chapters
-
         # Last resort: use embedded chapters from the manga page response,
         # then paginate via the manga page endpoint if hasMoreChapters is set.
+        # /api/manga/chapters returns empty without an authenticated session
+        # for adult-content manga, and /api/manga/page always includes the
+        # first batch regardless of login state.
         embedded: List[Dict] = list(context.comic.get("_embedded_chapters") or [])
         has_more: bool = bool(context.comic.get("_has_more_chapters"))
 
         for entry in embedded:
-            chapters.append(self._parse_chapter_entry(slug, entry, fallback_index=len(chapters) + 1))
+            chapters.append(
+                self._parse_chapter_entry(
+                    slug, entry,
+                    fallback_index=len(chapters) + 1,
+                    scanlators=scanlators,
+                )
+            )
 
         if has_more and embedded:
             # Paginate using the last chapter's index field as the offset.
@@ -267,7 +336,13 @@ class AtsumaruSiteHandler(BaseSiteHandler):
                     eid = entry.get("id")
                     if eid and eid not in seen_ids:
                         seen_ids.add(eid)
-                        chapters.append(self._parse_chapter_entry(slug, entry, fallback_index=len(chapters) + 1))
+                        chapters.append(
+                            self._parse_chapter_entry(
+                                slug, entry,
+                                fallback_index=len(chapters) + 1,
+                                scanlators=scanlators,
+                            )
+                        )
                         added_any = True
                 
                 if not added_any:

@@ -34,6 +34,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getResolvedPaths: () => ipcRenderer.invoke("get-resolved-paths"),
   getTheme: () => ipcRenderer.invoke("get-theme"),
 
+  // ── Download queue persistence ──
+  // The queue lives in React state and dies with the renderer, so it's
+  // mirrored to download_queue.json (electron/history.js owns the file +
+  // shape). useDownloader.js reads this once on mount and writes from a
+  // debounced effect — grep queueHydratedRef there.
+  getQueueSnapshot: () => ipcRenderer.invoke("queue:get"),
+  saveQueueSnapshot: (snap) => ipcRenderer.invoke("queue:save", snap),
+
   // ── OS dialogs ──
   openFolder: (p) => ipcRenderer.invoke("open-folder", p),
   pickFolder: () => ipcRenderer.invoke("pick-folder"),
@@ -68,6 +76,20 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("theme-changed", handler);
     return () => ipcRenderer.removeListener("theme-changed", handler);
   },
+
+  // ── Quit confirmation ──
+  // main.js preventDefaults the window close while a download is actually
+  // RUNNING and pushes "confirm-quit" with { running: [{downloadId, title,
+  // url, startedAt}] }; ConfirmQuitDialog.jsx answers with exactly one of
+  // confirmQuit (close for real) / cancelQuit (stay, and cancel main's 15s
+  // safety valve).
+  onConfirmQuit: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on("confirm-quit", handler);
+    return () => ipcRenderer.removeListener("confirm-quit", handler);
+  },
+  confirmQuit: () => ipcRenderer.invoke("quit:confirm"),
+  cancelQuit: () => ipcRenderer.invoke("quit:cancel"),
 
   // ── Cross-site search ──
   // runSearch resolves with the parsed JSON result (candidate list +

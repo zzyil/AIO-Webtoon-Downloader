@@ -532,9 +532,6 @@ class AsuraSiteHandler(BaseSiteHandler):
 
         return chapters
 
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        return chapter_version.get("group_name")
-
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")
         if not chapter_url:

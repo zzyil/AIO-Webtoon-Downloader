@@ -7,7 +7,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SearchHit, SiteComicContext
+from .base import BaseSiteHandler, GroupInfo, SearchHit, SiteComicContext
 
 
 class DynastySiteHandler(BaseSiteHandler):
@@ -66,9 +66,18 @@ class DynastySiteHandler(BaseSiteHandler):
         text = soup.get_text("\n", strip=True)
         return text or None
 
-    def _chapter_scanlator(self, tags: List[Dict]) -> Optional[str]:
-        scanlators = [t["name"] for t in tags if t.get("type") == "Scanlator"]
-        return ", ".join(scanlators) if scanlators else None
+    def _chapter_scanlators(self, tags: List[Dict]) -> List[str]:
+        """Every Scanlator tag, as a LIST.
+
+        Used to comma-join into one string, which get_group_match_key then
+        squashed into a single opaque key — so `--group "X"` could never match
+        a chapter jointly released as "X, Y". Each name now becomes its own
+        GroupInfo; base.get_group_name re-joins them for display.
+        """
+        return [
+            t["name"] for t in tags
+            if t.get("type") == "Scanlator" and t.get("name")
+        ]
 
     # ----------------------------------------------------------- Base overrides
     def fetch_comic_context(
@@ -180,7 +189,7 @@ class DynastySiteHandler(BaseSiteHandler):
             title = item.get("title") or permalink.replace("_", " ")
             chap_title = f"{header} {title}".strip() if header else title
             tags = item.get("tags") or []
-            scanlator = self._chapter_scanlator(tags)
+            scanlators = self._chapter_scanlators(tags)
             chapters.append(
                 {
                     "hid": permalink,
@@ -188,17 +197,14 @@ class DynastySiteHandler(BaseSiteHandler):
                     "title": chap_title,
                     "url": f"/{self._CHAPTER_DIR}/{permalink}",
                     "uploaded": self._to_timestamp(item.get("released_on")),
-                    "group_name": scanlator,
+                    "_groups": [GroupInfo(name=n) for n in scanlators],
+                    "group_name": ", ".join(scanlators) or None,
                 }
             )
 
         if (first_page.get("type") or "").lower() != "doujin":
             chapters.reverse()
         return chapters
-
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        group = chapter_version.get("group_name")
-        return group if isinstance(group, str) and group else None
 
     def get_chapter_images(
         self,

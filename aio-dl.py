@@ -56,7 +56,13 @@ from aio_config import (
 )
 from sites import get_handler_by_name, get_handler_for_url
 from sites.chapter_merger import group_chapters_for_download, _extract_chapter_num
-from sites.base import SiteComicContext, IncompleteChapterError
+from sites.base import (
+    SiteComicContext,
+    IncompleteChapterError,
+    GroupSelectionPolicy,
+    build_group_census,
+)
+from sites.group_quality import MTL_CONFIRMED, classify_mtl
 from sites._image_io import (
     sniff_image_extension as _sniff_image_extension,
     finalize_pending_image as _finalize_pending_image,
@@ -871,6 +877,53 @@ def is_chapter_wanted(chapter_num_float: float, range_spec: str) -> bool:
         if parsed is not None and chapter_num_float == parsed:
             return True
     return False
+
+
+def _chapter_range_floor(range_spec: str) -> Optional[float]:
+    """Lowest chapter number a `--chapters` spec can possibly select, or None.
+
+    Feeds BaseSiteHandler.chapter_floor_hint (see the contract there): purely
+    an optimization hint letting a handler with expensive paginated listing
+    stop early. Returns None — meaning "no floor, list everything" — whenever
+    the answer isn't provably safe, so a wrong guess can never drop a chapter
+    the user asked for. That includes:
+
+      * "all" (the default),
+      * the negative "last N chapters" form (`--chapters -20`), whose floor
+        depends on the very list we haven't fetched yet,
+      * any spec with a part we can't parse a lower bound from (open-ended
+        `100-`, junk, an unrecognized alias).
+
+    The result is a FLOOR over the whole comma-separated spec, i.e. the minimum
+    across parts, so `--chapters 5,300-400` yields 5.0 and still lists
+    everything down to chapter 5.
+    """
+    text = (range_spec or "").strip()
+    if not text or text.lower() == "all":
+        return None
+    # "-20" (and only that form) means "last 20 chapters" to the caller.
+    if text.startswith("-") and "," not in text:
+        return None
+    lows: List[float] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            return None
+        low: Optional[float] = None
+        if "-" in part:
+            raw_start, _, raw_end = part.partition("-")
+            start = _parse_chapter_spec_number(raw_start)
+            end = _parse_chapter_spec_number(raw_end)
+            # Both ends must parse; "chapter-1" style values aren't ranges and
+            # fall through to the single-number read below.
+            if start is not None and end is not None:
+                low = start
+        if low is None:
+            low = _parse_chapter_spec_number(part)
+        if low is None:
+            return None
+        lows.append(low)
+    return min(lows) if lows else None
 
 
 # -----------------------------------------------------------
@@ -1690,6 +1743,41 @@ def _try_download_url(
     return False, last_error, None
 
 
+def _log_url_for_page(url: str, limit: int = 160) -> str:
+    """Shorten a URL for a one-line log. A data: URI is megabytes of base64 —
+    print only its MIME segment."""
+    if not isinstance(url, str):
+        return ""
+    if url.startswith("data:"):
+        return "data:" + url[5:].split(",", 1)[0][:60]
+    return url if len(url) <= limit else url[:limit] + "…"
+
+
+def _finalize_downloaded_image(pending_pth, folder, base, content_type, name, url):
+    """`_finalize_pending_image` + the single verbose log line when the body is
+    a 200 that isn't an image (dead host serving an HTML error page under an
+    image URL — see sites/_image_io.py:looks_like_real_image).
+
+    Returns the final path, or None. A None is the normal "page failed"
+    signal; callers with variants left MUST fall through to them rather than
+    give up, because a mirror URL may serve the real bytes.
+
+    Deliberately does NOT call `_record_failure` / `_record_host_failure_for_backoff`:
+    the host answered 200 and is healthy, so this is a content problem, and
+    feeding it to the Phase-D AIMD concurrency cap would throttle a CDN that
+    is doing nothing wrong (grep _HOST_CONCURRENCY_CAP)."""
+    reasons = []
+    final = _finalize_pending_image(
+        pending_pth, folder, base, content_type, on_reject=reasons.append
+    )
+    if final is None and reasons:
+        log_verbose(
+            f"  Rejected page {os.path.basename(base)}: {reasons[0]} "
+            f"— {_log_url_for_page(url)}"
+        )
+    return final
+
+
 def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) -> str:
     """
     Downloads an image using a sophisticated fallback chain with parallel attempts.
@@ -1759,7 +1847,8 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
         ct = header[5:].split(";", 1)[0].strip() if header.startswith("data:") else ""
         with open(pending_pth, "wb") as fh:
             fh.write(data)
-        return _finalize_pending_image(pending_pth, folder, base, ct)
+        # No fallback exists for an inline body — a rejection is terminal.
+        return _finalize_downloaded_image(pending_pth, folder, base, ct, name, url)
 
     # Browser-byte-capture cache check (sites/image_cache). Some site
     # handlers (comix.to) capture image response bodies via Patchright's
@@ -1789,7 +1878,11 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
                 f"(browser-capture cache hit, {len(_body)} bytes, "
                 f"content_type={_ct or 'unknown'})"
             )
-            return _finalize_pending_image(pending_pth, folder, base, _ct)
+            # The browser captured these bytes off the wire; there is no URL
+            # variant to retry, so a rejection is terminal.
+            return _finalize_downloaded_image(
+                pending_pth, folder, base, _ct, name, url
+            )
         except Exception as _e:
             log_verbose(
                 f"  Cache write failed for {os.path.basename(name)} "
@@ -1815,8 +1908,21 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
         url, pending_pth, name, scraper, max_retries, retry_delay, timeout
     )
     if success:
-        log_debug(f"  Successfully downloaded {os.path.basename(name)} using first variant.")
-        return _finalize_pending_image(pending_pth, folder, base, content_type)
+        _final = _finalize_downloaded_image(
+            pending_pth, folder, base, content_type, name, url
+        )
+        if _final is not None:
+            # Logged AFTER validation, not on the 200 — a dead host answering
+            # with an HTML error page is an HTTP success and would otherwise
+            # print "Successfully downloaded" immediately above "Rejected page".
+            log_debug(f"  Successfully downloaded {os.path.basename(name)} using first variant.")
+            return _final
+        # HTTP said 200 but the body was not an image (dead host answering with
+        # an HTML error page). Do NOT return — fall through to the variant
+        # cascade below; a `-m`/other-extension mirror may serve real bytes.
+        # `first_error` is already None here (_try_download_url returns
+        # (True, None, ct) on success), so the sequential-vs-parallel choice
+        # below correctly treats this as "no throttling seen".
 
     # After the first attempt, re-check fast-fail conditions before generating
     # variants. If we just hit the poison threshold or watchdog, abort the
@@ -1891,11 +1997,18 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
                 timeout,
             )
             if success:
+                _final = _finalize_downloaded_image(
+                    pending_pth, folder, base, alt_content_type, name, alt_url
+                )
+                if _final is None:
+                    # 200 with a non-image body — keep walking the variants
+                    # instead of failing the page on one bad mirror.
+                    continue
                 log_verbose(
                     f"  Successfully downloaded {os.path.basename(name)} via sequential fallback variant: {os.path.basename(alt_url)}"
                 )
                 print(f"  [Fallback] {os.path.basename(name)}: succeeded with variant {os.path.basename(alt_url)}")
-                return _finalize_pending_image(pending_pth, folder, base, alt_content_type)
+                return _final
 
         print(
             f"  Error: Skipping image {os.path.basename(name)} after throttled sequential retries across {len(unique_urls_to_try)} variants."
@@ -2035,21 +2148,20 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
     if successful_temp_file[0]:
         temp_path, successful_url, parallel_ct = successful_temp_file[0]
         try:
-            # Sniff the winning temp file and pick its real extension. Then
-            # atomic-rename into <folder>/<base><ext>. Same-folder rename is
-            # atomic on POSIX and NT, so the file appears at its final path
-            # with correct extension in one step.
-            try:
-                with open(temp_path, "rb") as fh:
-                    head = fh.read(32)
-            except Exception:
-                head = b""
-            ext = _sniff_image_extension(head, parallel_ct)
-            final_pth = os.path.join(folder, base + ext)
-            shutil.move(temp_path, final_pth)
-            log_verbose(f"  Successfully downloaded {os.path.basename(name)} using variant: {os.path.basename(successful_url)}")
-            print(f"  [Fallback] {os.path.basename(name)}: succeeded with variant {os.path.basename(successful_url)}")
-            return final_pth
+            # Validate + sniff the winning temp file, then atomic-rename into
+            # <folder>/<base><ext>. mkstemp put temp_path in `folder`, so this
+            # is a same-folder rename — atomic on POSIX and NT, and os.replace
+            # (inside the helper) is overwrite-safe where shutil.move was not.
+            final_pth = _finalize_downloaded_image(
+                temp_path, folder, base, parallel_ct, name, successful_url
+            )
+            if final_pth is not None:
+                log_verbose(f"  Successfully downloaded {os.path.basename(name)} using variant: {os.path.basename(successful_url)}")
+                print(f"  [Fallback] {os.path.basename(name)}: succeeded with variant {os.path.basename(successful_url)}")
+                return final_pth
+            # Winner's body was not an image (the helper already deleted the
+            # tempfile). Every variant is exhausted at this point, so fall
+            # through to the all-attempts-failed return below.
         except Exception as e:
             print(f"  Error: Failed to move temp file: {e}")
             # Clean up the temp file if move failed
@@ -5231,6 +5343,67 @@ def rm_tree(path):
 
 
 # ──────────────────────────────────────────────────────────────────
+# Scanlation-group / chapter-version selection
+#
+# The per-chapter ranking itself lives in sites/base.py
+# (select_best_chapter_version + _rank_version). These two helpers turn CLI
+# args into the run-level policy that ranking needs, and are the only place
+# aio-dl.py reasons about groups directly.
+# ──────────────────────────────────────────────────────────────────
+def _build_group_selection_policy(handler, chapters_by_num, args):
+    """Assemble the per-series GroupSelectionPolicy.
+
+    Called ONCE per series, right after the chapter pool has been bucketed by
+    chapter number and before any version is selected — that is the only point
+    where the whole series is visible, and the census (how many chapters each
+    group actually supplies) cannot be computed from a single bucket.
+
+    Runtime-only: nothing here is persisted or hashed. The --mtl /
+    --exclude-group ARGS are resume-gating (grep _RESUME_GATING_DESTS), but the
+    derived census is rebuilt from the live chapter list every run.
+    """
+    census, census_total = build_group_census(handler, chapters_by_num)
+    excluded_keys = frozenset(
+        key for key in (
+            handler.get_group_match_key(name)
+            for name in (getattr(args, "exclude_group", None) or [])
+        ) if key
+    )
+    policy = GroupSelectionPolicy(
+        census=census or None,
+        census_total=census_total,
+        mtl=getattr(args, "mtl", "avoid") or "avoid",
+        excluded_keys=excluded_keys,
+    )
+    if census:
+        top = sorted(census.items(), key=lambda kv: -kv[1])[:5]
+        log_verbose(
+            "  Group census ({} distinct chapters): {}".format(
+                census_total,
+                ", ".join(f"{k}={v}" for k, v in top) or "none",
+            )
+        )
+    return policy
+
+
+def _version_is_confirmed_mtl(handler, version):
+    """True when EVERY credited group on a version is confirmed machine TL.
+
+    Deliberately stricter than the ranker's own folding rule (which takes the
+    best verdict across co-credited groups): this only drives the user-facing
+    "skipped under --mtl exclude" tally, and over-reporting a skip is worse
+    than under-reporting it.
+    """
+    infos = handler.get_group_infos(version)
+    if not infos:
+        return False
+    return all(
+        classify_mtl(info.name, description=info.description)[0] == MTL_CONFIRMED
+        for info in infos
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # Resume parameter persistence
 # ──────────────────────────────────────────────────────────────────
 # Single source of truth for what gets written to tmp_<hid>/run_params.json
@@ -5272,6 +5445,11 @@ _RESUME_GATING_DESTS = frozenset({
     "width", "aspect_ratio",
     "quality", "scaling", "chapters", "group",
     "mix_by_upvote", "no_group_fallback", "no_partials",
+    # Group/version selection: these decide WHICH version's image bytes land
+    # on disk, so a mid-run change must invalidate them. Without gating, a run
+    # started under --mtl allow and resumed under --mtl exclude would stitch a
+    # half-machine-translated volume.
+    "mtl", "exclude_group",
     "download_volumes", "collapse_splits", "no_processing",
     # Phase 1 (2026-05-11): LINE Webtoon WebP recompression. Changing any
     # of these between runs invalidates the on-disk images because the
@@ -5381,6 +5559,8 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         "scaling": getattr(args, "scaling", 100),
         "cookies": getattr(args, "cookies", "") or "",
         "group": getattr(args, "group", []) or [],
+        "exclude_group": getattr(args, "exclude_group", []) or [],
+        "mtl": getattr(args, "mtl", "avoid"),
         "split": getattr(args, "split", None),
         "mix_by_upvote": bool(getattr(args, "mix_by_upvote", False)),
         "no_group_fallback": bool(getattr(args, "no_group_fallback", False)),
@@ -5577,6 +5757,17 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         groups = [groups]
     for group in groups:
         child_cmd.extend(["--group", str(group)])
+    # Same shape as --group. Without replaying these, an --update-all child
+    # reverts to the defaults and the series slowly accumulates chapters from
+    # groups the user explicitly rejected (the S4-2 bug class).
+    excluded = params.get("exclude_group") or []
+    if isinstance(excluded, str):
+        excluded = [excluded]
+    for group in excluded:
+        child_cmd.extend(["--exclude-group", str(group)])
+    mtl_policy = params.get("mtl")
+    if mtl_policy and mtl_policy != "avoid":
+        child_cmd.extend(["--mtl", str(mtl_policy)])
     if params.get("split"):
         child_cmd.extend(["--split", str(params["split"])])
     for key, flag in (
@@ -7675,13 +7866,39 @@ def main():
     p.add_argument(
         "--mix-by-upvote",
         action="store_true",
-        help="When multiple --group args are used, ignore priority and pick the "
-        "version with the most upvotes from any of the specified groups.",
+        help="When multiple --group args are used, ignore priority order and "
+        "rank across the union of the specified groups instead. (Upvotes are "
+        "now only a weak tiebreak inside that ranking — most sites report no "
+        "vote count at all — so this is 'best of my groups' rather than "
+        "'most upvoted'. Flag name kept for back-compat.)",
     )
     p.add_argument(
         "--no-group-fallback",
         action="store_true",
         help="When --group is set, skip chapters missing all preferred groups instead of falling back to another group.",
+    )
+    p.add_argument(
+        "--mtl",
+        choices=("avoid", "allow", "exclude"),
+        default="avoid",
+        help="How to treat machine-translated (MTL) chapter versions, detected "
+        "from the scanlation group's name and self-description (grep "
+        "sites/group_quality.py). 'avoid' (default) ranks them below every "
+        "human translation but still downloads one when it is the ONLY "
+        "version of that chapter — you never silently lose a chapter. "
+        "'allow' ignores the signal entirely. 'exclude' skips a chapter whose "
+        "every version is confirmed MTL (heuristic 'suspect' matches are never "
+        "excluded, only demoted). To force a specific group regardless of this "
+        "setting, name it in --group.",
+    )
+    p.add_argument(
+        "--exclude-group",
+        nargs="+",
+        default=[],
+        help="Scanlation groups to avoid. Same input shape as --group (repeat "
+        "the flag or pass one comma-separated string). Excluded versions rank "
+        "below everything else but are still used when no alternative exists; "
+        "add --no-group-fallback to skip those chapters instead.",
     )
     p.add_argument(
         "--no-partials",
@@ -8782,13 +8999,20 @@ def main():
     if not handler:
         sys.exit("Unable to resolve site handler. Use --site to specify explicitly.")
 
-    # Process the group argument to handle comma-separated strings
+    # Process the group arguments to handle comma-separated strings
     if args.group:
         # Flatten the list of strings, splitting each by comma, and stripping whitespace.
         args.group = [
             g.strip()
             for group_string in args.group
             for g in group_string.split(",")
+        ]
+    if getattr(args, "exclude_group", None):
+        args.exclude_group = [
+            g.strip()
+            for group_string in args.exclude_group
+            for g in group_string.split(",")
+            if g.strip()
         ]
 
     global _VERBOSE, _DEBUG
@@ -9083,12 +9307,32 @@ def main():
         safe_group = sanitize_filename(" ".join(args.group))
         base_filename = join_name(base_filename, safe_group)
 
+    # Advisory early-stop hint for handlers with expensive paginated chapter
+    # listing (comix's browser DOM scrape walks up to ~360 pager pages on a
+    # long multi-group series). Set on the INSTANCE just before the call; see
+    # BaseSiteHandler.chapter_floor_hint for the contract. None whenever the
+    # floor isn't provably safe, so this can never drop a wanted chapter — the
+    # real --chapters filter still runs over the returned pool below either way.
+    chapter_floor = _chapter_range_floor(getattr(args, "chapters", "all"))
+    try:
+        handler.chapter_floor_hint = chapter_floor
+    except Exception:
+        # Handlers are plain objects, but never let a hint break the run.
+        chapter_floor = None
+
     if getattr(args, "download_volumes", False):
         pool = handler.get_volumes(context, scraper, args.language, make_request)
         if not pool:
             sys.exit("This site handler does not expose volume listing.")
     else:
         pool = handler.get_chapters(context, scraper, args.language, make_request)
+
+    # A floored listing is a PARTIAL view of the series by design, so the
+    # "how many chapters existed at download time" stat below must not report
+    # it as the total. Volumes never take the hint.
+    pool_is_partial = bool(chapter_floor is not None) and not getattr(
+        args, "download_volumes", False
+    )
 
     # ── Direct-URL multi-source: find alternatives for fallback ──
     # When --multi-source is set and we got here via a direct URL (not via
@@ -9304,7 +9548,7 @@ def main():
         # handlers that emit 4.0 (mangathemesia subclasses) don't split
         # from "4"-emitting peers; we mirror that here so the dedupe and
         # the optional collapse pass see the same canonical keys.
-        seen_nums = set()
+        list_chapters_by_num: Dict[str, List[Dict[str, Any]]] = {}
         deduped_pool: List[Dict[str, Any]] = []
         # Premium/locked placeholders (tapas.get_chapters emits them for
         # WAIT_OR_MUST_PAY episodes) are surfaced SEPARATELY as locked_chapters
@@ -9351,13 +9595,29 @@ def main():
             # ALL non-numeric labels. Residual follow-up.
             if _chap_as_float(num) is None:
                 continue
-            if num in seen_nums:
-                continue
-            seen_nums.add(num)
             # Carry the dict shape (group_chapters_for_download needs it) but
             # with the normalized label injected so its `_extract_chapter_num`
             # parse and our diff target both see the same string.
-            deduped_pool.append({**ch, "chap": num})
+            list_chapters_by_num.setdefault(num, []).append({**ch, "chap": num})
+
+        # Collapse each number to ONE version with the SAME selector the
+        # download path uses. This used to be a plain first-wins `seen_nums`
+        # dedupe, which diverged from the download in two ways: it ignored
+        # --group entirely, and under --no-group-fallback it would LIST a
+        # chapter the download then skipped (a permanent "+1 new" in the UI).
+        # The winner choice never changes which NUMBERS exist, so the UI's
+        # update diff is unaffected — only the per-chapter group metadata below.
+        _list_policy = _build_group_selection_policy(handler, list_chapters_by_num, args)
+        for num in sorted(list_chapters_by_num.keys(), key=float):
+            best = handler.select_best_chapter_version(
+                list_chapters_by_num[num],
+                args.group,
+                args.mix_by_upvote,
+                allow_group_fallback=not getattr(args, "no_group_fallback", False),
+                selection_policy=_list_policy,
+            )
+            if best:
+                deduped_pool.append(best)
 
         collapse_splits_enabled = bool(getattr(args, "collapse_splits", False))
         if collapse_splits_enabled:
@@ -9385,6 +9645,60 @@ def main():
 
         locked_chapters = sorted(set(locked_labels), key=lambda x: float(x))
 
+        # Scanlation groups available for this series, most-prolific first, so
+        # the UI can show what exists and let the user pick instead of typing a
+        # name blind. Purely additive — the UI ignores unknown keys, and none of
+        # this participates in the "+N new" diff.
+        group_rows: List[Dict[str, Any]] = []
+        _group_display: Dict[str, str] = {}
+        _group_flags: Dict[str, Dict[str, Any]] = {}
+        for _versions in list_chapters_by_num.values():
+            for _v in _versions:
+                for _info in handler.get_group_infos(_v):
+                    _key = handler.get_group_match_key(_info.name)
+                    if not _key:
+                        continue
+                    _group_display.setdefault(_key, _info.name)
+                    _flags = _group_flags.setdefault(
+                        _key, {"is_official": False, "mtl": "none"}
+                    )
+                    _flags["is_official"] = _flags["is_official"] or _info.is_official
+                    if _flags["mtl"] == "none":
+                        _verdict, _ = classify_mtl(
+                            _info.name, description=_info.description
+                        )
+                        _flags["mtl"] = _verdict
+        # Which chapter numbers each group does NOT cover — the one thing a
+        # user actually needs before picking one ("if I force Dusk, what do I
+        # lose?"). Deliberately NOT a full per-chapter group map: on a site
+        # where every chapter has 3-4 competing versions (atsumaru: 201
+        # chapters x 4 groups) that map is a second copy of the chapter list,
+        # and the UI runs --list-chapters for EVERY library series on an
+        # update check. This inverted form is near-empty in the common case.
+        _covered: Dict[str, set] = {}
+        for _num, _versions in list_chapters_by_num.items():
+            for _v in _versions:
+                for _info in handler.get_group_infos(_v):
+                    _k = handler.get_group_match_key(_info.name)
+                    if _k:
+                        _covered.setdefault(_k, set()).add(_num)
+        _all_nums = set(list_chapters_by_num.keys())
+        for _key, _count in sorted(
+            (_list_policy.census or {}).items(), key=lambda kv: (-kv[1], kv[0])
+        ):
+            _missing = sorted(_all_nums - _covered.get(_key, set()), key=float)
+            group_rows.append({
+                "name": _group_display.get(_key, _key),
+                "key": _key,
+                "chapters": _count,
+                "is_official": _group_flags.get(_key, {}).get("is_official", False),
+                "mtl": _group_flags.get(_key, {}).get("mtl", "none"),
+                "missing_count": len(_missing),
+                # Capped: a group covering 3 of 800 chapters would otherwise
+                # inline the other 797.
+                "missing_sample": _missing[:50],
+            })
+
         result = {
             "hid": hid,
             "title": title,
@@ -9401,6 +9715,7 @@ def main():
             # or the "+N new" diff — see the locked_labels comment above.
             "locked_chapters": locked_chapters,
             "collapse_applied": collapse_splits_enabled,
+            "groups": group_rows,
         }
         print(json.dumps(result))
         sys.exit(0)
@@ -9568,7 +9883,9 @@ def main():
             continue
 
     # 2. For each chapter number, select the best version
+    selection_policy = _build_group_selection_policy(handler, chapters_by_num, args)
     best_chapters = []
+    skipped_mtl_labels: List[str] = []
     sorted_chap_nums = sorted(chapters_by_num.keys(), key=float)
     for num in sorted_chap_nums:
         versions = chapters_by_num[num]
@@ -9578,9 +9895,28 @@ def main():
             args.mix_by_upvote,
             allow_group_fallback=not getattr(args, "no_group_fallback", False),
             log_debug_fn=log_debug,
+            selection_policy=selection_policy,
         )
         if best_version:
             best_chapters.append(best_version)
+        elif selection_policy.mtl == "exclude" and len(versions) > 0:
+            # Distinguish an MTL-policy skip from a --no-group-fallback skip so
+            # the count below can't over-report. A chapter is only attributed to
+            # the MTL policy when every version was confirmed machine-translated.
+            if all(
+                _version_is_confirmed_mtl(handler, v) for v in versions
+            ):
+                skipped_mtl_labels.append(num)
+    if skipped_mtl_labels:
+        # Counted + aggregated, never a silent drop. Mirrors the
+        # "N premium/locked chapter(s) skipped" notice below.
+        preview = ", ".join(skipped_mtl_labels[:8])
+        more = f" (+{len(skipped_mtl_labels) - 8} more)" if len(skipped_mtl_labels) > 8 else ""
+        print(
+            f"[i] {len(skipped_mtl_labels)} chapter(s) skipped — every available "
+            f"version is machine-translated and --mtl exclude is set: "
+            f"{preview}{more}. Use --mtl avoid to take them anyway."
+        )
 
     # 3. Apply filters to the final list
     chapters = best_chapters
@@ -10194,7 +10530,16 @@ def main():
                     )
                     rm_tree(tdir)
 
-            print(f"\nChapter {n} ({grp_name or 'No Group'})")
+            # Group credit + (when more than one version existed) the tier that
+            # actually decided the pick. `_group_selection` is written by
+            # base.select_best_chapter_version; grep it there for the tuple.
+            _gsel = ch.get("_group_selection") or {}
+            _why = _gsel.get("why")
+            _avail = _gsel.get("available") or ""
+            _sel_note = ""
+            if _why and _avail and "," in _avail:
+                _sel_note = f" — chosen on {_why} from: {_avail}"
+            print(f"\nChapter {n} ({grp_name or 'No Group'}){_sel_note}")
             _t0_imageurls = time.monotonic()
             # Phase 8 (2026-05-08): split-cluster collapse — when this chapter
             # was synthesized by group_chapters_for_download from multiple
@@ -12428,7 +12773,12 @@ def main():
             # update-check (main.js:_checkSeriesUpdates). Empty for single-source
             # / lazy / collapse-off series. grep chapters_skipped_fragments.
             "chapters_skipped_fragments": merged_skipped,
-            "total_available_at_download": len(pool),
+            # None when the chapter listing was deliberately cut short by
+            # chapter_floor_hint (grep pool_is_partial): reporting a floored
+            # pool as the series total would be a lie, and "unknown" is the
+            # honest answer. Nothing reads this field today; keep it truthful
+            # anyway so anything that starts to can trust it.
+            "total_available_at_download": None if pool_is_partial else len(pool),
             "last_downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             # --- AniList enrichment fields (--metadata-source=anilist) ---
             # Populated when enrichment matched a series confidently;
@@ -12575,4 +12925,21 @@ if __name__ == "__main__":
         raise
     except Exception as e:
         _hb("error", str(e))
+        # comix's WAF / truncated-scrape failures are USER-actionable, not
+        # bugs: the message already carries the remediation, and a traceback
+        # buries it in noise the user can do nothing with. Everything else
+        # still re-raises with the full traceback. Imported lazily so a
+        # renamed/missing handler can never break the CLI's own error path.
+        # Cross-file: sites/comix.py (grep ComixWafChallengeError).
+        try:
+            from sites.comix import (
+                ComixChapterScrapeError,
+                ComixWafChallengeError,
+            )
+            _actionable = (ComixWafChallengeError, ComixChapterScrapeError)
+        except Exception:
+            _actionable = ()
+        if _actionable and isinstance(e, _actionable):
+            print(f"\n[!] {e}", file=sys.stderr, flush=True)
+            sys.exit(2)
         raise

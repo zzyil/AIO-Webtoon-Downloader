@@ -188,9 +188,6 @@ class MangaReaderSiteHandler(BaseSiteHandler):
             )
         return chapters
 
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        return None
-
     def get_chapter_images(
         self,
         chapter: Dict,

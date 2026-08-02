@@ -7,6 +7,7 @@ import LogPanel from "@/components/LogPanel";
 import SettingsTab from "@/components/SettingsTab";
 import LibraryTab from "@/components/LibraryTab";
 import ResumeBar from "@/components/ResumeBar";
+import ConfirmQuitDialog from "@/components/ConfirmQuitDialog";
 import appIcon from "../build-resources/icon.png";
 import {
   Download,
@@ -274,6 +275,11 @@ export default function App() {
           onRefresh={dl.refreshResumable}
         />
       </div>
+
+      {/* Quit confirmation — self-contained (subscribes to main's
+          "confirm-quit" push, renders null the rest of the time). Sits outside
+          the tab-content area so it overlays whatever tab is open. */}
+      <ConfirmQuitDialog />
     </div>
   );
 }

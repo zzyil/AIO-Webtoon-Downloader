@@ -1,23 +1,33 @@
 // ============================================================
 // HISTORY MANAGER
 //
-// Persists download history and user settings to JSON files
-// in Electron's userData folder:
+// Persists download history, user settings, and the pending
+// download queue to JSON files in Electron's userData folder:
 //   Windows: %AppData%/aio-downloader-ui/
 //
-// Two files:
+// Three files:
 //   download_history.json  → list of past downloads
 //   settings.json          → user preferences and defaults
+//   download_queue.json    → queue snapshot, restored on next launch
+//
+// Read by electron/main.js only (it owns every IPC handler that
+// touches these); the renderer reaches them through preload.js.
 // ============================================================
 
 const fs = require("fs");
 const path = require("path");
+
+// Watermark for the one-time settings fixups in _migrateSettings. Bump when
+// you add a step there; `settingsSchemaVersion` is stamped into settings.json
+// so each step runs exactly once per install.
+const SETTINGS_SCHEMA_VERSION = 1;
 
 class HistoryManager {
   constructor(userDataPath) {
     this._dataDir = userDataPath;
     this._historyPath = path.join(userDataPath, "download_history.json");
     this._settingsPath = path.join(userDataPath, "settings.json");
+    this._queuePath = path.join(userDataPath, "download_queue.json");
 
     // Make sure the data directory exists
     fs.mkdirSync(userDataPath, { recursive: true });
@@ -25,6 +35,39 @@ class HistoryManager {
     // Load existing data from disk (or start with empty arrays/objects)
     this._history = this._loadJson(this._historyPath, []);
     this._settings = this._loadJson(this._settingsPath, {});
+    // null (not {}) when absent — the renderer treats a missing snapshot as
+    // "nothing to restore" rather than "restore an empty queue".
+    this._queue = this._loadJson(this._queuePath, null);
+
+    // Runs HERE, in the constructor, and NOT in SettingsTab: main.js reads
+    // settings for the updater at startup (grep initAppUpdater), long before
+    // the renderer mounts — a renderer-side migration would leave auto-update
+    // off until the user happened to open Settings and press Save.
+    this._migrateSettings();
+  }
+
+  /**
+   * One-time, versioned settings fixups. `settingsSchemaVersion` (absent = 0)
+   * is the watermark; the stamp is persisted, so a relaunch is a no-op and a
+   * future step is one more `if (from < N)` block plus a bump of the const.
+   */
+  _migrateSettings() {
+    const from = Number(this._settings.settingsSchemaVersion) || 0;
+    if (from >= SETTINGS_SCHEMA_VERSION) return;
+
+    // v1 — appAutoUpdate flipped from opt-IN to opt-OUT, and every reader now
+    // tests `!== false`. SettingsTab.handleSave spreads the ENTIRE ~90-key
+    // draft, so anyone who ever pressed Save carries an explicit
+    // `appAutoUpdate: false` written by the old default — indistinguishable
+    // from a deliberate opt-out, and it would pin them off forever. That
+    // stored false carries no intent, so drop it once and let the new default
+    // apply. An explicit `true` is left alone.
+    if (from < 1 && this._settings.appAutoUpdate === false) {
+      delete this._settings.appAutoUpdate;
+    }
+
+    this._settings.settingsSchemaVersion = SETTINGS_SCHEMA_VERSION;
+    this._saveJson(this._settingsPath, this._settings);
   }
 
   /**
@@ -186,6 +229,34 @@ class HistoryManager {
 
     this._settings = { ...this._settings, ...filtered };
     this._saveJson(this._settingsPath, this._settings);
+  }
+
+  // ── Download queue snapshot ──
+  //
+  // The queue is pure React state (useDownloader.js) and dies with the
+  // renderer, so it's mirrored to disk and replayed on the next launch.
+  // Written by useDownloader's debounced persist effect through main.js's
+  // "queue:save" IPC; read once on mount via "queue:get". Shape:
+  //   {
+  //     queue:   [ <queue items verbatim, see useDownloader's STATE SHAPES> ],
+  //     running: [ { hid, url, displayUrl, title, type, tmpDir, args } ],
+  //     savedAt: <epoch ms>
+  //   }
+  // `running` = what was mid-download at close. The renderer reconstitutes
+  // those against a FRESH scanResumable and drops any whose tmp_<hid> folder
+  // is gone, so nothing here is trusted as proof that work is resumable.
+
+  /** null when no snapshot has ever been written. */
+  getQueueSnapshot() {
+    return this._queue;
+  }
+
+  saveQueueSnapshot(snap) {
+    this._queue =
+      snap && typeof snap === "object"
+        ? snap
+        : { queue: [], running: [], savedAt: Date.now() };
+    this._saveJson(this._queuePath, this._queue);
   }
 }
 

@@ -9,7 +9,22 @@ from urllib.parse import urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound, NavigableString
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, GroupInfo, SiteComicContext
+
+
+def _clean_group_name(value: Optional[str]) -> Optional[str]:
+    """Strip mangataro's em-dash separator off a group label.
+
+    The site renders chapter rows as "Ch. 12 — Group Name", and both the
+    `data-group-name` attribute and the API's `group_name` occasionally keep a
+    leading/trailing em dash. Lived in a get_group_name override until the
+    canonical GroupInfo model landed; it belongs at the parse sites so the
+    stored value is clean for every reader, not just the selector.
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().strip("—").strip()
+    return cleaned or None
 
 
 class MangataroSiteHandler(BaseSiteHandler):
@@ -103,13 +118,6 @@ class MangataroSiteHandler(BaseSiteHandler):
 
         api_chapters = self._fetch_chapters_via_api(manga_id, scraper, make_request)
         return api_chapters
-
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        group_name = chapter_version.get("group_name")
-        if isinstance(group_name, str) and group_name.strip():
-            cleaned = group_name.strip().strip("—").strip()
-            return cleaned or None
-        return None
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")
@@ -332,15 +340,21 @@ class MangataroSiteHandler(BaseSiteHandler):
             if chap_number is None:
                 continue
 
-            group_name = (link.get("data-group-name") or "").strip() or None
+            group_name = _clean_group_name(link.get("data-group-name"))
 
             chapters.append(
                 {
                     "hid": chapter_id,
                     "chap": chap_number,
                     "url": chapter_url,
+                    "_groups": [GroupInfo(name=group_name)] if group_name else [],
                     "group_name": group_name,
                     "title": (link.get("title") or "").strip() or None,
+                    # NOTE: no `up_count` on this path — the site only exposes
+                    # likes via the signed API below. base._build_rank_context
+                    # requires >=2 reporters before the upvote tier engages, so
+                    # a mixed HTML/API pool can't compare a real count against
+                    # a missing one.
                 }
             )
 
@@ -410,12 +424,14 @@ class MangataroSiteHandler(BaseSiteHandler):
             except Exception:
                 likes = 0
 
+            api_group = _clean_group_name(entry.get("group_name"))
             chapters.append(
                 {
                     "hid": chapter_id,
                     "chap": chap_number,
                     "url": chapter_url,
-                    "group_name": (entry.get("group_name") or "").strip() or None,
+                    "_groups": [GroupInfo(name=api_group)] if api_group else [],
+                    "group_name": api_group,
                     "title": (entry.get("title") or "").strip() or None,
                     "lang": (entry.get("language") or "").strip() or None,
                     "up_count": likes,

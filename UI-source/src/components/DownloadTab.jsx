@@ -48,6 +48,11 @@ const DEFAULT_FORM = {
   splitMode: "none",
   splitValue: "",
   group: "",
+  excludeGroup: "",
+  // "avoid" mirrors aio-dl.py's --mtl default: machine-translated versions
+  // rank below every human one but are still used when they're the only
+  // version of a chapter.
+  mtl: "avoid",
   mixByUpvote: false,
   cookies: "",
   jobs: 1,
@@ -384,6 +389,8 @@ export default function DownloadTab({
     if (form.splitMode === "size" && form.splitValue) args.split = form.splitValue;
     if (form.splitMode === "chapters" && form.splitValue) args.split = `${form.splitValue}ch`;
     if (form.group.trim()) args.group = form.group.trim();
+    if (form.excludeGroup.trim()) args.excludeGroup = form.excludeGroup.trim();
+    if (form.mtl && form.mtl !== "avoid") args.mtl = form.mtl;
     if (form.mixByUpvote) args.mixByUpvote = true;
     if (form.cookies.trim()) args.cookies = form.cookies.trim();
     if (form.jobs > 1) args.jobs = form.jobs;
@@ -856,14 +863,39 @@ export default function DownloadTab({
         <SectionHeader>Advanced</SectionHeader>
         <div className="space-y-2">
           <Collapsible title="Scanlation Groups">
-            <div className="space-y-2">
-              <Label htmlFor="group" className="text-xs">Preferred groups (comma-separated, priority order)</Label>
-              <Input id="group" value={form.group} onChange={(e) => set("group", e.target.value)} placeholder='e.g. "Official, GroupA"' />
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="group" className="text-xs">Preferred groups (comma-separated, priority order)</Label>
+                <Input id="group" value={form.group} onChange={(e) => set("group", e.target.value)} placeholder='e.g. "Official, GroupA"' />
+                <p className="text-[11px] text-muted-foreground">
+                  Naming a group here forces it, overriding every automatic signal
+                  below. Use <code>Official</code> to match any licensed/publisher release.
+                </p>
+              </div>
+
               <div className="flex items-center gap-2">
                 <Checkbox id="mixByUpvote" checked={form.mixByUpvote} onCheckedChange={(v) => set("mixByUpvote", v)} disabled={!form.group.trim()} />
                 <Label htmlFor="mixByUpvote" className={cn("text-xs cursor-pointer", !form.group.trim() && "opacity-40")}>
-                  Pick by most upvotes instead of priority order
+                  Rank across all my groups instead of using priority order
                 </Label>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="excludeGroup" className="text-xs">Groups to avoid (comma-separated)</Label>
+                <Input id="excludeGroup" value={form.excludeGroup} onChange={(e) => set("excludeGroup", e.target.value)} placeholder='e.g. "SomeGroup"' />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="mtl" className="text-xs">Machine translations (MTL)</Label>
+                <Select id="mtl" value={form.mtl} onChange={(e) => set("mtl", e.target.value)}>
+                  <option value="avoid">Avoid — use only if it's the only version</option>
+                  <option value="allow">Allow — treat like any other version</option>
+                  <option value="exclude">Exclude — skip the chapter entirely</option>
+                </Select>
+                <p className="text-[11px] text-muted-foreground">
+                  Detected from the group's name and self-description. "Avoid" never
+                  costs you a chapter; "Exclude" leaves gaps where only MTL exists.
+                </p>
               </div>
             </div>
           </Collapsible>

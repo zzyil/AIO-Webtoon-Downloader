@@ -72,6 +72,7 @@ from bs4 import BeautifulSoup
 from .base import (
     AssetSpec,
     BaseSiteHandler,
+    GroupInfo,
     IncompleteChapterError,
     SearchHit,
     SiteComicContext,
@@ -582,6 +583,19 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                     # kept distinct so diagnostics can tell them apart.
                     "is_official": (not is_canvas),
                     "publisher": publisher_label,
+                    # Originals vs Canvas now stay DISTINCT groups. They used
+                    # to collapse into one bucket named "official" because
+                    # base.normalize_group_name rewrote any name matching
+                    # \b(official|webtoons?|naver)\b — which defeated the very
+                    # distinction the is_official line above sets up. That
+                    # rewrite is gone; `--group official` keys on the
+                    # is_official FLAG instead (grep _OFFICIAL_ALIAS_KEYS).
+                    "_groups": [
+                        GroupInfo(
+                            name=publisher_label,
+                            is_official=(not is_canvas),
+                        )
+                    ],
                     "group_name": publisher_label,
                     "thumbnail": thumb,
                     # Audio-archival hint (faithful-archival feature). The
@@ -595,12 +609,6 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                 }
             )
         return chapters
-
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        """Surface our hardcoded `LINE Webtoon` to the orchestrator's
-        per-source diagnostics. Mirrors weebcentral.py:246–248."""
-        name = chapter_version.get("group_name")
-        return name if isinstance(name, str) and name else None
 
     # ------------------------------------------------------------- chapter images
 

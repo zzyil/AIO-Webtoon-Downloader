@@ -51,6 +51,26 @@ const OUTPUT_EXTENSIONS = new Set(["pdf", "epub", "cbz"]);
 // webp/avif/png/gif, not just jpg. Cross-file: grep _IMG_EXTS in aio-dl.py.
 const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "avif", "gif"]);
 
+// Numeric-aware comparator: "Ch 2.cbz" sorts before "Ch 10.cbz" instead of
+// after "Ch 100.cbz". Plain localeCompare (no options) defaults numeric:false
+// and compares digit runs character by character, which is what put a series'
+// archive list in 1 / 10 / 100 / 2 order in the detail view. Hoisted rather
+// than per-call String.localeCompare because localeCompare builds a fresh
+// collator every invocation and this sorts every file of every series per scan.
+//
+// Cross-file: MIRROR TWIN of `naturalCompare` in src/lib/utils.js — electron/
+// is CommonJS and can't import from src/. Same arrangement as
+// electron/resource-limits.js vs src/lib/resourceLimits.js. Grep naturalCompare
+// if you touch either.
+//
+// NOT for the ISO-8601 `lastModified`/`modifiedAt` strings: those already sort
+// correctly as plain strings, and numeric:true would parse digit groups across
+// the '-' and ':' separators and break them.
+const naturalCompare = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+}).compare;
+
 // ── CONFIGURABLE ──
 // Width of generated thumbnails in pixels.
 // Smaller = faster to generate and less memory used.
@@ -568,7 +588,7 @@ function scanLibrary(mangasDir, thumbCacheDir) {
     entries.push({
       title: folder.name,
       folderPath,
-      files: files.sort((a, b) => a.name.localeCompare(b.name)),
+      files: files.sort((a, b) => naturalCompare(a.name, b.name)),
       coverPdfPath,
       thumbPath,
       webCoverCached,
@@ -587,7 +607,7 @@ function scanLibrary(mangasDir, thumbCacheDir) {
   }
 
   // Sort by title by default
-  entries.sort((a, b) => a.title.localeCompare(b.title));
+  entries.sort((a, b) => naturalCompare(a.title, b.title));
   return entries;
 }
 
