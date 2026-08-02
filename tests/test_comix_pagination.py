@@ -42,6 +42,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import os
+import re
 import sys
 
 import pytest
@@ -559,13 +560,53 @@ def test_stabilize_user_agent_tolerates_missing_input():
 
 
 def test_start_pins_a_stable_user_agent():
-    """A pinned UA is what makes headed and headless present identically; it
-    also drops the `HeadlessChrome` token, which is a blatant bot signal and
-    likely part of why the check fired at all."""
+    """The UA pin drops the `HeadlessChrome` token from the UA STRING.
+
+    Necessary but NOT sufficient on its own — see
+    test_start_also_sets_the_browser_channel for the other half.
+    """
     src = inspect.getsource(comix._ComixBrowserSession._start)
     assert "_resolve_stable_user_agent()" in src
     assert "_stabilize_user_agent" in src
     assert 'ctx_kwargs["user_agent"]' in src
+
+
+def test_start_also_sets_the_browser_channel():
+    """THE half b014f12 missed. Playwright's `user_agent=` calls
+    Emulation.setUserAgentOverride without userAgentMetadata, so it fixes the UA
+    header and NOTHING else: Sec-CH-UA and navigator.userAgentData keep saying
+    HeadlessChrome. Measured 2026-08-02 — pin alone leaves the context
+    announcing HeadlessChrome in the hints while its UA claims Chrome, a
+    contradiction no real browser emits. `channel="chromium"` is what moves the
+    hints; only the two together match the headed handoff window."""
+    src = inspect.getsource(comix._ComixBrowserSession._start)
+    assert "channel=_COMIX_BROWSER_CHANNEL" in src
+    assert comix._COMIX_BROWSER_CHANNEL == "chromium"
+    # An install that doesn't know the channel must still launch.
+    assert "_launch(**ctx_kwargs)" in src, "channel launch needs a fallback"
+
+
+def test_true_user_agent_is_read_past_the_override():
+    """A UA override makes navigator.userAgent report our own pin straight back,
+    so a WRONG pin looks self-consistent and re-caches itself forever. The
+    reconciliation must therefore read the browser, not the page."""
+    src = inspect.getsource(comix._ComixBrowserSession._probe_true_user_agent)
+    assert "Browser.getVersion" in src
+    start = inspect.getsource(comix._ComixBrowserSession._start)
+    assert "_probe_true_user_agent()" in start
+    assert 'evaluate("navigator.userAgent")' not in start, (
+        "_start must not reconcile the pin against the overridden page value"
+    )
+
+
+def test_start_ua_relaunch_is_bounded():
+    """Termination must be provable locally, not inferred from cache warmth."""
+    sig = inspect.signature(comix._ComixBrowserSession._start)
+    assert "_ua_relaunch" in sig.parameters
+    assert sig.parameters["_ua_relaunch"].default is False
+    src = inspect.getsource(comix._ComixBrowserSession._start)
+    assert "_ua_relaunch=True" in src
+    assert "not _ua_relaunch" in src
 
 
 def test_successful_solve_does_not_consume_the_ask_again_budget(waf_budget_reset):
@@ -625,6 +666,158 @@ def test_failure_message_never_claims_the_user_failed_a_check_it_never_showed():
     assert "Re-run" in comix._waf_failure_message("x", None)
 
 
+# ------------------------------- HTTP metadata path uses the browser (2026-08-02)
+# The old recovery opened the interactive handoff, copied the solved cookies into
+# cloudscraper, overwrote its User-Agent, and retried over HTTP. It could not
+# work, and burned a human solve to fail anyway — live log: "verification passed
+# - thanks" at 00:48:22, "it was not completed" at 00:48:27.
+
+class _FakeScraper:
+    def __init__(self):
+        self.headers = {}
+        self.cookies = self
+        self.set_calls = []
+
+    def set(self, name, value, **kw):
+        self.set_calls.append((name, value, kw))
+
+
+class _FakeResponse:
+    def __init__(self, text, url, status_code=200):
+        self.text = text
+        self.url = url
+        self.status_code = status_code
+
+
+_WAF_BODY = "<html><title>Security check</title><meta name='robots' content='noindex'></html>"
+
+
+def test_waf_recovery_reads_through_the_browser_not_a_cookie_transplant():
+    """The clearance rides an HttpOnly cookie bound to the browser identity that
+    earned it; replaying it from cloudscraper's OpenSSL TLS + 2017 header set is
+    not the same client by any measure the WAF uses. Re-read the page with the
+    browser — which already holds a PERSISTED session — instead."""
+    handler = comix.ComixSiteHandler()
+    scraper = _FakeScraper()
+    challenged = _FakeResponse(_WAF_BODY, "https://comix.to/@waf/challenge?return=%2Ftitle%2Fx")
+
+    calls = {"series_html": 0, "make_request": 0}
+
+    def _fake_make_request(url, s):
+        calls["make_request"] += 1
+        return _FakeResponse(_WAF_BODY, url)
+
+    def _fake_series_html(url):
+        calls["series_html"] += 1
+        return "<html><script id='initial-data'>{}</script></html>"
+
+    comix._COMIX_BROWSER_BRIDGE.fetch_series_html = _fake_series_html
+    comix._COMIX_BROWSER_BRIDGE.context_cookies = lambda: [
+        {"name": "session", "value": "abc", "domain": "comix.to", "path": "/"}
+    ]
+    try:
+        out = handler._waf_recover_once(
+            challenged, "https://comix.to/title/x", scraper, _fake_make_request
+        )
+    finally:
+        del comix._COMIX_BROWSER_BRIDGE.fetch_series_html
+        del comix._COMIX_BROWSER_BRIDGE.context_cookies
+
+    assert calls["series_html"] == 1, "must re-read the page with the browser"
+    assert calls["make_request"] == 0, "must NOT retry the doomed HTTP request"
+    assert "initial-data" in out.text
+    assert out.status_code == 200
+    # The UA must be left alone: mixing a modern UA into cloudscraper's
+    # period-correct header set is what made the old retry self-contradictory.
+    assert "User-Agent" not in scraper.headers
+
+
+def test_waf_recovery_is_a_noop_when_no_challenge_is_present():
+    handler = comix.ComixSiteHandler()
+    clean = _FakeResponse("<html>a comic about a challenge</html>",
+                          "https://comix.to/title/x")
+    comix._COMIX_BROWSER_BRIDGE.fetch_series_html = lambda url: pytest.fail(
+        "must not boot a browser when nothing is blocking"
+    )
+    try:
+        out = handler._waf_recover_once(
+            clean, "https://comix.to/title/x", _FakeScraper(), lambda u, s: clean
+        )
+    finally:
+        del comix._COMIX_BROWSER_BRIDGE.fetch_series_html
+    assert out is clean
+
+
+def test_waf_recovery_raises_when_the_browser_cannot_help():
+    handler = comix.ComixSiteHandler()
+    challenged = _FakeResponse(_WAF_BODY, "https://comix.to/@waf/challenge")
+    comix._COMIX_BROWSER_BRIDGE.fetch_series_html = lambda url: None
+    try:
+        with pytest.raises(comix.ComixWafChallengeError) as exc:
+            handler._waf_recover_once(
+                challenged, "https://comix.to/title/x", _FakeScraper(),
+                lambda u, s: challenged,
+            )
+    finally:
+        del comix._COMIX_BROWSER_BRIDGE.fetch_series_html
+    assert "browser" in str(exc.value).lower()
+
+
+def test_series_html_path_enforces_waf_and_is_bridged():
+    """The browser read must go through the raising guard (so a challenged
+    browser prompts and then RELOADS the target), and the bridge facade must not
+    swallow that exception the way the search facade does."""
+    src = inspect.getsource(comix._ComixBrowserSession.fetch_series_html)
+    assert "_enforce_no_waf" in src
+    assert "page.content()" in src
+    facade = inspect.getsource(comix._ComixBrowserBridge.fetch_series_html)
+    assert "except Exception" not in facade, (
+        "ComixWafChallengeError must reach _waf_recover_once to become the "
+        "user-facing remediation — only the timeout parse may be guarded"
+    )
+
+
+def test_failure_message_never_calls_a_completed_check_incomplete():
+    """The contradiction the user hit: the HTTP path had its own hardcoded 'it
+    was not completed' string and used it even when the check HAD been passed —
+    the thing that actually failed was the request afterwards."""
+    msg = comix._waf_failure_message(
+        "the series page", "solved_but_browser_still_blocked"
+    )
+    assert "not completed" not in msg.lower()
+    assert "WAS completed" in msg
+
+    unavailable = comix._waf_failure_message("the series page", "browser_unavailable")
+    assert "patchright install chromium" in unavailable
+
+    # And the raising site must use the helper rather than a private string.
+    src = inspect.getsource(comix.ComixSiteHandler._waf_recover_once)
+    assert "_waf_failure_message(" in src
+    assert "it was not completed" not in src
+
+
+def test_http_session_does_not_advertise_a_decade_old_browser():
+    """cloudscraper picks a RANDOM 2016-2019 profile per session (Chrome 53-72,
+    Win 7/8, Opera 43, and one synthetic Chrome/53.7.2410.8782), sends a
+    Chrome-56-era Accept, and no client hints at all. That is why the metadata
+    request was challenged so reliably."""
+    headers = comix._comix_http_headers()
+    ua = headers["User-Agent"]
+    major = int(re.search(r"Chrome/(\d+)", ua).group(1))
+    assert major >= 120, f"UA must not be ancient: {ua}"
+    assert "HeadlessChrome" not in ua
+    # Hints must be DERIVED from the UA, never drift from it.
+    assert f'v="{major}"' in headers["sec-ch-ua"]
+    assert "image/avif" in headers["Accept"], "modern UA needs a modern Accept"
+    assert headers["Sec-Fetch-Mode"] == "navigate"
+
+    handler = comix.ComixSiteHandler()
+    scraper = _FakeScraper()
+    handler.configure_session(scraper, None)
+    assert scraper.headers["User-Agent"] == ua
+    assert scraper.headers["Referer"] == "https://comix.to/"
+
+
 def test_enforce_no_waf_recursion_is_bounded_locally(waf_budget_reset):
     """Termination must not depend on the module-level prompt budget: a solve
     that always reports success would otherwise loop forever."""
@@ -659,3 +852,138 @@ def test_bridge_passes_chapter_floor_through():
     sig = inspect.signature(comix._ComixBrowserBridge.fetch_chapters_via_dom)
     assert "chapter_floor" in sig.parameters
     assert sig.parameters["chapter_floor"].default is None
+
+
+# ------------------------------------------- reader preload preference (2026-08-02)
+# The chapter-image scrape used to open comix.to on EVERY chapter purely to
+# write `localStorage['reader.default'] = {preload:'all'}` — a key the site does
+# not read, in a shape it does not use. Verified live: a profile that has
+# rendered a chapter and opened the reader settings panel holds
+# `front_t3.searchHistory`, `auth` and `reader.webtoon.v3`, never
+# `reader.default`. So the navigation was paid every chapter and bought nothing.
+# Effect of the correct write on one 75-page chapter, same URL, plain reload:
+# preload `some` (site default) -> 3 pages with a loaded <img>; `all` -> 68.
+
+class _FakeEvalPage(_FakePage):
+    """_FakePage plus an evaluate() stub, so the navigation DECISION (real
+    Python control flow) can be tested without executing the injected JS."""
+
+    def __init__(self, start_url: str, eval_result="all", raises: bool = False):
+        super().__init__(start_url)
+        self.eval_calls: list[str] = []
+        self._eval_result = eval_result
+        self._raises = raises
+
+    def evaluate(self, js, *_args):
+        self.eval_calls.append(js)
+        if self._raises:
+            raise RuntimeError("execution context destroyed")
+        return self._eval_result
+
+
+def _preload_source() -> str:
+    return inspect.getsource(comix._ComixBrowserSession._apply_reader_preload_pref)
+
+
+def test_preload_targets_the_key_the_site_actually_reads():
+    """THE regression guard for this fix. `reader.default` was never read by
+    anything; the reader's store is `reader.webtoon.v3`."""
+    src = _preload_source()
+    assert "reader.webtoon.v3" in src
+    # The dead key may only survive in prose explaining what changed, never as
+    # a getItem/setItem target.
+    assert "getItem('reader.default')" not in src
+    assert "setItem('reader.default'" not in src
+
+
+def test_preload_writes_under_state_not_at_the_top_level():
+    """The store is a Zustand-persist envelope: {"state": {...}, "version": 0}.
+    A top-level `cur.preload` is ignored even with the right key — that was the
+    second half of why the old write could not have worked."""
+    src = _preload_source()
+    assert "cur.state.preload = 'all'" in src
+    assert "cur.preload =" not in src
+
+
+def test_preload_is_a_read_modify_write_that_leaves_version_alone():
+    """The profile carries the user's other reader settings, so a blind
+    overwrite would clobber them. `version` in particular must not be rewritten:
+    the store's own migration logic would treat the blob as a different schema
+    generation and discard it."""
+    src = _preload_source()
+    assert "localStorage.getItem(k)" in src   # reads before writing
+    assert "cur.version =" not in src
+
+
+def test_preload_does_not_navigate_when_already_on_the_origin():
+    """The whole per-chapter saving. localStorage is per-origin, but by the time
+    chapters are being fetched the page is already on comix.to (the chapter-list
+    scrape or the previous chapter left it there), so the steady-state cost must
+    be one evaluate and NO navigation."""
+    page = _FakeEvalPage("https://comix.to/title/k7yg7-x/6132494-chapter-8")
+    sess = _session_with_page(page)
+    assert sess._apply_reader_preload_pref() is True
+    assert page.goto_calls == []
+    assert len(page.eval_calls) == 1
+
+
+def test_preload_navigates_only_when_off_origin():
+    """Cold page (about:blank after a relaunch) still has to reach the origin
+    once — the optimization must not become a silent no-op."""
+    page = _FakeEvalPage("about:blank")
+    sess = _session_with_page(page)
+    assert sess._apply_reader_preload_pref() is True
+    assert page.goto_calls == ["https://comix.to/"]
+
+
+def test_preload_reports_failure_without_raising():
+    """Failure here is cosmetic — the per-page scroll loop still works, just
+    slower — so it must never propagate out of a chapter fetch."""
+    unconfirmed = _session_with_page(_FakeEvalPage("https://comix.to/", eval_result="some"))
+    assert unconfirmed._apply_reader_preload_pref() is False
+
+    throwing = _session_with_page(_FakeEvalPage("https://comix.to/", raises=True))
+    assert throwing._apply_reader_preload_pref() is False
+
+
+def _image_scrape_source() -> str:
+    return inspect.getsource(comix._ComixBrowserSession.fetch_chapter_images_via_dom)
+
+
+def test_image_scrape_no_longer_opens_the_homepage_every_chapter():
+    """The unconditional `page.goto("https://comix.to/")` pre-flight is what
+    made the dead write cost a full SPA navigation per chapter."""
+    src = _image_scrape_source()
+    assert 'goto(\n                "https://comix.to/"' not in src
+    assert "_apply_reader_preload_pref()" in src
+
+
+# ------------------------------------ zero-page diagnostics (2026-08-02)
+# "chapter had 0 .rpage-page divs ... Either the React app failed to mount or CF
+# re-challenged" asserted two causes while testing neither, so a renamed
+# selector was indistinguishable from a transient miss. The chapter-LIST scrape
+# had collected evidence before failing for a while; this path now matches it.
+
+def test_zero_page_failure_collects_evidence_before_blaming_the_render():
+    src = _image_scrape_source()
+    # Reader-mounted-but-selector-missed probe (the analogue of the list
+    # scrape's ".mchap-row__primary exists but .mchap-item doesn't" hint).
+    assert "rpageAny" in src
+    assert "dataPage" in src
+    assert "renamed the" in src
+    # The CF layer is now actually tested rather than named as a guess.
+    assert "is_cf_challenge(200, body_text)" in src
+
+
+def test_zero_page_failure_does_not_claim_a_wait_that_never_happened():
+    """`deadline` is armed before the preload step, the navigation and any WAF
+    handoff (which alone can burn 180s of a 300s budget), so the mount loop can
+    break on its first line having waited nothing. The old message said "after
+    wait" regardless, which sent you looking for a render bug."""
+    src = _image_scrape_source()
+    assert "mount_polls" in src
+    assert "mount_waited_s" in src
+    assert "if mount_polls == 0:" in src
+    # The unconditional claim is gone.
+    assert "divs in DOM \n" not in src
+    assert "Either the React app failed to mount or" not in src
