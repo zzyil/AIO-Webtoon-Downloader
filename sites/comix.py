@@ -1625,6 +1625,16 @@ class _ComixBrowserSession:
         """No-op unless the WAF interstitial is up; otherwise attempt ONE
         interactive handoff and raise ComixWafChallengeError if it doesn't pass.
 
+        POSTCONDITION on a normal return: the browser is back on ``return_url``
+        and verified clear. That reload is load-bearing, not tidiness — the
+        handoff tears the whole context down and relaunches headless, so
+        ``self._page`` comes back pointing at a fresh about:blank. Without
+        restoring the target, every caller would resume its DOM waits on a blank
+        page and fail *after* the user had successfully completed the check,
+        which is the most infuriating possible outcome. (Only the page-1 path
+        happened to recover, via its own retry navigation, and only after
+        burning a 20s wait on the blank page first.)
+
         Shared by the chapter-list and chapter-image scrapes so both fail the
         same way. Search deliberately does NOT use this — see
         ComixSiteHandler.search for why a raise there would blocklist the host.
@@ -1637,6 +1647,29 @@ class _ComixBrowserSession:
         except Exception:
             pass
         if (self.solve_waf_interactively(return_url) or {}).get("solved"):
+            if not return_url:
+                # No target to restore (defensive: every browser call site
+                # passes one). The session cookie is still banked in the
+                # profile, so let the caller proceed on whatever it has.
+                return
+            try:
+                self._page.goto(
+                    return_url, wait_until="domcontentloaded", timeout=30000
+                )
+            except Exception as exc:
+                raise ComixChapterScrapeError(
+                    f"comix: verification passed but reloading {return_url} "
+                    f"afterwards failed ({type(exc).__name__}: {exc})."
+                ) from exc
+            # A second challenge on the reload means the solve didn't stick;
+            # one handoff per process is the cap, so this is terminal.
+            if self._waf_blocked(f"{stage} (after verification)"):
+                raise ComixWafChallengeError(
+                    "comix.to re-issued its human-verification check "
+                    f"immediately after one was completed, so {stage} could "
+                    "not be read. Re-run in a few minutes.",
+                    challenge_url=challenge_url,
+                )
             return
         raise ComixWafChallengeError(
             "comix.to is asking for human verification and it was not "
@@ -2256,8 +2289,12 @@ class _ComixBrowserSession:
                     break
             return False
 
-        def _waf_guard(stage: str) -> None:
-            self._enforce_no_waf(stage, _page_url(1))
+        def _waf_guard(stage: str, page_num: int = 1) -> None:
+            # page_num matters: _enforce_no_waf restores the page it is given
+            # after a successful handoff, and handing it page 1 from a
+            # mid-pagination call site would silently rewind the walk to the
+            # start while the loop counter still said page N.
+            self._enforce_no_waf(stage, _page_url(page_num))
 
         items: List[Dict] = []
         seen_ids: set = set()
@@ -2338,25 +2375,45 @@ class _ComixBrowserSession:
             # shows more, which is how the first cut of this code still
             # truncated the list.
             total_pages = max(total_pages, int(pager.get("max") or 1))
-            if pager.get("hasLast") and _click_pager("last page"):
-                # Wait for the pager to actually LAND on the last page —
-                # "rows exist" is not enough. comix's React list swaps row
-                # content in place, so page 1's rows survive the click and a
-                # rows-only wait returns instantly on stale DOM reporting
-                # active=1. The last page is the one with no Next.
-                last_state = _wait_for_pager(
-                    lambda s: not s.get("hasNext") and bool(s.get("active")),
-                    20.0,
-                )
-                if last_state and last_state.get("active"):
-                    total_pages = max(total_pages, int(last_state["active"]))
-                else:
-                    print(
-                        "[!] Comix DOM scrape: could not read the last page "
-                        "number from the pager; falling back to the highest "
-                        f"visible page ({total_pages}).",
-                        flush=True,
+            if pager.get("hasLast"):
+                # A live Last button PROVES pages exist beyond the visible
+                # window, so the window maximum is a lower bound and must never
+                # be accepted as the total: doing so would walk ~5 pages of a
+                # 360-page series and report it complete, which is exactly the
+                # truncation this rewrite exists to kill. Determine the real
+                # last page or fail — no fallback.
+                determined: Optional[int] = None
+                for attempt in (1, 2):
+                    if _click_pager("last page"):
+                        # Wait for the pager to actually LAND on the last page —
+                        # "rows exist" is not enough. comix's React list swaps
+                        # row content in place, so page 1's rows survive the
+                        # click and a rows-only wait returns instantly on stale
+                        # DOM reporting active=1. The last page has no Next.
+                        last_state = _wait_for_pager(
+                            lambda s: not s.get("hasNext") and bool(s.get("active")),
+                            20.0,
+                        )
+                        if last_state and last_state.get("active"):
+                            determined = int(last_state["active"])
+                            break
+                    if attempt == 1:
+                        print(
+                            "[!] Comix DOM scrape: could not read the last page "
+                            "number from the pager; retrying.",
+                            flush=True,
+                        )
+                        # Let a mid-render pager settle before the second try.
+                        _wait_for_pager(lambda s: s.get("hasLast"), 5.0)
+                if determined is None:
+                    raise ComixChapterScrapeError(
+                        "comix chapter list: the pager advertises more pages "
+                        "than it displays, but the last-page number could not "
+                        f"be read after two attempts (highest visible page: "
+                        f"{total_pages}). Refusing to walk only the visible "
+                        f"window — that would silently return a partial series."
                     )
+                total_pages = max(total_pages, determined)
                 # Back to the start. Fall back to a hard navigation if the
                 # First button doesn't take.
                 if not (_click_pager("first page") and _wait_for_page(1, 20.0)):
@@ -2419,7 +2476,7 @@ class _ComixBrowserSession:
                 # page after the first. The pager knows whether more pages
                 # exist, so ask it instead of guessing.
                 on_last_page = page_n >= total_pages
-                _waf_guard(f"chapter list page {page_n}")
+                _waf_guard(f"chapter list page {page_n}", page_n)
                 if not on_last_page:
                     # Re-navigate this page directly and try once more; a slow
                     # SPA render is the common benign cause.
@@ -2436,7 +2493,7 @@ class _ComixBrowserSession:
                         )
                     except Exception:
                         pass
-                    _waf_guard(f"chapter list page {page_n}")
+                    _waf_guard(f"chapter list page {page_n}", page_n)
                     _wait_for_page(page_n, 20.0)
                     try:
                         rows = self._page.evaluate(scrape_js) or []
@@ -2570,7 +2627,7 @@ class _ComixBrowserSession:
                     )
                 except Exception:
                     pass
-                _waf_guard(f"chapter list page {next_page}")
+                _waf_guard(f"chapter list page {next_page}", next_page)
                 advanced = _wait_for_page(next_page, 20.0)
             if not advanced:
                 raise ComixChapterScrapeError(

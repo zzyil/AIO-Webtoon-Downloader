@@ -412,6 +412,109 @@ def test_chapter_and_image_paths_enforce_waf():
     )
 
 
+# ------------------------------------------- post-handoff recovery (PR #68 P1)
+
+class _FakePage:
+    """Minimal Patchright page stand-in: records goto() targets and reports a
+    url that follows them, which is all _enforce_no_waf touches."""
+
+    def __init__(self, start_url: str):
+        self._url = start_url
+        self.goto_calls: list[str] = []
+
+    def goto(self, url, **_kwargs):
+        self.goto_calls.append(url)
+        self._url = url
+
+    @property
+    def url(self):
+        return self._url
+
+
+def _session_with_page(page):
+    """A _ComixBrowserSession that skips __init__ (no browser, no profile)."""
+    sess = comix._ComixBrowserSession.__new__(comix._ComixBrowserSession)
+    sess._page = page
+    return sess
+
+
+def test_enforce_no_waf_reloads_the_target_after_a_successful_solve():
+    """PR #68 review (P1). The handoff tears the context down and relaunches
+    headless, so self._page comes back on about:blank. Without reloading the
+    caller's target, every scrape resumed on a blank page and failed AFTER the
+    user had successfully completed the verification."""
+    page = _FakePage("https://comix.to/@waf/challenge?return=%2Ftitle%2Fx")
+    sess = _session_with_page(page)
+    verdicts = iter([True, False])  # blocked, then clear once reloaded
+    sess._waf_blocked = lambda stage: next(verdicts)
+    sess.solve_waf_interactively = lambda return_url=None: {"solved": True}
+
+    target = "https://comix.to/title/3j50-magic-emperor?group_id=4856&page=7"
+    sess._enforce_no_waf("chapter list page 7", target)
+
+    assert page.goto_calls == [target], (
+        "a solved challenge must put the browser back on the caller's page"
+    )
+
+
+def test_enforce_no_waf_raises_when_challenge_survives_the_reload():
+    """One handoff per process is the cap, so a challenge that reappears on the
+    reload is terminal — it must not fall through as success."""
+    page = _FakePage("https://comix.to/@waf/challenge")
+    sess = _session_with_page(page)
+    sess._waf_blocked = lambda stage: True  # still blocked after the reload
+    sess.solve_waf_interactively = lambda return_url=None: {"solved": True}
+
+    with pytest.raises(comix.ComixWafChallengeError):
+        sess._enforce_no_waf("the chapter list", "https://comix.to/title/x")
+
+
+def test_enforce_no_waf_raises_when_not_solved():
+    page = _FakePage("https://comix.to/@waf/challenge")
+    sess = _session_with_page(page)
+    sess._waf_blocked = lambda stage: True
+    sess.solve_waf_interactively = lambda return_url=None: {"solved": False}
+
+    with pytest.raises(comix.ComixWafChallengeError):
+        sess._enforce_no_waf("the chapter list", "https://comix.to/title/x")
+    assert page.goto_calls == [], "must not reload when the check wasn't passed"
+
+
+def test_enforce_no_waf_is_a_noop_when_clear():
+    page = _FakePage("https://comix.to/title/x")
+    sess = _session_with_page(page)
+    sess._waf_blocked = lambda stage: False
+    sess.solve_waf_interactively = lambda return_url=None: pytest.fail(
+        "must not open a verification window when nothing is blocking"
+    )
+    sess._enforce_no_waf("the chapter list", "https://comix.to/title/x")
+    assert page.goto_calls == []
+
+
+def test_mid_pagination_guards_restore_their_own_page():
+    """A guard that always restored page 1 would silently rewind the walk to
+    the start while the loop counter still said page N."""
+    src = _chapters_scrape_source()
+    assert "def _waf_guard(stage: str, page_num: int = 1)" in src
+    assert '_waf_guard(f"chapter list page {page_n}", page_n)' in src
+    assert '_waf_guard(f"chapter list page {next_page}", next_page)' in src
+
+
+# --------------------------------------- last-page determination (PR #68 P2)
+
+def test_unknown_last_page_raises_instead_of_using_the_visible_window():
+    """PR #68 review (P2). A live Last button PROVES pages exist beyond the
+    visible window, so the window maximum is a LOWER BOUND. Accepting it as the
+    total would walk ~5 pages of a 360-page series and call it complete —
+    reintroducing the truncation this rewrite exists to kill."""
+    src = _chapters_scrape_source()
+    # The old lower-bound fallback must be gone...
+    assert "falling back to the highest visible page" not in src
+    # ...replaced by a bounded retry that raises when still unknown.
+    assert "determined" in src
+    assert "advertises more pages" in src
+
+
 def test_bridge_passes_chapter_floor_through():
     """The hint is useless if the facade drops it."""
     src = inspect.getsource(comix._ComixBrowserBridge.fetch_chapters_via_dom)
