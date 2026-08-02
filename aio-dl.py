@@ -7422,6 +7422,14 @@ def _refresh_library_metadata(args) -> int:
     return 1 if failed else 0
 
 
+# Dests declared with action="extend" + default=None in main()'s parser (grep
+# the --group / --exclude-group add_argument calls for why the default can't be
+# a shared []). Listed here so the post-parse [] normalization right after
+# parse_args() can never drift from the declarations when a third such flag is
+# added.
+_EXTEND_LIST_DESTS = ("group", "exclude_group")
+
+
 def main():
     p = argparse.ArgumentParser("comic downloader")
     p.add_argument("comic_url", nargs="*", help="One or more comic/manga URLs")
@@ -7855,13 +7863,27 @@ def main():
              "prefetched JSON skips the expensive search anyway).",
     )
     p.add_argument("--cookies", default="")
+    # action="extend" (NOT plain nargs="+") so a REPEATED flag accumulates
+    # instead of overwriting — bare nargs="+" keeps only the LAST occurrence,
+    # which silently dropped every group but one on the --update-all replay
+    # path (grep 'child_cmd.extend(["--group"' in _append_saved_update_options:
+    # it emits one flag per saved group). Comma-joining the replay into a
+    # single argument is NOT an alternative — group names may contain commas,
+    # and main() later splits every value on "," (grep 'group_string.split').
+    # default=None (NOT []) because argparse hands the extend default object
+    # itself back to the caller when the flag is absent — a shared mutable list
+    # one in-place mutation away from leaking groups between parses in the same
+    # process. Restored to [] right after parse_args (grep _EXTEND_LIST_DESTS)
+    # so consumers and the resume gating_hash still see [] for "not passed".
     p.add_argument(
         "--group",
         nargs="+",
-        default=[],
+        action="extend",
+        default=None,
         help="One or more preferred scanlation groups, in order of priority. "
-        'Can be a single quoted string with commas (e.g., "A, B") '
-        'or multiple arguments (e.g., "A" "B").',
+        'Can be a single quoted string with commas (e.g., "A, B"), '
+        'multiple arguments (e.g., "A" "B"), or a repeated flag '
+        '(e.g., --group "A" --group "B"); the forms compose.',
     )
     p.add_argument(
         "--mix-by-upvote",
@@ -7891,13 +7913,20 @@ def main():
         "excluded, only demoted). To force a specific group regardless of this "
         "setting, name it in --group.",
     )
+    # extend/default=None for the same reason as --group above — this one is
+    # what the Codex review on PR #68 actually caught: _append_saved_update_
+    # options emits one --exclude-group per saved group, so under bare
+    # nargs="+" an --update-all child honored only the LAST exclusion and
+    # re-downloaded everything else the user had rejected.
     p.add_argument(
         "--exclude-group",
         nargs="+",
-        default=[],
+        action="extend",
+        default=None,
         help="Scanlation groups to avoid. Same input shape as --group (repeat "
-        "the flag or pass one comma-separated string). Excluded versions rank "
-        "below everything else but are still used when no alternative exists; "
+        "the flag, pass several values at once, or pass one comma-separated "
+        "string — the forms compose). Excluded versions rank below everything "
+        "else but are still used when no alternative exists; "
         "add --no-group-fallback to skip those chapters instead.",
     )
     p.add_argument(
@@ -8325,6 +8354,15 @@ def main():
              "<Komikku-SAF-root>/local/ yourself.",
     )
     args = p.parse_args()
+    # Undo the default=None the action="extend" list flags need. Every consumer
+    # (select_best_chapter_version, _build_group_selection_policy,
+    # _save_download_params) and — critically — the resume gating_hash expect []
+    # for "flag not passed": these dests are in _RESUME_GATING_DESTS, so a None
+    # would hash as null and invalidate every in-progress partial download on an
+    # otherwise unchanged command line. Must stay ahead of get_resumable_params.
+    for _list_dest in _EXTEND_LIST_DESTS:
+        if getattr(args, _list_dest, None) is None:
+            setattr(args, _list_dest, [])
     _validate_resume_categories(p)  # fail-fast on dest typos / category overlap
     args.output_dir = resolve_output_dir(getattr(args, "output_dir", None))
 

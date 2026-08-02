@@ -29,6 +29,15 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+# No test may launch a browser. mangafire.to signs every /api/* call with a
+# `vrf=` token minted by driving Chromium (sites/mangafire_vrf.py), so ANY test
+# that calls a MangaFire handler method would otherwise boot a real browser and
+# hit the network — silently passing on a dev machine and failing in CI, where
+# no browser binary is installed. Tests that need signing to succeed must stub
+# `mangafire_vrf.sign_api_query` (see tests/test_mangafire_vrf.py's fake_signer
+# fixture and the MangaFire cases in tests/test_komikku_metadata.py).
+os.environ["AIO_MANGAFIRE_NO_SIGNER"] = "1"
+
 # Enable ML rating for tests, then prime every lazy availability getter so
 # the legacy module-level `_PYIQA_AVAILABLE` / `_T2_DEVICE` / `_CV2_AVAILABLE`
 # / `_TORCHMETRICS_AVAILABLE` / `_EASYOCR_AVAILABLE` / `_PIQ_AVAILABLE`

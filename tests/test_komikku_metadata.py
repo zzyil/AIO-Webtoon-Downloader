@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
 from bs4 import BeautifulSoup
 
 from sites import get_handler_by_name
@@ -501,7 +502,26 @@ _MANGAFIRE_DETAIL_JSON = {
 }
 
 
-def test_mangafire_authors_artists_from_json():
+@pytest.fixture
+def _mangafire_signer(monkeypatch):
+    """Stub the browser-backed vrf signer.
+
+    Every MangaFire `/api/*` call is signed by driving Chromium
+    (sites/mangafire_vrf.py). These tests are about the JSON→comic_data
+    mapping, not the transport, so the signer is replaced with a constant.
+    Without this they launch a real browser (silently passing wherever one is
+    installed) and fail in CI with MangaFireSigningError.
+    """
+    from sites import mangafire_vrf
+
+    monkeypatch.setattr(
+        mangafire_vrf,
+        "sign_api_query",
+        lambda path, pairs=(): {"vrf": "TESTTOKEN", "query": "vrf=TESTTOKEN"},
+    )
+
+
+def test_mangafire_authors_artists_from_json(_mangafire_signer):
     """fetch_comic_context extracts both authors and artists (plus genres,
     year, cover, alt names, mapped status, flattened desc) from the JSON
     detail payload."""
@@ -525,7 +545,7 @@ def test_mangafire_authors_artists_from_json():
     assert "<br>" not in ctx.comic["desc"]
 
 
-def test_mangafire_artists_empty_when_absent():
+def test_mangafire_artists_empty_when_absent(_mangafire_signer):
     """A payload with no artists yields an empty list (not a crash / stub)."""
     import copy
     payload = copy.deepcopy(_MANGAFIRE_DETAIL_JSON)

@@ -27,6 +27,32 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _is_api_token_rejection(resp) -> bool:
+    """True for a signed-API signature error (`Missing token.` / `Invalid
+    token.`) on a JSON 403. Kept narrow deliberately: it matches only a JSON
+    body whose `message` mentions a token, so an HTML Cloudflare block page
+    that happens to contain the word still falls through to the normal
+    rate-limit handling below.
+
+    Cross-file: sites/mangafire.py:_is_token_rejection makes the same
+    determination handler-side to decide whether to re-sign; keep the two in
+    agreement.
+    """
+    try:
+        ct = ((getattr(resp, "headers", {}) or {}).get("content-type", "") or "").lower()
+    except Exception:
+        return False
+    if "json" not in ct:
+        return False
+    try:
+        data = resp.json()
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return "token" in str(data.get("message") or "").lower()
+
+
 def looks_like_cloudflare_rate_limit(resp) -> bool:
     """Detect Cloudflare/app rate limiting and challenge pages."""
     status = getattr(resp, "status_code", None)
@@ -35,7 +61,19 @@ def looks_like_cloudflare_rate_limit(resp) -> bool:
     # essential for brute-forcing handlers like flamecomics.
     if status == 404:
         return False
-        
+
+    # Signed-API token rejections are DETERMINISTIC, not congestion: the same
+    # request will be refused identically forever, so the retry ladder is pure
+    # wasted wall-clock (4 attempts at 12/24/48s ≈ 84s per call). mangafire.to
+    # and comix.to both answer `403 {"message":"Missing token."}` for an
+    # unsigned /api/* call and `"Invalid token."` for a mismatched signature.
+    # Returning False here surfaces the 403 to the handler immediately, which
+    # is what lets sites/mangafire.py:_api_get re-sign and retry ONCE against a
+    # freshly bootstrapped bundle instead of stalling the search fan-out
+    # barrier and the chapter watchdog. Checked before the blanket 403 branch.
+    if status == 403 and _is_api_token_rejection(resp):
+        return False
+
     if status in (403, 429, 503):
         return True
 
