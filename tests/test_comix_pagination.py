@@ -500,6 +500,130 @@ def test_mid_pagination_guards_restore_their_own_page():
     assert '_waf_guard(f"chapter list page {next_page}", next_page)' in src
 
 
+# ------------------------------------- headless UA + handoff budget (live bug)
+# Both pinned from a real failing run: the user solved the check, and seconds
+# later the run died claiming the check "was not completed".
+
+@pytest.fixture
+def waf_budget_reset():
+    """Restore the module-level handoff counters around a test."""
+    saved = (
+        comix._COMIX_WAF_SOLVES_DONE,
+        comix._COMIX_WAF_FAILURES,
+        comix._COMIX_WAF_LAST_PROMPT_AT,
+    )
+    comix._COMIX_WAF_SOLVES_DONE = 0
+    comix._COMIX_WAF_FAILURES = 0
+    comix._COMIX_WAF_LAST_PROMPT_AT = 0.0
+    yield
+    (
+        comix._COMIX_WAF_SOLVES_DONE,
+        comix._COMIX_WAF_FAILURES,
+        comix._COMIX_WAF_LAST_PROMPT_AT,
+    ) = saved
+
+
+def test_headless_user_agent_is_stabilized():
+    """THE reason a solved check didn't stick. Headless Chromium advertises
+    `HeadlessChrome/147.0.7727.15`; the headed handoff window advertises
+    `Chrome/147.0.0.0`. The WAF binds its clearance to the UA that earned it, so
+    the relaunched headless context could not use what the user had just
+    passed — and got re-challenged instantly."""
+    headless = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) HeadlessChrome/147.0.7727.15 Safari/537.36"
+    )
+    out = comix._stabilize_user_agent(headless)
+    assert "HeadlessChrome" not in out
+    assert "Chrome/147.0.7727.15" in out
+    # Everything except the product token is left exactly as reported.
+    assert out == headless.replace("HeadlessChrome/", "Chrome/")
+
+
+def test_stabilize_user_agent_tolerates_missing_input():
+    assert comix._stabilize_user_agent(None) is None
+    assert comix._stabilize_user_agent("") is None
+
+
+def test_start_pins_a_stable_user_agent():
+    """A pinned UA is what makes headed and headless present identically; it
+    also drops the `HeadlessChrome` token, which is a blatant bot signal and
+    likely part of why the check fired at all."""
+    src = inspect.getsource(comix._ComixBrowserSession._start)
+    assert "_resolve_stable_user_agent()" in src
+    assert "_stabilize_user_agent" in src
+    assert 'ctx_kwargs["user_agent"]' in src
+
+
+def test_successful_solve_does_not_consume_the_ask_again_budget(waf_budget_reset):
+    """THE live bug. The old cap was a single "already attempted" boolean, so a
+    SUCCESSFUL solve for the HTTP metadata request spent the whole allowance.
+    When the browser was then challenged separately (cloudscraper and the
+    browser are distinct identities to the WAF), no window was opened and the
+    run died claiming the user hadn't completed a check it never showed them."""
+    comix._COMIX_WAF_SOLVES_DONE = 1  # one solve already succeeded this run
+    comix._COMIX_WAF_FAILURES = 0
+    sess = comix._ComixBrowserSession.__new__(comix._ComixBrowserSession)
+    sess._cleanup = lambda: None
+    sess._start = lambda headless=True: False  # fail fast, no real browser
+
+    out = sess.solve_waf_interactively("https://comix.to/title/x")
+
+    # It must have gone PAST the budget gates and actually tried to open a
+    # window; only the stubbed launch stopped it.
+    assert out["reason"] == "launch_failed", (
+        "a previous successful solve must not block a later prompt"
+    )
+
+
+def test_a_declined_prompt_stops_further_prompting(waf_budget_reset):
+    """The flip side: if the user let one window time out or closed it, don't
+    keep popping windows they are ignoring."""
+    comix._COMIX_WAF_FAILURES = comix._COMIX_WAF_MAX_FAILURES
+    sess = comix._ComixBrowserSession.__new__(comix._ComixBrowserSession)
+    sess._start = lambda headless=True: pytest.fail("must not open a window")
+    out = sess.solve_waf_interactively("https://comix.to/title/x")
+    assert out["solved"] is False
+    assert out["reason"] == "already_declined"
+
+
+def test_repeated_solves_are_capped(waf_budget_reset):
+    comix._COMIX_WAF_SOLVES_DONE = comix._COMIX_WAF_MAX_SOLVES
+    sess = comix._ComixBrowserSession.__new__(comix._ComixBrowserSession)
+    sess._start = lambda headless=True: pytest.fail("must not open a window")
+    out = sess.solve_waf_interactively("https://comix.to/title/x")
+    assert out["reason"] == "solve_limit"
+
+
+def test_failure_message_never_claims_the_user_failed_a_check_it_never_showed():
+    """The original message said "it was not completed" for every outcome,
+    including the case where no window was ever opened."""
+    never_asked = comix._waf_failure_message("the chapter list", "already_declined")
+    assert "not completed" not in never_asked.lower().split("verification window")[0]
+    assert "opened earlier this run" in never_asked
+
+    for reason in ("solve_limit", "too_soon", "disabled", "no_display",
+                   "launch_failed", "window_closed"):
+        msg = comix._waf_failure_message("the chapter list", reason)
+        assert msg.startswith("comix.to is asking for human verification")
+        assert len(msg) > 90, f"{reason} needs an actionable tail"
+
+    # Unknown/absent reason still gets the generic actionable text.
+    assert "Re-run" in comix._waf_failure_message("x", None)
+
+
+def test_enforce_no_waf_recursion_is_bounded_locally(waf_budget_reset):
+    """Termination must not depend on the module-level prompt budget: a solve
+    that always reports success would otherwise loop forever."""
+    page = _FakePage("https://comix.to/@waf/challenge")
+    sess = _session_with_page(page)
+    sess._waf_blocked = lambda stage: True          # never clears
+    sess.solve_waf_interactively = lambda return_url=None: {"solved": True}
+    with pytest.raises(comix.ComixWafChallengeError):
+        sess._enforce_no_waf("the chapter list", "https://comix.to/title/x")
+    assert len(page.goto_calls) <= comix._WAF_MAX_ENFORCE_PASSES
+
+
 # --------------------------------------- last-page determination (PR #68 P2)
 
 def test_unknown_last_page_raises_instead_of_using_the_visible_window():

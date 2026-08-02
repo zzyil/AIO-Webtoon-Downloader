@@ -109,11 +109,62 @@ _FORCE_WAF_ENV = "AIO_COMIX_FORCE_WAF"
 _WAF_NO_INTERACTIVE_ENV = "AIO_COMIX_NO_INTERACTIVE_WAF"
 _WAF_SOLVE_TIMEOUT_ENV = "AIO_COMIX_WAF_SOLVE_TIMEOUT"
 _WAF_DEFAULT_SOLVE_TIMEOUT_S = 180.0
-# One handoff per process. Without this a series whose every chapter trips the
-# WAF would pop a window per chapter; after the first failure we want the run to
-# end with a clear error, not to keep interrupting.
-_COMIX_WAF_HANDOFF_ATTEMPTED = False
+# Handoff budget. The first cut of this was a single boolean "already
+# attempted", which counted SUCCESSES against the allowance and broke a real
+# run: the HTTP metadata request tripped the WAF, the user solved it, and then
+# the browser's own chapter-list navigation was challenged separately — but the
+# allowance was already spent, so the second challenge was never surfaced and
+# the run died claiming the check "was not completed" when it had never asked.
+#
+# Budget the two outcomes separately instead:
+#   - successful solves are cheap for the user and legitimately needed more than
+#     once per run (the cloudscraper session and the browser are distinct
+#     identities to the WAF), so allow a few;
+#   - a FAILED prompt (timed out, window closed) means the user declined, so
+#     stop asking immediately rather than nagging.
+# The interval floor stops a pathological series from popping windows back to
+# back. Grep _waf_budget_state for the consumer.
+_COMIX_WAF_MAX_SOLVES = 3
+_COMIX_WAF_MAX_FAILURES = 1
+# Hard depth bound on _enforce_no_waf's solve -> reload -> re-check cycle, kept
+# independent of the prompt budget above so termination is provable locally.
+_WAF_MAX_ENFORCE_PASSES = 2
+_COMIX_WAF_MIN_PROMPT_INTERVAL_S = 20.0
+_COMIX_WAF_SOLVES_DONE = 0
+_COMIX_WAF_FAILURES = 0
+_COMIX_WAF_LAST_PROMPT_AT = 0.0
 _COMIX_WAF_HANDOFF_LOCK = threading.Lock()
+
+# Cached "stable" User-Agent for the Patchright profile.
+#
+# THE reason a solved check didn't stick: headless Chromium advertises
+# `HeadlessChrome/147.0.7727.15` while the headed window advertises
+# `Chrome/147.0.0.0` (measured 2026-08-02). The WAF binds its clearance to the
+# UA that earned it, so a clearance obtained in the headed handoff window was
+# rejected the moment the relaunched headless context presented a different UA —
+# the user solved the check and was immediately re-challenged.
+#
+# Pinning ONE UA across both modes fixes that, and independently removes the
+# `HeadlessChrome` token, which is about the loudest bot signal a client can
+# emit and is very likely part of why the check fires "sometimes" at all.
+#
+# Cached in the profile dir so only the first run in a fresh profile pays the
+# probe-and-relaunch; grep _resolve_stable_user_agent.
+_UA_CACHE_FILENAME = "aio-stable-ua.txt"
+_COMIX_STABLE_UA: Optional[str] = None
+_COMIX_UA_LOCK = threading.Lock()
+
+
+def _stabilize_user_agent(raw: Optional[str]) -> Optional[str]:
+    """Return *raw* with the headless giveaway removed.
+
+    Only rewrites the product token — the version string and everything else
+    stay exactly as the real browser reports them, so the result is still a
+    truthful description of the engine actually making the request.
+    """
+    if not raw:
+        return None
+    return raw.replace("HeadlessChrome/", "Chrome/")
 
 # Sanity bound on the pager-reported page count. Real worst case observed is
 # 360 (Magic Emperor, ~890 chapters x ~8 groups at 20 rows/page); this only
@@ -154,6 +205,57 @@ def _looks_like_waf_challenge(url: Optional[str], text: Optional[str] = None) ->
         if "security check" in lowered and "noindex" in lowered:
             return True
     return False
+
+
+def _waf_failure_message(stage: str, reason: Optional[str]) -> str:
+    """User-facing text for an unsolved challenge, keyed on WHY.
+
+    Exists because the first version printed "it was not completed" for every
+    outcome — including the case where the downloader never opened a window at
+    all because its one-per-process allowance was already spent. Telling someone
+    they failed to do something they were never asked to do is the worst
+    possible error message, so each outcome now says what actually happened.
+    """
+    head = f"comix.to is asking for human verification, so {stage} could not be read."
+    tails = {
+        "already_declined": (
+            " A verification window was opened earlier this run and not "
+            "completed, so no further windows were opened. Re-run and complete "
+            "the check when it appears."
+        ),
+        "solve_limit": (
+            " The check has already been passed several times this run, which "
+            "usually means the site is challenging aggressively right now. Try "
+            "again in a few minutes."
+        ),
+        "too_soon": (
+            " A verification window was opened moments ago. Re-run in a minute."
+        ),
+        "disabled": (
+            f" Interactive verification is turned off ({_WAF_NO_INTERACTIVE_ENV} "
+            "is set). Unset it, or open comix.to in a browser and pass the check "
+            "once so the saved session is reused."
+        ),
+        "no_display": (
+            " No display is available for the verification window. Run the "
+            "downloader on a desktop session once so the session is saved to "
+            f"{_comix_profile_dir()}, or set AIO_COMIX_PROFILE_DIR to a profile "
+            "that already has one."
+        ),
+        "launch_failed": (
+            " The verification window could not be opened. Check that the "
+            "bundled browser is installed (patchright install chromium)."
+        ),
+        "window_closed": (
+            " The verification window was closed before the check completed. "
+            "Re-run and finish it to continue."
+        ),
+    }
+    return head + tails.get(
+        reason or "",
+        " It was not completed. Re-run and finish the check in the window the "
+        "downloader opens, or visit comix.to in a browser and pass it once.",
+    )
 
 
 class ComixWafChallengeError(RuntimeError):
@@ -1396,7 +1498,7 @@ class _ComixBrowserSession:
             profile_dir = _comix_profile_dir()
             os.makedirs(profile_dir, exist_ok=True)
             ctx_kwargs: Dict[str, Any] = {}
-            cached_ua = self._cached_cf_user_agent()
+            cached_ua = self._resolve_stable_user_agent()
             if cached_ua:
                 ctx_kwargs["user_agent"] = cached_ua
             self._context = self._pw.chromium.launch_persistent_context(
@@ -1417,6 +1519,23 @@ class _ComixBrowserSession:
             print(f"[!] Comix Playwright launch failed: {e}")
             self._cleanup()
             return False
+
+        # First launch in a fresh profile: the browser's UA isn't knowable until
+        # it is running, so probe it, stabilize it, and relaunch with it pinned
+        # so headless and headed present IDENTICALLY from here on. Recurses at
+        # most once — the relaunch finds the cached value via
+        # _resolve_stable_user_agent and takes the ctx_kwargs branch above.
+        if not cached_ua:
+            try:
+                raw_ua = self._page.evaluate("navigator.userAgent")
+            except Exception:
+                raw_ua = None
+            stable_ua = _stabilize_user_agent(raw_ua)
+            if stable_ua:
+                self._remember_stable_user_agent(stable_ua)
+                if stable_ua != raw_ua:
+                    self._cleanup()
+                    return self._start(headless)
 
         # Session-level <img> byte capture. This is the single most important
         # wire in the comix chapter pipeline: the ~70-80 pages per chapter load
@@ -1504,6 +1623,46 @@ class _ComixBrowserSession:
         self._page = None
         self._last_cf_cookie_ts = 0.0
         self._headless = True
+
+    def _resolve_stable_user_agent(self) -> Optional[str]:
+        """UA to pin on the persistent context, or None if not known yet.
+
+        Priority: a zendriver CF solve's UA (that cookie is bound to it) >
+        the cached stable UA for this profile > None, which makes _start probe
+        the launched browser and relaunch once with the stabilized value.
+        """
+        global _COMIX_STABLE_UA
+        cf_ua = self._cached_cf_user_agent()
+        if cf_ua:
+            return cf_ua
+        with _COMIX_UA_LOCK:
+            if _COMIX_STABLE_UA:
+                return _COMIX_STABLE_UA
+        try:
+            path = os.path.join(_comix_profile_dir(), _UA_CACHE_FILENAME)
+            with open(path, "r", encoding="utf-8") as fh:
+                cached = (fh.read() or "").strip()
+        except Exception:
+            cached = ""
+        if cached:
+            with _COMIX_UA_LOCK:
+                _COMIX_STABLE_UA = cached
+            return cached
+        return None
+
+    def _remember_stable_user_agent(self, ua: str) -> None:
+        """Persist the stabilized UA beside the profile it belongs to, so later
+        processes launch with it directly instead of re-probing."""
+        global _COMIX_STABLE_UA
+        with _COMIX_UA_LOCK:
+            _COMIX_STABLE_UA = ua
+        try:
+            path = os.path.join(_comix_profile_dir(), _UA_CACHE_FILENAME)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(ua)
+        except Exception:
+            # A read-only profile dir just means we re-probe next process.
+            pass
 
     def _cached_cf_user_agent(self) -> Optional[str]:
         """Return the User-Agent string from any cached zendriver CF solve
@@ -1621,7 +1780,9 @@ class _ComixBrowserSession:
             return True
         return False
 
-    def _enforce_no_waf(self, stage: str, return_url: Optional[str] = None) -> None:
+    def _enforce_no_waf(
+        self, stage: str, return_url: Optional[str] = None, _attempt: int = 1
+    ) -> None:
         """No-op unless the WAF interstitial is up; otherwise attempt ONE
         interactive handoff and raise ComixWafChallengeError if it doesn't pass.
 
@@ -1646,38 +1807,45 @@ class _ComixBrowserSession:
             challenge_url = self._page.url
         except Exception:
             pass
-        if (self.solve_waf_interactively(return_url) or {}).get("solved"):
-            if not return_url:
-                # No target to restore (defensive: every browser call site
-                # passes one). The session cookie is still banked in the
-                # profile, so let the caller proceed on whatever it has.
-                return
-            try:
-                self._page.goto(
-                    return_url, wait_until="domcontentloaded", timeout=30000
-                )
-            except Exception as exc:
-                raise ComixChapterScrapeError(
-                    f"comix: verification passed but reloading {return_url} "
-                    f"afterwards failed ({type(exc).__name__}: {exc})."
-                ) from exc
-            # A second challenge on the reload means the solve didn't stick;
-            # one handoff per process is the cap, so this is terminal.
-            if self._waf_blocked(f"{stage} (after verification)"):
+        outcome = self.solve_waf_interactively(return_url) or {}
+        if not outcome.get("solved"):
+            raise ComixWafChallengeError(
+                _waf_failure_message(stage, outcome.get("reason")),
+                challenge_url=challenge_url,
+            )
+        if not return_url:
+            # No target to restore (defensive: every browser call site passes
+            # one). The session is banked in the profile, so let the caller
+            # proceed on whatever it has.
+            return
+        try:
+            self._page.goto(
+                return_url, wait_until="domcontentloaded", timeout=30000
+            )
+        except Exception as exc:
+            raise ComixChapterScrapeError(
+                f"comix: verification passed but reloading {return_url} "
+                f"afterwards failed ({type(exc).__name__}: {exc})."
+            ) from exc
+        # Re-challenged on the reload. Historically this was the UA mismatch
+        # (headless advertising HeadlessChrome/... could not use a clearance
+        # earned by the headed window); that is pinned now, so reaching here
+        # means something else.
+        #
+        # Bounded by an EXPLICIT depth rather than by the prompt budget in
+        # solve_waf_interactively. The budget does stop the real prompting, but
+        # making termination depend on distant module state is how you get an
+        # infinite loop from an innocent refactor — one that a mocked solve
+        # demonstrates immediately.
+        if self._waf_blocked(f"{stage} (after verification)"):
+            if _attempt >= _WAF_MAX_ENFORCE_PASSES:
                 raise ComixWafChallengeError(
                     "comix.to re-issued its human-verification check "
-                    f"immediately after one was completed, so {stage} could "
-                    "not be read. Re-run in a few minutes.",
+                    f"immediately after one was completed, so {stage} could not "
+                    "be read. Try again in a few minutes.",
                     challenge_url=challenge_url,
                 )
-            return
-        raise ComixWafChallengeError(
-            "comix.to is asking for human verification and it was not "
-            f"completed, so {stage} could not be read. Re-run and complete the "
-            "check in the window the downloader opens, or visit comix.to in a "
-            "browser and pass it once.",
-            challenge_url=challenge_url,
-        )
+            self._enforce_no_waf(stage, return_url, _attempt + 1)
 
     def solve_waf_interactively(self, return_url: Optional[str] = None) -> Dict[str, Any]:
         """Open the downloader's own browser profile VISIBLY on comix's
@@ -1700,7 +1868,7 @@ class _ComixBrowserSession:
         (ComixSiteHandler._waf_recover_once) adopt the same session, which it
         otherwise could not see.
         """
-        global _COMIX_WAF_HANDOFF_ATTEMPTED
+        global _COMIX_WAF_SOLVES_DONE, _COMIX_WAF_FAILURES, _COMIX_WAF_LAST_PROMPT_AT
         result: Dict[str, Any] = {"solved": False, "cookies": [], "user_agent": None}
 
         if (os.environ.get(_WAF_NO_INTERACTIVE_ENV) or "").strip() not in ("", "0"):
@@ -1726,10 +1894,19 @@ class _ComixBrowserSession:
             return result
 
         with _COMIX_WAF_HANDOFF_LOCK:
-            if _COMIX_WAF_HANDOFF_ATTEMPTED:
-                result["reason"] = "already_attempted"
+            if _COMIX_WAF_FAILURES >= _COMIX_WAF_MAX_FAILURES:
+                # The user already declined (timed out / closed the window).
+                # Don't nag.
+                result["reason"] = "already_declined"
                 return result
-            _COMIX_WAF_HANDOFF_ATTEMPTED = True
+            if _COMIX_WAF_SOLVES_DONE >= _COMIX_WAF_MAX_SOLVES:
+                result["reason"] = "solve_limit"
+                return result
+            waited = time.monotonic() - _COMIX_WAF_LAST_PROMPT_AT
+            if _COMIX_WAF_LAST_PROMPT_AT and waited < _COMIX_WAF_MIN_PROMPT_INTERVAL_S:
+                result["reason"] = "too_soon"
+                return result
+            _COMIX_WAF_LAST_PROMPT_AT = time.monotonic()
 
         try:
             timeout_s = float(
@@ -1845,12 +2022,34 @@ class _ComixBrowserSession:
             except Exception:
                 result["user_agent"] = None
             result["solved"] = True
-        elif not result.get("reason"):
-            result["reason"] = "timeout"
-            print(
-                f"[!] Comix: verification not completed within {int(timeout_s)}s.",
-                flush=True,
-            )
+            with _COMIX_WAF_HANDOFF_LOCK:
+                # A success does NOT count against the ask-again budget: the
+                # cloudscraper session and the browser are separate identities
+                # to the WAF, so one run legitimately needs a solve for each.
+                _COMIX_WAF_SOLVES_DONE += 1
+                _COMIX_WAF_FAILURES = 0
+        else:
+            if not result.get("reason"):
+                result["reason"] = "timeout"
+                print(
+                    f"[!] Comix: verification not completed within "
+                    f"{int(timeout_s)}s.",
+                    flush=True,
+                )
+            with _COMIX_WAF_HANDOFF_LOCK:
+                # The user declined (timed out or closed the window). Stop
+                # asking — repeated windows they're ignoring help nobody.
+                _COMIX_WAF_FAILURES += 1
+
+        # The UA the solve was performed under is the one the clearance is bound
+        # to, so pin it for every later launch. Without this the relaunched
+        # headless context presented `HeadlessChrome/...` instead of
+        # `Chrome/...`, the clearance was rejected, and the user was
+        # re-challenged seconds after passing the check.
+        if result.get("user_agent"):
+            stable_ua = _stabilize_user_agent(result["user_agent"])
+            if stable_ua:
+                self._remember_stable_user_agent(stable_ua)
 
         # Back to headless for the rest of the run. The close flushes the
         # solved session into the profile dir, so the relaunch inherits it.
