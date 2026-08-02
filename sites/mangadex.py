@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from .base import (
     BaseSiteHandler,
+    GroupInfo,
     IncompleteChapterError,
     SearchHit,
     SiteComicContext,
@@ -427,43 +428,87 @@ class MangaDexSiteHandler(BaseSiteHandler):
                 # alternative anyway.
                 if attr.get("isUnavailable") is True:
                     continue
-                group_name = None
-                group_id = None
+                # EVERY scanlation_group rel, not just the first: MangaDex
+                # models a joint release as multiple rels, and the old
+                # `break` silently dropped every co-group — which also made
+                # `--group "<co-group>"` unable to match its own chapters.
+                groups: List[GroupInfo] = []
+                is_official = False
+                publisher_canonical = None
                 for rel in relationships:
-                    if rel.get("type") == "scanlation_group":
-                        group_id = rel.get("id")
-                        group_name = rel.get("attributes", {}).get("name")
-                        break
-                # Phase 4c is_official annotation: match scanlation_group
-                # against sites/official_publishers.json (UUID first, name
-                # alias fallback). When True, the chapter_merger will rank
-                # this source first within a chapter row, and downstream
-                # JSON output exposes it for UI badges. canonical publisher
-                # name from the catalog (e.g. "MangaPlus" not "MangaPlus by
-                # Shueisha") is used as `publisher` so cross-site dedupe by
-                # publisher works even when group_name strings drift.
-                is_official, publisher_canonical = lookup_publisher(group_id, group_name)
+                    if rel.get("type") != "scanlation_group":
+                        continue
+                    gattr = rel.get("attributes") or {}
+                    group_id = rel.get("id")
+                    group_name = gattr.get("name")
+                    # Phase 4c is_official annotation: match scanlation_group
+                    # against sites/official_publishers.json (UUID first, name
+                    # alias fallback). When True, the chapter_merger will rank
+                    # this source first within a chapter row, and downstream
+                    # JSON output exposes it for UI badges. canonical publisher
+                    # name from the catalog (e.g. "MangaPlus" not "MangaPlus by
+                    # Shueisha") is used as `publisher` so cross-site dedupe by
+                    # publisher works even when group_name strings drift.
+                    catalog_official, canonical = lookup_publisher(group_id, group_name)
+                    # MangaDex's own `official` flag is BROADER than our
+                    # 13-entry catalog, so OR them — but `publisher` stays
+                    # catalog-only, because chapter_merger and the SearchTab
+                    # badge key on the canonical name and a MangaDex-official
+                    # group we've never catalogued has no canonical form.
+                    # (SearchTab.jsx renders `publisher || group_name ||
+                    # "Official"`, so a null publisher degrades cleanly.)
+                    group_official = bool(catalog_official or gattr.get("official"))
+                    is_official = is_official or group_official
+                    if canonical and not publisher_canonical:
+                        publisher_canonical = canonical
+                    groups.append(
+                        GroupInfo(
+                            name=group_name,
+                            group_id=group_id,
+                            is_official=group_official,
+                            verified=bool(gattr.get("verified")),
+                            inactive=bool(gattr.get("inactive")),
+                            # Feeds sites/group_quality.classify_mtl — MangaDex
+                            # is the only site exposing a group blurb, and MTL
+                            # groups routinely say so there even when their name
+                            # doesn't. Already in this response (includes[]=
+                            # scanlation_group); no extra request.
+                            description=gattr.get("description"),
+                        )
+                    )
+                page_count = attr.get("pages")
+                external_url = attr.get("externalUrl")
                 chapters.append(
                     {
                         "hid": chapter_id,
                         "chap": attr.get("chapter") or attr.get("title") or attr.get("volume"),
                         "title": attr.get("title"),
                         "url": chapter_id,
-                        "group_name": group_name,
+                        "_groups": groups,
+                        "group_name": ", ".join(
+                            g.name for g in groups if g.name
+                        ) or None,
                         "language": attr.get("translatedLanguage"),
                         "uploaded": self._parse_timestamp(attr.get("publishAt")),
                         "is_official": is_official,
                         "publisher": publisher_canonical,
+                        "_pages": page_count if isinstance(page_count, int) else None,
+                        "_external_url": external_url,
+                        # Licensed publishers (MangaPlus, Viz…) publish chapters
+                        # that live on THEIR site: pages:0 + externalUrl set.
+                        # /at-home/server returns no images for these, so
+                        # get_chapter_images raises "chapter has no pages".
+                        # They are RANKED DOWN, never filtered out — filtering
+                        # would empty the list entirely for a DMCA'd series like
+                        # One Piece, whose every English chapter is this shape.
+                        # Grep _undownloadable: sites/base.py:_rank_version.
+                        "_undownloadable": bool(external_url) and page_count == 0,
                     }
                 )
             offset += len(data)
             if offset >= total or not data:
                 break
         return chapters
-
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        group = chapter_version.get("group_name")
-        return group if isinstance(group, str) and group else None
 
     # ---------------------------------------------- chapter image download
     def _fetch_at_home_assignment(

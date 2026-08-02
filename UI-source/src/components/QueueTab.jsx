@@ -1,7 +1,62 @@
-import React from "react";
+import React, { useState, useEffect } from "react";
 import { Button, Card, Badge } from "@/components/ui/primitives";
 import { X, Trash2, Clock, Loader2, RotateCw, Zap } from "lucide-react";
-import { cn, formatDuration } from "@/lib/utils";
+import { cn, formatDuration, formatEta } from "@/lib/utils";
+
+// 1s heartbeat so the elapsed-time readout advances even while a download is
+// quiet. The parent only re-renders on log/progress flushes, and those stall
+// for minutes during a single slow chapter fetch — without this the clock
+// would visibly freeze. Disabled when nothing is running, so an idle Queue tab
+// costs zero timers.
+function useElapsedTick(active) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [active]);
+}
+
+// ── Elapsed + "time left" row under the active card's progress bar ──
+//
+// etaMs / etaSamples are stamped per chapter tick in the MAIN process
+// (electron/downloader.js, grep applyChapterEta) and ride the existing
+// download-progress payload. Three display states:
+//   - cached prefix draining (the chapter ticks are "already processed,
+//     collecting files", which take ~0ms and are deliberately NOT sampled):
+//     say so in words instead of showing a number that would be fiction.
+//   - exactly 2 samples — the minimum the estimator publishes at: render at
+//     reduced opacity. The estimate is real, but it's young.
+//   - 3+ samples, or no total chapter count at all: plain, or nothing.
+//
+// The transition sits on the SPAN as a whole rather than on the digits, and
+// the readout is tabular-nums font-mono, so a value changing at the 100ms
+// flush cadence can't strobe or reflow the row.
+function TimingRow({ dl }) {
+  const p = dl.progress || {};
+  const elapsed = dl.startedAt ? formatDuration(Date.now() - dl.startedAt) : "";
+  const eta = (p.etaSamples || 0) >= 2 && p.etaMs > 0 ? formatEta(p.etaMs) : "";
+  const draining = !eta && p.chapterCached === true;
+
+  if (!elapsed && !eta && !draining) return null;
+
+  return (
+    <div className="flex items-baseline justify-between gap-3 mt-1.5">
+      <span className="text-[10px] text-muted-foreground tabular-nums font-mono">
+        {elapsed}
+      </span>
+      <span
+        className={cn(
+          "text-[10px] tabular-nums font-mono transition-opacity duration-300",
+          eta ? "text-foreground/75" : "text-muted-foreground",
+          eta && p.etaSamples === 2 && "opacity-60",
+        )}
+      >
+        {eta ? `~${eta} left` : draining ? "Resuming cached chapters…" : ""}
+      </span>
+    </div>
+  );
+}
 
 function ProgressBar({ value, max, indeterminate, className }) {
   const percent = max > 0 ? Math.min(100, (value / max) * 100) : 0;
@@ -53,6 +108,8 @@ export default function QueueTab({
       completed.push({ id, ...dl });
     }
   }
+
+  useElapsedTick(running.length > 0);
 
   return (
     <div className="flex flex-col h-full">
@@ -126,6 +183,8 @@ export default function QueueTab({
               <ProgressBar indeterminate />
             ) : null}
 
+            <TimingRow dl={dl} />
+
             <div className="flex gap-1.5 mt-2 flex-wrap">
               {dl.args?.format && <Badge variant="secondary">{dl.args.format.toUpperCase()}</Badge>}
               {dl.args?.quality && <Badge variant="secondary">Q{dl.args.quality}</Badge>}
@@ -180,6 +239,16 @@ export default function QueueTab({
                 </div>
                 <div className="flex gap-1.5 mt-1.5 ml-6 flex-wrap">
                   {isResume && <Badge variant="default">Resume</Badge>}
+                  {/* Carried over from the previous session (useDownloader's
+                      queue snapshot, grep _restoreQueueItems). Badged so the
+                      auto-start on launch isn't mysterious; the dashed border
+                      echoes the queued card's own, tying "not yet started" to
+                      "carried over". */}
+                  {item.restored && (
+                    <Badge variant="secondary" className="border-dashed">
+                      Restored
+                    </Badge>
+                  )}
                   {isResume && item.cachedChapters > 0 && (
                     <Badge variant="secondary">{item.cachedChapters} ch cached</Badge>
                   )}

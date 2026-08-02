@@ -462,10 +462,6 @@ class TapasSiteHandler(BaseSiteHandler):
         except (TypeError, ValueError):
             return 0
 
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        name = chapter_version.get("group_name")
-        return name if isinstance(name, str) and name else None
-
     # ------------------------------------------------------------- chapter images
     def get_chapter_images(
         self,

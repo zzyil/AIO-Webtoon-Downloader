@@ -168,13 +168,21 @@ const DEFAULT_SETTINGS = {
   scriptPath: DEV_DEFAULTS.scriptPath,
   workingDir: DEV_DEFAULTS.workingDir,
   verboseAlways: true,
-  // App self-update opt-in (grep appAutoUpdate — consumed by
-  // electron/updater.js via main.js's save-settings live-sync). OFF by
-  // default, deliberately: when on, the app downloads new releases in the
-  // background and installs them silently on exit, so it needs explicit
-  // buy-in. Top-level (not defaults.*) — an app preference, not a
-  // per-download flag. NOT related to the Library chapter update checks.
-  appAutoUpdate: false,
+  // App self-update, OPT-OUT (grep appAutoUpdate — consumed by
+  // electron/updater.js via main.js's save-settings live-sync). ON by
+  // default: staying current is the right default for a scraper whose site
+  // handlers break when sites change, and the install is silent-on-exit
+  // behind a 5-day maturity delay, so it never interrupts. Top-level (not
+  // defaults.*) — an app preference, not a per-download flag. NOT related to
+  // the Library chapter update checks.
+  //
+  // main.js RESOLVES the default (get-settings returns
+  // `saved.appAutoUpdate !== false`), so this value only shows for the ~50ms
+  // before the first IPC lands; the reads below still use `!== false` so a
+  // user with no saved key sees the switch ON either way. history.js's v1
+  // settings migration clears the explicit `false` that the old opt-in
+  // default wrote for every user who ever pressed Save.
+  appAutoUpdate: true,
   // Update maturity delay: only install a release once it's this many
   // days old, so a bad release can be pulled or superseded before it
   // reaches installs. 0 = update as soon as a release is published.
@@ -915,6 +923,12 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
     // getResolvedPaths shows what will run) — DEFAULT_SETTINGS already carries
     // "" for all three. Only isPackaged is overridden: it's owned by main.js,
     // so keep the current value rather than DEFAULT_SETTINGS's placeholder.
+    //
+    // Note for the next reader: because this clones DEFAULT_SETTINGS wholesale,
+    // Reset RE-ENABLES appAutoUpdate (it's `true` there since the opt-out
+    // flip). That's correct under an opt-out default — Reset means "back to
+    // shipped defaults" — but it does silently undo a deliberate opt-out, so
+    // don't be surprised by it.
     setLocal((prev) => ({
       ...structuredClone(DEFAULT_SETTINGS),
       isPackaged: prev.isPackaged,
@@ -1127,10 +1141,11 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
   // App SELF-update (not Library chapter checks). Deliberately the ONLY
   // update UI in the app — no banners, no dialogs anywhere else; install
   // happens silently on exit (user decision, 2026-07-12). The toggle
-  // persists settings.appAutoUpdate; main.js's save-settings handler
-  // live-syncs electron/updater.js (enable arms a check immediately,
-  // disable also cancels install-on-quit for an already-downloaded
-  // update). Status states + shape: updater.js's `status` object.
+  // persists settings.appAutoUpdate, which is OPT-OUT: every read here is
+  // `!== false` so an absent key renders ON, matching main.js's resolution.
+  // main.js's save-settings handler live-syncs electron/updater.js (enable
+  // arms a check immediately, disable also cancels install-on-quit for an
+  // already-downloaded update). Status states + shape: updater.js's `status`.
   const renderAppUpdates = () => {
     const st = updStatus; // null pre-snapshot / in browser dev mode
     const supported = !!st?.supported;
@@ -1183,7 +1198,9 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
           statusNode = <>Waiting for the first background check</>;
           break;
         case "disabled":
-          statusNode = <>Automatic updates are off</>;
+          // Only reachable by an explicit opt-out now that the default is ON,
+          // so word it as the user's choice rather than a resting state.
+          statusNode = <>Turned off — you'll update manually</>;
           break;
         default:
           statusNode = null; // unsupported → reason rendered under the toggle
@@ -1195,13 +1212,14 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
         <div className="flex items-center justify-between gap-3">
           <div className="flex-1">
             <Label className="text-xs cursor-pointer">
-              Automatically install app updates
+              Keep the app up to date automatically
             </Label>
             <p className="text-[10px] text-muted-foreground mt-0.5">
-              Checks GitHub Releases in the background after launch,
-              downloads new versions silently, and applies them on the next
-              app exit — never interrupts, never prompts. Updates come from
-              the repo that built this install.
+              On by default. Checks GitHub Releases in the background after
+              launch, downloads new versions silently, and applies them on the
+              next app exit — never interrupts, never prompts. Turn it off to
+              stay on this build and update by hand. Updates come from the repo
+              that built this install.
             </p>
             {st && !supported && (
               <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug">
@@ -1209,19 +1227,24 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
               </p>
             )}
           </div>
+          {/* `!== false`, not `=== true`: a user with no saved key — a fresh
+              install, or one whose legacy stored `false` was cleared by
+              history.js's v1 migration — must see the switch ON, matching what
+              the updater is actually doing. */}
           <Switch
-            checked={local.appAutoUpdate === true}
+            checked={local.appAutoUpdate !== false}
             onCheckedChange={(v) => set("appAutoUpdate", v)}
           />
         </div>
 
-        {/* Maturity delay — nested under the opt-in. A release only
-            downloads once it's this many days old (clock = the feed's
-            releaseDate, stamped when CI built it), so a bad release can
-            be pulled/superseded before it reaches installs. Lowering it
-            to 0 + Save is the "update me now" escape hatch — main.js's
-            save-settings sync re-evaluates a deferred release live. */}
-        {local.appAutoUpdate === true && (
+        {/* Maturity delay — nested under the master toggle, same
+            absent-means-ON gate. A release only downloads once it's this many
+            days old (clock = the feed's releaseDate, stamped when CI built
+            it), so a bad release can be pulled/superseded before it reaches
+            installs. Lowering it to 0 + Save is the "update me now" escape
+            hatch — main.js's save-settings sync re-evaluates a deferred
+            release live. */}
+        {local.appAutoUpdate !== false && (
           <div className="flex items-start justify-between gap-3 mt-3 animate-slide-up">
             <div className="flex-1">
               <Label className="text-xs cursor-pointer">

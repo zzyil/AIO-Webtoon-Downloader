@@ -7,6 +7,8 @@
 //   - A queue system: auto-advances ONE at a time (currentDownloadId = the
 //     serial "anchor"), but a queued item can be launched in PARALLEL with the
 //     anchor via startQueuedNow ("start alongside")
+//   - Persisting that queue across app close and replaying it on the next
+//     launch (grep QUEUE_PERSIST_LIMIT / queueHydratedRef)
 //   - Log lines from each download (flat array)
 //   - Resumable downloads found on disk (tmp_* folders)
 //   - App settings
@@ -14,13 +16,16 @@
 // STATE SHAPES (what each component expects):
 //   activeDownloads: { [downloadId]: { url, args, status, progress, logs, tmpDir? } }
 //   logs: [ { downloadId, line, level, timestamp }, ... ]
-//   queue: [ { id, type:"download"|"resume", url, displayUrl, queuedAt,
+//   queue: [ { id, type:"download"|"resume", url, displayUrl, queuedAt, restored?,
 //             args? (download) | tmpDir?/format?/epubLayout?/title?/cachedChapters? (resume) }, ... ]
 //   resumable: [ { hid, tmpDir, params, cachedChapters }, ... ]
 //   settings: { pythonCmd, scriptPath, workingDir, defaults, verboseAlways }
+//
+// `progress` also carries the main-process ETA fields (etaMs / chapterMsEma /
+// etaSamples) — see electron/downloader.js:applyChapterEta.
 // ============================================================
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { formatDuration } from "@/lib/utils";
 
 // DEFAULT_DOWNLOAD_DEFAULTS / mergeSettings / normalizeDownloadArgs were
@@ -76,6 +81,80 @@ function _activeEntryForQueueItem(item) {
     queuedAt: item.queuedAt,
     startedAt: Date.now(),
   };
+}
+
+// ── Queue persistence across app close ──
+// The queue is pure React state and dies with the renderer, so it's mirrored
+// to download_queue.json via the queue:get / queue:save IPC (storage + shape:
+// electron/history.js:saveQueueSnapshot). Restore behavior is RESTORE +
+// AUTO-START: whatever was queued comes back in order, and whatever was
+// RUNNING at close is re-inserted at the HEAD as a resume job.
+const QUEUE_PERSIST_LIMIT = 200;
+// Long enough to coalesce a burst of enqueues (queue-from-search fires several
+// setQueue calls in a row), short enough that a close right after a click has
+// already flushed. The confirm-quit dialog also buys dwell time whenever
+// something is actually running.
+const QUEUE_PERSIST_DEBOUNCE_MS = 300;
+
+// Rebuild the queue array from a saved snapshot. Module-level for the same
+// reason as _spawnQueueItem: no dep-array churn. `mintId` supplies fresh
+// `q<N>` ids from the caller's counter; `resumableList` is a FRESH
+// scanResumable (the mount effect awaits it first — the ordering is
+// load-bearing).
+//
+// A snapshot's `running` entries were mid-download when the app closed. They
+// come back as type:"resume" jobs at the HEAD of the restored queue, NOT as
+// fresh downloads: their tmp_<hid> folder holds the chapters that already
+// finished, and replaying them from scratch would redo that work. An entry
+// with no LIVE tmp folder is DROPPED, not resurrected — the user deleted it,
+// or the run never got far enough to write run_params.json.
+//
+// Queued items are restored VERBATIM (both types) — they never started, so
+// there's nothing on disk to validate them against.
+function _restoreQueueItems(snap, resumableList, mintId) {
+  const savedQueue = Array.isArray(snap?.queue) ? snap.queue : [];
+  const savedRunning = Array.isArray(snap?.running) ? snap.running : [];
+  const live = Array.isArray(resumableList) ? resumableList : [];
+
+  const revived = [];
+  for (const r of savedRunning) {
+    // hid is the tmp folder's own key; url is the fallback for a run that
+    // died before the "Title (hid=…)" line landed. main.js's scan-resumable
+    // handler back-fills BOTH fields from download history, so either can hit.
+    const match = live.find(
+      (x) => (r?.hid && x.hid === r.hid) || (r?.url && x.url === r.url)
+    );
+    if (!match) continue;
+    // Two processes writing one tmp_ folder corrupts the resume state — same
+    // invariant resumeDownload's dupInQueue/dupActive check protects.
+    if (revived.some((v) => v.tmpDir === match.tmpDir)) continue;
+    revived.push({
+      id: mintId(),
+      type: "resume",
+      url: r.url || match.url,
+      tmpDir: match.tmpDir,
+      // A running RESUME carries no args (see _activeEntryForQueueItem), so
+      // match.format — which scanResumable read out of run_meta.json — is the
+      // authoritative fallback. undefined is fine too: downloader.resume
+      // re-reads run_meta.json when no format is passed.
+      format: r.args?.format || match.format || undefined,
+      epubLayout: r.args?.epubLayout,
+      title: r.title || match.title || "",
+      cachedChapters: match.cachedChapters,
+      displayUrl: r.displayUrl || r.title || match.title || r.url || match.url,
+      queuedAt: Date.now(),
+      restored: true,
+    });
+  }
+
+  const queued = savedQueue
+    .filter((item) => item && item.id && (item.type === "resume" ? item.tmpDir : item.url))
+    .slice(0, QUEUE_PERSIST_LIMIT)
+    // `restored` is purely a UI marker — QueueTab badges it so the auto-start
+    // isn't mysterious. Nothing in the spawn path reads it.
+    .map((item) => ({ ...item, restored: true }));
+
+  return [...revived, ...queued];
 }
 
 export function useDownloader() {
@@ -175,6 +254,12 @@ export function useDownloader() {
   // collide. Refs are exempt from exhaustive-deps, so the useCallback closures
   // below mint ids inline via `q${++queueIdRef.current}`.
   const queueIdRef = useRef(0);
+  // Flips true once the saved snapshot has been read (whether or not it had
+  // anything in it). The persist effect below refuses to write until then —
+  // otherwise the initial EMPTY queue state would overwrite the saved file in
+  // the ~50ms before hydration lands, which is exactly the data we're trying
+  // to keep. grep QUEUE_PERSIST_DEBOUNCE_MS.
+  const queueHydratedRef = useRef(false);
   const currentIdRef = useRef(currentDownloadId);
   currentIdRef.current = currentDownloadId;
   // activeDownloadsRef gives the IPC complete-handler synchronous read access
@@ -230,7 +315,22 @@ export function useDownloader() {
     }
   }, []);
 
-  // ── Load settings + resumable list on mount ──
+  // ── Load settings + resumable list + the saved queue on mount ──
+  //
+  // ORDER MATTERS inside the async block: scanResumable must RESOLVE before
+  // the queue snapshot is applied. Restored `running` entries are
+  // reconstituted against that fresh list (see _restoreQueueItems), so running
+  // the two in parallel would race the liveness check and either drop a valid
+  // resume or revive a job whose tmp folder is gone.
+  //
+  // getSettings stays fire-and-forget alongside it — nothing here depends on
+  // it, and blocking the queue restore on a settings read would delay the
+  // auto-start for no reason.
+  //
+  // Deliberately references _startNextInQueue, which is defined further down:
+  // effect BODIES run after the whole component body, and it's a
+  // useCallback(…, []) so it never changes identity. Same arrangement as the
+  // IPC-subscription effect below, which also omits it from its deps.
   useEffect(() => {
     if (!hasAPI()) return;
 
@@ -238,9 +338,64 @@ export function useDownloader() {
       if (s) setSettings(s);
     });
 
-    window.electronAPI.scanResumable().then((r) => {
-      if (Array.isArray(r)) setResumable(r);
-    });
+    let cancelled = false;
+
+    (async () => {
+      let resumableList = [];
+      try {
+        const r = await window.electronAPI.scanResumable();
+        if (Array.isArray(r)) {
+          resumableList = r;
+          if (!cancelled) setResumable(r);
+        }
+      } catch (err) {
+        console.error("Failed to scan resumable downloads:", err);
+      }
+      if (cancelled) return;
+
+      let snap = null;
+      try {
+        snap = await window.electronAPI.getQueueSnapshot?.();
+      } catch (err) {
+        console.error("Failed to read the saved download queue:", err);
+      }
+      if (cancelled) return;
+
+      // Restored queue items KEEP their original q<N> ids (they're React keys
+      // and the stable handle removeFromQueue / startQueuedNow operate on), so
+      // reseed the counter past the highest one before minting anything new —
+      // otherwise a fresh enqueue would collide with a restored row and both
+      // would vanish on the first remove.
+      let maxId = queueIdRef.current;
+      for (const item of Array.isArray(snap?.queue) ? snap.queue : []) {
+        const n = Number(String(item?.id || "").replace(/^q/, ""));
+        if (Number.isFinite(n) && n > maxId) maxId = n;
+      }
+      queueIdRef.current = maxId;
+
+      const restored = _restoreQueueItems(
+        snap,
+        resumableList,
+        () => `q${++queueIdRef.current}`,
+      );
+
+      // Set BEFORE the early return so the persist effect is unblocked even
+      // when there was nothing to restore.
+      queueHydratedRef.current = true;
+      if (restored.length === 0) return;
+
+      setQueue(restored);
+      // Auto-start. The serial anchor is always free at mount, so this drains
+      // the head — the revived running job when the last session had one. The
+      // existing serial-anchor logic needs no change, and resumeDownload's
+      // tmpDir dedupe already blocks a double-spawn if the user also clicks
+      // Resume in the bar. Delayed so React has committed setQueue before
+      // _startNextInQueue reads queueRef (same reason the completion path
+      // waits 500ms).
+      setTimeout(() => _startNextInQueue(), 300);
+    })();
+
+    return () => { cancelled = true; };
   }, []);
 
   // ── Configurable: how often to flush buffered logs/progress to the UI ──
@@ -442,6 +597,60 @@ export function useDownloader() {
     return () => clearInterval(timer);
   }, [flushInterval]);
 
+  // ── Cheap signature of what's RUNNING ──
+  // "<downloadId>:<hid>" per running entry, sorted and joined. This is a
+  // persist TRIGGER, and it exists because activeDownloads itself is a fresh
+  // object ~10x/sec under the flush timer above — depending on it directly
+  // would turn every log line into a disk write. The signature only changes
+  // when a download starts, ends, or first reports its hid (the field the
+  // restore matches on), which is exactly when the snapshot is stale.
+  // Recomputing it per render is a handful of property reads over 1-3 entries.
+  const runningSignature = useMemo(() => {
+    const parts = [];
+    for (const [id, dl] of Object.entries(activeDownloads || {})) {
+      if (dl.status !== "running") continue;
+      parts.push(`${id}:${dl.progress?.hid || ""}`);
+    }
+    return parts.sort().join("|");
+  }, [activeDownloads]);
+
+  // ── Persist the queue + what's running (debounced) ──
+  // Read back on the next launch by the mount effect above. Reads the CURRENT
+  // activeDownloads through its ref rather than closing over the value, so the
+  // debounce window always writes the freshest state.
+  useEffect(() => {
+    if (!hasAPI() || !queueHydratedRef.current) return;
+    if (typeof window.electronAPI.saveQueueSnapshot !== "function") return;
+
+    const timer = setTimeout(() => {
+      const running = [];
+      for (const [id, dl] of Object.entries(activeDownloadsRef.current || {})) {
+        if (dl.status !== "running") continue;
+        running.push({
+          downloadId: id,
+          hid: dl.progress?.hid || null,
+          url: Array.isArray(dl.url) ? dl.url[0] : dl.url || null,
+          displayUrl: dl.displayUrl || null,
+          title: dl.progress?.title || null,
+          // tmpDir is only ever set on resume entries (_activeEntryForQueueItem),
+          // so it doubles as the type discriminator.
+          type: dl.tmpDir ? "resume" : "download",
+          tmpDir: dl.tmpDir || null,
+          args: dl.args || null,
+        });
+      }
+      window.electronAPI
+        .saveQueueSnapshot({
+          queue: queueRef.current.slice(0, QUEUE_PERSIST_LIMIT),
+          running,
+          savedAt: Date.now(),
+        })
+        .catch((err) => console.error("Failed to persist the download queue:", err));
+    }, QUEUE_PERSIST_DEBOUNCE_MS);
+
+    return () => clearTimeout(timer);
+  }, [queue, runningSignature]);
+
   // ── Internal: start the next item in the queue ──
   const _startNextInQueue = useCallback(async () => {
     const q = queueRef.current;
@@ -511,6 +720,17 @@ export function useDownloader() {
         // closes the asymmetry where Search honored the toggle but
         // multi-source-direct-URL downloads ignored it.
         ...(s?.searchOpts?.seededOnly ? { seededOnly: true } : {}),
+        // Global machine-translation policy. Injected HERE rather than at each
+        // callsite so search-initiated and library-update downloads honor it
+        // too, not just the New tab (which passes its own args.mtl and wins on
+        // the spread below). Skipped at "avoid" — that's the Python default,
+        // so omitting it keeps older saved settings producing identical spawns.
+        ...(s?.defaults?.mtl && s.defaults.mtl !== "avoid"
+          ? { mtl: s.defaults.mtl }
+          : {}),
+        ...(s?.defaults?.excludeGroup
+          ? { excludeGroup: s.defaults.excludeGroup }
+          : {}),
         // -1 sentinel = "match --image-workers"; the Python side resolves it.
         // Skip injecting if the value is explicitly -1 (the default) so the
         // CLI default also kicks in without a redundant flag in the spawn.

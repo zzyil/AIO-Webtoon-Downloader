@@ -6,9 +6,10 @@ What this module owns:
   - Content-Type fallback when magic is ambiguous.
   - Header-only pixel-dimension sniffing (`sniff_image_dimensions`) + a
     `looks_like_real_image()` validity predicate that rescues legitimately tiny
-    images from the download/probe byte-size gate (see that function's docstring).
-  - `finalize_pending_image()`: atomic-rename a `.pending_<base>` tempfile to
-    `<folder>/<base><ext>` once bytes have landed.
+    images from the download/probe byte-size gate (see that function's docstring)
+    while rejecting HTML/JSON error documents served under an image URL.
+  - `finalize_pending_image()`: validate + atomic-rename a `.pending_<base>`
+    tempfile to `<folder>/<base><ext>` once bytes have landed.
 
 What reads from it:
   - `aio-dl.py:dl_image` (the main download path) — uses both helpers.
@@ -56,32 +57,50 @@ def content_type_to_ext(content_type: str) -> Optional[str]:
     }.get((content_type or "").strip().lower())
 
 
+def image_magic_extension(head: bytes) -> Optional[str]:
+    """Extension implied by `head`'s magic bytes, or None when no known raster
+    signature matches.
+
+    Split out of `sniff_image_extension` so callers can ask "are these bytes
+    RECOGNIZABLY an image?" — `sniff_image_extension` always returns something
+    (`.jpg` fallback) and therefore can never answer that question. Both share
+    this one magic table; `sniff_image_extension`'s return contract is
+    unchanged. Cross-file: `looks_like_real_image` below is the only consumer
+    in-tree (grep image_magic_extension)."""
+    if not head:
+        return None
+    if head.startswith(JPEG_MAGIC):
+        return ".jpg"
+    if head.startswith(PNG_MAGIC):
+        return ".png"
+    if head.startswith(GIF_MAGIC):
+        return ".gif"
+    # WebP: bytes 0-3 = 'RIFF', bytes 8-11 = 'WEBP'.
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    # AVIF/HEIC: ISO-BMFF "ftyp" box. Major brand at offset 8-11 tells
+    # us the codec family. We only special-case AVIF; HEIC is rare in
+    # manga aggregators but recognized so we don't accidentally label
+    # it `.jpg`.
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        major = head[8:12]
+        if major in (b"avif", b"avis"):
+            return ".avif"
+        if major in (b"heic", b"heix", b"mif1", b"msf1"):
+            return ".heic"
+    return None
+
+
 def sniff_image_extension(head: bytes, content_type: Optional[str] = None) -> str:
     """Return the most accurate file extension (with leading dot) for an image
     given its first ≥12 bytes and an optional Content-Type. Magic bytes are
     primary; Content-Type is consulted only when magic is ambiguous. Falls
     back to `.jpg` so callers always get a usable extension (matches prior
-    blanket-`.jpg` behavior for unknown content)."""
-    if head:
-        if head.startswith(JPEG_MAGIC):
-            return ".jpg"
-        if head.startswith(PNG_MAGIC):
-            return ".png"
-        if head.startswith(GIF_MAGIC):
-            return ".gif"
-        # WebP: bytes 0-3 = 'RIFF', bytes 8-11 = 'WEBP'.
-        if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-            return ".webp"
-        # AVIF/HEIC: ISO-BMFF "ftyp" box. Major brand at offset 8-11 tells
-        # us the codec family. We only special-case AVIF; HEIC is rare in
-        # manga aggregators but recognized so we don't accidentally label
-        # it `.jpg`.
-        if len(head) >= 12 and head[4:8] == b"ftyp":
-            major = head[8:12]
-            if major in (b"avif", b"avis"):
-                return ".avif"
-            if major in (b"heic", b"heix", b"mif1", b"msf1"):
-                return ".heic"
+    blanket-`.jpg` behavior for unknown content) — which is exactly why it must
+    NOT be used as a validity test; use `looks_like_real_image` for that."""
+    magic = image_magic_extension(head)
+    if magic:
+        return magic
     fallback = content_type_to_ext(
         (content_type or "").split(";", 1)[0]
     )
@@ -189,25 +208,116 @@ def _sniff_jpeg_dimensions(head: bytes) -> Optional[Tuple[int, int]]:
     return None
 
 
-def looks_like_real_image(data: bytes, min_bytes: int = _MIN_IMAGE_BYTES) -> bool:
+# Prefixes that mark a body as a text document rather than a raster image. No
+# raster signature starts with any of these (JPEG=0xFFD8, PNG=0x89, GIF='G',
+# RIFF='R', BMP='B', ISO-BMFF has 'ftyp' at offset 4), so matching one is a
+# zero-false-positive reject — which is what makes the size-independent
+# rejection below safe.
+_MARKUP_PREFIXES = (
+    b"<!doctype", b"<html", b"<head", b"<body", b"<?xml", b"{", b"[",
+)
+_ASCII_SPACE = b" \t\r\n\f\v"
+
+# Bare Content-Types that promise a text document. A body carrying one of these
+# AND no recognizable image bytes is junk regardless of size.
+_NON_IMAGE_CONTENT_TYPES = frozenset({
+    "application/json",
+    "application/xml",
+    "application/xhtml+xml",
+})
+
+
+def _looks_like_markup(head: bytes) -> bool:
+    """Do these leading bytes open an HTML/XML/JSON document? Byte-oriented on
+    purpose — a `.decode()` here would raise on real image bytes."""
+    if not head:
+        return False
+    probe = head.lstrip(_ASCII_SPACE)
+    # A BOM can precede the first tag. UTF-16 additionally interleaves NULs
+    # between ASCII characters, so drop those before prefix-matching.
+    for bom, utf16 in ((b"\xef\xbb\xbf", False), (b"\xff\xfe", True), (b"\xfe\xff", True)):
+        if probe.startswith(bom):
+            probe = probe[len(bom):]
+            if utf16:
+                probe = probe.replace(b"\x00", b"")
+            probe = probe.lstrip(_ASCII_SPACE)
+            break
+    return probe[:16].lower().startswith(_MARKUP_PREFIXES)
+
+
+def _is_non_image_content_type(content_type: Optional[str]) -> bool:
+    bare = (content_type or "").split(";", 1)[0].strip().lower()
+    if not bare:
+        return False
+    return bare.startswith("text/") or bare in _NON_IMAGE_CONTENT_TYPES
+
+
+def _head_rejects_image(
+    head: bytes, size: int, content_type: Optional[str] = None
+) -> Optional[str]:
+    """Head-only rejection shared by `looks_like_real_image` (whole body in
+    memory) and `finalize_pending_image` (body on disk, only the head read).
+    Returns a short reason, or None when the head gives no grounds to reject —
+    the caller still applies its own size/dimension rules."""
+    if size <= 0:
+        return "empty body"
+    if _looks_like_markup(head):
+        return "markup"
+    if _is_non_image_content_type(content_type):
+        if image_magic_extension(head) is None and sniff_image_dimensions(head) is None:
+            return "declared non-image"
+    return None
+
+
+def describe_invalid_image(
+    head: bytes, content_type: Optional[str] = None, size: int = 0
+) -> str:
+    """One-line human reason for a rejected body, naming the Content-Type and
+    byte size. Used verbatim in aio-dl.py:dl_image's per-page verbose log (grep
+    "Rejected page")."""
+    bare = (content_type or "").split(";", 1)[0].strip().lower()
+    if bare:
+        return f"server returned {bare} ({size} bytes), not an image"
+    if _looks_like_markup(head):
+        return f"server returned an HTML/JSON document ({size} bytes), not an image"
+    return f"body is not a recognized image ({size} bytes)"
+
+
+def looks_like_real_image(
+    data: bytes,
+    min_bytes: int = _MIN_IMAGE_BYTES,
+    content_type: Optional[str] = None,
+) -> bool:
     """Does `data` look like a real, downloadable image, as opposed to a CDN
     error stub, an HTML/JSON error body, or a 1x1 tracking pixel?
 
-    Policy:
+    `content_type` is optional and third so every existing positional caller
+    (`looks_like_real_image(body)`, `(body, 512)`) is unaffected — grep
+    looks_like_real_image across sites/base.py.
+
+    Policy, in order:
       - Empty -> False.
+      - Opens like HTML/XML/JSON -> False REGARDLESS OF SIZE. A dead host can
+        answer 200 + `Content-Type: text/html` + a 19 KB error page for an
+        image URL (manhuaplus' retired `*.files.wordpress.com` pages), and the
+        old size-only fast-accept below waved those straight into the CBZ as
+        `0001.jpg`.
+      - Declared text/* or JSON/XML AND no recognizable image bytes -> False.
       - len >= min_bytes -> True. Preserves the historical `len(body) >= 256`
         accept threshold verbatim, so nothing that used to download is newly
         rejected (no regression on large/unusual formats we don't dimension-parse,
-        e.g. AVIF/HEIC).
+        e.g. AVIF/HEIC/JXL).
       - len < min_bytes -> True ONLY if the bytes decode (by header) to a
         recognized image larger than a single pixel. This rescues legitimately
         tiny images (divider bars, thin spacers) while still rejecting sub-256-byte
-        junk: HTML/JSON stubs and truncated bodies fail the format sniff, and 1x1
-        tracking pixels fail the area check.
+        junk: truncated bodies fail the format sniff and 1x1 tracking pixels fail
+        the area check.
 
-    See bench/webtoonCanvasShelterLogs.md for the run this fixes.
+    See bench/webtoonCanvasShelterLogs.md for the tiny-divider run this rescues.
     """
     if not data:
+        return False
+    if _head_rejects_image(data[:64], len(data), content_type) is not None:
         return False
     if len(data) >= min_bytes:
         return True
@@ -219,21 +329,75 @@ def looks_like_real_image(data: bytes, min_bytes: int = _MIN_IMAGE_BYTES) -> boo
 
 
 def finalize_pending_image(
-    pending_path: str, folder: str, base: str, content_type: Optional[str]
+    pending_path: str,
+    folder: str,
+    base: str,
+    content_type: Optional[str],
+    *,
+    validate: bool = True,
+    on_reject=None,
 ) -> Optional[str]:
-    """Sniff a successfully-downloaded pending file's first bytes, atomic-
-    rename it to `<folder>/<base><ext>`, and return the final path. Returns
-    None if the pending file is missing (caller should treat as failure).
+    """Validate a successfully-downloaded pending file, sniff its first bytes,
+    atomic-rename it to `<folder>/<base><ext>`, and return the final path.
+
+    Returns None — the established "this page failed" contract every caller
+    already understands — when the pending file is missing, OR when `validate`
+    and the bytes are not an image (in which case the pending file is DELETED
+    so no half-written junk survives, and `on_reject(reason)` is invoked with a
+    `describe_invalid_image` string). `on_reject` fires ONLY for a validation
+    reject, so a caller can still distinguish that from a missing tempfile.
+
     `os.replace` is atomic on both POSIX and NT when source/dest share a
-    volume — pending and final live in the same folder, so this is safe."""
+    volume — pending and final live in the same folder, so this is safe.
+    Callers: aio-dl.py:dl_image (5 sites, grep _finalize_downloaded_image) and
+    sites/base.py:fast_download_images."""
     if not os.path.exists(pending_path):
         return None
     try:
+        # 64 bytes: every magic signature plus the markup sniff fit; WebP VP8X
+        # dimensions need 30. Was 32, which could not see a BOM-prefixed
+        # `<!doctype html>` past its leading whitespace.
         with open(pending_path, "rb") as fh:
-            head = fh.read(32)
+            head = fh.read(64)
     except Exception:
         head = b""
+    if validate:
+        try:
+            size = os.path.getsize(pending_path)
+        except OSError:
+            size = len(head)
+        if not _pending_file_is_image(pending_path, head, size, content_type):
+            if on_reject is not None:
+                try:
+                    on_reject(describe_invalid_image(head, content_type, size))
+                except Exception:
+                    pass
+            try:
+                os.remove(pending_path)
+            except OSError:
+                pass
+            return None
     ext = sniff_image_extension(head, content_type)
     final_path = os.path.join(folder, base + ext)
     os.replace(pending_path, final_path)
     return final_path
+
+
+def _pending_file_is_image(
+    path: str, head: bytes, size: int, content_type: Optional[str]
+) -> bool:
+    """`looks_like_real_image`'s policy against a file we've only read the head
+    of. Deliberately NOT `looks_like_real_image(head)`: a 64-byte head of a real
+    900 KB JPEG is under min_bytes and its SOF may sit past byte 64, which would
+    reject every large page on the site."""
+    if _head_rejects_image(head, size, content_type) is not None:
+        return False
+    if size >= _MIN_IMAGE_BYTES:
+        return True
+    # Sub-256-byte body: the divider-bar rescue needs the whole file to
+    # dimension-sniff. Bounded read — the file is smaller than _MIN_IMAGE_BYTES.
+    try:
+        with open(path, "rb") as fh:
+            return looks_like_real_image(fh.read(_MIN_IMAGE_BYTES), content_type=content_type)
+    except OSError:
+        return False

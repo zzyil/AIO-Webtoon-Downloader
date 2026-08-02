@@ -219,3 +219,58 @@ def test_image_prefetch_parallel_default_is_2():
     )
     assert block
     assert "default: 2" in block, f"block was: {block[:300]}"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Scanlation-group / MTL flags (2026-08-02)
+#
+# --mtl and --exclude-group decide WHICH version's image bytes land on disk,
+# so both must be resume-gating: a run started under one policy and resumed
+# under another would otherwise stitch a mixed-provenance volume.
+# ────────────────────────────────────────────────────────────────────────
+
+def test_mtl_flag_appears_in_help_with_its_three_choices():
+    proc = _run_aio_dl("--help")
+    assert "--mtl {avoid,allow,exclude}" in proc.stdout
+    assert proc.returncode == 0
+
+
+def test_exclude_group_flag_appears_in_help():
+    proc = _run_aio_dl("--help")
+    assert "--exclude-group" in proc.stdout
+
+
+def test_group_flags_are_resume_gating():
+    mod = _load_aio_dl_module()
+    for dest in ("mtl", "exclude_group", "group", "mix_by_upvote",
+                 "no_group_fallback"):
+        assert dest in mod._RESUME_GATING_DESTS, dest
+
+
+def test_group_flags_are_not_also_transient():
+    """_validate_resume_categories hard-errors on overlap; assert it up front."""
+    mod = _load_aio_dl_module()
+    overlap = mod._RESUME_GATING_DESTS & mod._RESUME_TRANSIENT_DESTS
+    assert overlap == set()
+
+
+def test_mtl_and_exclude_group_are_persisted_for_update_replay():
+    """Without these keys in download_params.json, an --update-all child
+    reverts to defaults and the series accumulates mixed provenance."""
+    import argparse
+    mod = _load_aio_dl_module()
+    args = argparse.Namespace(mtl="exclude", exclude_group=["Bad"], group=[])
+    # _save_download_params builds its dict from getattr(args, ...) — exercise
+    # the same accessors the writer uses rather than doing disk I/O here.
+    assert getattr(args, "mtl", "avoid") == "exclude"
+    assert getattr(args, "exclude_group", []) == ["Bad"]
+    src = __import__("inspect").getsource(mod._save_download_params)
+    assert '"mtl"' in src
+    assert '"exclude_group"' in src
+
+
+def test_exclude_group_is_replayed_to_update_children():
+    mod = _load_aio_dl_module()
+    src = __import__("inspect").getsource(mod._append_saved_update_options)
+    assert "--exclude-group" in src
+    assert "--mtl" in src

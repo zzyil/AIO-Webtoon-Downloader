@@ -19,6 +19,16 @@ const { NOISY_LINE_RE, stripAnsi, classifyLogLevel } = require("./log-filter");
 // Passed to the shared classifyLogLevel; searcher.js supplies its own set.
 const DOWNLOAD_SUCCESS_RE = /Done\.|saved →|✓|Completed|recovered/i;
 
+// ── Per-chapter ETA estimator ──
+// EMA weight for a fresh chapter-duration sample. 0.3 tracks a real slowdown
+// (CDN throttle, a chapter with 3x the pages) within a couple of chapters
+// without letting one outlier swing the readout.
+const ETA_EMA_ALPHA = 0.3;
+// Publish nothing until a SECOND sample confirms the first. One sample off a
+// cold start (DNS, Cloudflare solve, browser launch) is badly unrepresentative
+// and would show a number the very next tick contradicts.
+const ETA_MIN_SAMPLES = 2;
+
 /**
  * Builds an array of CLI arguments from the UI's args object.
  *
@@ -50,6 +60,11 @@ function buildCliArgs(args) {
     site: "--site",
     cookies: "--cookies",
     group: "--group",
+    // Scanlation-group policy. `mtl` is a choice flag (avoid|allow|exclude,
+    // default avoid) and excludeGroup takes the same comma-separated string
+    // shape as `group` — aio-dl.py splits both on comma after parse.
+    mtl: "--mtl",
+    excludeGroup: "--exclude-group",
     jobs: "--jobs",
     imageWorkers: "--image-workers",
     httpTimeout: "--http-timeout",
@@ -171,6 +186,10 @@ function buildCliArgs(args) {
     // Skip empty/null/undefined values, and skip "all" for chapters (it's the default)
     if (value === null || value === undefined || value === "") continue;
     if (key === "chapters" && value === "all") continue;
+    // "avoid" is aio-dl.py's --mtl default; emitting it would add a flag to
+    // every single spawn for no behavior change (and churn the saved
+    // download_params.json diff on every run).
+    if (key === "mtl" && value === "avoid") continue;
 
     cliArgs.push(flag, String(value));
   }
@@ -477,6 +496,55 @@ function parseProgressLine(line) {
   return progress;
 }
 
+/**
+ * Fold one "Chapter N (…)" tick into the entry's rolling per-chapter EMA and
+ * stamp etaMs / chapterMsEma / etaSamples onto the outgoing progress payload.
+ *
+ * Measured HERE, in the main process, and not in the renderer: useDownloader's
+ * 100ms flush coalesces bursts (it keeps only the latest progress per download
+ * between ticks), so renderer-side deltas would silently merge two chapters
+ * into one sample. This rides the existing download-progress payload — no new
+ * IPC channel — and merges through the renderer's shallow progress spread.
+ *
+ * ONLY intervals whose OPENING chapter was actually downloaded are sampled.
+ * On a resume the first N ticks are "already processed, collecting files" and
+ * take ~0 ms; averaging those in yields a wildly optimistic ETA that then
+ * stalls the moment real work starts. Excluding them OVER-estimates while the
+ * cached prefix drains — the honest failure direction — and the UI shows
+ * "Resuming cached chapters…" for that window instead of a number.
+ *
+ * totalChapters comes from the verbose-gated "Selected N chapters." /
+ * "Filtered list down to N chapters." lines. queueDownload injects verbose and
+ * Downloader.resume hardcodes --verbose, so it is present in practice; when it
+ * isn't, etaMs is emitted as null and QueueTab keeps its indeterminate bar.
+ *
+ * Reads entry.progress.totalChapters (the value from a PREVIOUS line) —
+ * _spawn's Object.assign of progressUpdate happens after this call, and a
+ * chapter line never carries a total anyway.
+ */
+function applyChapterEta(entry, progressUpdate) {
+  const now = Date.now();
+  if (entry._lastTickAt && !entry._lastTickCached) {
+    const sample = now - entry._lastTickAt;
+    entry._chapterMsEma = entry._etaSamples
+      ? entry._chapterMsEma + ETA_EMA_ALPHA * (sample - entry._chapterMsEma)
+      : sample;
+    entry._etaSamples++;
+  }
+  entry._lastTickAt = now;
+  entry._lastTickCached = progressUpdate.chapterCached === true;
+
+  if (entry._etaSamples < ETA_MIN_SAMPLES) return;
+
+  const total = entry.progress.totalChapters || 0;
+  const remaining = Math.max(0, total - entry.processedChapters);
+  progressUpdate.chapterMsEma = Math.round(entry._chapterMsEma);
+  progressUpdate.etaSamples = entry._etaSamples;
+  // Explicit null (not "omit") when the total is unknown: the renderer merges
+  // progress shallowly, so omitting the key would leave a stale ETA on screen.
+  progressUpdate.etaMs = total > 0 ? Math.round(remaining * entry._chapterMsEma) : null;
+}
+
 class Downloader {
   constructor({ onLog, onProgress, onComplete, extraEnv }) {
     // These callbacks send data back to the Electron main process,
@@ -669,6 +737,13 @@ class Downloader {
       progress: { phase: "starting", title: "", totalChapters: 0, currentChapter: 0 },
       // Running counter: how many "Chapter N" lines we've seen so far
       processedChapters: 0,
+      // ETA estimator state — see applyChapterEta above. _lastTickCached is
+      // the OPENING chapter of the interval we're about to close, which is
+      // what decides whether that interval counts as a sample.
+      _lastTickAt: 0,
+      _lastTickCached: false,
+      _chapterMsEma: 0,
+      _etaSamples: 0,
     };
     // Promise that resolves when this child process finally exits — both
     // the close and error handlers below resolve it. Used by cancelAll() so
@@ -737,6 +812,9 @@ class Downloader {
           if (progressUpdate.chapterTick) {
             entry.processedChapters++;
             progressUpdate.processedChapters = entry.processedChapters;
+            // Must run AFTER the counter bump — the ETA is computed off
+            // (totalChapters - processedChapters).
+            applyChapterEta(entry, progressUpdate);
           }
 
           // When we detect the hid (from "Title (hid=xxx)"), save the URL
@@ -872,6 +950,37 @@ class Downloader {
       // Process might have already exited
     }
     return entry.closePromise;
+  }
+
+  /**
+   * How many child processes are alive right now. _processes is private and
+   * self-maintaining (the close/error handlers delete their own entry), so
+   * this is the authoritative "is anything running" answer.
+   *
+   * Consumed by main.js's mainWindow "close" listener to decide whether to
+   * prompt before quitting — grep confirm-quit.
+   */
+  runningCount() {
+    return this._processes.size;
+  }
+
+  /**
+   * Identifying details for each live download, for the quit-confirmation
+   * dialog's "these are still running" list. `title` is empty until the
+   * "Title (hid=…)" line lands, so the renderer falls back to the URL.
+   */
+  getRunning() {
+    const out = [];
+    for (const [downloadId, entry] of this._processes) {
+      const url = Array.isArray(entry.meta?.url) ? entry.meta.url[0] : entry.meta?.url;
+      out.push({
+        downloadId,
+        title: entry.progress?.title || "",
+        url: url || "",
+        startedAt: entry.startTime,
+      });
+    }
+    return out;
   }
 
   /**

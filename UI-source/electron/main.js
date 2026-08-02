@@ -34,9 +34,12 @@ const {
 const { HistoryManager } = require("./history");
 const { PythonSetup, isSetupComplete, deleteEnv, PYTHON_VERSION } = require("./setup");
 const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice, getImageChaptersOnDevice } = require("./library");
-// App self-update (opt-in, settings.appAutoUpdate) — cheap require; the
+// App self-update (opt-OUT, settings.appAutoUpdate) — cheap require; the
 // heavy electron-updater load is deferred inside updater.js. NOT the manga
-// chapter update-check family below (check-for-updates etc.).
+// chapter update-check family below (check-for-updates etc.). Polarity is
+// owned HERE: updater.js is `opts.enabled === true` throughout and this file
+// is its only caller, so the `!== false` (absent-means-ON) reads below are
+// the single place the default lives.
 const appUpdater = require("./updater");
 
 // ── DEV MODE DEFAULTS ──
@@ -141,6 +144,25 @@ let defaultWorkingDir = DEV_WORKING_DIR;
 // Cross-file: UI-source/electron/preload.js exposes cancelCheckAllUpdates;
 // UI-source/src/components/UpdatesCenter.jsx calls it from the Cancel button.
 let _checkAllAbortCtrl = null;
+
+// Quit-confirmation gate. The mainWindow "close" listener (createWindow)
+// preventDefaults while a download is actually RUNNING and asks the renderer
+// (src/components/ConfirmQuitDialog.jsx) instead of using
+// dialog.showMessageBox — a native modal breaks Electron's renderer focus/
+// input handling, which is why every confirmation in this app is a React
+// affordance (see ResumeBar.jsx's hand-rolled delete confirm).
+// quitConfirmed short-circuits the listener once the user (or the safety
+// valve, or the silent-update path) has answered. Module-scoped because the
+// listener in createWindow() and the IPC handlers in setupIPC() share them.
+let quitConfirmed = false;
+let quitSafetyTimer = null;
+
+function clearQuitSafetyTimer() {
+  if (quitSafetyTimer) {
+    clearTimeout(quitSafetyTimer);
+    quitSafetyTimer = null;
+  }
+}
 
 // ── PATH COMPUTATION ──
 
@@ -509,6 +531,28 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
   }
 
+  // ── Confirm on close while a download is running ──
+  // ONLY when something is actively running. Queued items now survive the
+  // close (download_queue.json — grep queue:save), so a backlog is not worth a
+  // prompt, and prompting on it would fire on nearly every close while a queue
+  // drains. See the quitConfirmed declaration for why this is a renderer
+  // dialog rather than dialog.showMessageBox.
+  mainWindow.on("close", (e) => {
+    if (quitConfirmed || !downloader || downloader.runningCount() === 0) return;
+    e.preventDefault();
+    sendToUI("confirm-quit", { running: downloader.getRunning() });
+    // Safety valve: a wedged renderer (crashed React tree, blocked main thread)
+    // must never leave the window un-closable. 15s is far longer than the
+    // dialog needs to paint, and "quit:cancel" clears it the moment the user
+    // actually answers.
+    clearQuitSafetyTimer();
+    quitSafetyTimer = setTimeout(() => {
+      quitSafetyTimer = null;
+      quitConfirmed = true;
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+    }, 15_000);
+  });
+
   applyTheme();
   nativeTheme.on("updated", applyTheme);
 }
@@ -597,6 +641,13 @@ function setupIPC() {
       // SettingsTab can hydrate from its own defaults on first load).
       defaults: saved.defaults || {},
       verboseAlways: saved.verboseAlways !== false,
+      // App self-update is OPT-OUT: absent means ON. Resolved here rather than
+      // left to SettingsTab's DEFAULT_SETTINGS so main is the single source of
+      // truth (the updater arms off `saved` at startup, before the renderer
+      // exists) AND so countDirtySettings stays honest — the renderer's draft
+      // and the hydrated prop agree on the same resolved boolean instead of
+      // reporting a phantom pending change for a key that was never saved.
+      appAutoUpdate: saved.appAutoUpdate !== false,
       logUpdateInterval: saved.logUpdateInterval || 100,
       isPackaged: IS_PACKAGED,
       // NOTE: intentionally NOT merging pythonCmd / scriptPath / workingDir.
@@ -634,7 +685,10 @@ function setupIPC() {
     // deferred release. See electron/updater.js:applySettings.
     const merged = history.getSettings();
     appUpdater.applySettings({
-      enabled: merged.appAutoUpdate === true,
+      // `!== false` — opt-OUT. Must match the get-settings resolution above
+      // and the initAppUpdater call at startup; updater.js itself only ever
+      // sees a resolved boolean.
+      enabled: merged.appAutoUpdate !== false,
       delayDays: merged.appUpdateDelayDays,
     });
     return { ok: true };
@@ -776,6 +830,37 @@ function setupIPC() {
   // ── Get download history ──
   ipcMain.handle("get-history", async () => {
     return history.getAll();
+  });
+
+  // ── Download queue snapshot (survives app close) ──
+  // Pure pass-through to history.js, which owns the file + shape (grep
+  // saveQueueSnapshot there). Renderer side: useDownloader.js hydrates on
+  // mount and writes from a debounced effect — grep queueHydratedRef.
+  ipcMain.handle("queue:get", async () => {
+    return history.getQueueSnapshot();
+  });
+
+  ipcMain.handle("queue:save", async (_event, snapshot) => {
+    history.saveQueueSnapshot(snapshot);
+    return { ok: true };
+  });
+
+  // ── Quit confirmation (ConfirmQuitDialog.jsx) ──
+  // The window "close" listener in createWindow() preventDefaults while a
+  // download is running and pushes "confirm-quit"; these two are the answers.
+  // The reinstall-python handler is deliberately UNAFFECTED: it uses
+  // app.exit(0), which tears the process down without ever emitting a window
+  // "close" event, so no prompt can appear there.
+  ipcMain.handle("quit:confirm", async () => {
+    clearQuitSafetyTimer();
+    quitConfirmed = true;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+    return { ok: true };
+  });
+
+  ipcMain.handle("quit:cancel", async () => {
+    clearQuitSafetyTimer();
+    return { ok: true };
   });
 
   // ── Reveal a folder in the OS file manager (Explorer / Finder / Files) ──
@@ -1458,6 +1543,11 @@ function setupIPC() {
     if (appUpdater.getStatus().state !== "downloaded") {
       return { ok: false, reason: "No downloaded update to apply." };
     }
+    // Set BEFORE cancelAll: that call bounds itself at 5s, so a stuck child
+    // could still be in _processes when quitAndInstall closes the window, and
+    // the close listener would answer a user-initiated update with a quit
+    // prompt. Explicit here rather than relying on runningCount() hitting 0.
+    quitConfirmed = true;
     if (downloader) await downloader.cancelAll();
     return appUpdater.applyNow();
   });
@@ -1524,14 +1614,17 @@ app.whenReady().then(async () => {
   initDownloader();
   createWindow();
 
-  // App self-update — armed only when the user opted in (Settings →
+  // App self-update — armed unless the user opted OUT (Settings →
   // General → App Updates) AND this install supports it (packaged
   // Windows NSIS / Linux AppImage). First check runs ~30s post-launch;
   // the require("electron-updater") itself is deferred until then, so
-  // startup cost is zero either way. See electron/updater.js.
+  // startup cost is zero either way. See electron/updater.js. The stored
+  // `false` that the old opt-in default wrote for every saving user is
+  // cleared once by history.js's v1 settings migration — without that,
+  // `!== false` would leave the whole existing install base off.
   const updaterSettings = history.getSettings();
   appUpdater.initAppUpdater({
-    enabled: updaterSettings.appAutoUpdate === true,
+    enabled: updaterSettings.appAutoUpdate !== false,
     delayDays: updaterSettings.appUpdateDelayDays,
     onStatus: (s) => sendToUI("app-update-status", s),
   });

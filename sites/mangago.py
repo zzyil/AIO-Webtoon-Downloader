@@ -8,7 +8,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from .base import BaseSiteHandler, SearchHit, SiteComicContext
+from .base import BaseSiteHandler, GroupInfo, SearchHit, SiteComicContext
 
 
 class MangaGoSiteHandler(BaseSiteHandler):
@@ -335,27 +335,36 @@ class MangaGoSiteHandler(BaseSiteHandler):
                         existing["uploader"] = uploader
                 continue
             seen_urls.add(url)
+            # /br_chapter- is mangago's own official-release path (see
+            # _extract_group_name), so flag it — that's what makes
+            # `--group official` and the ranker's official tier work here.
+            is_official = "/br_chapter-" in url
             chapter = {
                 "hid": self._chapter_identifier(url),
                 "chap": chap,
                 "title": label or f"Ch.{chap}",
                 "url": url,
+                # Display string, NOT an epoch ("2 days ago"-shaped). The
+                # ranker's recency tier rejects non-numeric `uploaded` on
+                # purpose rather than risk a wrong parse silently reordering
+                # picks — grep _coerce_epoch in sites/base.py.
                 "uploaded": uploaded,
+                "_groups": (
+                    [GroupInfo(name=group_name, is_official=is_official)]
+                    if group_name else []
+                ),
                 "group": group_name,
                 "publisher": group_name,
                 "uploader": uploader,
                 "language": "en",
+                # Hardcoded 0 for every chapter — mangago exposes no vote
+                # count. base._build_rank_context treats an all-zero field as
+                # "no data" and leaves the upvote tier inert.
                 "up_count": 0,
             }
             chapters_by_url[url] = chapter
             chapters.append(chapter)
         return chapters
-
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        group = chapter_version.get("group") or chapter_version.get("publisher")
-        if isinstance(group, str) and group.strip():
-            return group.strip()
-        return None
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")

@@ -26,6 +26,44 @@ export function formatDuration(ms) {
   return `${min}m ${sec % 60}s`;
 }
 
+// Numeric-aware string comparator ("Ch 2" before "Ch 10", not after "Ch 100").
+// A hoisted Intl.Collator, NOT per-call String.localeCompare: localeCompare
+// constructs a fresh collator on every invocation, which is measurable at a few
+// hundred library entries x sort. sensitivity:"base" also makes it
+// case/accent-insensitive, matching what a user expects from an A-Z picker.
+//
+// DO NOT use this on the ISO-8601 date sorts (LibraryTab's "date"/"date-asc"):
+// those already sort correctly as plain strings, and numeric:true would parse
+// the digit groups across the '-' and ':' separators and break them.
+//
+// Cross-file: electron/library.js carries a MIRROR TWIN of this const (CommonJS
+// there can't import from src/), same arrangement as electron/resource-limits.js
+// vs src/lib/resourceLimits.js. Grep naturalCompare if you touch either.
+export const naturalCompare = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+}).compare;
+
+// Coarse "time remaining" label for the live download ETA: "45s" / "3m" /
+// "1h 12m". Deliberately COARSER than formatDuration above — an estimate that
+// renders "12m 37s" implies a precision the per-chapter EMA doesn't have, and
+// the seconds digit would churn on every 100ms progress flush. Returns "" for
+// null/negative so callers can conditional-render.
+//
+// Sub-minute is the one place seconds appear, because "0m" would read as done.
+// Producer: electron/downloader.js stamps progress.etaMs per chapter tick;
+// consumer: QueueTab's active card. Grep etaMs.
+export function formatEta(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "";
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec < 60) return `${Math.max(1, totalSec)}s`;
+  const totalMin = Math.round(totalSec / 60);
+  if (totalMin < 60) return `${totalMin}m`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
 // Collapse a list of chapter numbers into a compact human range string:
 // ["51","52","53","55","60"] → "51-53, 55, 60". Consecutive runs (gap ≤ 1.001,
 // so decimals like 60.1 join their neighbor) collapse to "start-end"; isolated

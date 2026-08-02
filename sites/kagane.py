@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, GroupInfo, SiteComicContext
 
 try:  # Optional dependency; only needed for Kagane
     from pywidevine.cdm import Cdm
@@ -557,14 +557,18 @@ class KaganeSiteHandler(BaseSiteHandler):
                 continue
             pages = entry.get("page_count") or 0
             chap_num = entry.get("chapter_no")
-            # First group's title is the scanlation group name (most series
-            # have exactly one group per chapter).
-            group_name = None
-            groups = entry.get("groups")
-            if isinstance(groups, list) and groups and isinstance(groups[0], dict):
-                gname = groups[0].get("title") or groups[0].get("group_name")
+            # EVERY group in the list, not just groups[0]. Most series have
+            # exactly one group per chapter, but keeping only the first made a
+            # joint release unmatchable by `--group "<co-group>"`.
+            group_infos = []
+            for gentry in entry.get("groups") or []:
+                if not isinstance(gentry, dict):
+                    continue
+                gname = gentry.get("title") or gentry.get("group_name")
                 if isinstance(gname, str) and gname:
-                    group_name = gname
+                    group_infos.append(
+                        GroupInfo(name=gname, group_id=gentry.get("group_id"))
+                    )
             chapters.append(
                 {
                     "hid": chapter_id,
@@ -575,13 +579,13 @@ class KaganeSiteHandler(BaseSiteHandler):
                     "_chapter_id": chapter_id,
                     "_pages": int(pages),
                     "uploaded": entry.get("published_on"),
-                    "group_name": group_name,
+                    "_groups": group_infos,
+                    "group_name": ", ".join(
+                        g.name for g in group_infos if g.name
+                    ) or None,
                 }
             )
         return chapters
-
-    def get_group_name(self, chapter_version: Dict) -> Optional[str]:
-        return chapter_version.get("group_name")
 
     def get_chapter_images(
         self, chapter: Dict, scraper, make_request
