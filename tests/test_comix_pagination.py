@@ -505,8 +505,21 @@ def test_mid_pagination_guards_restore_their_own_page():
 # later the run died claiming the check "was not completed".
 
 @pytest.fixture
-def waf_budget_reset():
-    """Restore the module-level handoff counters around a test."""
+def waf_budget_reset(monkeypatch):
+    """Isolate the handoff budget so these tests measure only the budget.
+
+    Two gates sit AHEAD of the budget in solve_waf_interactively — the
+    "interactive verification disabled" env flag and the "no display available"
+    check — and both short-circuit with their own reason. On a headless Linux CI
+    runner the display gate fires first, so the budget assertions below never
+    ran and these tests passed only on Windows (where the gate is skipped
+    outright). Neutralize both so the budget is exercised on every platform.
+
+    Nothing here opens a window: every test using this fixture stubs _start.
+    """
+    monkeypatch.delenv(comix._WAF_NO_INTERACTIVE_ENV, raising=False)
+    monkeypatch.setenv("DISPLAY", ":0")
+
     saved = (
         comix._COMIX_WAF_SOLVES_DONE,
         comix._COMIX_WAF_FAILURES,
