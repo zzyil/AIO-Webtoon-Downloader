@@ -1034,3 +1034,203 @@ def test_zero_page_failure_does_not_claim_a_wait_that_never_happened():
     # The unconditional claim is gone.
     assert "divs in DOM \n" not in src
     assert "Either the React app failed to mount or" not in src
+
+
+# ------------------------------- human-facing window geometry (2026-08-03)
+# A user reported the verification window opening COMPLETELY BLANK, so the
+# check could not be solved at all. Nothing had failed to load: _COMIX_VIEWPORT
+# is 2400px tall and is applied via device-metrics EMULATION, so it holds no
+# matter how big the OS window is, while comix's interstitial is a flex-centred
+# card on a `min-height:100vh` body. Measured against the live challenge page:
+#
+#     .card 978->1422   .ring 1077   Verify 1335   scrollHeight == innerHeight
+#
+# A real window shows ~950-1180px, and the document being exactly
+# viewport-height means there is no scrollbar to reach the rest with — so the
+# widget sat below the fold, unreachable, on a page that reported itself fine.
+#
+# It only became reachable-by-accident before 2026-08-03 because the handoff
+# relaunched the browser headed at Playwright's 1280x720 default. Making headed
+# the default removed that relaunch, and the human inherited the reader's
+# scrape geometry. Both human-facing windows now swap in
+# _COMIX_INTERACTIVE_VIEWPORT and put the reader's back in a `finally`.
+#
+# Offline: the fake page records geometry calls, so no browser and no network.
+
+class _FakeHumanWindow:
+    """Page stand-in that records the viewport swaps and navigations a
+    human-facing window performs, in order.
+
+    `wait_for_timeout` is a no-op rather than a sleep — the handoff's poll loop
+    would otherwise make this suite wait real seconds for nothing.
+    """
+
+    def __init__(self, url="about:blank", goto_error=None, is_closed_error=None):
+        self._url = url
+        self.events: list = []
+        self._goto_error = goto_error
+        self._is_closed_error = is_closed_error
+
+    def set_viewport_size(self, size):
+        self.events.append(("viewport", dict(size)))
+
+    def goto(self, url, **_kwargs):
+        self.events.append(("goto", url))
+        if self._goto_error is not None:
+            raise self._goto_error
+        self._url = url
+
+    @property
+    def url(self):
+        return self._url
+
+    def is_closed(self):
+        if self._is_closed_error is not None:
+            raise self._is_closed_error
+        return False
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    def evaluate(self, *_args, **_kwargs):
+        # open_login_window's auth probe: report "signed in" so the happy path
+        # completes on the first poll.
+        return True
+
+
+def _viewport_events(page):
+    return [size for kind, size in page.events if kind == "viewport"]
+
+
+def _interactive_session(page, monkeypatch):
+    """A session wired for a human-facing window, with every environmental
+    escape hatch neutralised so the geometry code is actually REACHED.
+
+    DISPLAY matters most: CI is bare ubuntu-latest with no X server, and both
+    methods bail at their no_display guard before touching the viewport. Left
+    unset, these tests would pass green on a machine that never ran the code
+    they exist to pin. Setting it here (harmless on win32/darwin, which skip
+    the check) is what makes them meaningful in CI.
+    """
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv(comix._WAF_NO_INTERACTIVE_ENV, raising=False)
+    monkeypatch.delenv(comix._WAF_SOLVE_TIMEOUT_ENV, raising=False)
+    monkeypatch.delenv(comix._FORCE_WAF_ENV, raising=False)
+    # Module-level handoff budget: reset through monkeypatch so a test that
+    # spends it can't leak into the next one.
+    monkeypatch.setattr(comix, "_COMIX_WAF_SOLVES_DONE", 0)
+    monkeypatch.setattr(comix, "_COMIX_WAF_FAILURES", 0)
+    monkeypatch.setattr(comix, "_COMIX_WAF_LAST_PROMPT_AT", 0.0)
+
+    sess = comix._ComixBrowserSession.__new__(comix._ComixBrowserSession)
+    sess._page = page
+    # Headed already — the mode the default configuration runs in, and the one
+    # where no relaunch intervenes to reset the viewport for us.
+    sess._headless = False
+    sess._context = None
+    sess._browser = None
+    sess._pw = None
+    return sess
+
+
+def test_interactive_viewport_fits_a_real_window():
+    """The value itself is the fix, so pin it rather than just its use.
+
+    950px is the content height of a maximised window on a 1080p screen — the
+    reporter's case and the smallest realistic target. A future "let's make the
+    handoff taller too" edit has to fail here.
+    """
+    interactive = comix._COMIX_INTERACTIVE_VIEWPORT["height"]
+    assert interactive <= 950, (
+        "the human-facing viewport must fit inside a real window, else the "
+        "centred CAPTCHA lands below the fold on a page that cannot scroll"
+    )
+    assert interactive < comix._COMIX_VIEWPORT["height"], (
+        "shrinking is the entire point; the reader's tall viewport is what "
+        "pushed the widget off-screen"
+    )
+
+
+def test_waf_handoff_hands_the_user_a_usable_viewport_then_restores_it(monkeypatch):
+    """Shrink BEFORE the navigation, restore after.
+
+    Order matters on both ends: shrinking after the goto would reflow the
+    interstitial under the user mid-solve, and failing to restore would leave
+    the run at 720 — where comix's chunk-boundary pages never enter the
+    viewport, silently shorting every later chapter by ~10%.
+    """
+    page = _FakeHumanWindow()
+    sess = _interactive_session(page, monkeypatch)
+
+    # The handoff navigates to the page the user WANTED; the site is what
+    # redirects to /@waf/. Landing on a non-challenge URL means the poll loop
+    # sees a pass on its first iteration.
+    target = "https://comix.to/title/zq5g5-heavenly-demon-reborn"
+    result = sess.solve_waf_interactively(target)
+
+    assert result["solved"] is True
+    assert page.events[0] == ("viewport", dict(comix._COMIX_INTERACTIVE_VIEWPORT)), (
+        "the window must be resized before the challenge is loaded into it"
+    )
+    assert ("goto", target) in page.events
+    assert page.events[-1] == ("viewport", dict(comix._COMIX_VIEWPORT)), (
+        "the reader's geometry must be back before any chapter scrape resumes"
+    )
+
+
+def test_waf_handoff_restores_the_viewport_when_the_wait_is_interrupted(monkeypatch):
+    """The restore lives in a `finally` for a reason.
+
+    The user stares at this window for up to 180s, so Ctrl-C during the wait is
+    an ordinary event — and KeyboardInterrupt is a BaseException, so the poll
+    loop's `except Exception` does not catch it. A trailing call instead of a
+    `finally` would leave the session at 720px, and the resulting short
+    chapters carry no error to trace back to here.
+    """
+    page = _FakeHumanWindow(is_closed_error=KeyboardInterrupt())
+    sess = _interactive_session(page, monkeypatch)
+
+    with pytest.raises(KeyboardInterrupt):
+        sess.solve_waf_interactively("https://comix.to/title/x")
+
+    assert _viewport_events(page)[-1] == dict(comix._COMIX_VIEWPORT)
+
+
+def test_login_window_hands_the_user_a_usable_viewport(monkeypatch):
+    """comix's login card is centred too, so it had the same defect."""
+    page = _FakeHumanWindow()
+    sess = _interactive_session(page, monkeypatch)
+
+    result = sess.open_login_window(timeout_s=5.0)
+
+    assert result["signed_in"] is True
+    assert page.events[0] == ("viewport", dict(comix._COMIX_INTERACTIVE_VIEWPORT))
+
+
+def test_login_window_restores_the_viewport_when_navigation_fails(monkeypatch):
+    """The `navigation_failed` early return skips the trailing _cleanup(), so
+    it hands back a LIVE context — the one path where a missing restore would
+    silently leave the whole run at the interactive viewport."""
+    page = _FakeHumanWindow(goto_error=RuntimeError("net::ERR_CONNECTION_RESET"))
+    sess = _interactive_session(page, monkeypatch)
+
+    result = sess.open_login_window(timeout_s=5.0)
+
+    assert result["reason"] == "navigation_failed"
+    assert _viewport_events(page)[-1] == dict(comix._COMIX_VIEWPORT), (
+        "a failed navigation must not strand the run at the human viewport"
+    )
+
+
+def test_viewport_swap_survives_a_dead_page(monkeypatch):
+    """_apply_viewport is best-effort by contract: both callers may run it
+    against a page that has just been torn down (open_login_window's success
+    path closes the context before the `finally` fires). It must not turn that
+    into a raised error on an otherwise successful sign-in."""
+    class _DeadPage:
+        def set_viewport_size(self, _size):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    sess = comix._ComixBrowserSession.__new__(comix._ComixBrowserSession)
+    sess._apply_viewport(_DeadPage(), comix._COMIX_VIEWPORT)
+    sess._apply_viewport(None, comix._COMIX_VIEWPORT)
