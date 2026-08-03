@@ -14,7 +14,7 @@ import {
   Button, Input, Textarea, Label, Switch, Slider, Select,
   Checkbox, SectionHeader, Collapsible, Badge,
 } from "@/components/ui/primitives";
-import { Download, Lock, Sparkles } from "lucide-react";
+import { Download, Lock, Sparkles, MonitorPlay, LogIn } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
 
@@ -241,6 +241,107 @@ function TapasPremiumCallout({ active, onEnable }) {
   );
 }
 
+// ── comix.to browser callout ──────────────────────────────────────────────
+// comix is the only site whose DOWNLOAD path drives a real browser: its chapter
+// list, page URLs and search all sit behind a signed + encrypted API, so pages
+// are captured out of the rendered reader (grep fetch_chapter_images_via_dom).
+//
+// Two consequences the user has to know about BEFORE pressing Start, because
+// both look like bugs otherwise:
+//   1. A visible Chromium window opens and scrolls itself. It runs headed on
+//      purpose — comix's reader defers roughly every 10th page until it scrolls
+//      into view, which needs a live rendering lifecycle; headless chapters come
+//      out short (grep _COMIX_HEADLESS_ENV).
+//   2. Occasionally the site asks for human verification, and the run pauses on
+//      that window until it's completed.
+// Multi-source is the safety net for any chapter that still comes up short, so
+// this offers the same one-click enable as the tapas callout.
+const COMIX_URL_RE = /\bcomix\.to/i;
+function hasComixUrl(urls) {
+  return typeof urls === "string" && COMIX_URL_RE.test(urls);
+}
+
+function ComixBrowserCallout({ active, onEnable, onLogin }) {
+  return (
+    <div
+      className={cn(
+        "relative mt-2 overflow-hidden rounded-lg border px-4 py-3",
+        "animate-slide-up transition-colors duration-300",
+        active
+          ? "border-success/40 bg-gradient-to-br from-success/10 to-success/[0.02]"
+          : "border-info/40 bg-gradient-to-br from-info/10 to-info/[0.02]"
+      )}
+    >
+      {/* Left accent bar — same status-band idiom as the tapas callout. */}
+      <div
+        className={cn(
+          "absolute inset-y-0 left-0 w-1 transition-colors duration-300",
+          active ? "bg-success" : "bg-info"
+        )}
+      />
+      <div className="flex items-start gap-3 pl-1.5">
+        <div
+          className={cn(
+            "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+            "ring-1 transition-colors duration-300",
+            active
+              ? "bg-success/15 text-success ring-success/30"
+              : "bg-info/15 text-info ring-info/30"
+          )}
+        >
+          <MonitorPlay className="h-4 w-4" />
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <p className="text-xs font-semibold text-foreground">
+              A browser window will open
+            </p>
+            <Badge
+              variant="secondary"
+              className="h-4 px-1.5 font-mono text-[9px] uppercase tracking-wider"
+            >
+              comix.to
+            </Badge>
+          </div>
+          <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+            comix pages are read out of its own reader, so a Chromium window
+            opens and scrolls through each chapter. Leave it alone while it
+            works &mdash; it closes itself. If the site asks you to verify
+            you&rsquo;re human, the download waits for you to do it.
+          </p>
+          <div className="mt-2.5 flex flex-wrap items-center gap-2.5">
+            {!active && (
+              <Button
+                size="sm"
+                onClick={onEnable}
+                className="h-7 gap-1.5 px-2.5 text-[11px] shadow-sm transition-transform active:scale-[0.97]"
+              >
+                <Sparkles className="h-3 w-3" />
+                Enable Multi-source
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onLogin}
+              className="h-7 gap-1.5 px-2.5 text-[11px] transition-transform active:scale-[0.97]"
+            >
+              <LogIn className="h-3 w-3" />
+              Sign in to comix.to
+            </Button>
+            <span className="text-[10px] text-muted-foreground">
+              {active
+                ? "any chapter that comes up short is refilled from another site"
+                : "multi-source refills any chapter that comes up short"}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function formDefaults(settings) {
   return { ...DEFAULT_FORM, ...(settings?.defaults || {}) };
 }
@@ -459,6 +560,22 @@ export default function DownloadTab({
                   multiSourceLazy: true,
                 }))
               }
+            />
+          )}
+          {/* comix-only: a visible browser window is part of how this site is
+              downloaded at all (grep hasComixUrl / fetch_chapter_images_via_dom).
+              Warn before Start so the window isn't mistaken for a bug. */}
+          {hasComixUrl(form.urls) && (
+            <ComixBrowserCallout
+              active={form.multiSource}
+              onEnable={() =>
+                updateForm((prev) => ({
+                  ...prev,
+                  multiSource: true,
+                  multiSourceLazy: true,
+                }))
+              }
+              onLogin={() => window.electronAPI?.comixLogin?.()}
             />
           )}
         </div>
