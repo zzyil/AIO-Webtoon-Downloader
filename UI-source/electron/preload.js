@@ -103,6 +103,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("search-log", handler);
   },
 
+  // ── comix.to sign-in ──
+  // Runs `aio-dl.py --comix-login`, which opens comix.to in the downloader's own
+  // persistent browser profile and waits while the user signs in. Credentials
+  // are typed into the real site in a real window — nothing is read, stored or
+  // forwarded by us. Resolves {ok, reason}. Cross-file: main.js "comix:login",
+  // aio-dl.py --comix-login, sites/comix.py:open_login_window.
+  comixLogin: () => ipcRenderer.invoke("comix:login"),
+
   // ── Library (manga browser) ──
   scanLibrary: () => ipcRenderer.invoke("scan-library"),
   openFile: (path) => ipcRenderer.invoke("open-file", path),

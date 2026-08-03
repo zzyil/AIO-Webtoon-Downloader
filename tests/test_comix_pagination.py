@@ -618,8 +618,13 @@ def test_successful_solve_does_not_consume_the_ask_again_budget(waf_budget_reset
     comix._COMIX_WAF_SOLVES_DONE = 1  # one solve already succeeded this run
     comix._COMIX_WAF_FAILURES = 0
     sess = comix._ComixBrowserSession.__new__(comix._ComixBrowserSession)
+    # __new__ skips __init__, so supply the two attributes the handoff reads to
+    # decide whether it must switch the browser's mode. Headless here forces the
+    # teardown+relaunch path, which is what this test wants to reach.
+    sess._page = None
+    sess._headless = True
     sess._cleanup = lambda: None
-    sess._start = lambda headless=True: False  # fail fast, no real browser
+    sess._start = lambda headless=None: False  # fail fast, no real browser
 
     out = sess.solve_waf_interactively("https://comix.to/title/x")
 
@@ -627,6 +632,44 @@ def test_successful_solve_does_not_consume_the_ask_again_budget(waf_budget_reset
     # window; only the stubbed launch stopped it.
     assert out["reason"] == "launch_failed", (
         "a previous successful solve must not block a later prompt"
+    )
+
+
+def test_the_browser_is_headed_by_default(monkeypatch):
+    """comix's reader defers every 10th page until the viewport reaches it, which
+    needs a live rendering lifecycle (layout, compositing, IntersectionObserver
+    delivery). Measured 2026-08-03: in a non-compositing context an observer over
+    103 page elements fired ZERO callbacks, so those pages can never load. Headed
+    is therefore correctness, not just anti-bot politeness."""
+    monkeypatch.delenv(comix._COMIX_HEADLESS_ENV, raising=False)
+    assert comix._comix_headless() is False
+    sig = inspect.signature(comix._ComixBrowserSession._start)
+    assert sig.parameters["headless"].default is None, (
+        "_start must defer to _comix_headless(), not hardcode a mode"
+    )
+
+
+def test_headless_remains_available_as_an_explicit_opt_out(monkeypatch):
+    """Unattended runs (cron/CI/headless servers) still need a way out, even
+    though chunk-boundary pages may not load there."""
+    monkeypatch.setenv(comix._COMIX_HEADLESS_ENV, "1")
+    assert comix._comix_headless() is True
+    monkeypatch.setenv(comix._COMIX_HEADLESS_ENV, "0")
+    assert comix._comix_headless() is False
+
+
+def test_the_handoff_does_not_relaunch_when_already_headed():
+    """THE identity bug, structurally closed. A clearance is bound to the client
+    that earned it; the old code always relaunched headless afterwards, handing
+    the rest of the run a measurably different client (HeadlessChrome in
+    Sec-CH-UA even with the UA string pinned) — so the very next navigation was
+    re-challenged. When the session is already headed nothing may be torn down."""
+    src = inspect.getsource(
+        comix._ComixBrowserSession.solve_waf_interactively
+    )
+    assert "mode_switched" in src
+    assert "self._start(headless=True)" not in src, (
+        "an unconditional headless relaunch re-introduces the identity mismatch"
     )
 
 
@@ -899,9 +942,13 @@ def test_preload_targets_the_key_the_site_actually_reads():
 def test_preload_writes_under_state_not_at_the_top_level():
     """The store is a Zustand-persist envelope: {"state": {...}, "version": 0}.
     A top-level `cur.preload` is ignored even with the right key — that was the
-    second half of why the old write could not have worked."""
+    second half of why the old write could not have worked.
+
+    The written VALUE is a parameter now (`all` for normal capture, `some` for
+    the recovery ladder's last rung — grep _apply_reader_preload_pref), so this
+    pins the nesting, which is the actual invariant, rather than the literal."""
     src = _preload_source()
-    assert "cur.state.preload = 'all'" in src
+    assert "cur.state.preload =" in src
     assert "cur.preload =" not in src
 
 

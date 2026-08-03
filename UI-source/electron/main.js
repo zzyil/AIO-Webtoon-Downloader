@@ -899,6 +899,49 @@ function setupIPC() {
     );
   });
 
+  // ── comix.to sign-in ──
+  // Spawns `aio-dl.py --comix-login`, which opens comix.to in the downloader's
+  // own persistent Chromium profile and blocks until the user signs in (or the
+  // 300s wait elapses). The session is written into that profile and inherited
+  // by every later download/search process.
+  //
+  // The user types their credentials into the real comix.to page in a real
+  // browser window. Nothing about them is read, stored or forwarded by this app
+  // — we only wait for the site's own `auth` key to appear. Cross-file:
+  // sites/comix.py:open_login_window, aio-dl.py --comix-login.
+  //
+  // stdio is inherited-free (piped and discarded): the banner the child prints
+  // is for CLI users, and the renderer already knows what it asked for. Only the
+  // exit code matters here — 0 = signed in, 2 = not completed.
+  ipcMain.handle("comix:login", async () => {
+    const settings = history.getSettings();
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
+    return new Promise((resolve) => {
+      let proc;
+      try {
+        proc = spawn(pythonCmd, [scriptPath, "--comix-login"], {
+          cwd: workingDir,
+          env: { ...process.env, PYTHONUNBUFFERED: "1" },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (err) {
+        resolve({ ok: false, reason: err.message || String(err) });
+        return;
+      }
+      let stderr = "";
+      proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      proc.on("error", (err) => {
+        resolve({ ok: false, reason: err.message || String(err) });
+      });
+      proc.on("close", (code) => {
+        resolve({
+          ok: code === 0,
+          reason: code === 0 ? "" : (stderr.trim() || `exited with ${code}`),
+        });
+      });
+    });
+  });
+
   // ── Scan library (read all downloaded manga) ──
   // Returns the list immediately. Missing thumbnails are generated
   // in the background using mupdf (WASM) in the main process.

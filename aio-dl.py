@@ -235,7 +235,18 @@ class ChapterPermanentSkipError(Exception):
 #   - "locked": premium/wait-to-unlock episode emitted as a placeholder
 #     (get_chapter_images short-circuits it) so --multi-source can fill it; when
 #     no alt has it, this clean-skips instead of aborting the whole run.
-_PERMANENT_SKIP_REASONS = frozenset({"mature_login_required", "locked"})
+#   - "comix_pages_stalled" (sites/comix.py): comix's reader defers every 10th
+#     page — a chunk boundary — until the viewport reaches it, and when the
+#     handler's full recovery ladder (re-nudge → reload → lazy-mode) still can't
+#     reach one, re-rendering the identical chapter cannot either. Live
+#     2026-08-02: 99/107 captured, inline retry, 99/107, inline retry, 99/107,
+#     then the whole 256-chapter run aborted on chapter 1. The two 90s retries
+#     were pure cost. Note comix raises this ONLY for the deferral signature
+#     (grep _looks_like_stalled_capture); an ordinary render miss stays
+#     retryable as "comix_dom_render_incomplete".
+_PERMANENT_SKIP_REASONS = frozenset({
+    "mature_login_required", "locked", "comix_pages_stalled",
+})
 
 
 # -----------------------------------------------------------
@@ -4082,6 +4093,7 @@ def build_per_chapter_comic_info_xml(
     lang: str,
     page_count: int,
     aux_records: Optional[Dict[str, Any]] = None,
+    missing_pages: Optional[List[int]] = None,
 ) -> str:
     """Per-chapter ComicInfo.xml string for Komikku-mode CBZs.
 
@@ -4213,6 +4225,20 @@ def build_per_chapter_comic_info_xml(
         lines.append(f'  <AnilistId>{int(anilist_id)}</AnilistId>')
     if mal_id is not None:
         lines.append(f'  <MalId>{int(mal_id)}</MalId>')
+
+    # Pages the source could not deliver, recorded so a gap is never SILENT.
+    #
+    # Only ever populated under an explicit opt-in
+    # (--comix-allow-gapped-chapters). It exists because pages are renumbered
+    # 0001..000N on the way into the archive, so a chapter missing its 10th page
+    # is byte-for-byte indistinguishable from a complete one that simply had
+    # fewer pages — which is how a 67-of-68 chapter shipped unnoticed in
+    # 2026-08. These are the SOURCE's page numbers, not archive indices, so they
+    # stay meaningful after renumbering. Aio-prefixed and therefore dropped
+    # silently by Komga/Kavita, exactly like <AnilistId>.
+    if missing_pages:
+        joined = ",".join(str(int(p)) for p in sorted(missing_pages))
+        lines.append(f'  <AioMissingPages>{escape(joined)}</AioMissingPages>')
 
     # Auxiliary assets (audio / motion-toon) that ride INSIDE this CBZ under the
     # _aio/ prefix. Aio-prefixed custom elements — dropped silently by Komga/
@@ -8332,6 +8358,43 @@ def main():
              "flag skips all of that (images are unaffected). Not a resume-gating "
              "flag — toggling it doesn't invalidate downloaded images.",
     )
+    # ── comix.to browser controls ──────────────────────────────────────────
+    # comix is the only handler that drives a real browser for the DOWNLOAD path
+    # (its chapter list, page URLs and search are all behind a signed +
+    # encrypted API). These three flags surface the parts of that a user may
+    # legitimately need to steer. All of them just set the env vars sites/comix.py
+    # already reads, so the CLI and the env knobs share exactly one code path and
+    # neither can drift. None are resume-gating: they change HOW bytes are
+    # obtained, not WHICH bytes land (same reasoning as --no-fast-download).
+    p.add_argument(
+        "--comix-headless",
+        action="store_true",
+        help="Run comix.to's browser headless instead of showing a window. "
+             "NOT recommended: comix's reader defers roughly every 10th page "
+             "until it scrolls into view, which needs a live rendering "
+             "lifecycle, so headless chapters can come out short. Use this only "
+             "for unattended runs (cron/CI/headless servers). Equivalent to "
+             "AIO_COMIX_HEADLESS=1.",
+    )
+    p.add_argument(
+        "--comix-allow-gapped-chapters",
+        action="store_true",
+        help="Keep a comix.to chapter even when some pages could not be "
+             "captured, instead of skipping it. The shortfall is logged and the "
+             "missing page numbers are recorded in the chapter's ComicInfo.xml, "
+             "so the gap is never silent. Off by default — a skipped chapter "
+             "that --multi-source can refill from another site beats an archive "
+             "with invisible holes. Equivalent to AIO_COMIX_ALLOW_GAPPED=1.",
+    )
+    p.add_argument(
+        "--comix-login",
+        action="store_true",
+        help="Open comix.to in the downloader's own browser window and wait "
+             "while you sign in, then exit. The session is saved to the "
+             "persistent profile and reused by every later run. Your "
+             "credentials are typed into the real site — the downloader never "
+             "sees, stores or transmits them.",
+    )
     # ── Komikku-compatible per-chapter CBZ output (Komikku LocalSource format) ──
     # Writes per-chapter CBZs with per-chapter ComicInfo.xml, plus
     # cover.jpg and details.json at the series-folder root, matching the
@@ -8379,6 +8442,34 @@ def main():
             "--mangafire-image-concurrency is deprecated; use --image-concurrency",
             DeprecationWarning,
         )
+
+    # comix browser flags -> the env vars sites/comix.py already reads. Setting
+    # the env rather than threading args through means the CLI flag and the env
+    # knob cannot drift apart, and the handler stays usable from the search
+    # subprocess and the API server, neither of which sees `args`. Must run
+    # before any handler is constructed.
+    if getattr(args, "comix_headless", False):
+        os.environ["AIO_COMIX_HEADLESS"] = "1"
+    if getattr(args, "comix_allow_gapped_chapters", False):
+        os.environ["AIO_COMIX_ALLOW_GAPPED"] = "1"
+
+    if getattr(args, "comix_login", False):
+        # Standalone action: open the window, wait for the user to sign in, exit.
+        # Deliberately its own mode rather than a pre-step on a download — a
+        # login is a one-off that then persists in the profile for every later
+        # run, and blocking a download on it would be the wrong default.
+        from sites.comix import _COMIX_BROWSER_BRIDGE
+
+        outcome = _COMIX_BROWSER_BRIDGE.open_login_window() or {}
+        if outcome.get("signed_in"):
+            print("\n[*] comix.to sign-in saved. Future runs will reuse it.")
+            return
+        print(
+            f"\n[!] comix.to sign-in was not completed "
+            f"({outcome.get('reason') or 'unknown'}).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     if args.serve:
         try:
@@ -11667,6 +11758,7 @@ def main():
                                 lang=args.language,
                                 page_count=len(processed_page_images),
                                 aux_records=ch.get("_aux_records"),
+                                missing_pages=ch.get("_missing_pages"),
                             )
                             zf.writestr(
                                 "ComicInfo.xml",
@@ -11871,6 +11963,7 @@ def main():
                             lang=args.language,
                             page_count=len(cbz_images),
                             aux_records=ch.get("_aux_records"),
+                            missing_pages=ch.get("_missing_pages"),
                         )
                     with _cpu_guard('build_cbz'):
                         build_cbz(
