@@ -97,6 +97,40 @@ _COMIX_CAPTURE_STALL_S = 20.0
 # additional loading benefit.
 _COMIX_VIEWPORT = {"width": 1280, "height": 2400}
 
+# Viewport for the two windows a HUMAN has to use: the WAF handoff and the
+# sign-in window. Grep _apply_viewport for the swap.
+#
+# THE BUG THIS FIXES (measured against the live challenge page, 2026-08-03).
+# _COMIX_VIEWPORT above is emulated via Emulation.setDeviceMetricsOverride, so
+# it sets the CSS viewport REGARDLESS of how big the OS window is. comix's
+# interstitial is a flex-centred card on a `min-height:100vh` body, so at 2400
+# it lays out like this:
+#
+#     .card            top=978   bottom=1422
+#     .ring/.dragLayer top=1077  bottom=1297   <- the part you drag
+#     "Verify" button  top=1335
+#     scrollHeight == innerHeight == 2400      -> NOT scrollable
+#
+# A real Chromium window has ~950-1180 px of content area (1080p / maximised
+# 1440p), so every one of those lands below the bottom edge — and because the
+# document is exactly viewport-height there is no scrollbar to reach them with.
+# The user sees a correctly-loaded, completely blank window and cannot solve a
+# check the run then blames them for not completing. On 1080p not even the
+# card's top edge is visible; the Verify button is unreachable at ANY realistic
+# window height.
+#
+# This was invisible before 2026-08-03 only because the handoff used to relaunch
+# the browser headed with Playwright's 1280x720 default (no viewport= kwarg), so
+# it never inherited the reader's tall viewport. Making headed the default
+# removed that relaunch — see solve_waf_interactively's mode_switched — which is
+# right for clearance stickiness but handed the human the scrape geometry.
+#
+# 720 restores exactly the geometry that demonstrably worked. Deliberately a
+# FIXED size rather than something derived from window.screen: device-metrics
+# emulation overrides window.screen too, so the page would report the emulated
+# value back and the derivation would be circular.
+_COMIX_INTERACTIVE_VIEWPORT = {"width": 1280, "height": 720}
+
 # Opt-in: keep a chapter whose capture came up short instead of skipping it.
 #
 # Off by default, deliberately. The standing rule in this repo is that a stop
@@ -2023,11 +2057,19 @@ class _ComixBrowserSession:
             os.makedirs(profile_dir, exist_ok=True)
 
             def _launch(**extra):
-                # viewport= sets the CSS viewport the page renders against;
-                # --window-size makes the HEADED window actually that big, so a
-                # user watching the handoff sees a normal browser rather than a
-                # tiny frame scrolling a giant document. Both are needed — they
-                # control different things. See _COMIX_VIEWPORT for why 2400.
+                # viewport= sets the CSS viewport the page renders against (via
+                # device-metrics emulation, so it holds no matter what the OS
+                # window does). See _COMIX_VIEWPORT for why 2400.
+                #
+                # --window-size is a BEST-EFFORT HINT ONLY: a browser window
+                # can't exceed the display work area, so on any real monitor
+                # this resolves to "as tall as the screen" — nowhere near 2400.
+                # It must NOT be read as a guarantee that the emulated viewport
+                # is visible. An earlier version of this comment claimed it
+                # stopped the window being "a tiny frame scrolling a giant
+                # document", which is precisely what the clamp produces instead:
+                # the human-facing windows have to shrink the EMULATED viewport
+                # to be usable at all (grep _COMIX_INTERACTIVE_VIEWPORT).
                 return self._pw.chromium.launch_persistent_context(
                     profile_dir,
                     headless=headless,
@@ -2213,6 +2255,32 @@ class _ComixBrowserSession:
         if len(self._scrambled_urls) >= self._SCRAMBLED_URL_MEMORY:
             return
         self._scrambled_urls.add(url)
+
+    def _apply_viewport(self, page, size: Dict[str, int]) -> None:
+        """Re-emulate the CSS viewport on a live page. Best-effort, never raises.
+
+        Used to hand a HUMAN a window they can actually use and then put the
+        reader's tall geometry back — see _COMIX_INTERACTIVE_VIEWPORT for the
+        measurement, and solve_waf_interactively / open_login_window for the two
+        callers.
+
+        Swallows failures on purpose: a viewport swap is a usability
+        improvement, and neither caller has a better answer than "carry on" if
+        the page is mid-navigation or already gone. The restore side runs in a
+        `finally` precisely because the reverse — leaving the run at 720 — is
+        NOT cosmetic: it would silently strand comix's chunk-boundary pages
+        (grep _COMIX_VIEWPORT) and short every later chapter.
+
+        Note this only moves the EMULATED viewport, not the OS window; that is
+        what makes it usable, since the emulated size ends up smaller than the
+        window rather than larger.
+        """
+        if page is None:
+            return
+        try:
+            page.set_viewport_size(dict(size))
+        except Exception:
+            pass
 
     def _cleanup(self):
         # context.close() on a persistent context is what FLUSHES cookies and
@@ -2617,98 +2685,115 @@ class _ComixBrowserSession:
                 return result
 
         page = self._page
+        # Hand the user a window whose content they can actually reach. The
+        # reader's 2400px viewport puts this challenge's drag ring and Verify
+        # button below the bottom of any real window, on a page that cannot
+        # scroll — grep _COMIX_INTERACTIVE_VIEWPORT for the measured layout.
+        # Applied BEFORE the goto so the interstitial lays out at the size it
+        # will be read at, never reflowing under the user.
+        self._apply_viewport(page, _COMIX_INTERACTIVE_VIEWPORT)
         try:
-            page.goto(target, wait_until="domcontentloaded", timeout=30000)
-        except Exception as exc:
-            print(
-                f"[!] Comix: could not load the verification page "
-                f"({type(exc).__name__}: {exc}).",
-                flush=True,
-            )
-
-        # Every line is [!]-prefixed on purpose. The Electron LogPanel classifies
-        # by line shape (UI-source/electron/log-filter.js:classifyLogLevel):
-        # a leading "[!]" paints the line as an error, while a line starting
-        # with 2+ spaces is demoted to "verbose" — so an indented banner would
-        # render the one instruction the user MUST read as dim filler.
-        print("[!] " + "=" * 68, flush=True)
-        print(
-            "[!] ACTION NEEDED - comix.to is asking for human verification.",
-            flush=True,
-        )
-        print(
-            "[!] A browser window just opened. Complete the check in it: drag",
-            flush=True,
-        )
-        print(
-            "[!] the slider until the picture lines up, then press Verify.",
-            flush=True,
-        )
-        print(
-            f"[!] The download resumes by itself once it passes (waiting up to "
-            f"{int(timeout_s)}s).",
-            flush=True,
-        )
-        print(
-            "[!] The session is saved to disk, so this should be rare.",
-            flush=True,
-        )
-        print("[!] " + "=" * 68, flush=True)
-
-        deadline = time.monotonic() + timeout_s
-        solved = False
-        while time.monotonic() < deadline:
             try:
-                if page.is_closed():
-                    # User closed the window. Treat as a decision to abort
-                    # rather than waiting out the full timeout.
-                    print(
-                        "[!] Comix: verification window was closed before the "
-                        "check completed.",
-                        flush=True,
-                    )
-                    result["reason"] = "window_closed"
-                    break
-                current = page.url
-            except Exception:
-                result["reason"] = "window_lost"
-                break
-            if current and not _looks_like_waf_challenge(current):
-                # The site routed us off the interstitial — that IS the pass
-                # signal (it redirects back to ?return=). Small settle wait so
-                # the Set-Cookie lands before we read cookies.
-                try:
-                    page.wait_for_timeout(1500)
-                except Exception:
-                    pass
-                solved = True
-                break
-            try:
-                page.wait_for_timeout(1000)
-            except Exception:
-                break
-
-        if solved:
-            print("[*] Comix: verification passed - thanks. Resuming.", flush=True)
-            result["solved"] = True
-            with _COMIX_WAF_HANDOFF_LOCK:
-                # A success does NOT count against the ask-again budget: the
-                # cloudscraper session and the browser are separate identities
-                # to the WAF, so one run legitimately needs a solve for each.
-                _COMIX_WAF_SOLVES_DONE += 1
-                _COMIX_WAF_FAILURES = 0
-        else:
-            if not result.get("reason"):
-                result["reason"] = "timeout"
+                page.goto(target, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
                 print(
-                    f"[!] Comix: verification not completed within "
-                    f"{int(timeout_s)}s.",
+                    f"[!] Comix: could not load the verification page "
+                    f"({type(exc).__name__}: {exc}).",
                     flush=True,
                 )
-            with _COMIX_WAF_HANDOFF_LOCK:
-                # The user declined (timed out or closed the window). Stop
-                # asking — repeated windows they're ignoring help nobody.
-                _COMIX_WAF_FAILURES += 1
+
+            # Every line is [!]-prefixed on purpose. The Electron LogPanel
+            # classifies by line shape
+            # (UI-source/electron/log-filter.js:classifyLogLevel): a leading
+            # "[!]" paints the line as an error, while a line starting with 2+
+            # spaces is demoted to "verbose" — so an indented banner would
+            # render the one instruction the user MUST read as dim filler.
+            print("[!] " + "=" * 68, flush=True)
+            print(
+                "[!] ACTION NEEDED - comix.to is asking for human verification.",
+                flush=True,
+            )
+            print(
+                "[!] A browser window just opened. Complete the check in it: drag",
+                flush=True,
+            )
+            print(
+                "[!] the slider until the picture lines up, then press Verify.",
+                flush=True,
+            )
+            print(
+                f"[!] The download resumes by itself once it passes (waiting up to "
+                f"{int(timeout_s)}s).",
+                flush=True,
+            )
+            print(
+                "[!] The session is saved to disk, so this should be rare.",
+                flush=True,
+            )
+            print("[!] " + "=" * 68, flush=True)
+
+            deadline = time.monotonic() + timeout_s
+            solved = False
+            while time.monotonic() < deadline:
+                try:
+                    if page.is_closed():
+                        # User closed the window. Treat as a decision to abort
+                        # rather than waiting out the full timeout.
+                        print(
+                            "[!] Comix: verification window was closed before the "
+                            "check completed.",
+                            flush=True,
+                        )
+                        result["reason"] = "window_closed"
+                        break
+                    current = page.url
+                except Exception:
+                    result["reason"] = "window_lost"
+                    break
+                if current and not _looks_like_waf_challenge(current):
+                    # The site routed us off the interstitial — that IS the pass
+                    # signal (it redirects back to ?return=). Small settle wait so
+                    # the Set-Cookie lands before we read cookies.
+                    try:
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+                    solved = True
+                    break
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    break
+
+            if solved:
+                print("[*] Comix: verification passed - thanks. Resuming.", flush=True)
+                result["solved"] = True
+                with _COMIX_WAF_HANDOFF_LOCK:
+                    # A success does NOT count against the ask-again budget: the
+                    # cloudscraper session and the browser are separate identities
+                    # to the WAF, so one run legitimately needs a solve for each.
+                    _COMIX_WAF_SOLVES_DONE += 1
+                    _COMIX_WAF_FAILURES = 0
+            else:
+                if not result.get("reason"):
+                    result["reason"] = "timeout"
+                    print(
+                        f"[!] Comix: verification not completed within "
+                        f"{int(timeout_s)}s.",
+                        flush=True,
+                    )
+                with _COMIX_WAF_HANDOFF_LOCK:
+                    # The user declined (timed out or closed the window). Stop
+                    # asking — repeated windows they're ignoring help nobody.
+                    _COMIX_WAF_FAILURES += 1
+        finally:
+            # Put the reader's geometry back before anything else runs on this
+            # context. NOT cosmetic: every later chapter scrapes through this
+            # same page, and at 720 comix's chunk-boundary pages never enter the
+            # viewport, so chapters would come up ~10% short with no error.
+            # A `finally` rather than a trailing call because that failure is
+            # silent, so it must not depend on this method exiting normally.
+            self._apply_viewport(page, _COMIX_VIEWPORT)
 
         # No UA bookkeeping here any more. It used to re-read
         # navigator.userAgent and cache it, which became actively wrong once the
@@ -2783,90 +2868,104 @@ class _ComixBrowserSession:
                 return result
 
         page = self._page
+        # Same reason as the WAF handoff: the reader's 2400px viewport is
+        # emulated, so it survives whatever size the OS gives the window and
+        # pushes centred UI — comix's login card included — below the bottom
+        # edge of a page that cannot scroll. Grep _COMIX_INTERACTIVE_VIEWPORT.
+        self._apply_viewport(page, _COMIX_INTERACTIVE_VIEWPORT)
         try:
-            page.goto(
-                _WAF_CHALLENGE_HINT_URL,
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-        except Exception as exc:
-            print(
-                f"[!] Comix: could not load comix.to "
-                f"({type(exc).__name__}: {exc}).",
-                flush=True,
-            )
-            result["reason"] = "navigation_failed"
-            return result
-
-        # [!]-prefixed so the Electron LogPanel paints these as must-read rather
-        # than dim filler — same reasoning as the WAF banner.
-        print("[!] " + "=" * 68, flush=True)
-        print("[!] ACTION NEEDED - sign in to comix.to.", flush=True)
-        print(
-            "[!] A browser window just opened on comix.to. Log in there as you",
-            flush=True,
-        )
-        print(
-            "[!] normally would. The downloader never sees your password.",
-            flush=True,
-        )
-        print(
-            f"[!] It saves the session and closes by itself (waiting up to "
-            f"{int(timeout_s)}s).",
-            flush=True,
-        )
-        print("[!] " + "=" * 68, flush=True)
-
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
             try:
-                if page.is_closed():
-                    result["reason"] = "window_closed"
-                    break
-                # The reader's own auth store. Present and populated is the
-                # SITE's statement that a session exists — more reliable than
-                # watching for a URL change, since comix keeps you on the same
-                # route after login.
-                signed = page.evaluate(
-                    """() => {
-                        try {
-                            const v = localStorage.getItem('auth');
-                            if (!v) return false;
-                            const p = JSON.parse(v);
-                            if (!p) return false;
-                            const s = p.state || p;
-                            return !!(s.token || s.user || s.accessToken);
-                        } catch (e) { return false; }
-                    }"""
+                page.goto(
+                    _WAF_CHALLENGE_HINT_URL,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
                 )
-            except Exception:
-                result["reason"] = "window_lost"
-                break
-            if signed:
-                try:
-                    page.wait_for_timeout(1500)
-                except Exception:
-                    pass
-                result["signed_in"] = True
-                break
-            try:
-                page.wait_for_timeout(1000)
-            except Exception:
-                break
+            except Exception as exc:
+                print(
+                    f"[!] Comix: could not load comix.to "
+                    f"({type(exc).__name__}: {exc}).",
+                    flush=True,
+                )
+                result["reason"] = "navigation_failed"
+                return result
 
-        if result["signed_in"]:
-            print("[*] Comix: signed in - thanks. Session saved.", flush=True)
-        elif not result["reason"]:
-            result["reason"] = "timeout"
+            # [!]-prefixed so the Electron LogPanel paints these as must-read
+            # rather than dim filler — same reasoning as the WAF banner.
+            print("[!] " + "=" * 68, flush=True)
+            print("[!] ACTION NEEDED - sign in to comix.to.", flush=True)
             print(
-                f"[!] Comix: sign-in not completed within {int(timeout_s)}s.",
+                "[!] A browser window just opened on comix.to. Log in there as you",
                 flush=True,
             )
+            print(
+                "[!] normally would. The downloader never sees your password.",
+                flush=True,
+            )
+            print(
+                f"[!] It saves the session and closes by itself (waiting up to "
+                f"{int(timeout_s)}s).",
+                flush=True,
+            )
+            print("[!] " + "=" * 68, flush=True)
 
-        # Closing the context is what FLUSHES cookies + localStorage into the
-        # profile dir; without it a freshly-created session can be lost.
-        self._cleanup()
-        return result
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                try:
+                    if page.is_closed():
+                        result["reason"] = "window_closed"
+                        break
+                    # The reader's own auth store. Present and populated is the
+                    # SITE's statement that a session exists — more reliable than
+                    # watching for a URL change, since comix keeps you on the same
+                    # route after login.
+                    signed = page.evaluate(
+                        """() => {
+                            try {
+                                const v = localStorage.getItem('auth');
+                                if (!v) return false;
+                                const p = JSON.parse(v);
+                                if (!p) return false;
+                                const s = p.state || p;
+                                return !!(s.token || s.user || s.accessToken);
+                            } catch (e) { return false; }
+                        }"""
+                    )
+                except Exception:
+                    result["reason"] = "window_lost"
+                    break
+                if signed:
+                    try:
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+                    result["signed_in"] = True
+                    break
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    break
+
+            if result["signed_in"]:
+                print("[*] Comix: signed in - thanks. Session saved.", flush=True)
+            elif not result["reason"]:
+                result["reason"] = "timeout"
+                print(
+                    f"[!] Comix: sign-in not completed within {int(timeout_s)}s.",
+                    flush=True,
+                )
+
+            # Closing the context is what FLUSHES cookies + localStorage into the
+            # profile dir; without it a freshly-created session can be lost.
+            self._cleanup()
+            return result
+        finally:
+            # The success path already tore the context down, so this is a
+            # no-op there (the helper swallows the closed-page error). It exists
+            # for the paths that DON'T: the navigation_failed early return above
+            # leaves a live context behind, and leaving that context at 720
+            # would silently short every later chapter — see the matching
+            # `finally` in solve_waf_interactively.
+            self._apply_viewport(page, _COMIX_VIEWPORT)
 
     def context_cookies(self) -> List[Dict[str, Any]]:
         """Current cookies from the persistent context, or [] if unavailable.
