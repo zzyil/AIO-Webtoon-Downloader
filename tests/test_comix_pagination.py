@@ -590,8 +590,17 @@ def test_true_user_agent_is_read_past_the_override():
     """A UA override makes navigator.userAgent report our own pin straight back,
     so a WRONG pin looks self-consistent and re-caches itself forever. The
     reconciliation must therefore read the browser, not the page."""
+    # The implementation lives in the shared module now (both comix and
+    # mangafire need it); comix must still route through it rather than
+    # growing a second, drifting copy.
+    from sites import browser_identity
+
+    assert "Browser.getVersion" in inspect.getsource(
+        browser_identity.probe_true_user_agent
+    )
     src = inspect.getsource(comix._ComixBrowserSession._probe_true_user_agent)
-    assert "Browser.getVersion" in src
+    assert "probe_true_user_agent" in src
+    assert 'evaluate("navigator.userAgent")' not in src
     start = inspect.getsource(comix._ComixBrowserSession._start)
     assert "_probe_true_user_agent()" in start
     assert 'evaluate("navigator.userAgent")' not in start, (

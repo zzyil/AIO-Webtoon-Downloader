@@ -16,7 +16,12 @@ from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from ._image_io import finalize_pending_image, looks_like_real_image
+from ._image_io import (
+    IMAGE_ACCEPT,
+    IMAGE_ACCEPT_HEADERS,
+    finalize_pending_image,
+    looks_like_real_image,
+)
 from .group_quality import MTL_CONFIRMED, MTL_NONE, classify_mtl, mtl_rank
 
 # Preferred BeautifulSoup parser, detected once at import. lxml is faster and
@@ -713,11 +718,17 @@ class BaseSiteHandler:
         per-host headers (rare); the default ignores it and emits a static
         dict driven entirely by the class config.
 
-        Order: extra headers first, then Referer, then User-Agent — the last
-        two override extras if a key collision happens (unlikely; called out
-        for predictability).
+        Order: the image Accept first, then extra headers, then Referer, then
+        User-Agent — each later group overrides the earlier one on a key
+        collision (so a handler needing a different Accept just puts it in
+        FAST_DL_EXTRA_HEADERS; none does today).
+
+        Accept matters: curl_cffi's `impersonate` seeds a *document* Accept, and
+        hosts that content-negotiate then serve an HTML wrapper page for an
+        image URL. See sites/_image_io.py:IMAGE_ACCEPT.
         """
-        headers: Dict[str, str] = dict(self.FAST_DL_EXTRA_HEADERS)
+        headers: Dict[str, str] = {"Accept": IMAGE_ACCEPT}
+        headers.update(self.FAST_DL_EXTRA_HEADERS)
         if self.FAST_DL_REFERER_FROM:
             headers["Referer"] = self.FAST_DL_REFERER_FROM
         if self.FAST_DL_USER_AGENT:
@@ -1781,7 +1792,13 @@ class BaseSiteHandler:
             return None, False
         if isinstance(item, str) and item:
             try:
-                response = scraper.get(item, timeout=15)
+                # Image Accept, same reason as the download path: a wrapper-page
+                # response is a 200 that fails looks_like_real_image, which would
+                # score every page 0.0 and rate the whole site unusable on a
+                # purely request-side mistake. Grep IMAGE_ACCEPT.
+                response = scraper.get(
+                    item, timeout=15, headers=IMAGE_ACCEPT_HEADERS
+                )
                 if response.status_code >= 400:
                     return None, False
                 data = response.content  # can itself time out on a chunked read
@@ -2443,7 +2460,9 @@ class BaseSiteHandler:
             except Exception:
                 return None
         try:
-            response = scraper.get(cover_url, timeout=10)
+            response = scraper.get(
+                cover_url, timeout=10, headers=IMAGE_ACCEPT_HEADERS
+            )
             if response.status_code >= 400:
                 return None
             data = response.content

@@ -22,6 +22,7 @@ from .base import (
     SearchHit,
     SiteComicContext,
 )
+from . import browser_identity as _bid
 
 # Optional zendriver-backed Cloudflare fallback. comix.to added CF
 # protection in upstream's 2026-05 release; direct-HTTP API calls (the
@@ -291,7 +292,7 @@ _COMIX_WAF_HANDOFF_LOCK = threading.Lock()
 #
 # Cached in the profile dir so only the first run in a fresh profile pays the
 # probe-and-relaunch; grep _resolve_stable_user_agent.
-_UA_CACHE_FILENAME = "aio-stable-ua.txt"
+_UA_CACHE_FILENAME = _bid.UA_CACHE_FILENAME
 _COMIX_STABLE_UA: Optional[str] = None
 _COMIX_UA_LOCK = threading.Lock()
 
@@ -308,9 +309,7 @@ def _stabilize_user_agent(raw: Optional[str]) -> Optional[str]:
     the browser and keep saying HeadlessChrome, so a UA pin alone leaves the
     headless context both detectable AND self-contradictory.
     """
-    if not raw:
-        return None
-    return raw.replace("HeadlessChrome/", "Chrome/")
+    return _bid.stabilize_user_agent(raw)
 
 
 # Used only when no browser has run yet in this profile, so there is no probed
@@ -322,10 +321,7 @@ def _stabilize_user_agent(raw: Optional[str]) -> Optional[str]:
 # fields, so a real Chrome 147 reports exactly `Chrome/147.0.0.0` and the full
 # build number lives only in Sec-CH-UA-Full-Version-List. Writing a real build
 # here (e.g. 147.0.7727.15) would be the one UA no genuine Chrome ever sends.
-_COMIX_FALLBACK_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
-)
+_COMIX_FALLBACK_UA = _bid.FALLBACK_UA
 
 
 def _cached_stable_user_agent() -> str:
@@ -434,7 +430,7 @@ def _comix_http_headers() -> Dict[str, str]:
 # the hints) — it has to be the channel. Falls back to a channel-less launch when
 # the installed Playwright/Patchright doesn't know the channel, so an older
 # install degrades to b014f12's behavior rather than failing to launch.
-_COMIX_BROWSER_CHANNEL = "chromium"
+_COMIX_BROWSER_CHANNEL = _bid.BROWSER_CHANNEL
 
 # comix runs HEADED by default (2026-08-03, user directive + measurement).
 #
@@ -2317,39 +2313,11 @@ class _ComixBrowserSession:
     def _probe_true_user_agent(self) -> Optional[str]:
         """The browser's REAL User-Agent, seen past any page-level override.
 
-        `page.evaluate("navigator.userAgent")` is useless for this once
-        `user_agent=` is set on the context: Emulation.setUserAgentOverride makes
-        it report our own pin straight back, so a wrong pin looks self-consistent
-        and survives forever. CDP `Browser.getVersion` reports the browser
-        itself, override or not (verified 2026-08-02: page said the pinned
-        `Chrome/999.0.1.2`, getVersion said the true
-        `HeadlessChrome/147.0.0.0`).
-
-        Falls back to the page's own view when CDP is unavailable — which is
-        correct precisely in the case that makes CDP necessary impossible, i.e.
-        when nothing is overriding the UA.
+        Thin wrapper: the reasoning (and why navigator.userAgent cannot answer
+        this once a pin is applied) lives in
+        sites/browser_identity.py:probe_true_user_agent.
         """
-        if self._context is None or self._page is None:
-            return None
-        cdp = None
-        try:
-            cdp = self._context.new_cdp_session(self._page)
-            version = cdp.send("Browser.getVersion") or {}
-            ua = version.get("userAgent")
-            if ua:
-                return ua
-        except Exception:
-            pass
-        finally:
-            if cdp is not None:
-                try:
-                    cdp.detach()
-                except Exception:
-                    pass
-        try:
-            return self._page.evaluate("navigator.userAgent")
-        except Exception:
-            return None
+        return _bid.probe_true_user_agent(self._context, self._page)
 
     def _resolve_stable_user_agent(self) -> Optional[str]:
         """UA to pin on the persistent context, or None if not known yet.

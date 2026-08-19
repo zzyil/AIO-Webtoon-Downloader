@@ -25,17 +25,18 @@ except ImportError:
 # plain requests (image fetches, chapter pages) inherit the solved challenge.
 # Graceful fallback when zendriver isn't installed — affected handlers will
 # still load but will fail on actual fetch attempts with a clear error.
+#
+# ZENDRIVER_AVAILABLE is deliberately NOT imported here. It was, and it was
+# never read, and a module-scope flag named that is an invitation to gate a
+# rescue on it — which is exactly the bug this family just had (see
+# _fetch_html_guarded). The live question is cf_solver_available(), imported
+# where it is used.
 try:
     from .crawlee_utils import (
-        fetch_html_with_cf_cookies,
         fetch_html_zendriver,
         sync_cf_cookies,
-        ZENDRIVER_AVAILABLE,
     )
 except ImportError:
-    ZENDRIVER_AVAILABLE = False
-    def fetch_html_with_cf_cookies(*args, **kwargs):
-        raise ImportError("zendriver not available")
     def fetch_html_zendriver(*args, **kwargs):
         raise ImportError("zendriver not available")
     def sync_cf_cookies(*args, **kwargs):
@@ -82,6 +83,66 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
     
     def _make_soup(self, html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
+
+    def _fetch_html_guarded(self, url: str, scraper, make_request) -> str:
+        """`make_request` + Cloudflare detect-and-divert. Use this instead of a
+        bare make_request anywhere the result gets parsed for series data.
+
+        WHY IT EXISTS: 27 of the 28 registered MangaThemesia variants have no CF
+        handling at all — only kingofshojo sets use_zendriver, and use_playwright
+        (violetscans) navigates but does not solve. Everyone else did a bare
+        `make_request` and parsed whatever came back, so a challenged site
+        yielded a title of "Unknown" and zero chapters with nothing logged. That
+        is the same defect as sites/madara.py:_fetch_html and this mirrors its
+        shape deliberately: detect FIRST, gate on cf_solver_available() (never
+        on ZENDRIVER_AVAILABLE, which is False on Android and short-circuits the
+        detector away), warn on both failure paths, and never let a broken
+        rescue kill an otherwise-fine fetch.
+
+        USED BY `search()` TOO, and the history there is worth keeping. This
+        helper originally skipped search on purpose, to stop a background
+        cross-site fan-out from opening a browser window per challenged host for
+        a query the user might never pick from. The reasoning was right; the
+        mechanism was not. "Don't interrupt a human" is a property of the CALL
+        CONTEXT, and encoding it as "one method doesn't call this helper" left
+        the other ~6 doors open — the image-quality probe calls
+        fetch_comic_context / get_chapters / get_chapter_images (grep
+        sites/base.py:_probe_chapter_aggregate), so a search reached an
+        interactive solve anyway, a few seconds later than it would have.
+
+        That concern now lives where it belongs: crawlee_utils' opt-in
+        `interactive_solve_allowed()`, granted only by a foreground download.
+        So every fetch in this file can be guarded uniformly, and a background
+        search gets the headless rescue tiers (impit, cached clearance) while
+        the human-in-the-loop tiers stay withheld — strictly better than the
+        omission, which withheld all three.
+
+        Grep _fetch_html_guarded for the call sites.
+        """
+        response = make_request(url, scraper)
+        html = response.text
+        try:
+            from .crawlee_utils import (
+                cf_solver_available,
+                is_cf_challenge,
+                rescue_cf_html,
+                warn_cf_no_solver,
+                warn_cf_rescue,
+            )
+
+            if is_cf_challenge(response.status_code, html):
+                if cf_solver_available():
+                    try:
+                        html = rescue_cf_html(
+                            url, base_url=self.base_url, scraper=scraper
+                        )
+                    except Exception as exc:
+                        warn_cf_rescue(url, f"rescue failed: {exc}")
+                else:
+                    warn_cf_no_solver(url)
+        except Exception:
+            pass
+        return html
 
     def _normalize_url(self, url: str) -> str:
         """Normalize URL if custom normalizer is provided."""
@@ -180,11 +241,13 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             return []
         url = f"{self.base_url.rstrip('/')}/?s={quote(clean)}"
         # HTTP errors propagate to orchestrator's _run_one for probe-cache
-        # tracking. Sites that return tiny bodies (some MangaThemesia sites
-        # serve a JS-only search and return ~24 bytes from the static path)
-        # produce empty results without raising.
-        response = make_request(url, scraper)
-        html = response.text or ""
+        # tracking — _fetch_html_guarded only wraps the CF detection, never the
+        # make_request itself, so that contract is unchanged. Sites that return
+        # tiny bodies (some MangaThemesia sites serve a JS-only search and
+        # return ~24 bytes from the static path) produce empty results without
+        # raising. A challenged search now gets the headless rescue tiers
+        # instead of parsing the interstitial into zero hits.
+        html = self._fetch_html_guarded(url, scraper, make_request) or ""
         if len(html) < 200:
             return []
         soup = self._make_soup(html)
@@ -275,10 +338,9 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             html = fetch_html_playwright(url)
             soup = BeautifulSoup(html, "html.parser")
         else:
-            response = make_request(url, scraper)
-            html = response.text
+            html = self._fetch_html_guarded(url, scraper, make_request)
             soup = BeautifulSoup(html, "html.parser")
-        
+
         # Standard MangaThemesia selectors
         title_node = soup.select_one("h1.entry-title, h1.series-title, h1.post-title")
         if not title_node:
@@ -434,8 +496,8 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             else:
                 # Fallback: cookies should already be cached from fetch_comic_context
                 sync_cf_cookies(scraper, url)
-                response = make_request(url, scraper)
-                soup = BeautifulSoup(response.text, "html.parser")
+                html = self._fetch_html_guarded(url, scraper, make_request)
+                soup = BeautifulSoup(html, "html.parser")
         elif self.use_playwright:
             # Use custom selector for waiting if available
             wait_sel = self.chapter_selector if self.chapter_selector else "#chapterlist li, .eplister li"
@@ -444,8 +506,8 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         else:
             # Re-fetch page to ensure we have fresh content (sometimes context soup is enough, but safe to refetch)
             # Actually, we can reuse context.soup if it's full page, but let's follow pattern
-            response = make_request(url, scraper)
-            soup = BeautifulSoup(response.text, "html.parser")
+            html = self._fetch_html_guarded(url, scraper, make_request)
+            soup = BeautifulSoup(html, "html.parser")
 
         chapters = []
         
@@ -544,15 +606,13 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             # make_request works — no need to open yet another Chrome
             # window per chapter (which would 5-10× the per-chapter latency).
             sync_cf_cookies(scraper, url)
-            response = make_request(url, scraper)
-            html = response.text
+            html = self._fetch_html_guarded(url, scraper, make_request)
             soup = BeautifulSoup(html, "html.parser")
         elif self.use_playwright:
             html = fetch_html_playwright(url, wait_selector="img.ts-main-image")
             soup = BeautifulSoup(html, "html.parser")
         else:
-            response = make_request(url, scraper)
-            html = response.text
+            html = self._fetch_html_guarded(url, scraper, make_request)
             soup = self._make_soup(html)
 
         ts_payload = extract_ts_reader_payload(html or "")

@@ -9,6 +9,7 @@
 #                                   commit's date-version + timestamp)
 #
 # Jobs:
+#   guard   — cheap duplicate-run filter, see DOUBLE-RUN below.
 #   build   — matrix over windows-latest / macos-latest / ubuntu-latest.
 #             Each runner does its own `npm ci` and runs the right
 #             `dist:<os>` script. macOS DMGs cannot be cross-built from
@@ -19,6 +20,22 @@
 #             draft has to be manually published in the GitHub UI before
 #             the tag is actually created on the commit, so manual runs
 #             with a synthesized tag are safe to discard.
+#
+# DOUBLE-RUN (fixed 2026-08-03, `guard` job):
+#   Publishing a draft is what materializes the tag on the commit, and
+#   because a human clicks Publish (not GITHUB_TOKEN), that tag creation
+#   DOES emit a `push` event — so every published draft used to kick off a
+#   second, fully redundant 3-OS build for a tag whose release already
+#   exists and already has every asset attached. Worse, that second run
+#   would hand softprops/action-gh-release a tag with a *published*
+#   release plus `draft: true`, flipping the freshly published release
+#   back to draft and re-uploading assets over it.
+#   The `guard` job discriminates the two tag-push cases with one API
+#   call: a tag whose release already exists AND already carries assets
+#   can only have come from publishing one of our own drafts → skip the
+#   whole run. A tag pushed by hand from a clone has no release yet →
+#   build normally, so the CLI `git push --tags` path still works.
+#   workflow_dispatch always proceeds; it is the deliberate path.
 #
 # Notes:
 #   - All builds are unsigned (no Apple Developer cert, no Authenticode).
@@ -66,7 +83,77 @@ permissions:
   contents: write  # needed by softprops/action-gh-release to create the draft
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Duplicate-run filter. Runs in ~10s on a single Linux runner with no
+  # checkout (gh api takes the full repos/... path, so no local git needed)
+  # and gates BOTH heavy jobs below. See DOUBLE-RUN in the header.
+  # ───────────────────────────────────────────────────────────────────────
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+    steps:
+      - name: Decide whether this run is a duplicate
+        id: decide
+        shell: bash
+        env:
+          # gh CLI is preinstalled on the runner but needs a token; the
+          # read is covered by the workflow-level contents: write.
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # --- knobs -------------------------------------------------------
+          # Set to "false" to disable the filter entirely (every tag push
+          # builds again, i.e. the pre-2026-08-03 behaviour).
+          SKIP_TAGS_FROM_PUBLISHED_DRAFTS=true
+          # -----------------------------------------------------------------
+
+          emit() { echo "proceed=$1" >> "$GITHUB_OUTPUT"; echo "$2"; }
+
+          if [ "$EVENT_NAME" != "push" ]; then
+            emit true "Event '${EVENT_NAME}' is not a tag push — proceeding."
+            exit 0
+          fi
+
+          if [ "$SKIP_TAGS_FROM_PUBLISHED_DRAFTS" != "true" ]; then
+            emit true "Duplicate filter disabled by knob — proceeding."
+            exit 0
+          fi
+
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          # /releases/tags/<tag> only ever returns PUBLISHED releases —
+          # drafts are not addressable by tag — so a 404 here means "no
+          # release owns this tag yet", i.e. a genuinely new hand-pushed tag.
+          # Existence alone is the verdict (not asset count): a published
+          # release is something this workflow must never touch, since the
+          # release job's `draft: true` would UPDATE it back into a draft.
+          # Same predicate as "Refuse to overwrite a published release"
+          # below, deliberately — the two must never disagree.
+          if RELEASE_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>/dev/null); then
+            # Asset count is log decoration only; never fail the guard on it.
+            ASSET_COUNT=$(printf '%s' "$RELEASE_JSON" | jq -r '.assets | length' 2>/dev/null || echo '?')
+            emit false "Tag ${TAG} is already owned by a published release (${ASSET_COUNT} asset(s)) — this push came from publishing a draft this workflow already built. Skipping the duplicate run."
+          else
+            emit true "No published release owns tag ${TAG} — fresh tag push, building."
+          fi
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Release guard"
+            echo "- event: \`${{ github.event_name }}\`"
+            echo "- ref: \`${{ github.ref }}\`"
+            echo "- proceed: \`${{ steps.decide.outputs.proceed }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -170,11 +257,16 @@ jobs:
           retention-days: 14
 
   release:
-    needs: build
+    needs: [guard, build]
     # Fire on tag pushes (the canonical release path) AND manual runs
     # (workflow_dispatch). Without the second clause, a manual run would
     # stop at `build` and leave the artifacts unattached to anything.
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # The guard clause is redundant on paper — a skipped `build` skips this
+    # job too — but it is stated explicitly so the "never touch an already
+    # published release" invariant is readable here rather than inferred.
+    if: >-
+      needs.guard.outputs.proceed == 'true' &&
+      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
 
     steps:
@@ -220,6 +312,27 @@ jobs:
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Resolved release tag: ${TAG}"
+
+      # Last line of defence for the DOUBLE-RUN invariant: `draft: true`
+      # below is an UPDATE, not a create, when a release already owns the
+      # tag — so aiming this at a published release would silently
+      # unpublish it. The guard job should have skipped the run long
+      # before here; this fails loudly if some path ever gets past it
+      # (e.g. the knob flipped off, or a tag re-pushed onto a live
+      # release). Manual runs with an explicit tag_name hit this too,
+      # which is the point: reusing a live tag is never what you want.
+      - name: Refuse to overwrite a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already has a PUBLISHED release. Refusing to run softprops/action-gh-release with draft:true, which would flip it back to draft and overwrite its assets. Use a different tag, or delete that release first."
+            exit 1
+          fi
+          echo "No published release owns ${TAG} — safe to create/update a draft."
 
       # gh-release v3 is the Node 24 line; same API as v2. tag_name is
       # passed explicitly (not inferred from github.ref) so the manual

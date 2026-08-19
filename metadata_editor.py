@@ -18,6 +18,72 @@ except ImportError:
     HAS_PIL = False
 
 # ---------------------------------------------------------
+# Field value normalization
+# ---------------------------------------------------------
+# EVERY writer below funnels its incoming value through _as_text, because the
+# callers legitimately disagree about the shape of a multi-value field.
+# LibraryTab.jsx's MetadataEditorPanel splits "Writers"/"Pencillers"/"Genres" on
+# commas and POSTs them as JSON ARRAYS; the Android editor and metadata_cli's
+# stdin payload can carry either. Everything on disk is a single delimited
+# string (ComicInfo <Writer>, OPF dc:creator, PDF /Author), so a list has to
+# collapse somewhere — and collapsing it here, once, is what keeps the three
+# format writers from each inventing their own rule.
+#
+# This was a live bug, not a hypothetical: the setters called `value.strip()`
+# directly, so a list raised AttributeError and every desktop metadata save that
+# touched those three fields failed outright.
+
+def _replace_preserving_mode(temp_path: str, dest_path: str) -> None:
+    """Move `temp_path` over `dest_path`, keeping the ORIGINAL's permissions.
+
+    Every writer below rebuilds the archive into a `tempfile.mkstemp()` file and
+    moves it into place. mkstemp creates with mode 0600 by design, and when the
+    temp file is on another filesystem shutil.move degrades to copy2 + unlink —
+    which copies the SOURCE's mode onto the destination. So editing metadata
+    silently rewrites the file's permissions to 0600, discarding whatever they
+    were. Observed on device: `-rw-rw----` became `-rw-------`.
+
+    An in-place edit changing a file's permissions is wrong on its own terms,
+    and it matters most where the library is a SHARED folder that other apps
+    read (the whole point of the MANAGE_EXTERNAL_STORAGE option) or a
+    multi-user/NAS path on desktop.
+
+    Scope note, because the device measurement is easy to over-read: on Android
+    app-scoped external storage, aio-dl.py's OWN downloads also land as 0600, so
+    this was not the difference between a readable and an unreadable library
+    there. It is a correctness fix, not a rescue.
+
+    Best-effort: a filesystem that cannot chmod (Android's FUSE-mounted external
+    storage rejects it outright; on Windows it only moves the read-only bit)
+    must not fail the save over it.
+    """
+    try:
+        mode = os.stat(dest_path).st_mode
+    except OSError:
+        mode = None
+    shutil.move(temp_path, dest_path)
+    if mode is not None:
+        try:
+            os.chmod(dest_path, mode & 0o7777)
+        except OSError:
+            pass
+
+
+def _as_text(value) -> str:
+    """One field's value as the single string every container format stores.
+
+    Lists join with ", " (matching how the UI splits them back apart), None
+    becomes empty — which the setters read as "remove this element" — and
+    anything else is stringified rather than rejected.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(part for part in (_as_text(item).strip() for item in value) if part)
+    return str(value)
+
+
+# ---------------------------------------------------------
 # ComicInfo (CBZ) XML element helpers
 # ---------------------------------------------------------
 # Shared by read_cbz_metadata (get) and update_cbz_metadata (set) so the
@@ -32,11 +98,14 @@ def _xml_get(root, tag: str) -> str:
 
 def _xml_set(root, tag: str, value):
     el = root.find(tag)
-    if value is not None and value.strip():
+    text = _as_text(value).strip()
+    if text:
         if el is None:
             el = ET.SubElement(root, tag)
-        el.text = value.strip()
+        el.text = text
     elif el is not None:
+        # An explicitly-blanked field REMOVES the element rather than writing an
+        # empty one — readers treat a present-but-empty tag as a real value.
         root.remove(el)
 
 
@@ -104,7 +173,7 @@ def update_cbz_metadata(path: str, data: dict, cover_path: str = None):
                 ext = os.path.splitext(cover_path)[1]
                 zout.write(cover_path, f"0000_cover{ext}")
                 
-        shutil.move(temp_path, path)
+        _replace_preserving_mode(temp_path, path)
     except Exception as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -193,9 +262,11 @@ def update_epub_metadata(path: str, data: dict, cover_path: str = None):
                                 # remove old
                                 for e in metadata_node.findall(f"{tag_ns_prefix}:{tag_name}", ns):
                                     metadata_node.remove(e)
-                                if new_val and new_val.strip():
+                                # Same list-tolerance as the CBZ path; see _as_text.
+                                text = _as_text(new_val).strip()
+                                if text:
                                     el = ET.SubElement(metadata_node, f"{{{tag_ns_url}}}{tag_name}")
-                                    el.text = new_val.strip()
+                                    el.text = text
 
                             if "title" in data:
                                 update_tag("title", "dc", "http://purl.org/dc/elements/1.1/", data["title"])
@@ -224,7 +295,7 @@ def update_epub_metadata(path: str, data: dict, cover_path: str = None):
                 # We expect the EPUB usually holds images/cover.jpg
                 zout.write(cover_path, "EPUB/images/cover.jpg")
                 
-        shutil.move(temp_path, path)
+        _replace_preserving_mode(temp_path, path)
     except Exception as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -264,9 +335,12 @@ def update_pdf_metadata(path: str, data: dict, cover_path: str = None):
         if reader.metadata:
             pdf_meta.update(reader.metadata)
             
-        if "title" in data: pdf_meta["/Title"] = data["title"]
-        if "writers" in data: pdf_meta["/Author"] = data["writers"]
-        if "synopsis" in data: pdf_meta["/Subject"] = data["synopsis"]
+        # pypdf writes these into the document info dictionary verbatim, so a
+        # list would land as its repr ("['A', 'B']"). Normalized for the same
+        # reason the XML setters are; see _as_text.
+        if "title" in data: pdf_meta["/Title"] = _as_text(data["title"])
+        if "writers" in data: pdf_meta["/Author"] = _as_text(data["writers"])
+        if "synopsis" in data: pdf_meta["/Subject"] = _as_text(data["synopsis"])
         
         writer.add_metadata(pdf_meta)
         
@@ -300,7 +374,7 @@ def update_pdf_metadata(path: str, data: dict, cover_path: str = None):
         with open(temp_path, "wb") as f:
             writer.write(f)
             
-        shutil.move(temp_path, path)
+        _replace_preserving_mode(temp_path, path)
     except Exception as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)

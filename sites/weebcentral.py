@@ -129,13 +129,89 @@ class WeebCentralSiteHandler(BaseSiteHandler):
     def _extract_chapter_number(self, text: str) -> Optional[str]:
         return self._chapter_number_from_text(text)
 
+    def _fetch_html(self, url: str, scraper, make_request, what: str) -> str:
+        """Fetch *url*, diverting to the shared CF rescue when turned away.
+
+        Ladder: cloudscraper → crawlee_utils.rescue_cf_html → raise.
+
+        Turn-away is TWO tests — a 403/429/503 status, and is_cf_challenge on
+        the body, which is what catches the HTTP-200 interstitial. Getting by
+        with only the first is what let a challenge page reach the parser here.
+
+        The rescue itself is deliberately NOT a ladder in this file any more.
+        It used to be one (embedder browser → impit → CF solver), ordered by
+        hand so that impit stayed ahead of the window-opening solver on desktop
+        while the Android WebView — the only rung that exists there — went
+        first. All of that is now expressed once, inside rescue_cf_html, whose
+        tiers are impit → embedder WebView → zendriver with the last two gated
+        on an opt-in permission. A per-file copy of that policy is exactly how
+        sites/manhwaread.py and sites/madara.py drifted apart.
+
+        Not a zstd problem. The comment here used to blame cloudscraper
+        advertising zstd it cannot decode; that was measured false — cloudscraper
+        sends `Accept-Encoding: gzip, deflate, br` (and strips `br` unless
+        allow_brotli), and urllib3 only offers zstd when backports.zstd is
+        installed. What actually fires this path is the 403/429/503 Cloudflare
+        branch below.
+        """
+        from .crawlee_utils import (
+            is_cf_challenge,
+            rescue_cf_html,
+            warn_cf_rescue,
+        )
+
+        errors: List[str] = []
+        try:
+            resp = make_request(url, scraper)
+            if resp.status_code in (403, 429, 503):
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            # BOTH tests, because they catch different things and this file
+            # shipped with only the first. A status check alone misses the
+            # JS-redirect interstitial, which CF serves with **HTTP 200** — that
+            # body was being returned verbatim and parsed as the series page,
+            # i.e. exactly the defect the ladder below exists to prevent, still
+            # live inside the function rewritten to fix it. is_cf_challenge
+            # covers the 200 variant (grep its `status_code == 200` branch);
+            # the status check stays because a bare 403/429/503 with no CF
+            # phrases is still a turn-away worth escalating.
+            if is_cf_challenge(resp.status_code, resp.text):
+                raise RuntimeError("Cloudflare interstitial served with HTTP 200")
+            return resp.text
+        except Exception as exc:
+            errors.append(f"cloudscraper: {exc}")
+
+        # ONE rung now, not three. rescue_cf_html owns the tier order itself
+        # (impit -> embedder WebView -> zendriver, with the two human-facing
+        # tiers gated on interactive_solve_allowed()), so the hand-rolled
+        # ladder that used to live here — including the embedder_only= dance
+        # that existed purely to keep impit ahead of a window-opening solver on
+        # desktop — is now a second copy of a policy that has a home. Two copies
+        # of a rescue policy is how sites/manhwaread.py drifted from
+        # sites/madara.py; grep the tier list in crawlee_utils.rescue_cf_html.
+        # Unconditional: rescue_cf_html's first tier is impit, which needs no
+        # solver at all, so there is no capability question left to ask here.
+        try:
+            return rescue_cf_html(url, base_url=self._BASE_URL, scraper=scraper)
+        except Exception as exc:
+            errors.append(f"rescue: {exc}")
+
+        warn_cf_rescue(url, "; ".join(errors))
+        raise RuntimeError(
+            f"WeebCentral {what} fetch failed: " + "; ".join(errors)
+        )
+
     # ----------------------------------------------------------- Base overrides
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault("Referer", self._BASE_URL + "/")
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
-        response = make_request(url, scraper)
-        soup = self._make_soup(response.text)
+        # Same ladder as the other two fetches. This one used to be a bare
+        # make_request, which on a content-bearing 403 hands the interstitial
+        # straight to the parser: title degrades to the URL slug, no cover, no
+        # description — and get_chapters raises seconds later anyway. Failing
+        # here with the ladder's own message beats shipping junk metadata.
+        html = self._fetch_html(url, scraper, make_request, "series page")
+        soup = self._make_soup(html)
 
         sections = soup.select("section[x-data] > section")
         hero = sections[0] if sections else None
@@ -212,23 +288,9 @@ class WeebCentralSiteHandler(BaseSiteHandler):
             series_url = urljoin(self._BASE_URL + "/", f"series/{context.identifier}")
 
         chapter_url = self._build_chapter_list_url(series_url)
-        try:
-            resp = make_request(chapter_url, scraper)
-            if resp.status_code in (403, 429, 503):
-                raise RuntimeError(f"HTTP {resp.status_code} on chapter list")
-            chapter_html = resp.text
-        except Exception:
-            # WeebCentral uses zstd compression that cloudscraper can't decode;
-            # impit with Chrome impersonation handles it transparently.
-            try:
-                from .crawlee_utils import fetch_html_impit, IMPIT_AVAILABLE
-                if not IMPIT_AVAILABLE:
-                    raise RuntimeError("impit not available")
-                chapter_html = fetch_html_impit(chapter_url, browser="chrome")
-            except Exception as imp_err:
-                raise RuntimeError(
-                    f"WeebCentral chapter list fetch failed: {imp_err}"
-                ) from imp_err
+        chapter_html = self._fetch_html(
+            chapter_url, scraper, make_request, "chapter list"
+        )
         soup = self._make_soup(chapter_html)
 
         chapters: List[Dict] = []
@@ -270,21 +332,7 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         base = chapter_url.rstrip("/")
         # Ensure we request the full list
         images_url = f"{base}/images?is_prev=False&current_page=1&reading_style=long_strip"
-        try:
-            resp = make_request(images_url, scraper)
-            if resp.status_code in (403, 429, 503):
-                raise RuntimeError(f"HTTP {resp.status_code}")
-            images_html = resp.text
-        except Exception:
-            try:
-                from .crawlee_utils import fetch_html_impit, IMPIT_AVAILABLE
-                if not IMPIT_AVAILABLE:
-                    raise RuntimeError("impit not available")
-                images_html = fetch_html_impit(images_url, browser="chrome")
-            except Exception as imp_err:
-                raise RuntimeError(
-                    f"WeebCentral images fetch failed: {imp_err}"
-                ) from imp_err
+        images_html = self._fetch_html(images_url, scraper, make_request, "images")
         soup = self._make_soup(images_html)
         
         images: List[str] = []
@@ -341,8 +389,14 @@ class WeebCentralSiteHandler(BaseSiteHandler):
             f"&sort=Best+Match&order=Descending&official=Any&anime=Any"
             f"&adult=Any&display_mode=Full+Display&series_status=Any"
         )
-        response = make_request(url, scraper)
-        html = response.text
+        # The FOURTH bare fetch in this file, and the one the earlier CF sweep
+        # missed because it lives in search() rather than the three data
+        # fetches. Same treatment now: a challenged body must never be parsed
+        # into "0 results", which is indistinguishable from a genuine miss and
+        # is what made this class of failure invisible. Interactive solving is
+        # already denied here by default (crawlee_utils' opt-in permission), so
+        # this buys the headless tiers without ever facing a human.
+        html = self._fetch_html(url, scraper, make_request, "search")
         if not html or len(html) < 100:
             return []
 

@@ -14,6 +14,7 @@ machinery (which would need a mocked event loop and HTTP fixtures).
 
 from __future__ import annotations
 
+from sites._image_io import IMAGE_ACCEPT
 from sites.base import BaseSiteHandler, _CURL_CFFI_AVAILABLE
 from sites.linewebtoon import LineWebtoonSiteHandler
 from sites.mangadex import MangaDexSiteHandler
@@ -132,10 +133,40 @@ def test_mangadex_does_not_opt_into_fast_download():
 # _fast_dl_build_headers behavior
 # ────────────────────────────────────────────────────────────────────────
 
-def test_base_handler_build_headers_returns_empty_dict_by_default():
-    """Default handler config has no Referer, no UA, no extras → empty headers."""
+def test_base_handler_build_headers_returns_only_image_accept_by_default():
+    """Default handler config has no Referer, no UA, no extras — so the ONLY
+    header is the image Accept every fast download must send.
+
+    This replaced a former "== {}" assertion (2026-08-03). curl_cffi's
+    `impersonate` seeds a *document* Accept, and hosts that content-negotiate
+    then answer an image URL with an HTML wrapper page instead of the image
+    (WordPress.com does exactly this; it silently broke manhuaplus' entire
+    WordPress-hosted back catalogue). Grep IMAGE_ACCEPT."""
     h = BaseSiteHandler()
-    assert h._fast_dl_build_headers("anyhost.example") == {}
+    assert h._fast_dl_build_headers("anyhost.example") == {"Accept": IMAGE_ACCEPT}
+
+
+def test_build_headers_image_accept_prefers_image_over_html():
+    """The whole point of the seeded Accept: image types must outrank
+    text/html, otherwise a content-negotiating host serves the wrapper page.
+    Asserts the ordering property rather than the exact string."""
+    accept = BaseSiteHandler()._fast_dl_build_headers("h")["Accept"]
+    assert accept.startswith("image/")
+    assert "text/html" not in accept
+
+
+def test_build_headers_extra_headers_can_override_image_accept():
+    """Accept is SEEDED, not forced — a handler whose CDN wants something else
+    (e.g. application/json for a binary-in-JSON endpoint) overrides it through
+    FAST_DL_EXTRA_HEADERS. No shipped handler does today; this keeps the
+    escape hatch honest."""
+
+    class _JsonHandler(BaseSiteHandler):
+        FAST_DL_EXTRA_HEADERS = {"Accept": "application/json"}
+
+    assert _JsonHandler()._fast_dl_build_headers("h")["Accept"] == "application/json"
+    # And the shared module-level dict was not mutated by that override.
+    assert BaseSiteHandler()._fast_dl_build_headers("h")["Accept"] == IMAGE_ACCEPT
 
 
 def test_mangafire_build_headers_includes_referer_and_ua():

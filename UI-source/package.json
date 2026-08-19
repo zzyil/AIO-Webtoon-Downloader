@@ -10,8 +10,8 @@
     "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
     "electron:build": "node scripts/prepare-src.js && vite build && electron-builder --publish never",
     "electron:preview": "vite build && cross-env NODE_ENV=production electron .",
-    "dist:win":   "node scripts/prepare-src.js && vite build && electron-builder --win --publish never",
-    "dist:mac":   "node scripts/prepare-src.js && vite build && electron-builder --mac --publish never",
+    "dist:win": "node scripts/prepare-src.js && vite build && electron-builder --win --publish never",
+    "dist:mac": "node scripts/prepare-src.js && vite build && electron-builder --mac --publish never",
     "dist:linux": "node scripts/prepare-src.js && vite build && electron-builder --linux --publish never"
   },
   "build": {
@@ -47,7 +47,9 @@
         {
           "from": "build-resources/vcruntime",
           "to": "vcruntime",
-          "filter": ["*.dll"]
+          "filter": [
+            "*.dll"
+          ]
         }
       ]
     },
@@ -60,7 +62,13 @@
     },
     "mac": {
       "target": [
-        { "target": "dmg", "arch": ["x64", "arm64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
       ],
       "category": "public.app-category.utilities",
       "identity": null,
@@ -77,8 +85,18 @@
     },
     "linux": {
       "target": [
-        { "target": "AppImage", "arch": ["x64"] },
-        { "target": "deb", "arch": ["x64"] }
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "category": "Network",
       "maintainer": "AIO Downloader Project <noreply@github.com>",

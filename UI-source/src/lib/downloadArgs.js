@@ -34,6 +34,21 @@
 // NOTE the XF-2 quality default of 100 (NOT 85): any --quality < 100 flips the
 // child's _user_set_quality True and disables the CBZ byte-passthrough
 // fast-path (silent lossy re-encode). Keep it 100.
+//
+// KEEP-CHAPTERS IS DELIBERATELY *NOT* SPECIAL-CASED HERE, and that is worth a
+// note because it briefly was. Every download this builder produces is a DELTA
+// — `chapters` is only the missing range — so its chapter set does not cover
+// the combined `<Title>.<fmt>` already on disk, and aio-dl.py's overwrite guard
+// (grep _final_file_would_shrink) declines to rebuild that archive rather than
+// truncating 53 chapters to 3. That leaves the run's chapters with nowhere
+// durable to go unless --keep-chapters is on.
+//
+// Python fixes that in Python: the same predicate runs BEFORE the chapter loop
+// and coerces keep_chapters itself, announced with one `[Delta]` line, exactly
+// as --komikku coerces its three flags (grep "Forcing" in aio-dl.py). Doing it
+// here instead would mean every caller of the engine has to remember to
+// compensate for a decision only the engine can make — this builder AND
+// core/DownloadForm.kt's Android twin, forever.
 export function buildLibraryDownloadArgs(
   meta,
   d,

@@ -740,23 +740,52 @@ class MadaraSiteHandler(BaseSiteHandler):
 
     def _fetch_html(self, url: str, scraper, make_request) -> str:
         """Fetch page HTML, solving a Cloudflare challenge if the plain request
-        hits one. Zendriver-first when self.use_zendriver, else a plain request
-        with a zendriver fallback on a detected CF challenge. Shared by
-        fetch_comic_context / get_chapters / get_chapter_images (grep _fetch_html)."""
-        if self.use_zendriver:
-            from .crawlee_utils import fetch_html_with_cf_cookies, sync_cf_cookies
+        hits one. Browser-first when self.use_zendriver, else a plain request
+        with a rescue on a detected CF challenge. Shared by
+        fetch_comic_context / get_chapters / get_chapter_images (grep _fetch_html).
 
-            html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
-            sync_cf_cookies(scraper, url)
-            return html
+        THIS IS THE ONLY CF CHOKEPOINT FOR ALL 244 MADARA HANDLERS — none of
+        them sets use_zendriver and none overrides this method, so the branch
+        below is the whole story for 80% of the registry. Two things it must
+        keep doing:
+
+          * detect FIRST, gate SECOND. The old condition was
+            `if ZENDRIVER_AVAILABLE and is_cf_challenge(...)`, so on a platform
+            without zendriver (Android) `and` short-circuited, the detector was
+            never even called, and the interstitial was parsed as the page.
+          * never go silent. The whole block is `except Exception:` so a broken
+            rescue cannot kill an otherwise-fine fetch, but a swallowed rescue
+            is exactly why this survived a milestone unnoticed — the user saw
+            "No chapters selected", never Cloudflare.
+
+        Cross-file: sites/crawlee_utils.py owns the gate (cf_solver_available),
+        the diversion (rescue_cf_html) and the wording (warn_cf_*).
+        """
+        if self.use_zendriver:
+            from .crawlee_utils import rescue_cf_html
+
+            return rescue_cf_html(url, base_url=self.base_url, scraper=scraper)
         response = make_request(url, scraper)
         html = response.text
         try:
-            from .crawlee_utils import ZENDRIVER_AVAILABLE, is_cf_challenge, fetch_html_with_cf_cookies, sync_cf_cookies
+            from .crawlee_utils import (
+                cf_solver_available,
+                is_cf_challenge,
+                rescue_cf_html,
+                warn_cf_no_solver,
+                warn_cf_rescue,
+            )
 
-            if ZENDRIVER_AVAILABLE and is_cf_challenge(response.status_code, html):
-                html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
-                sync_cf_cookies(scraper, url)
+            if is_cf_challenge(response.status_code, html):
+                if cf_solver_available():
+                    try:
+                        html = rescue_cf_html(
+                            url, base_url=self.base_url, scraper=scraper
+                        )
+                    except Exception as exc:
+                        warn_cf_rescue(url, f"rescue failed: {exc}")
+                else:
+                    warn_cf_no_solver(url)
         except Exception:
             pass
         return html
