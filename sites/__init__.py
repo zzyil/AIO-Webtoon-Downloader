@@ -14,7 +14,6 @@ from .arc_relight import ArcRelightSiteHandler
 from .arcanescans import ArcaneScansSiteHandler
 from .dynasty import DynastySiteHandler
 from .likemanga import LikeMangaSiteHandler
-from .kagane import KaganeSiteHandler
 from .madara import MadaraSiteHandler
 from .manhwaread import ManhwaReadHandler
 from .madara_extra_sites import MADARA_EXTRA_SITES
@@ -23,13 +22,11 @@ from .mangabin import MangaBinSiteHandler
 from .mangahub import MangaHubSiteHandler
 from .mangafox import MangaFoxSiteHandler
 from .manganato import ManganatoSiteHandler
-from .mangareader import MangaReaderSiteHandler
 from .mangakatana import MangaKatanaSiteHandler
 from .mangataro import MangataroSiteHandler
 from .summanga import SumMangaSiteHandler
 from .weebcentral import WeebCentralSiteHandler
 from .mangafire import MangaFireSiteHandler
-from .mangago import MangaGoSiteHandler
 from .comix import ComixSiteHandler
 from .flamecomics import FlameComicsSiteHandler
 from .tcbscans import TCBScansSiteHandler
@@ -55,49 +52,109 @@ from .mangathemesia_sites import MANGATHEMESIA_SITES
 from .manhuaplus import ManhuaPlusSiteHandler
 from .manhuaus import ManhuaUSSiteHandler
 
-_BASE_HANDLERS: Iterable[BaseSiteHandler] = (
-    MangataroSiteHandler(),
-    MangaFireSiteHandler(),
-    MangaGoSiteHandler(),
-    AsuraSiteHandler(),
-    ArtlapsaSiteHandler(),
-    AsmotoonSiteHandler(),
-    AssortedScansSiteHandler(),
-    ArcRelightSiteHandler(),
-    ArcaneScansSiteHandler(),
-    MangaBinSiteHandler(),
-    MangaReaderSiteHandler(),
-    SumMangaSiteHandler(),
-    WeebCentralSiteHandler(),
-    AtsumaruSiteHandler(),
-    MangaKatanaSiteHandler(),
-    ManganatoSiteHandler(),
-    LikeMangaSiteHandler(),
-    MangaFoxSiteHandler(),
-    KaganeSiteHandler(),
-    DynastySiteHandler(),
-    MangaDexSiteHandler(),
-    MangaHubSiteHandler(),
-    ComixSiteHandler(),
-    FlameComicsSiteHandler(),
-    TCBScansSiteHandler(),
-    VoyceMeSiteHandler(),
-    WebtoonXYZSiteHandler(),
-    ToonilySiteHandler(),
-    ZeroScansSiteHandler(),
-    MangaPillSiteHandler(),
-    ManhuaPlusSiteHandler(),
-    ManhuaUSSiteHandler(),
-    OmegaScansSiteHandler(),
-    RizzComicSiteHandler(),
-    RizzFablesSiteHandler(),
-    TecnoxmoonSiteHandler(),
-    VioletScansSiteHandler(),
-    BoratScansSiteHandler(),
-    LineWebtoonSiteHandler(),
-    TapasSiteHandler(),
-    ManhwaReadHandler(),
-    KappabeastSiteHandler(),
+# ---------------------------------------------------------------------------
+# Optional handlers — modules that import a NATIVE extension at module scope.
+#
+# All three pull in `cryptography` (mangareader additionally imports Pillow).
+# On desktop those always resolve, so this block is a no-op and the registry
+# stays at the documented REGISTERED: 303 / BASE: 42.
+#
+# WHY GUARD AT ALL: every import in this file runs before `_BASE_HANDLERS` is
+# built, so ONE missing wheel takes down the ENTIRE registry — all 303 domains
+# — rather than the 3 sites that actually need it. That is a real platform, not
+# a hypothetical: Android via Chaquopy is the live case.
+#
+# Failures are RECORDED, not swallowed — a site vanishing silently is how you
+# spend an afternoon wondering why a URL says "no handler". Cross-file:
+# aio_android.py logs _OPTIONAL_HANDLER_ERRORS at startup.
+# ---------------------------------------------------------------------------
+_OPTIONAL_HANDLER_ERRORS: dict = {}
+
+try:
+    from .kagane import KaganeSiteHandler
+except Exception as _exc:  # noqa: BLE001 — any import-time failure, not just ImportError
+    KaganeSiteHandler = None  # type: ignore[assignment]
+    _OPTIONAL_HANDLER_ERRORS["kagane"] = f"{type(_exc).__name__}: {_exc}"
+
+try:
+    from .mangago import MangaGoSiteHandler
+except Exception as _exc:  # noqa: BLE001
+    MangaGoSiteHandler = None  # type: ignore[assignment]
+    _OPTIONAL_HANDLER_ERRORS["mangago"] = f"{type(_exc).__name__}: {_exc}"
+
+try:
+    from .mangareader import MangaReaderSiteHandler
+except Exception as _exc:  # noqa: BLE001
+    MangaReaderSiteHandler = None  # type: ignore[assignment]
+    _OPTIONAL_HANDLER_ERRORS["mangareader"] = f"{type(_exc).__name__}: {_exc}"
+
+
+def _optional(factory):
+    """Instantiate an optional handler, or None when its module didn't import.
+
+    Kept as a filtered-out None rather than an omitted entry so the literal
+    below preserves its ORIGINAL ORDER. Order is load-bearing:
+    get_handler_for_url returns the FIRST handler whose domain matches, so
+    reshuffling could silently reassign a URL to a different handler.
+    """
+    if factory is None:
+        return None
+    try:
+        return factory()
+    except Exception as exc:  # noqa: BLE001 — a ctor that needs a missing dep
+        _OPTIONAL_HANDLER_ERRORS.setdefault(
+            getattr(factory, "__name__", str(factory)), f"{type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+_BASE_HANDLERS: Iterable[BaseSiteHandler] = tuple(
+    _h
+    for _h in (
+        MangataroSiteHandler(),
+        MangaFireSiteHandler(),
+        _optional(MangaGoSiteHandler),
+        AsuraSiteHandler(),
+        ArtlapsaSiteHandler(),
+        AsmotoonSiteHandler(),
+        AssortedScansSiteHandler(),
+        ArcRelightSiteHandler(),
+        ArcaneScansSiteHandler(),
+        MangaBinSiteHandler(),
+        _optional(MangaReaderSiteHandler),
+        SumMangaSiteHandler(),
+        WeebCentralSiteHandler(),
+        AtsumaruSiteHandler(),
+        MangaKatanaSiteHandler(),
+        ManganatoSiteHandler(),
+        LikeMangaSiteHandler(),
+        MangaFoxSiteHandler(),
+        _optional(KaganeSiteHandler),
+        DynastySiteHandler(),
+        MangaDexSiteHandler(),
+        MangaHubSiteHandler(),
+        ComixSiteHandler(),
+        FlameComicsSiteHandler(),
+        TCBScansSiteHandler(),
+        VoyceMeSiteHandler(),
+        WebtoonXYZSiteHandler(),
+        ToonilySiteHandler(),
+        ZeroScansSiteHandler(),
+        MangaPillSiteHandler(),
+        ManhuaPlusSiteHandler(),
+        ManhuaUSSiteHandler(),
+        OmegaScansSiteHandler(),
+        RizzComicSiteHandler(),
+        RizzFablesSiteHandler(),
+        TecnoxmoonSiteHandler(),
+        VioletScansSiteHandler(),
+        BoratScansSiteHandler(),
+        LineWebtoonSiteHandler(),
+        TapasSiteHandler(),
+        ManhwaReadHandler(),
+        KappabeastSiteHandler(),
+    )
+    if _h is not None
 )
 
 

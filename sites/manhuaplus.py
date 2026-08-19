@@ -6,13 +6,23 @@ for reader URLs. When fixing something here, check sites/madara.py first — the
 attribute ladder + selector-break loop below are deliberate mirrors of
 `MadaraSiteHandler.get_chapter_images` (grep reader_selectors).
 
-Site-specific trap: old chapters (roughly < ch.1000) point at
-`*.files.wordpress.com`, a host that was retired but still answers **HTTP 200
-with `Content-Type: text/html` and a ~19 KB error page** for every image URL.
-Nothing here can tell that apart from a real image — the rejection lives in
-`sites/_image_io.py:looks_like_real_image`, enforced by aio-dl.py:dl_image
-(grep _finalize_downloaded_image). Those chapters now fail loudly instead of
-producing a CBZ of 15 HTML documents named 0001.jpg.
+Site-specific trap: this site's back catalogue is split across two image hosts.
+Recent chapters serve from `cdn.manhuaplus.com`; old ones (roughly < ch.1000)
+point at per-upload WordPress.com blogs — `anhanh1221.files.wordpress.com`,
+`manhuaus5.files.wordpress.com`, … (the subdomain varies PER CHAPTER, so never
+special-case one host).
+
+WordPress.com content-negotiates those image URLs on the request's `Accept`:
+ask for text/html and it answers **200 + `Content-Type: text/html` + a ~19 KB
+attachment wrapper page**; ask for image/* and the same URL returns the real
+JPEG. Since cloudscraper seeds every session with a document Accept, the whole
+WordPress-hosted back catalogue used to download as markup — diagnosed at the
+time as a retired host, which it is NOT (verified 2026-08-03: every one of
+those URLs still serves its original bytes). The fix is request-side and
+global: `sites/_image_io.py:IMAGE_ACCEPT`, sent per-request by
+aio-dl.py:_try_download_url. `looks_like_real_image` (same module) still
+backstops it, so a genuine wrapper page fails loudly instead of producing a
+CBZ of HTML documents named 0001.jpg.
 """
 from __future__ import annotations
 from typing import Dict, List, Optional

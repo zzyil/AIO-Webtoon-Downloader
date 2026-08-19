@@ -22,6 +22,7 @@ from .base import (
     SiteComicContext,
 )
 from ._publishers import lookup_publisher
+from ._image_io import IMAGE_ACCEPT_HEADERS
 
 
 _logger = logging.getLogger(__name__)
@@ -655,7 +656,10 @@ class MangaDexSiteHandler(BaseSiteHandler):
         status: Optional[int] = None
         success = False
         try:
-            resp = scraper.get(url, timeout=self._IMAGE_TIMEOUT_S, stream=True)
+            resp = scraper.get(
+                url, timeout=self._IMAGE_TIMEOUT_S, stream=True,
+                headers=IMAGE_ACCEPT_HEADERS,  # grep IMAGE_ACCEPT
+            )
             status = resp.status_code
             cached = (resp.headers.get("X-Cache", "") or "").upper().startswith("HIT")
             if status == 200:

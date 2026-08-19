@@ -48,6 +48,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from . import fuzzy_match
+
 
 # --- Constants -------------------------------------------------------------
 
@@ -540,17 +542,20 @@ _AUTHOR_PLACEHOLDERS = frozenset(
 def _load_rapidfuzz():
     """Lazy-import (fuzz, default_process) from rapidfuzz. Module-wide pattern so
     a packager who strips rapidfuzz breaks only --metadata-source enrichment,
-    with a clear ImportError. grep callers: _author_match_score,
-    _score_candidate_detail."""
+    with a clear ImportError.
+
+    Kept as a named function even though sites/fuzzy_match now owns the seam:
+    the message names the FEATURE the user was using, and the scorer wrappers
+    below can't do that. Scores themselves go through fuzzy_match so the C++ and
+    pure-Python rapidfuzz backends agree -- see that module's header.
+    """
     try:
-        from rapidfuzz import fuzz
-        from rapidfuzz.utils import default_process
+        return fuzzy_match.load_rapidfuzz()
     except ImportError as exc:
         raise ImportError(
             "rapidfuzz is required for --metadata-source enrichment. "
             "Install with: pip install rapidfuzz"
         ) from exc
-    return fuzz, default_process
 
 
 def _author_match_score(
@@ -566,7 +571,7 @@ def _author_match_score(
     empty/<3-char site strings are dropped so a bare "Unknown" can't match an
     AniList "Unknown". grep callers: _pick_best_candidate, enrich_from_anilist.
     """
-    fuzz, default_process = _load_rapidfuzz()
+    _load_rapidfuzz()  # surface the feature-named ImportError before scoring
     srcs: List[str] = []
     for author in source_authors or []:
         author = str(author or "").strip()
@@ -578,7 +583,7 @@ def _author_match_score(
     best = 0.0
     for s in srcs:
         for c in cand_names:
-            score = float(fuzz.token_set_ratio(s, c, processor=default_process))
+            score = fuzzy_match.processed_token_set_ratio(s, c)
             if score > best:
                 best = score
     return best
@@ -600,7 +605,7 @@ def _score_candidate_detail(
     rapidfuzz lazy-imported here (module-wide pattern) so a packager who strips
     it breaks only enrichment, with a clear ImportError.
     """
-    fuzz, default_process = _load_rapidfuzz()
+    _load_rapidfuzz()  # surface the feature-named ImportError before scoring
     if not source_titles:
         return 0.0, False
     primary, synonyms = _candidate_titles_split(candidate)
@@ -617,7 +622,7 @@ def _score_candidate_detail(
                 # Alchemist" = 25 raw / 100 processed (id 30025); unrelated
                 # "Hagane no Renkinjutsushi" stays 26. The 75 floor still
                 # separates cleanly.
-                score = float(fuzz.WRatio(s, c, processor=default_process))
+                score = fuzzy_match.processed_wratio(s, c)
                 if score > best:
                     best = score
         return best

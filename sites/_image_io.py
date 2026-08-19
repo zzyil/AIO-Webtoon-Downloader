@@ -4,6 +4,9 @@ and per-site handlers that implement their own image fetcher.
 What this module owns:
   - Magic-byte detection for JPEG / PNG / GIF / WebP / AVIF / HEIC.
   - Content-Type fallback when magic is ambiguous.
+  - `IMAGE_ACCEPT` / `IMAGE_ACCEPT_HEADERS`: the request-side counterpart —
+    the Accept header an image fetch must send so content-negotiating hosts
+    return the image and not an HTML wrapper page. See its comment below.
   - Header-only pixel-dimension sniffing (`sniff_image_dimensions`) + a
     `looks_like_real_image()` validity predicate that rescues legitimately tiny
     images from the download/probe byte-size gate (see that function's docstring)
@@ -38,6 +41,39 @@ JPEG_MAGIC = b"\xff\xd8"           # SOI marker
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"   # ISO 15948 §5.2 file signature
 GIF_MAGIC = b"GIF8"                # both GIF87a and GIF89a
 # WebP/AVIF/HEIC use ISO BMFF / RIFF containers — checked via byte ranges.
+
+
+# --- Request side: how to ASK for an image ----------------------------------
+# Byte-for-byte what Chrome sends on an <img> subresource request, as opposed to
+# the document Accept a session default carries. This is NOT cosmetic
+# fingerprinting — some hosts content-negotiate on it and serve a *different
+# resource* for the same URL:
+#
+#   WordPress.com (`<sub>.files.wordpress.com/...jpg`, and the
+#   `<sub>.wordpress.com/wp-content/uploads/...` form it redirects to) answers
+#   an image URL with `200 text/html` + a ~19 KB attachment WRAPPER PAGE
+#   (`x-orig-src: 0_wrapper`) whenever text/html outranks image/* in Accept, and
+#   with the real JPEG (`x-orig-src: 01_mogdir`) otherwise. Both responses are
+#   200, and the response carries `Vary: Accept`.
+#
+# cloudscraper seeds every session with the *document* Accept
+# (`text/html,...;q=0.9,image/webp,image/apng,*/*;q=0.8`), and curl_cffi's
+# `impersonate` does the same — so before this constant existed, every image
+# fetch in the tree asked for HTML and WordPress-hosted chapters (manhuaplus'
+# entire pre-~ch.1000 back catalogue) downloaded 19 KB of markup per page.
+# `looks_like_real_image` below correctly rejected them, which is why the
+# symptom read as a dead host rather than a bad request.
+#
+# Pass PER REQUEST, never onto `session.headers` — the same session fetches
+# HTML pages, and a session-level image Accept would break those instead.
+# Callers: aio-dl.py:_try_download_url, sites/base.py (_fast_dl_build_headers,
+# _fetch_probe_item_bytes_ex, _probe_cover_image), sites/mangadex.py
+# (_fetch_image_blob). grep IMAGE_ACCEPT.
+IMAGE_ACCEPT = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+
+# Ready-made dict for `requests`/`curl_cffi` `headers=` kwargs. Module-level and
+# shared, so treat it as read-only: `dict(IMAGE_ACCEPT_HEADERS)` before mutating.
+IMAGE_ACCEPT_HEADERS = {"Accept": IMAGE_ACCEPT}
 
 
 def content_type_to_ext(content_type: str) -> Optional[str]:

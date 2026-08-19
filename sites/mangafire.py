@@ -27,7 +27,14 @@ from . import mangafire_vrf
 # every fetch here still runs through plain `make_request` (cloudscraper) and
 # images download via the inherited curl_cffi fast path.
 #
-# THE ONE THING THAT NEEDS A BROWSER: every `/api/*` call must carry a `vrf=`
+# TWO THINGS NEED A BROWSER NOW. The second one is Cloudflare: mangafire.to
+# went behind a Managed Challenge sitewide around 2026-08-16, so while it is up
+# `make_request` gets an interstitial for every call and `_api_get` transparently
+# switches to the browser-backed read (grep _api_via_browser). Images are on the
+# separate `*.mfcdn*.xyz` CDN, which is NOT challenged, so they stay on the
+# inherited curl_cffi fast path either way.
+#
+# THE ONE THING THAT ALWAYS NEEDS A BROWSER: every `/api/*` call must carry a `vrf=`
 # query parameter or the server answers `403 {"message":"Missing token."}`
 # (and `"Invalid token."` if the token doesn't match the params sent). Minting
 # that token is delegated to sites/mangafire_vrf.py — read its header for why
@@ -113,6 +120,28 @@ def _html_to_text(raw: Optional[str]) -> Optional[str]:
     return s or None
 
 
+class _BrowserApiResponse:
+    """A minimal requests-shaped view over an in-page fetch result.
+
+    Exists so `_is_token_rejection`, `_resp_diag` and the plain `status != 200`
+    check keep working byte-for-byte whichever transport produced the response.
+    Adding a second shape for them to handle is how the token-rejection retry
+    would quietly stop firing on the browser path.
+    """
+
+    __slots__ = ("status_code", "text", "headers")
+
+    def __init__(self, status: int, body: str) -> None:
+        self.status_code = status
+        self.text = body
+        self.headers = {"content-type": "application/json"}
+
+    def json(self):
+        import json as _json
+
+        return _json.loads(self.text)
+
+
 class MangaFireSiteHandler(BaseSiteHandler):
     name = "mangafire"
     domains = ("mangafire.to",)
@@ -141,6 +170,12 @@ class MangaFireSiteHandler(BaseSiteHandler):
     # Set once by _warn_signing_unavailable_once; class-level so the suppression
     # spans every handler instance the search fan-out creates.
     _signing_warned = False
+
+    # Sticky once Cloudflare has challenged the plain-HTTP path: every later call
+    # goes straight to the browser rather than re-paying a guaranteed-403 round
+    # trip. Class-level for the same reason as _signing_warned — the search
+    # fan-out builds several handler instances and they should share one verdict.
+    _api_via_browser = False
 
     # When both an "official" and an "unofficial" scan exist for the same
     # chapter number (common), keep this one; fall back to the other when the
@@ -234,6 +269,59 @@ class MangaFireSiteHandler(BaseSiteHandler):
             return False
         return "token" in msg.lower()
 
+    @staticmethod
+    def _is_cf_challenge_response(resp) -> bool:
+        """True when *resp* is Cloudflare's interstitial rather than the API.
+
+        Cross-file: sites/crawlee_utils.py:is_cf_challenge owns the phrase list.
+        Soft-imported and failure-swallowing on purpose — a missing crawlee is a
+        reason to keep the old behaviour, not to break every MangaFire call.
+        """
+        try:
+            from .crawlee_utils import is_cf_challenge
+        except Exception:
+            return False
+        try:
+            return bool(
+                is_cf_challenge(getattr(resp, "status_code", 0) or 0, resp.text or "")
+            )
+        except Exception:
+            return False
+
+    def _fetch_signed(self, url: str, scraper, make_request):
+        """GET a signed API URL, over plain HTTP for as long as that works.
+
+        mangafire.to has been behind a Cloudflare Managed Challenge since
+        ~2026-08-16 and NO headless client gets past it — measured 2026-08-19,
+        plain requests / impit chrome / curl_cffi chrome / cloudscraper were all
+        served the interstitial for both the homepage and /api/*. While that is
+        up, the browser the signer already keeps open is the only client that can
+        read this API, so the first challenged response flips `_api_via_browser`
+        and everything after it reads in-page.
+
+        Costs one bool when Cloudflare is off, which is the point: the "only
+        signing needs a browser" property still holds in the normal case.
+
+        Returns a response-shaped object, or None when the browser could not
+        produce one. Retryable/rate-limit failures raised by make_request
+        propagate per its contract.
+        """
+        if not type(self)._api_via_browser:
+            resp = make_request(url, scraper)
+            if not self._is_cf_challenge_response(resp):
+                return resp
+            type(self)._api_via_browser = True
+            print(
+                "[!] MangaFire: Cloudflare is challenging the API over HTTP; "
+                "switching to the browser-backed fetch for the rest of this run."
+            )
+        out = mangafire_vrf.fetch_api_json(url)
+        if not isinstance(out, dict):
+            return None
+        return _BrowserApiResponse(
+            int(out.get("status") or 0), str(out.get("body") or "")
+        )
+
     def _api_get(
         self,
         path: str,
@@ -264,7 +352,13 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 url = f"{url}?{query}"
 
             _mf_throttle()
-            resp = make_request(url, scraper)
+            resp = self._fetch_signed(url, scraper, make_request)
+            if resp is None:
+                print(
+                    f"[!] {label}: could not reach the MangaFire API "
+                    f"(Cloudflare challenge and no browser-backed fetch available)."
+                )
+                return None
             status = getattr(resp, "status_code", None)
 
             if self._is_token_rejection(resp):

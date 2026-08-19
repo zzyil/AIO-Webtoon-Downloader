@@ -43,7 +43,7 @@ import textwrap
 import xml.sax.saxutils
 import zipfile
 import zlib
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse, unquote_to_bytes
 
 from aio_config import (
@@ -65,11 +65,13 @@ from sites.base import (
 from sites.group_quality import MTL_CONFIRMED, classify_mtl
 from sites._image_io import (
     sniff_image_extension as _sniff_image_extension,
+    image_magic_extension as _image_magic_extension,
     finalize_pending_image as _finalize_pending_image,
     JPEG_MAGIC as _JPEG_MAGIC,
     PNG_MAGIC as _PNG_MAGIC,
     GIF_MAGIC as _GIF_MAGIC,
     content_type_to_ext as _content_type_to_ext,
+    IMAGE_ACCEPT_HEADERS as _IMAGE_ACCEPT_HEADERS,
 )
 
 
@@ -244,8 +246,16 @@ class ChapterPermanentSkipError(Exception):
 #     were pure cost. Note comix raises this ONLY for the deferral signature
 #     (grep _looks_like_stalled_capture); an ordinary render miss stays
 #     retryable as "comix_dom_render_incomplete".
+#   * decode_dropped_pages — pages downloaded fine and then failed to DECODE
+#     (live cause: Chaquopy's Pillow ships no WebP codec, android/PARITY.md D4).
+#     Deterministic for this build: the same bytes through the same missing
+#     codec fail identically, so the two long inline retries were pure cost. It
+#     still reaches the alt-source loop first, and that is the point — the
+#     rescue that works is an ALTERNATE SOURCE serving a format this build can
+#     read, not a retry.
 _PERMANENT_SKIP_REASONS = frozenset({
     "mature_login_required", "locked", "comix_pages_stalled",
+    "decode_dropped_pages",
 })
 
 
@@ -712,6 +722,34 @@ def make_request(url: str, scraper):
                 # errors), so when the body has content we surface the response
                 # rather than raising. Tiny-body 4xx fails fast — there's
                 # nothing to inspect.
+                # A Cloudflare interstitial lands here too (403 + ~5 KB of
+                # challenge HTML), and handing it back as "a response with
+                # content" is how a challenged site reads downstream as an empty
+                # page: no title, no chapters, and the run dies on "No chapters
+                # selected" with Cloudflare never mentioned once.
+                #
+                # WARN AND STILL RETURN, deliberately. sites/madara.py:_fetch_html
+                # (the CF chokepoint for 244 handlers), mangathemesia's
+                # _fetch_html_guarded and kappabeast's _read_frontend_text all
+                # call make_request and THEN inspect the body to decide whether to
+                # rescue — raising here would silently disable every one of those
+                # rescues. This only makes the failure legible for handlers that
+                # have no rescue of their own (kagane, manhuaus).
+                # Cross-file: sites/crawlee_utils.py:warn_cf_rescue dedups to one
+                # line per host per process.
+                try:
+                    from sites.crawlee_utils import is_cf_challenge, warn_cf_rescue
+
+                    if is_cf_challenge(r.status_code, r.text or ""):
+                        warn_cf_rescue(
+                            url,
+                            "the site served a Cloudflare verification page "
+                            f"instead of content (HTTP {r.status_code}). Anything "
+                            "parsed from this response will be empty.",
+                            kind="detected",
+                        )
+                except Exception:
+                    pass
                 if not r.text or len(r.text) < 100:
                     r.raise_for_status()
                 log_verbose(
@@ -1013,6 +1051,121 @@ _HOST_CAP_LOCK = threading.Lock()
 # return early so the chapter aborts within seconds of the deadline.
 # None outside the chapter loop (e.g. during cover download).
 _CHAPTER_CANCEL: Optional[threading.Event] = None
+
+# RUN-level cancel — "the user pressed stop", not "this chapter ran long".
+#
+# WHY A SECOND EVENT instead of reusing _CHAPTER_CANCEL: that one is owned by
+# the per-chapter watchdog and is deliberately torn down twice per chapter —
+# the completeness gate CLEARS it when a chapter finished N/N despite the
+# deadline (grep "accepting despite"), and _process_chapter's finally sets the
+# global back to None. Either would silently un-cancel a user's stop request.
+# Keeping them separate means the watchdog can keep standing itself down
+# without ever countermanding the user.
+#
+# Always a real Event, never None — unlike _CHAPTER_CANCEL, which needs the
+# capture-once dance at _chapter_cancelled to dodge a None race (see S5-6 in
+# that function). Nothing sets this back to None, so readers can just poll it.
+#
+# Who sets it: embedders that can't kill the process. On desktop a cancel is
+# `taskkill /f /t` / SIGTERM and this stays clear for the whole run; on Android
+# there is no separate process to kill, so aio_android.py flips this instead.
+# Cross-file: grep request_run_cancel.
+_RUN_CANCEL = threading.Event()
+
+
+def request_run_cancel() -> None:
+    """Ask the current run to wind down at the next cancellation checkpoint.
+
+    Cooperative, not immediate: in-flight page downloads finish or time out on
+    their own, then the chapter loop, the image pools, and the prefetch workers
+    all notice via _chapter_cancelled / run_cancelled. Callers that need a hard
+    stop should still kill the process."""
+    _RUN_CANCEL.set()
+
+
+def clear_run_cancel() -> None:
+    """Reset before starting a new run in the same process. Only embedders that
+    reuse an interpreter need this — a one-shot CLI process never does."""
+    _RUN_CANCEL.clear()
+
+
+def run_cancelled() -> bool:
+    return _RUN_CANCEL.is_set()
+
+
+def _self_spawn_unavailable() -> Optional[str]:
+    """Why this process can't re-invoke itself, or None when it can.
+
+    Two modes fan out by spawning `[sys.executable, <this file>, ...]`:
+    --update-all and the multi-URL supervisor. That assumes CPython is running
+    as an interpreter BINARY. Wherever it's EMBEDDED instead — Chaquopy on
+    Android is the live case — sys.executable is not something you can exec,
+    and Popen either fails cryptically or (worse) launches the host app again.
+
+    Checked so those modes can refuse with a real explanation. Desktop always
+    returns None here, so nothing changes.
+    """
+    exe = sys.executable or ""
+    if not exe or not os.path.isfile(exe):
+        return (
+            f"this build has no runnable Python interpreter to spawn "
+            f"(sys.executable={exe!r}); run one URL per invocation instead"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Structured progress events (opt-in; None on desktop).
+#
+# The Electron UI learns a run's progress by REGEX-SCRAPING this file's
+# human-readable stdout — 14 patterns, see UI-source/electron/downloader.js
+# :parseProgressLine. That works, but it couples the UI to print() wording:
+# rephrase a log line and a progress bar quietly stops moving.
+#
+# An embedder that runs main() IN-PROCESS (no pipe to scrape) needs the data
+# anyway, so it gets a typed channel instead. Android is the live case —
+# grep set_event_sink in aio_android.py.
+#
+# DELIBERATELY ADDITIVE: every _emit() sits BESIDE its print(), never replaces
+# it. Desktop stdout is byte-identical and downloader.js's parser keeps
+# working untouched. The sink defaults to None, so on desktop _emit is one
+# global read and a return.
+#
+# Event kinds emitted today: series, chapters_selected, chapter_start,
+# chapter_saved, phase, file_saved, missed, recovered, still_missed, done.
+# Treat the set as open — consumers must ignore unknown kinds.
+# ---------------------------------------------------------------------------
+_EVENT_SINK: Optional[Callable[[Dict[str, Any]], None]] = None
+
+
+def set_event_sink(sink: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+    """Install (or clear, with None) the structured-event callback.
+
+    Called once per run by an embedder before main(). The sink runs ON THE
+    THREAD THAT EMITS — usually the main chapter loop, but chapter_saved can
+    fire from a worker — so it must be cheap and thread-safe. Queue and return;
+    don't do UI work inline.
+    """
+    global _EVENT_SINK
+    _EVENT_SINK = sink
+
+
+def _emit(kind: str, **fields: Any) -> None:
+    """Best-effort structured event. Never raises.
+
+    A misbehaving embedder sink must not be able to kill a download that is
+    otherwise going fine — losing a progress tick is always preferable to
+    losing the run, so every failure here is swallowed on purpose.
+    """
+    sink = _EVENT_SINK
+    if sink is None:
+        return
+    try:
+        payload: Dict[str, Any] = {"kind": kind}
+        payload.update(fields)
+        sink(payload)
+    except Exception:
+        pass
 
 
 # RACE-2: the LEGACY (non-fast-download) image-prefetch path downloads the NEXT
@@ -1574,6 +1727,13 @@ def _reset_host_concurrency_caps() -> None:
 def _chapter_cancelled() -> bool:
     """True if the current chapter's watchdog has fired or _CHAPTER_CANCEL was
     set explicitly. Returns False outside a chapter (cover download etc.)."""
+    # A RUN-level cancel outranks everything below, INCLUDING the background-
+    # prefetch exemption. That ordering is the whole point: prefetch workers are
+    # exempt from the foreground chapter's watchdog (RACE-2 below), so checking
+    # this after the exemption would leave them downloading the next chapters
+    # for minutes after the user pressed stop. Grep request_run_cancel.
+    if _RUN_CANCEL.is_set():
+        return True
     # RACE-2: background prefetch workers download the NEXT chapters and must not
     # honor the FOREGROUND chapter's watchdog/cancel.
     if _in_background_prefetch():
@@ -1656,7 +1816,15 @@ def _try_download_url(
 
         try:
             with _net_guard(f"IMG {host}"):
-                r = scraper.get(url, stream=True, timeout=timeout)
+                # Per-request image Accept: the session default (cloudscraper's)
+                # asks for text/html first, and hosts that content-negotiate
+                # answer an image URL with an HTML wrapper page — see
+                # sites/_image_io.py:IMAGE_ACCEPT. Never hoist onto
+                # scraper.headers; this session also fetches HTML pages.
+                r = scraper.get(
+                    url, stream=True, timeout=timeout,
+                    headers=_IMAGE_ACCEPT_HEADERS,
+                )
                 r.raise_for_status()
                 # Capture Content-Type before we stream the body; the header
                 # is available immediately after raise_for_status returns.
@@ -2829,11 +2997,23 @@ def _cpu_pool_budget() -> int:
 
 
 def process_chapter_images(
-    input_paths: List[str], target_w: int, target_h: int
+    input_paths: List[str],
+    target_w: int,
+    target_h: int,
+    *,
+    dropped: Optional[List[str]] = None,
 ) -> List[Image.Image]:
     """
     Uses a "fill the gap" algorithm to combine and slice images in memory.
     Returns a list of final page images as PIL objects.
+
+    ``dropped`` (out-parameter): every input path whose decode RAISED is appended
+    to it. Callers need this because the returned length is 1:N by design here —
+    the fill-the-gap assembly merges many source strips into fewer pages — so
+    comparing counts cannot distinguish "recombined" from "lost N pages to decode
+    failures". The reconciliation that consumes it is at the _process_chapter_impl
+    call site; grep decode_dropped_pages. ``list.append`` is atomic, so the decode
+    ThreadPool below appends without a lock.
 
     Phase G6 (2026-05-08): the decode + initial-resize pass runs through a
     cpu//2 ThreadPool. PIL.Image.open + .convert + .resize all release the
@@ -2868,6 +3048,8 @@ def process_chapter_images(
             return img
         except Exception as e:
             print(f"  Warning: Skipping corrupted image {path}: {e}")
+            if dropped is not None:
+                dropped.append(path)
             return None
 
     final_pages: List[Image.Image] = []
@@ -2940,9 +3122,16 @@ def process_chapter_images(
 
 
 def resize_chapter_images(
-    input_paths: List[str], target_w: int
+    input_paths: List[str],
+    target_w: int,
+    *,
+    dropped: Optional[List[str]] = None,
 ) -> List[Image.Image]:
-    """Resizes images to a target width and returns PIL objects."""
+    """Resizes images to a target width and returns PIL objects.
+
+    ``dropped`` (out-parameter): paths whose decode raised. Same contract as
+    process_chapter_images' — grep decode_dropped_pages for the consumer.
+    """
     output_images = []
     for i, path in enumerate(input_paths):
         try:
@@ -2956,6 +3145,8 @@ def resize_chapter_images(
             log_debug(f"    Resized image {i+1}/{len(input_paths)} in memory.")
         except Exception as e:
             print(f"  Warning: Could not process image {path}: {e}")
+            if dropped is not None:
+                dropped.append(path)
     log_verbose(f"  Resized {len(output_images)} pages in memory.")
     return output_images
 
@@ -3103,9 +3294,28 @@ def save_final_images(
         if fmt == "auto":
             src_fmt = None
             if use_sources and source_paths[i]:
+                # MAGIC BYTES, not Image.open. `images[i]` is already a decoded
+                # PIL image — the source file is consulted ONLY to learn what
+                # format it arrived in, and the three-way decision below
+                # (WEBP / JPEG / everything-else-goes-PNG) is exactly what a
+                # 64-byte header answers. Opening it with PIL made a
+                # metadata-only question pay a decode:
+                #   * desktop — one PIL open + parse per page, per chapter;
+                #   * Android — the image-codec bridge shim decodes EAGERLY in
+                #     _open (a JNI BitmapFactory decode, a PNG re-encode and a
+                #     PIL PNG decode), so reading a format string cost a full
+                #     round trip through the bridge for every page.
+                # An unrecognized signature yields None and falls to the same
+                # PNG branch that a failed Image.open already fell to, so the
+                # decision is unchanged for every format either path knows.
+                # Cross-file: sites/_image_io.py:image_magic_extension.
                 try:
-                    with Image.open(source_paths[i]) as probe:
-                        src_fmt = (probe.format or "").upper()
+                    with open(source_paths[i], "rb") as _probe_fh:
+                        _head = _probe_fh.read(64)
+                    src_fmt = {
+                        ".webp": "WEBP",
+                        ".jpg": "JPEG",
+                    }.get(_image_magic_extension(_head) or "")
                 except Exception:
                     src_fmt = None
             if src_fmt == "WEBP":
@@ -5279,6 +5489,208 @@ def merge_pdf_files(input_paths, out_path, metadata):
             "PDF merge failed with both PdfWriter and PdfMerger."
         ) from e
 
+# ---------------------------------------------------------------------------
+# Combined-archive overwrite guard
+# ---------------------------------------------------------------------------
+# The end-of-run final-file build writes IN PLACE over the same
+# `<base_filename>.<format>` a complete run produced, and both writers TRUNCATE
+# (grep `ZipFile(out_path, "w"` in build_cbz_from_content; merge_pdf_files opens
+# "wb"). Two routine paths reach that gate holding only PART of the series:
+#
+#   * DELTA RUN — the UI's update-check passes only the missing range as
+#     `--chapters` (UI-source/src/lib/downloadArgs.js:buildLibraryDownloadArgs,
+#     both platforms), so a 3-chapter run replaced a 50-chapter Series.cbz. Note
+#     that run set is typically DISJOINT from what is on disk, not a subset of
+#     it — which is why the predicate below is "does the existing archive cover
+#     chapters this run does not" and not "is the run a subset".
+#   * COOPERATIVE CANCEL — the chapter loop breaks (grep run_cancelled) and falls
+#     through to the same gate. Desktop escapes only because its cancel kills the
+#     process (UI-source/electron/downloader.js); Android returns normally.
+#
+# The damage used to be invisible afterwards: `.aio_series.json`'s
+# `chapters_downloaded` is UNIONed with the prior file's on every write, so the
+# library update-check saw nothing missing and nothing ever offered a repair.
+# `final_file_chapters` (written only by a build that actually happened) is the
+# un-unioned counterpart these helpers read.
+#
+# Deliberately NO in-place merge: these archives are multi-GB and a half-merged
+# output is a worse failure than declining to write. The caller prints an
+# actionable line and emits `final_file_skipped` instead.
+
+
+def _final_file_recorded_coverage(
+    meta: Optional[Dict[str, Any]], fmt: Optional[str] = None
+) -> Set[str]:
+    """Chapter labels the combined `<base>.<fmt>` on disk is believed to cover.
+
+    PER FORMAT, and that qualifier is the whole point. One `.aio_series.json`
+    serves the series folder, but there is one archive PER FORMAT in it
+    (`<base>.cbz`, `<base>.epub`, `<base>.pdf`) — `out_dir` does not vary with
+    --format, and --epub-dir moves only the artifact, never the metadata. A
+    single unqualified list meant the last build of ANY format described every
+    archive: download 50 chapters as CBZ, export 3 of them as EPUB, and the next
+    CBZ run compared itself against the EPUB's 3, found nothing dropped, and
+    truncated the 50-chapter CBZ. That is the archive-overwrite hazard reopened
+    through a side door.
+
+    `final_file_chapters` is therefore a {format: [labels]} map. Reading rules,
+    in order:
+      1. map with an entry for `fmt` — exact, use it.
+      2. LEGACY list (written before the map) — it describes exactly one build,
+         and `meta["format"]` records which. Use it only when that format
+         matches; otherwise it says nothing about the archive being asked about.
+      3. anything else, including a map with no entry for `fmt` — fall back to
+         `chapters_downloaded`, a running UNION across runs that can OVERSTATE
+         coverage. Overstating is the SAFE direction: it skips a build the user
+         can redo, where understating destroys an archive irreversibly.
+
+    Labels are renormalized through _chap_label_str so a legacy "4.0" entry
+    compares equal to this run's "4".
+    """
+    if not isinstance(meta, dict):
+        return set()
+    raw = meta.get("final_file_chapters")
+    if isinstance(raw, dict):
+        entry = raw.get(fmt) if fmt else None
+        raw = entry if isinstance(entry, (list, tuple, set, frozenset)) else None
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        # Legacy single-format shape. meta["format"] is the format that wrote it.
+        if fmt is not None and meta.get("format") != fmt:
+            raw = None
+    else:
+        raw = None
+    if raw is None:
+        raw = meta.get("chapters_downloaded")
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return set()
+    return {_chap_label_str(x) for x in raw}
+
+
+def _format_chapter_label_sample(labels: Iterable[Any], limit: int = 6) -> str:
+    """Chapter labels as a short, numerically-sorted human sample."""
+    ordered = sorted(
+        {_chap_label_str(x) for x in labels},
+        key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0, x),
+    )
+    head = ", ".join(ordered[:limit])
+    if len(ordered) > limit:
+        head += f", … (+{len(ordered) - limit} more)"
+    return head
+
+
+def _final_file_would_shrink(
+    run_labels: Iterable[Any],
+    existing_meta: Optional[Dict[str, Any]],
+    *,
+    final_file_exists: bool,
+    fmt: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Would writing the combined file now LOSE chapters that are already in it?
+
+    INVARIANT: returns None only when the write is safe — either there is no
+    archive to destroy, or this run carries every chapter the existing archive is
+    recorded as covering. Otherwise returns the skip payload
+    {reason, run_chapters, existing_chapters, dropped_chapters, sample}, which the
+    caller renders as one printed line plus a `final_file_skipped` event.
+
+    `final_file_exists` is checked FIRST and is what keeps this from misfiring:
+    with nothing on disk no loss is possible, and it also kills the false positive
+    where `chapters_downloaded` describes split parts / --no-final-file / komikku
+    output that never produced a combined archive in the first place.
+
+    KNOWN RESIDUAL HOLE, accepted deliberately: an archive whose `.aio_series.json`
+    was deleted has NO recorded coverage, so a delta run against it still rebuilds
+    (only the zero-chapter floor below still catches). The archive itself cannot
+    close it — a CBZ records page counts, never chapter labels, so any check
+    derived from it would be guesswork, and a false positive here permanently
+    refuses legitimate rebuilds. The metadata is rewritten on every run, so this
+    only reaches a user who deleted it by hand.
+    """
+    if not final_file_exists:
+        return None
+    run = {_chap_label_str(x) for x in (run_labels or [])}
+    existing = _final_file_recorded_coverage(existing_meta, fmt)
+    dropped = existing - run
+    if not dropped:
+        if not run:
+            # The floor is ONE PAGE, not one chapter: for CBZ the cover is
+            # appended to current_book_content before the chapter loop, so the
+            # build gate's `current_book_content` term is already true with zero
+            # chapters downloaded. Overwriting a real archive with a cover-only
+            # one is never right, even when metadata is absent and `existing` is
+            # therefore empty.
+            return {
+                "reason": "no_chapters",
+                "run_chapters": 0,
+                "existing_chapters": len(existing),
+                "dropped_chapters": 0,
+                "sample": "",
+            }
+        return None
+    return {
+        "reason": "partial_coverage",
+        "run_chapters": len(run),
+        "existing_chapters": len(existing),
+        "dropped_chapters": len(dropped),
+        "sample": _format_chapter_label_sample(dropped),
+    }
+
+
+def _run_claimed_chapter_labels(
+    attempted_labels: Iterable[Any],
+    missed_entries: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    """Chapter labels this run may claim it put on disk, normalized and sorted.
+
+    INVARIANT: never contains a chapter the run did not REACH. That is the whole
+    point of taking the attempted set (grep attempted_chapter_labels at the
+    chapter loop) rather than the selected chapter list.
+
+    The selected list is wrong for any run that stops early. The cancel
+    checkpoint breaks out of the loop and the abort path leaves it too, and
+    NEITHER records a missed entry for the chapters past that point — so
+    "selection minus misses" counted every un-reached chapter as downloaded.
+    Cancel a `--chapters 51-53` library update after chapter 51 and
+    .aio_series.json claimed 51, 52 and 53 with only 51 anywhere on disk; the
+    update-check then saw nothing missing and never offered a repair. Same
+    arithmetic hid the tail of an aborted run.
+
+    Extracted to module level for the same reason _final_file_would_shrink was:
+    inline in main() this is a set expression nobody can test, and it is the
+    exact expression that was wrong.
+    """
+    attempted = {_chap_label_str(x) for x in (attempted_labels or ())}
+    missed = {
+        _chap_label_str(e["chap"]) for e in (missed_entries or ()) if "chap" in e
+    }
+    return sorted(
+        attempted - missed,
+        key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+    )
+
+
+def _load_series_meta(out_dir: str) -> Dict[str, Any]:
+    """Parsed `.aio_series.json` from `out_dir`, or {} when absent/unreadable.
+
+    One reader for two consumers in main(): the overwrite guard above (which
+    needs it BEFORE the final-file build) and the metadata writer at the end
+    (which unions `chapters_downloaded` into it). Tolerant of every failure mode
+    for the same reason _load_cached_anilist_id is — a corrupt metadata file must
+    degrade to "no prior knowledge", never abort a finished download.
+    """
+    if not out_dir:
+        return {}
+    path = os.path.join(out_dir, ".aio_series.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def build_book_part(
     args,
     base_filename,
@@ -6392,7 +6804,14 @@ def _image_prefetch_worker_loop() -> None:
         if job is None:  # Shutdown sentinel
             return
         try:
-            _run_image_prefetch_job(job)
+            # A run-level cancel DRAINS the queue rather than working it: the
+            # foreground has stopped caring about these chapters, and the job
+            # would otherwise spend minutes fetching pages nobody consumes.
+            # Note this still falls through to the finally below, so a main
+            # thread parked in _consume_image_prefetch unblocks instead of
+            # deadlocking on a done-event that never fires.
+            if not run_cancelled():
+                _run_image_prefetch_job(job)
         finally:
             # Always signal completion (success or failure) so the main
             # thread's _consume_image_prefetch doesn't deadlock.
@@ -8486,6 +8905,9 @@ def main():
         return
 
     if args.update_all:
+        _no_spawn = _self_spawn_unavailable()
+        if _no_spawn:
+            sys.exit(f"--update-all cannot run here: {_no_spawn}")
         from library_state import scan_library
 
         scan_root = os.path.abspath(args.output_dir)
@@ -8960,6 +9382,13 @@ def main():
 
         # If multiple URLs were provided, run them sequentially (jobs=1) or concurrently (jobs>1)
     if len(urls) > 1:
+        # The supervisor below drives children via subprocess.Popen. Where
+        # that's impossible (embedded interpreter), refuse with a real reason
+        # instead of spawning something that can't work — an embedder should
+        # queue one URL per run, which is what the Android side does.
+        _no_spawn = _self_spawn_unavailable()
+        if _no_spawn:
+            sys.exit(f"Multiple URLs cannot be run here: {_no_spawn}")
         jobs = max(1, int(getattr(args, "jobs", 1) or 1))
         job_retries = max(0, int(getattr(args, "job_retries", 3) or 3))
         stall_timeout = max(30, int(getattr(args, "job_stall_timeout", 900) or 900))
@@ -9175,6 +9604,40 @@ def main():
         )
     handler.configure_session(scraper, args)
 
+    # --- The ONLY opt-in for interactive Cloudflare solving in the codebase ---
+    #
+    # Below this line a human is waiting on THIS run, so a challenge may open a
+    # browser window (desktop zendriver) or a phone ChallengeActivity (the
+    # Android WebView backend) and block until it is solved. Everything else —
+    # cross-site search, the image-quality probe, library update-checks, the
+    # Android update sweep — runs at the default of False and gets only the
+    # headless tiers. See sites/crawlee_utils.py's "TWO SEPARATE QUESTIONS"
+    # block for why this is opt-in rather than opt-out.
+    #
+    # PLACED HERE, before fetch_comic_context, because the defect this rescues
+    # (PARITY.md D2) is a challenged CHAPTER LIST at least as often as a
+    # challenged image — granting it later, around the download loop only, would
+    # leave the run failing at "No chapters selected." with the solver idle.
+    # One grant covers fetch_comic_context -> get_chapters -> get_chapter_images.
+    #
+    # --list-chapters is excluded and that exclusion is load-bearing: it is the
+    # entry point BOTH the desktop UI's update-check subprocess and Android's
+    # in-process update sweep use, and neither has anyone watching to solve a
+    # CAPTCHA. Reaching this line at all means a URL was resolved, so a
+    # search-only run never gets here.
+    #
+    # Unscoped grant, not a `with`: main() has no enclosing scope to hang a
+    # finally on (it runs to EOF and returns from many points). Desktop is a
+    # fresh process per run so there is nothing to restore, and on Android
+    # aio_android wraps every main() call in interactive_solving(...) whose
+    # reset() restores the pre-call value regardless of what is set inside —
+    # grep _cf_interactive_solving there. The helper's own docstring records
+    # that this is its only sanctioned caller.
+    if not getattr(args, "list_chapters", False):
+        from sites.crawlee_utils import allow_interactive_solving_for_this_run
+
+        allow_interactive_solving_for_this_run()
+
     try:
         context: SiteComicContext = handler.fetch_comic_context(
             args.comic_url, scraper, make_request
@@ -9192,6 +9655,7 @@ def main():
     # to exclude that suffix.
     title = re.sub(r"\s*\(hid=[^)]+\)\s*$", "", str(title or "")).strip() or "comic"
     print(f"{title} (hid={hid})")
+    _emit("series", title=title, hid=hid, url=getattr(args, "comic_url", None))
 
     temp_dir_base = getattr(args, "temp_dir", None)
     if temp_dir_base:
@@ -10189,6 +10653,7 @@ def main():
     # This is parsed by the Electron app to determine the total for the
     # "Chapter X/Y" progress indicator (regex: /Selected \d+ chapters/).
     print(f"  Selected {len(chapters)} chapters.")
+    _emit("chapters_selected", total=len(chapters))
     # --- End of Chapter Selection Logic ---
 
     # Ensure output folder exists (shared by chapter files, final book, and split parts)
@@ -10400,6 +10865,60 @@ def main():
         split_size_bytes = 0
         split_chapter_count = 0
 
+    # --- Delta run: coerce --keep-chapters so the run has somewhere to land ---
+    #
+    # A DELTA run is one whose selected chapters do not cover the combined
+    # archive already on disk — `--chapters 51-53` against a `<Title>.cbz`
+    # holding 1-50, which is exactly what the library's "download missing
+    # chapters" flow emits (UI-source/src/lib/downloadArgs.js, and the Android
+    # twin core/DownloadForm.kt). The end-of-run guard REFUSES to rebuild that
+    # archive from the delta (grep _final_file_would_shrink) because doing so
+    # truncated 50 chapters to 3. But refusing leaves the chapters just
+    # downloaded with nowhere durable to go: without --keep-chapters they exist
+    # only inside tmp_<hid>/, so the run spends the bandwidth and produces
+    # nothing the user can open.
+    #
+    # Coerced HERE, in the engine, rather than in the two arg builders: only the
+    # engine knows the guard will fire, and asking every caller to compensate
+    # for a decision it cannot see is how those two builders drift apart. Same
+    # pattern and same one-line notice as --komikku's coercion (grep
+    # "[Komikku] Forcing").
+    #
+    # PLACED AFTER THE --split RESET ABOVE, not next to the chapter selection,
+    # because that reset is what decides whether the series-wide archive gets
+    # written at all: with missed-chapter retry on (the default) a --split run
+    # falls back to building it, so a check upstream of here would read a stale
+    # split state and skip the coercion for a run that does overwrite.
+    #
+    # Predicted from the SELECTED chapters, before any of them download, so it
+    # can be wrong in one direction: a run that covers everything now but loses
+    # a chapter to a failure later declines the rebuild without having coerced.
+    # That case is benign — the archive it declined to overwrite is precisely
+    # the one that still holds the chapter that failed.
+    if (
+        not getattr(args, "keep_chapters", False)
+        and not getattr(args, "no_final_file", False)
+        and args.format != "none"
+        and split_size_bytes <= 0
+        and split_chapter_count <= 0
+    ):
+        _delta_out_dir = getattr(args, "epub_dir", None) if args.format == "epub" else None
+        _delta_final_path = os.path.join(
+            _delta_out_dir or out_dir, f"{base_filename}.{args.format}"
+        )
+        if _final_file_would_shrink(
+            [c.get("chap") for c in chapters],
+            _load_series_meta(out_dir),
+            final_file_exists=os.path.exists(_delta_final_path),
+            fmt=args.format,
+        ):
+            args.keep_chapters = True
+            print(
+                f"[Delta] Forcing --keep-chapters: this run does not cover all of "
+                f"{os.path.basename(_delta_final_path)}, which is being kept as is. "
+                f"Per-chapter files are where this run's chapters will land."
+            )
+
     def _chapter_key(ch: Dict[str, Any]) -> str:
         v = ch.get('id') or ch.get('chapter_id') or ch.get('url') or ch.get('chap')
         return str(v)
@@ -10513,6 +11032,10 @@ def main():
 
         if resume_mode and os.path.exists(marker_path):
             print(f"\nChapter {n} (already processed, collecting files)")
+            # resumed=True is the signal the ETA estimator needs: these ticks
+            # cost no network time and would otherwise poison the moving
+            # average. Mirrors downloader.js:applyChapterEta's skip rule.
+            _emit("chapter_start", chapter=n, resumed=True)
             if args.format in {"epub", "none"}:
                 log_verbose(
                     "  Resume mode not supported for this format; re-processing."
@@ -10669,6 +11192,7 @@ def main():
             if _why and _avail and "," in _avail:
                 _sel_note = f" — chosen on {_why} from: {_avail}"
             print(f"\nChapter {n} ({grp_name or 'No Group'}){_sel_note}")
+            _emit("chapter_start", chapter=n, group=grp_name or None, resumed=False)
             _t0_imageurls = time.monotonic()
             # Phase 8 (2026-05-08): split-cluster collapse — when this chapter
             # was synthesized by group_chapters_for_download from multiple
@@ -10687,6 +11211,10 @@ def main():
             ch.pop("_aux_assets", None)
             ch.pop("_aux_records", None)
             ch.pop("_aux_members", None)
+            # Same reason: the end-of-run retry re-feeds the SAME dict, so a
+            # stale count from the previous attempt would mislabel a fresh
+            # miss. Grep decode_dropped_pages.
+            ch.pop("_decode_dropped", None)
             merged_parts = ch.get("_merged_parts")
             if merged_parts:
                 media_entries = []
@@ -11412,6 +11940,11 @@ def main():
             # processing so _build_images_pdf can embed the original
             # download bytes (smaller and better quality than re-encoding).
             _pdf_source_paths: Optional[List[Optional[str]]] = None
+            # Downloaded pages the PIL decode below could not open. Filled by the
+            # three decode paths, reconciled once after them — grep
+            # decode_dropped_pages. Empty on the CBZ fast path and under
+            # --no-processing, neither of which decodes anything.
+            _decode_dropped: List[str] = []
 
             if raw_image_paths:
                 # Phase B (2026-05-07): CBZ fast-path. When the user is on
@@ -11505,7 +12038,10 @@ def main():
                         args.format == "epub" and not text_blocks
                     ):
                         pages_in_memory = process_chapter_images(
-                            raw_image_paths, width, recombine_target_height
+                            raw_image_paths,
+                            width,
+                            recombine_target_height,
+                            dropped=_decode_dropped,
                         )
                     elif args.format == "pdf":
                         # PDF MediaBox is per-page, so every image keeps its
@@ -11530,10 +12066,11 @@ def main():
                                 pages_in_memory.append(im)
                             except Exception as e:
                                 print(f"  Warning: Could not process image {path}: {e}")
+                                _decode_dropped.append(path)
                         log_verbose(f"  Loaded {len(pages_in_memory)} pages in memory.")
                     else:
                         pages_in_memory = resize_chapter_images(
-                            raw_image_paths, width
+                            raw_image_paths, width, dropped=_decode_dropped
                         )
 
                     log_verbose(f"  Applying {args.scaling}% scaling...")
@@ -11698,6 +12235,68 @@ def main():
                             source_paths=_src_paths_for_save,
                             webp_source_is_lossy=_webp_source_is_lossy,
                         )
+
+            # ── Post-decode page reconciliation (reason=decode_dropped_pages) ──
+            # pages_ok / pages_total are measured at DOWNLOAD time (grep
+            # `pages_total = len(download_tasks)`) and the zero-tolerance
+            # completeness gate runs there too — but the PIL decode happens HERE,
+            # hundreds of lines later. A page that downloads fine and then fails
+            # to decode is dropped by the decode helpers (grep "Skipping corrupted
+            # image"), so the chapter logged N/N and shipped SHORT. Nothing
+            # downstream could catch it either: on the recombine path the output
+            # page count is 1:N by design, so a count comparison proves nothing —
+            # which is why the signal is the list of DROPPED SOURCES.
+            #
+            # Live cause: Chaquopy's Pillow ships no WebP decoder, so a
+            # mixed-format chapter loses exactly its WebP pages
+            # (android/PARITY.md §2 D4). Pre-fix, an all-WebP chapter was caught
+            # (empty content → `empty_content`) while a mixed one silently shipped
+            # short — the loud/silent split this closes.
+            #
+            # RAISED, not returned. A bare `return None, …` returns NORMALLY, and
+            # _process_chapter_strict only catches ChapterSkippedError — so the
+            # alt-source loop, the lazy-discovery trigger and the inline retry
+            # were all skipped and this landed in the main loop's weak
+            # `if not chapter_content:` branch. That threw away the one rescue
+            # that actually fixes this: the live cause is a missing WebP decoder,
+            # so an ALTERNATIVE SOURCE serving JPEG succeeds where no amount of
+            # retrying the primary can. Multi-source was off the table for
+            # precisely the chapters it was built for.
+            #
+            # reason='decode_dropped_pages' is in _PERMANENT_SKIP_REASONS, which
+            # places it exactly right in _process_chapter_strict's ladder: it
+            # runs AFTER the alt-source loop (so alternates are tried) but
+            # BEFORE the inline retry (skipped — re-downloading the same bytes
+            # cannot make a codec appear, and those two long waits were pure
+            # cost), and it records-missed-and-continues rather than aborting the
+            # run, since the failure is environmental rather than a host fault.
+            #
+            # The count still rides on `ch` because the main loop's missed-reason
+            # branch reads it for the message; grep _decode_dropped there.
+            #
+            # Unreachable on the CBZ byte-passthrough fast path and under
+            # --no-processing: neither decodes anything, which is what keeps
+            # Android's stock configuration untouched.
+            if _decode_dropped:
+                print(
+                    f"  [!] Chapter {n}: {len(_decode_dropped)} of "
+                    f"{len(raw_image_paths)} downloaded page(s) could not be "
+                    f"decoded, so the output would be silently short. Trying an "
+                    f"alternate source if one is available, then recording the "
+                    f"chapter as missed rather than shipping it incomplete."
+                )
+                ch["_decode_dropped"] = len(_decode_dropped)
+                rm_tree(tdir)
+                raise ChapterSkippedError(
+                    reason="decode_dropped_pages",
+                    # No host blame ON PURPOSE: every page DOWNLOADED fine and
+                    # the failure is local (no codec). Naming a host here would
+                    # feed a blameless CDN into the diagnostics and read as a
+                    # server fault in the missed log.
+                    host="",
+                    pages_ok=0,
+                    pages_total=len(raw_image_paths),
+                )
 
             if args.format == "cbz":
                 for idx, block in enumerate(text_blocks):
@@ -11938,6 +12537,7 @@ def main():
                     except OSError:
                         shutil.copy2(src_cbz, ch_out_path)
                     print(f"CBZ saved → {os.path.basename(ch_out_path)}")
+                    _emit("chapter_saved", chapter=n, format="cbz", path=ch_out_path)
                 else:
                     # Legacy back-compat: chapter_content carries 'image'
                     # entries (pre-Phase-D code path). Build directly. In
@@ -11986,6 +12586,7 @@ def main():
                         # If size checks fail for any reason, fall back to copying.
                         shutil.copy2(src_pdf, ch_out_path)
                 print(f"PDF Chapter saved → {os.path.basename(ch_out_path)}")
+                _emit("chapter_saved", chapter=n, format="pdf", path=ch_out_path)
 
         return chapter_content, grp_name, n, chapter_content_size
 
@@ -12280,10 +12881,25 @@ def main():
                 f"then redownloading chapter inline..."
             )
             waited = 0.0
+            cancelled_during_wait = False
             while waited < wait:
+                # The 2s chunking exists so this wait CAN be interrupted; a run
+                # cancel has to actually do so. Without this check a user who
+                # hits Cancel while a CDN is being retried waits out the full
+                # backoff (up to 60s on the last attempt, and the retry then
+                # redownloads the whole chapter anyway) — on Android that reads
+                # as "Cancel is broken". Verified on-device 2026-08-08.
+                if run_cancelled():
+                    cancelled_during_wait = True
+                    break
                 chunk = min(2.0, wait - waited)
                 time.sleep(chunk)
                 waited += chunk
+            if cancelled_during_wait:
+                # Give up retrying and report the chapter as skipped. The caller
+                # records it and the main loop breaks, so everything already on
+                # disk stays resumable.
+                raise last_err
             try:
                 return _process_chapter(ch, force_redownload=True, next_chapter=next_chapter)
             except ChapterSkippedError as cse_retry:
@@ -12359,7 +12975,43 @@ def main():
     # failures" when in fact half the failures were silently rescued.
     multi_source_rescues: List[Dict[str, Any]] = []
 
+    # Chapters this run actually REACHED, as normalized labels.
+    #
+    # The .aio_series.json writer used to derive "what did we download" by
+    # subtracting the recorded misses from the SELECTED list (`chapters`). That
+    # is only true of a run that ran to completion. The cancel checkpoint below
+    # BREAKs, and the abort path exits the loop too — neither records a miss for
+    # the chapters it never reached, so every un-attempted chapter was being
+    # written into `chapters_downloaded` as downloaded. The library update-check
+    # then saw nothing missing, which is the self-concealing half of the
+    # archive-overwrite hazard (android/PARITY.md D1): cancel a `--chapters
+    # 51-53` update after 51 and the metadata claimed 52 and 53, which exist
+    # nowhere on disk and would never be offered for repair.
+    #
+    # Fixed at the source rather than by the caller compensating: for any run
+    # that finishes the loop this set EQUALS the selection, so complete
+    # downloads, split runs, komikku, --format none and resume are all
+    # byte-identical. Only a run that stopped early differs, and only in the
+    # direction of claiming less. Three doors close at once — the cancel break,
+    # the `aborted_remaining` exit, and a PDF/EPUB run cancelled before any
+    # chapter finished (that one never even enters the final-file gate, so the
+    # gate's own `final_build_stranded` guard could not have caught it).
+    attempted_chapter_labels: Set[str] = set()
+
     for ch_idx, ch in enumerate(chapters):
+        # Run-level cancel checkpoint. BREAK, don't raise: everything after this
+        # loop (details.json asset patch, .aio_series.json write, temp-dir
+        # retention, the timing/missed summaries) is what makes a partial run
+        # resumable, and an exception here would skip all of it. The chapters
+        # already on disk stay on disk. Grep request_run_cancel.
+        if run_cancelled():
+            print(f"\n[!] Cancelled — stopping before chapter {ch.get('chap')}.")
+            break
+        # Recorded AFTER the cancel check, so the chapter this run stopped
+        # before is not claimed. Recorded BEFORE any work, so a chapter that
+        # fails still counts as attempted and is removed by the missed-entry
+        # subtraction instead — the two mechanisms stay disjoint.
+        attempted_chapter_labels.add(_chap_label_str(ch.get("chap")))
         grp_name = handler.get_group_name(ch)
         insert_list_index = len(current_book_content)
         insert_chapter_index = len(current_book_chapters)
@@ -12494,7 +13146,9 @@ def main():
             # Deterministic per-chapter gate — record missed and continue, with
             # NO consecutive-host-block escalation (unlike the ghost soft-skip
             # above). See ChapterPermanentSkipError + _PERMANENT_SKIP_REASONS;
-            # producers are sites/tapas.py's mature_login_required and "locked".
+            # producers are sites/tapas.py's mature_login_required and "locked",
+            # sites/comix.py's comix_pages_stalled, and this file's
+            # decode_dropped_pages (grep _decode_dropped).
             # By the time we're here the alt-rescue loop already ran and failed
             # (or multi-source was off), so a "locked" chapter means no alt site
             # could supply it either. Fixes the old abort-on-one-gated-episode.
@@ -12503,16 +13157,40 @@ def main():
                     "premium/locked episode — no alternative source could "
                     "supply it (enable/broaden --multi-source to fill it)"
                 )
+                _gate_detail = (
+                    "deterministic per-chapter gate; no retry/alt source can clear it"
+                )
+            elif cpse.reason == "decode_dropped_pages":
+                # NOT a gate, and not the host's fault. Naming the cause matters
+                # here more than anywhere else in this handler: the remedy is a
+                # local build/flag change, and the previous message ("content is
+                # gated (needs a site login we don't have)") pointed at the one
+                # thing that is definitely not wrong.
+                _gate_note = (
+                    "pages downloaded but could not be DECODED by this build's "
+                    "Pillow (typically a WebP source with no WebP codec) — no "
+                    "alternative source could supply a readable format either. "
+                    "Fixes: download as CBZ without --quality/--width/--scaling "
+                    "(that path never decodes), or use a build whose Pillow has "
+                    "the codec"
+                )
+                _gate_detail = (
+                    "downloaded pages failed to decode; retrying the same source "
+                    "cannot help, alt sources were tried"
+                )
             else:
                 _gate_note = "content is gated (needs a site login we don't have)"
+                _gate_detail = (
+                    "deterministic per-chapter gate; no retry/alt source can clear it"
+                )
             print(
-                f"\n[!] Chapter {cpse.chap}: {cpse.reason} on "
-                f"{cpse.host or '?'} — {_gate_note}. Recorded as missed; the "
-                f"run continues."
+                f"\n[!] Chapter {cpse.chap}: {cpse.reason}"
+                f"{f' on {cpse.host}' if cpse.host else ''} — {_gate_note}. "
+                f"Recorded as missed; the run continues."
             )
             _record_missed(
                 ch, grp_name, cpse.reason,
-                "deterministic per-chapter gate; no retry/alt source can clear it",
+                _gate_detail,
                 insert_list_index=insert_list_index,
                 insert_chapter_index=insert_chapter_index,
                 insert_marker_index=insert_marker_index,
@@ -12594,7 +13272,30 @@ def main():
 
         if not chapter_content:
             consecutive_ghosts = 0  # reset: empty content is not a ghost
-            _record_missed(ch, grp_name, 'empty_content', 'No downloadable content', insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
+            # Two distinct causes land here, and the reason string is the only
+            # place they can be told apart in the missed report:
+            #   empty_content        — nothing downloadable at all;
+            #   decode_dropped_pages — pages DID download, then failed to decode.
+            #
+            # The decode branch is a BACKSTOP, not the live path. Decode drops
+            # now RAISE ChapterSkippedError('decode_dropped_pages') so they reach
+            # the alt-source rescue (grep _decode_dropped), and a chapter that
+            # exhausts that exits via ChapterPermanentSkipError above — which
+            # `continue`s before reaching here. `_decode_dropped` is also popped
+            # before every fetch, so an alt source's own empty return cannot
+            # carry the primary's flag in. Kept because mislabelling a decode
+            # failure as "No downloadable content" is exactly the diagnosis this
+            # detector exists to prevent, and the cost is four lines.
+            if _dropped_pages:
+                _miss_reason = 'decode_dropped_pages'
+                _miss_error = (
+                    f'{_dropped_pages} downloaded page(s) failed to decode; '
+                    f'chapter withheld rather than shipped short'
+                )
+            else:
+                _miss_reason = 'empty_content'
+                _miss_error = 'No downloadable content'
+            _record_missed(ch, grp_name, _miss_reason, _miss_error, insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
             continue
 
         # Successful chapter — reset the consecutive-ghost counter. The
@@ -12650,6 +13351,7 @@ def main():
     # 'empty_content' branches) still get this final pass.
     if retry_missed and missed_entries and missed_retries > 0 and not aborted_remaining:
         print(f"\n[*] Missed {len(missed_entries)} chapter(s). Retrying at the end...")
+        _emit("missed", count=len(missed_entries))
         missed_entries.sort(key=lambda e: (int(e.get('insert_chapter_index', 0)), int(e.get('insert_list_index', 0))))
         remaining: List[Dict[str, Any]] = []
         content_shift_items = 0
@@ -12715,11 +13417,13 @@ def main():
             marker_shift += 1
             page_shift += delta_pages
             print(f"  [+] Recovered chapter {n}")
+            _emit("recovered", chapter=n)
 
         missed_entries = remaining
         _save_missed(missed_entries)
         if missed_entries:
             print(f"[!] Still missed {len(missed_entries)} chapter(s). A log was saved to: {missed_log_path}")
+            _emit("still_missed", count=len(missed_entries), log_path=missed_log_path)
             try:
                 out_log = os.path.join(out_dir, f"{base_filename} (missed chapters).json")
                 shutil.copy(missed_log_path, out_log)
@@ -12730,6 +13434,29 @@ def main():
                 os.remove(missed_log_path)
             except Exception:
                 pass
+
+    # Read the on-disk series metadata ONCE, here, before anything below can
+    # rewrite it: the combined-archive overwrite guard needs to know what the
+    # existing archive covers, and the .aio_series.json writer further down needs
+    # the same dict for its chapters_downloaded union. Grep _load_series_meta.
+    existing_series_meta = _load_series_meta(out_dir)
+
+    # Set to the labels actually written into the combined archive, and ONLY when
+    # a build really happened — it becomes .aio_series.json's `final_file_chapters`
+    # below. Stays None for --no-final-file / --format none / komikku / split /
+    # skipped runs, in which case the previous value is carried forward untouched
+    # rather than replaced with a lie.
+    final_file_built_labels: Optional[List[str]] = None
+
+    # True when the overwrite guard declined the build AND --keep-chapters is off,
+    # i.e. this run's chapters exist ONLY as the per-chapter caches inside
+    # tmp_<hid>/. Two consequences below, and they are the other half of D1 (the
+    # metadata concealment): the tmp dir is KEPT rather than wiped, and this run's
+    # labels are withheld from the chapters_downloaded union — claiming chapters
+    # we are about to delete is exactly how the library update-check stopped
+    # noticing the damage. Only reachable from the guard branch, so komikku /
+    # --no-final-file / --format none / split can never set it.
+    final_build_stranded = False
 
     if current_book_content and not aborted_remaining:
         if args.no_final_file:
@@ -12748,61 +13475,157 @@ def main():
                 epub_markers=current_epub_markers,
             )
         else:
-            print("\nBuilding final file...")
+            # Two guards stand between "this run produced content" and the
+            # TRUNCATING write of the series-wide archive. Both live in this
+            # branch only, so --no-final-file / --format none / split mode keep
+            # their prior behaviour byte for byte. See the block comment above
+            # _final_file_would_shrink for what they protect against.
             active_out_dir = getattr(args, "epub_dir", None) if args.format == "epub" else None
-            if active_out_dir:
-                os.makedirs(active_out_dir, exist_ok=True)
             final_path = os.path.join(active_out_dir or out_dir, f"{base_filename}.{args.format}")
-            if args.format == "epub":
-                with _cpu_guard('build_epub'):
-                    build_epub(
-                    current_book_content,
-                    final_path,
-                    title,
-                    args.language,
-                    args.epub_layout,
-                    comic_data,
-                    list(current_book_scan_groups),
-                    original_cover_path,
-                    chapter_markers=current_epub_markers,
+            run_chapter_labels = [c.get("chap") for c in current_book_chapters]
+            if run_cancelled():
+                # A cancelled run holds a PREFIX of the series at best, so it can
+                # never be the authority on the combined archive. tmp_<hid>/ is
+                # deliberately kept for exactly this case (see the cleanup branch
+                # at the end of main()) and the resume re-collects every finished
+                # chapter before rebuilding.
+                final_skip: Optional[Dict[str, Any]] = {
+                    "reason": "cancelled",
+                    "run_chapters": len(run_chapter_labels),
+                    "existing_chapters": len(
+                        _final_file_recorded_coverage(
+                            existing_series_meta, args.format
+                        )
+                    ),
+                    "dropped_chapters": 0,
+                    "sample": "",
+                }
+            else:
+                final_skip = _final_file_would_shrink(
+                    run_chapter_labels,
+                    existing_series_meta,
+                    final_file_exists=os.path.exists(final_path),
+                    fmt=args.format,
                 )
-            elif args.format == "cbz":
-                # Phase D (2026-05-07): use the wrapper so cbz_cache entries
-                # produced during chapter processing get member-copied into
-                # the final archive instead of being silently dropped by the
-                # old type=="image" filter.
-                with _cpu_guard('build_cbz'):
-                    build_cbz_from_content(
+
+            if final_skip:
+                _skip_name = os.path.basename(final_path)
+                if final_skip["reason"] == "cancelled":
+                    print(
+                        f"\n[!] Cancelled — not rebuilding {_skip_name} from this "
+                        f"partial run ({final_skip['run_chapters']} chapter(s) "
+                        f"assembled). Temporary files are kept; resume to finish "
+                        f"the series and rebuild it."
+                    )
+                elif final_skip["reason"] == "no_chapters":
+                    print(
+                        f"\n[!] No chapters were assembled this run — keeping the "
+                        f"existing {_skip_name} untouched."
+                    )
+                else:
+                    print(
+                        f"\n[!] Keeping the existing "
+                        f"{final_skip['existing_chapters']}-chapter {_skip_name} — "
+                        f"this run covers only {final_skip['run_chapters']} "
+                        f"chapter(s), so rebuilding would drop "
+                        f"{final_skip['dropped_chapters']}: "
+                        f"{final_skip['sample']}."
+                    )
+                    # NOT --build-final-file for cbz/epub: that mode globs *.pdf
+                    # and merges per-chapter PDFs only (grep
+                    # build_final_pdf_from_chapter_folder). Re-running the URL with
+                    # the full range is the only recombine path for the others.
+                    print(
+                        "    Re-run this URL with --chapters all to rebuild the "
+                        "combined file from every chapter."
+                    )
+                    if args.format == "pdf":
+                        print(
+                            "    (Or --build-final-file <folder>, if the "
+                            "per-chapter PDFs are still on disk.)"
+                        )
+                _emit(
+                    "final_file_skipped",
+                    reason=final_skip["reason"],
+                    format=args.format,
+                    path=final_path,
+                    run_chapters=final_skip["run_chapters"],
+                    existing_chapters=final_skip["existing_chapters"],
+                    dropped_chapters=final_skip["dropped_chapters"],
+                )
+                final_build_stranded = not getattr(args, "keep_chapters", False)
+                if final_build_stranded and run_chapter_labels:
+                    print(
+                        f"    This run's {len(run_chapter_labels)} chapter(s) are "
+                        f"only in the temp folder (no --keep-chapters), so it is "
+                        f"being kept instead of cleaned up."
+                    )
+            else:
+                print("\nBuilding final file...")
+                _emit("phase", phase="building_final")
+                if active_out_dir:
+                    os.makedirs(active_out_dir, exist_ok=True)
+                # Recorded as `final_file_chapters` only where a file is really
+                # written (the PDF branch below can no-op when no chapter PDFs
+                # survived), so the key never claims coverage that isn't on disk.
+                built_labels = sorted(
+                    {_chap_label_str(x) for x in run_chapter_labels},
+                    key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+                )
+                if args.format == "epub":
+                    with _cpu_guard('build_epub'):
+                        build_epub(
                         current_book_content,
                         final_path,
                         title,
+                        args.language,
+                        args.epub_layout,
                         comic_data,
                         list(current_book_scan_groups),
-                        args.language,
+                        original_cover_path,
+                        chapter_markers=current_epub_markers,
                     )
-            elif args.format == "pdf":
-                pdf_inputs = [
-                    item["path"]
-                    for item in current_book_content
-                    if item.get("type") == "pdf"
-                ]
-                if pdf_inputs:
-                    with _cpu_guard('merge_pdf'):
-                        merge_pdf_files(
-                        pdf_inputs,
-                        final_path,
-                        {
-                            "/Title": title,
-                            "/Author": ", ".join(comic_data.get("authors", [])),
-                        },
-                    )
-                    print(f"PDF saved → {os.path.basename(final_path)}")
-                for item in current_book_content:
-                    if item.get("type") == "pdf" and item.get("path"):
-                        try:
-                            os.remove(item["path"])
-                        except OSError:
-                            pass
+                    final_file_built_labels = built_labels
+                elif args.format == "cbz":
+                    # Phase D (2026-05-07): use the wrapper so cbz_cache entries
+                    # produced during chapter processing get member-copied into
+                    # the final archive instead of being silently dropped by the
+                    # old type=="image" filter.
+                    with _cpu_guard('build_cbz'):
+                        build_cbz_from_content(
+                            current_book_content,
+                            final_path,
+                            title,
+                            comic_data,
+                            list(current_book_scan_groups),
+                            args.language,
+                        )
+                    final_file_built_labels = built_labels
+                elif args.format == "pdf":
+                    pdf_inputs = [
+                        item["path"]
+                        for item in current_book_content
+                        if item.get("type") == "pdf"
+                    ]
+                    if pdf_inputs:
+                        with _cpu_guard('merge_pdf'):
+                            merge_pdf_files(
+                            pdf_inputs,
+                            final_path,
+                            {
+                                "/Title": title,
+                                "/Author": ", ".join(comic_data.get("authors", [])),
+                            },
+                        )
+                        print(f"PDF saved → {os.path.basename(final_path)}")
+                        _emit("file_saved", format="pdf", path=final_path)
+                        final_file_built_labels = built_labels
+                    for item in current_book_content:
+                        if item.get("type") == "pdf" and item.get("path"):
+                            try:
+                                os.remove(item["path"])
+                            except OSError:
+                                pass
 
     # --- Patch details.json with the sidecar-asset rollup (Komikku mode) ---
     # details.json was written once up front (before the chapter loop), so the
@@ -12830,25 +13653,19 @@ def main():
         # --list-chapters and the series sticks at "+N new". Safe sort key so a
         # stray non-numeric label can't crash the whole .aio_series.json write
         # (it lives in a log-only except → silent metadata loss). XF-1/PYP-2.
-        downloaded_nums = set(_chap_label_str(ch["chap"]) for ch in chapters)
-        still_missed_nums = (
-            set(_chap_label_str(e["chap"]) for e in missed_entries)
-            if missed_entries else set()
-        )
-        actually_downloaded = sorted(
-            downloaded_nums - still_missed_nums,
-            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+        # ATTEMPTED, not SELECTED — see _run_claimed_chapter_labels and
+        # attempted_chapter_labels at the chapter loop. Equal to the selection
+        # for any run that finished the loop, so complete downloads are
+        # unchanged; a cancelled or aborted run now claims only what it reached.
+        actually_downloaded = _run_claimed_chapter_labels(
+            attempted_chapter_labels, missed_entries
         )
 
         # If a previous .aio_series.json exists (from an earlier download),
-        # merge the chapter lists so partial/split downloads accumulate.
-        existing_meta = {}
-        if os.path.isfile(series_meta_path):
-            try:
-                with open(series_meta_path, "r", encoding="utf-8") as f:
-                    existing_meta = json.load(f)
-            except Exception:
-                pass
+        # merge the chapter lists so partial/split downloads accumulate. Loaded
+        # once above the final-file gate (grep existing_series_meta) because the
+        # overwrite guard has to read it BEFORE the build.
+        existing_meta = existing_series_meta
 
         # Re-normalize any legacy "4.0"-style entries from an older writer so a
         # once-polluted file self-heals to "4" on this write (else the union
@@ -12856,8 +13673,17 @@ def main():
         prev_downloaded = set(
             _chap_label_str(x) for x in existing_meta.get("chapters_downloaded", [])
         )
+        # Withhold this run's labels when its chapters never reached a durable
+        # file (grep final_build_stranded): the combined build was declined and
+        # --keep-chapters is off, so the only copies live in tmp_<hid>/. Recording
+        # them would make the library update-check report the series complete
+        # while the bytes sit in a temp folder — the concealment half of D1.
+        # Prior labels are still preserved, so this only ever withholds, never
+        # forgets.
         merged_downloaded = sorted(
-            prev_downloaded | set(actually_downloaded),
+            prev_downloaded
+            if final_build_stranded
+            else prev_downloaded | set(actually_downloaded),
             key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
         )
 
@@ -12879,6 +13705,48 @@ def main():
             - set(merged_downloaded),
             key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
         )
+
+        # What each combined archive on disk actually contains, as of the last
+        # build of THAT FORMAT that really ran. DISTINCT from
+        # chapters_downloaded, which is a running UNION across runs ON PURPOSE
+        # (split/incremental downloads depend on that) and therefore can never
+        # answer "would rebuilding lose something" — the very question the
+        # overwrite guard asks. Read back by _final_file_recorded_coverage,
+        # which falls back to chapters_downloaded so pre-2026-08 files without
+        # the key still work, and migrates the pre-map single-list shape.
+        #
+        # Carried forward unchanged when this run built nothing (--no-final-file,
+        # --format none, komikku, split, or a guard-skipped build): recording the
+        # current run's chapters there would assert coverage no file has.
+        # KEYED BY FORMAT. A series folder holds one archive per format and one
+        # metadata file for all of them, so an unqualified list let an EPUB
+        # export describe the CBZ and the guard cleared a truncating rebuild.
+        # This run may only ever replace ITS OWN format's entry; the others are
+        # carried through untouched, because they still describe files that are
+        # still on disk. See _final_file_recorded_coverage for the read rules.
+        final_file_chapters = {}
+        _prev_ffc = existing_meta.get("final_file_chapters")
+        if isinstance(_prev_ffc, dict):
+            for _fmt, _labels in _prev_ffc.items():
+                if isinstance(_labels, (list, tuple)) and isinstance(_fmt, str):
+                    final_file_chapters[_fmt] = [
+                        _chap_label_str(x) for x in _labels
+                    ]
+        elif isinstance(_prev_ffc, list):
+            # Legacy single-format shape, migrated in place. meta["format"] is
+            # the format that wrote it; without that we cannot say which archive
+            # it described, so it is dropped rather than misfiled onto this run's
+            # format (the reader then falls back to chapters_downloaded, which
+            # overstates — the safe direction).
+            _prev_fmt = existing_meta.get("format")
+            if isinstance(_prev_fmt, str) and _prev_fmt:
+                final_file_chapters[_prev_fmt] = [
+                    _chap_label_str(x) for x in _prev_ffc
+                ]
+        if final_file_built_labels is not None:
+            final_file_chapters[args.format] = list(final_file_built_labels)
+        if not final_file_chapters:
+            final_file_chapters = None
 
         # Serialize AniList tags via the module-level _serialize_anilist_tag —
         # the same serializer the refresh writer + _build_aio_reader_extras use,
@@ -12904,6 +13772,13 @@ def main():
             # update-check (main.js:_checkSeriesUpdates). Empty for single-source
             # / lazy / collapse-off series. grep chapters_skipped_fragments.
             "chapters_skipped_fragments": merged_skipped,
+            # Absent (not null) when no build has ever been recorded — readers
+            # must treat "missing" as "unknown", never as "covers nothing".
+            **(
+                {"final_file_chapters": final_file_chapters}
+                if final_file_chapters is not None
+                else {}
+            ),
             # None when the chapter listing was deliberately cut short by
             # chapter_floor_hint (grep pool_is_partial): reporting a floored
             # pool as the series total would be a lie, and "unknown" is the
@@ -13037,12 +13912,49 @@ def main():
         print(f"\nABORTED. Run stopped because chapter {aborted_chapter.get('chap') if aborted_chapter else '?'} could not be downloaded.")
         print(f"Per-chapter PDFs saved before this point are kept in: {out_dir}")
         print(f"Temporary files kept at: {main_tmp_dir}")
+        # Emit BEFORE sys.exit: SystemExit unwinds straight past an embedder's
+        # try/finally-free call site, and a UI that never hears a terminal event
+        # leaves the download stuck "running" forever.
+        _emit(
+            "done",
+            ok=False,
+            aborted=True,
+            output_dir=out_dir,
+            temp_dir=main_tmp_dir,
+            cancelled=run_cancelled(),
+        )
         sys.exit(1)
-    elif not args.no_cleanup:
+    elif not args.no_cleanup and not run_cancelled() and not final_build_stranded:
         rm_tree(main_tmp_dir)
         print("\nDone.")
+        _emit("done", ok=True, aborted=False, output_dir=out_dir, cancelled=False)
     else:
+        # --no-cleanup, a CANCELLED run, or a run whose combined-file build the
+        # overwrite guard declined while --keep-chapters was off (grep
+        # final_build_stranded) — in that last case the per-chapter caches in here
+        # are the ONLY copy of what was just downloaded, so wiping them would turn
+        # a refusal-to-destroy into a different data loss.
+        #
+        # A cancelled run MUST keep tmp_<hid>/ — it is the entire input to a
+        # resume, and the completed chapter dirs in it are bytes the user
+        # already paid for. Same reasoning as the abort branch above.
+        #
+        # This only ever fires for an EMBEDDED caller: cancellation is
+        # cooperative (`request_run_cancel`, whose one caller is
+        # aio_android.cancel), so a cancelled run returns normally and falls
+        # through to here. The desktop cancels by KILLING the process, so
+        # main() never reaches this block at all and its tmp dir survives for
+        # free — which is why the desktop's resume bar has always worked and
+        # why this guard was not needed until Android.
         print(f"\nDone. Temporary files kept at: {main_tmp_dir}")
+        _emit(
+            "done",
+            ok=True,
+            aborted=False,
+            output_dir=out_dir,
+            temp_dir=main_tmp_dir,
+            cancelled=run_cancelled(),
+        )
 
 
 if __name__ == "__main__":

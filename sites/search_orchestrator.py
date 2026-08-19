@@ -37,6 +37,7 @@ from functools import cmp_to_key
 from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+from . import fuzzy_match
 from .base import BaseSiteHandler, SearchHit
 
 
@@ -5213,9 +5214,19 @@ def _best_title_match(query: str, hit: SearchHit) -> float:
     Cross-file: this is the only place query↔hit similarity is computed; if
     we ever migrate scorers, change here and update DEFAULT_MIN_MATCH above
     in the same edit.
+
+    Scores come from sites/fuzzy_match, which normalizes the three codepoints
+    rapidfuzz's C++ and pure-Python backends disagree on. That matters most
+    HERE: this compares a user query against titles scraped out of HTML, and a
+    `&nbsp;` is a token separator to one backend and an ordinary character to
+    the other. Android runs the pure-Python backend (no Chaquopy wheel exists),
+    so without normalization the same query would rank sources differently on
+    phone and desktop.
     """
+    # RuntimeError, not the wrapper's ImportError: long-standing contract of
+    # this function, and aio_search_cli reports it as a search-level failure.
     try:
-        from rapidfuzz import fuzz
+        fuzzy_match.load_rapidfuzz()
     except ImportError as exc:
         raise RuntimeError(
             "rapidfuzz is required for cross-site search. "
@@ -5235,7 +5246,7 @@ def _best_title_match(query: str, hit: SearchHit) -> float:
     for cand in candidates:
         if not cand:
             continue
-        score = fuzz.WRatio(q, cand) / 100.0
+        score = fuzzy_match.wratio(q, cand) / 100.0
         if score > best:
             best = score
     return best
@@ -6401,6 +6412,34 @@ def search_all(
                 )
 
             def _probe_one(src: SourceEntry) -> None:
+                """Probe one source, with interactive CF solving FORBIDDEN.
+
+                The image-quality probe calls straight into the handler API —
+                fetch_comic_context / get_chapters / get_chapter_images — and
+                those are exactly the methods that now divert to a Cloudflare
+                rescue. Without this, probing a challenged host during a search
+                opens a Chrome window (or a phone ChallengeActivity) for a
+                series the user has not picked and may never pick.
+
+                ENTERED HERE, INSIDE THE WORKER, not around the thread pool
+                below: a fresh thread does not inherit the spawning thread's
+                context, so a permission set around the submission would read as
+                unset in precisely the code it exists to govern. Setting it here
+                also covers the paths where this body runs on the MAIN thread —
+                a --multi-source download probes from inside an already-opted-in
+                main(), and that permission must not leak into the probe.
+
+                Impit and cached CF clearance are unaffected (see
+                crawlee_utils.rescue_cf_html's tier list), so a challenged
+                source still gets its headless rescue and only the
+                human-in-the-loop tiers are withheld.
+                """
+                from .crawlee_utils import interactive_solving
+
+                with interactive_solving(False):
+                    _probe_one_guarded(src)
+
+            def _probe_one_guarded(src: SourceEntry) -> None:
                 hit = hit_by_url.get(src.url)
                 if hit is None:
                     return

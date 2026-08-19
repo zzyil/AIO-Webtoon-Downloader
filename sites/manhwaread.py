@@ -94,24 +94,47 @@ class ManhwaReadHandler(MadaraSiteHandler):
 
         # Use the base handler's logic to fetch HTML (handles Cloudflare)
         if self.use_zendriver:
-            from .crawlee_utils import fetch_html_with_cf_cookies
-            html = fetch_html_with_cf_cookies(chapter_url, base_url=self.base_url)
+            from .crawlee_utils import rescue_cf_html
+            html = rescue_cf_html(chapter_url, base_url=self.base_url, scraper=scraper)
         else:
             response = make_request(chapter_url, scraper)
             html = response.text
-            # If Cloudflare blocked us, try CF cookie capture
-            if (
-                response.status_code in (403, 429, 503)
-                or len(html) < 2000
-                or "just a moment" in html.lower()
-                or "checking your browser" in html.lower()
-            ):
-                try:
-                    from .crawlee_utils import fetch_html_with_cf_cookies, ZENDRIVER_AVAILABLE
-                    if ZENDRIVER_AVAILABLE:
-                        html = fetch_html_with_cf_cookies(chapter_url, base_url=self.base_url)
-                except Exception:
-                    pass
+            # If Cloudflare blocked us, try CF cookie capture.
+            #
+            # The trigger keeps this handler's own heuristic (a short body is a
+            # blocked body on this site) OR'd with the shared detector, which
+            # adds the 200-with-interstitial case the length test misses. The
+            # GATE is what was broken: it read `if ZENDRIVER_AVAILABLE`, so on
+            # Android the rescue silently evaporated and the interstitial was
+            # parsed for images — same defect as sites/madara.py:_fetch_html,
+            # which this method deliberately mirrors.
+            try:
+                from .crawlee_utils import (
+                    cf_solver_available,
+                    is_cf_challenge,
+                    rescue_cf_html,
+                    warn_cf_no_solver,
+                    warn_cf_rescue,
+                )
+
+                if (
+                    is_cf_challenge(response.status_code, html)
+                    or response.status_code in (403, 429, 503)
+                    or len(html) < 2000
+                    or "just a moment" in html.lower()
+                    or "checking your browser" in html.lower()
+                ):
+                    if cf_solver_available():
+                        try:
+                            html = rescue_cf_html(
+                                chapter_url, base_url=self.base_url, scraper=scraper
+                            )
+                        except Exception as exc:
+                            warn_cf_rescue(chapter_url, f"rescue failed: {exc}")
+                    else:
+                        warn_cf_no_solver(chapter_url)
+            except Exception:
+                pass
 
         # Look for window.chapterData or chapterData
         # Example: chapterData = {"data":"...","base":"..."};

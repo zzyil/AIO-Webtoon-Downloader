@@ -1,10 +1,23 @@
 """Anti-bot fetch utilities for bot-protected sites.
 
-Two strategies are provided:
+Three strategies are provided:
 1. impit (Chrome/Firefox TLS impersonation, handles zstd/brotli) — fast, no browser launch.
    Use for sites that are blocked by header/fingerprint checks but serve readable HTML.
 2. zendriver (CDP-based Chrome with built-in CF challenge solver) — for Cloudflare-protected
    sites. Uses zendriver's cloudflare module to interact with and solve CF challenges.
+3. an embedder-supplied browser (sites/browser_backend.py) — Android installs its in-app
+   WebView here, which shows the challenge to the person holding the phone. get_cf_session
+   prefers it over zendriver when one is installed.
+
+Because of (3), **zendriver is no longer the only CF solver**. Handlers must ask
+`cf_solver_available()` before deciding they cannot rescue a challenge; gating on
+`ZENDRIVER_AVAILABLE` makes the whole rescue vanish on any platform without it (grep
+cf_solver_available for the four handlers this bit).
+
+Strategies 2 and 3 put a challenge in front of a PERSON, so they are additionally
+gated on `interactive_solve_allowed()` — an opt-in, dynamically-scoped permission
+that only a foreground download grants. Strategy 1 is headless and always available.
+Read the "TWO SEPARATE QUESTIONS" block further down before touching either gate.
 
 All functions are synchronous and safe to call from multiprocessing subprocesses.
 zendriver is async; fetch_html_zendriver wraps it synchronously via asyncio.run().
@@ -12,8 +25,13 @@ zendriver is async; fetch_html_zendriver wraps it synchronously via asyncio.run(
 
 from __future__ import annotations
 
-from typing import List, Optional
+from contextlib import contextmanager as _contextmanager
+from contextvars import ContextVar as _ContextVar
+from typing import TYPE_CHECKING, List, Optional
 from urllib.parse import urljoin
+
+if TYPE_CHECKING:  # `ContextVar[bool]` in an annotation, without the runtime import
+    from contextvars import ContextVar
 
 # ---------------------------------------------------------------------------
 # impit — fast TLS/browser impersonation (part of crawlee's dependency set)
@@ -304,7 +322,17 @@ def get_cf_session(base_url: str) -> "requests.Session":
     Raises:
         RuntimeError: If zendriver is not available or the solve fails.
     """
-    if not ZENDRIVER_AVAILABLE:
+    # An embedder-supplied browser that can solve challenges takes precedence
+    # over zendriver. On Android that's the WebView, where the "interactive"
+    # solve is genuinely better than on desktop: there's a real Chromium with a
+    # real UA, and the user just taps the checkbox.
+    # Cross-file: sites/browser_backend.py:custom_backend.
+    from . import browser_backend as _bb
+
+    _backend = _bb.custom_backend("cf")
+    _use_backend = _backend is not None and _backend.supports_challenge_solving
+
+    if not _use_backend and not ZENDRIVER_AVAILABLE:
         raise RuntimeError("zendriver is not installed. Run: pip install zendriver")
 
     import requests as _requests
@@ -320,6 +348,30 @@ def get_cf_session(base_url: str) -> "requests.Session":
             cookies = cached["cookies"]
             user_agent = cached["user_agent"]
         else:
+            # THE interactive gate, and it lives here rather than at the four
+            # handler call sites for one reason: this is the only line in the
+            # process that actually costs a human anything. Everything above it
+            # — the cookie cache, and therefore every request a background
+            # search makes against a host some earlier download already solved —
+            # stays free and ungated, so the gate cannot cost a rescue that was
+            # never going to interrupt anyone.
+            #
+            # Raised, not returned-empty: callers already treat a raising solve
+            # as "keep the challenged body and warn" (madara / mangathemesia /
+            # manhwaread) or "try the next rung" (weebcentral), so the blocked
+            # path reuses proven handling instead of adding a second one.
+            if not interactive_solve_allowed():
+                warn_cf_rescue(
+                    base_url,
+                    "needs a human to solve it, and this is a background "
+                    "operation (search / probe / update-check). Not opening a "
+                    "browser; re-run this series as a download to solve it once.",
+                    kind="background",
+                )
+                raise InteractiveSolveBlocked(
+                    f"Cloudflare solve for {domain} needs an interactive browser, "
+                    f"which is not permitted in this context"
+                )
             # Probe for a Patchright/Playwright Chromium up-front so
             # zendriver doesn't blow up with "could not find a valid
             # browser binary" on sandboxed boxes (Windows Sandbox /
@@ -328,10 +380,13 @@ def get_cf_session(base_url: str) -> "requests.Session":
             # browser_executable_path=None and zendriver's default
             # lookup runs unchanged — so installs with system Chrome
             # behave exactly as before.
-            browser_path = _find_patchright_chromium()
-            result = _asyncio.run(
-                _solve_cf_async(base_url, browser_executable_path=browser_path)
-            )
+            if _use_backend:
+                result = _backend.solve_challenge(base_url, timeout_s=45.0)
+            else:
+                browser_path = _find_patchright_chromium()
+                result = _asyncio.run(
+                    _solve_cf_async(base_url, browser_executable_path=browser_path)
+                )
             cookies = result["cookies"]
             user_agent = result["user_agent"]
             _cf_cookie_cache[domain] = {"cookies": cookies, "user_agent": user_agent, "ts": now}
@@ -360,6 +415,45 @@ _CF_PLAIN_UA = (
 )
 
 
+def _count_cf_phrases(text: str) -> int:
+    """How many of _CF_CHALLENGE_PHRASES appear in *text*.
+
+    The one primitive both detectors below share, so the phrase list can never
+    drift between the HTTP-body check and the rendered-DOM check. Bounds the
+    scan: an interstitial is ~5 KB of mostly inline script and the markers are
+    all near the top, so lowercasing a whole 2 MB reader page would be pure
+    waste on the hot path.
+    """
+    if not text:
+        return 0
+    lower = text[:200_000].lower()
+    return sum(1 for phrase in _CF_CHALLENGE_PHRASES if phrase in lower)
+
+
+def looks_like_cf_interstitial(text: str, title: Optional[str] = None) -> bool:
+    """True when *text* is Cloudflare's interstitial, judged WITHOUT a status code.
+
+    For callers holding a RENDERED DOM rather than an HTTP body — i.e. a
+    Playwright `page.content()`. Two things make is_cf_challenge wrong there:
+    there is no status code to key on (a browser that followed the challenge
+    reports nothing useful), and its 200-branch requires `len(text) < 15_000`,
+    which a hydrated interstitial (Turnstile iframe, inline challenge script)
+    can exceed. So this drops the length gate and raises the phrase bar to 2 to
+    keep the false-positive rate where the length gate used to hold it.
+
+    `title` is checked as well because "just a moment..." is the interstitial's
+    <title> and survives even when the body markup is unrecognisable.
+
+    Deliberately NOT merged with sites/comix.py:_looks_like_waf_challenge —
+    comix runs Cloudflare AND its own first-party CAPTCHA, only the latter needs
+    a human, and conflating them would send a solvable CF challenge down the
+    "ask the user" path. Cross-file: sites/mangafire_vrf.py:_challenged.
+    """
+    if title and "just a moment" in title.lower():
+        return True
+    return _count_cf_phrases(text) >= 2
+
+
 def is_cf_challenge(status_code: int, text: str) -> bool:
     """Return True if the HTTP response looks like a Cloudflare challenge page.
 
@@ -374,15 +468,11 @@ def is_cf_challenge(status_code: int, text: str) -> bool:
         True if a CF challenge / block is detected.
     """
     if status_code in (403, 429, 503):
-        lower = text.lower()
-        for phrase in _CF_CHALLENGE_PHRASES:
-            if phrase in lower:
-                return True
+        if _count_cf_phrases(text) >= 1:
+            return True
     # CF sometimes serves the interstitial with 200 (JS-redirect variant)
     if status_code == 200 and len(text) < 15_000:
-        lower = text.lower()
-        hits = sum(1 for phrase in _CF_CHALLENGE_PHRASES if phrase in lower)
-        if hits >= 2:
+        if _count_cf_phrases(text) >= 2:
             return True
     return False
 
@@ -440,8 +530,13 @@ def fetch_html_with_cf_cookies(
 
 def sync_cf_cookies(scraper, url: str) -> None:
     """If we have cached CF cookies for url's domain, sync them and User-Agent to scraper."""
-    if not ZENDRIVER_AVAILABLE:
-        return
+    # Gate on the CACHE, not on the zendriver import. The cache is written by
+    # whoever solved the challenge, and since get_cf_session can now be served
+    # by an embedder backend, zendriver is no longer the only writer. The old
+    # `if not ZENDRIVER_AVAILABLE: return` made this a SILENT no-op on any
+    # platform without zendriver — every solved challenge got thrown away,
+    # cookies never reached the scraper, and the next request was challenged
+    # again with no indication why. Android is exactly that platform.
     domain = _urlparse(url).netloc
     domain_no_www = domain[4:] if domain.startswith("www.") else domain
 
@@ -458,6 +553,241 @@ def sync_cf_cookies(scraper, url: str) -> None:
                     domain=c.get("domain", domain),
                     path=c.get("path", "/"),
                 )
+
+
+# ---------------------------------------------------------------------------
+# CF rescue seam — the gate + the diversion + the log, shared by every handler
+# that detects a Cloudflare interstitial in a response it already has.
+#
+# Consumers: sites/madara.py (_fetch_html, the chokepoint for 244 handlers),
+# sites/manhwaread.py (image path), sites/mangathemesia.py (_fetch_html_guarded,
+# 28 handlers), sites/weebcentral.py (its own fallback ladder).
+# Offline coverage: tests/test_cf_rescue_seam.py.
+#
+# TWO SEPARATE QUESTIONS, and conflating them is what shipped a hole here once:
+#   cf_solver_available()      — CAPABILITY. "Does this process own a solver?"
+#   interactive_solve_allowed() — PERMISSION. "May I interrupt a human RIGHT NOW?"
+# A rescue needs both. The first is a property of the install; the second is a
+# property of the CALL CONTEXT, which is why it is dynamically scoped rather
+# than passed as an argument (see the block below).
+# ---------------------------------------------------------------------------
+
+# Is a human sitting in front of this call, expecting it to do work?
+#
+# DEFAULT IS FALSE — interactive solving is OPT-IN, and main()'s foreground
+# download is the only opt-in. That direction is deliberate and was chosen after
+# the first attempt at this shipped protecting 1 of ~6 call sites: with opt-OUT,
+# a path nobody remembered to mark pops a Chrome window mid-search or launches a
+# ChallengeActivity on someone's phone, and the only way to find out is to see it
+# happen. With opt-IN, a path nobody remembered to mark merely loses the browser
+# tier — it still gets impit, still gets cached clearance, and says so on stderr.
+# Degraded and visible beats surprising and interactive, so the default is the
+# one that stays safe the next time a call site is missed.
+#
+# CONSEQUENCE WORTH KNOWING: `--list-chapters` and `--search` never opt in, so
+# desktop library update-checks and the Android update sweep are non-interactive
+# BY CONSTRUCTION — those are precisely the runs that must never demand a human.
+#
+# THREADING TRAP, designed around rather than worked around: a fresh thread does
+# NOT inherit the spawning thread's context — it starts empty and reads the
+# DEFAULT. So the permission cannot be granted around a pool submission and
+# expected to reach the workers, and (the direction that matters here) a worker
+# can never accidentally inherit a download's permission. The orchestrator still
+# sets False explicitly at its probe entry point (search_orchestrator.py:
+# _probe_one) because that body ALSO runs on the main thread in some paths, e.g.
+# a --multi-source download that probes inside an already-opted-in main().
+_INTERACTIVE_SOLVE: "ContextVar[bool]" = _ContextVar(
+    "aio_cf_interactive_solve", default=False
+)
+
+
+class InteractiveSolveBlocked(RuntimeError):
+    """A solve was needed, a solver existed, and the context forbade using it.
+
+    Distinct from "no solver installed" on purpose: the caller's fallback is the
+    same (keep the challenged body / try the next rung) but the OPERATOR's fix is
+    opposite — install zendriver, versus re-run this as a foreground download.
+    """
+
+
+@_contextmanager
+def interactive_solving(allowed: bool = True):
+    """Scope permission to open a browser/WebView for a CF solve.
+
+    Restores the previous value on exit, including on exception, so a download
+    that raises cannot leave the permission set for whatever runs next in the
+    same thread. Enter it INSIDE the thread whose calls it should govern.
+    """
+    token = _INTERACTIVE_SOLVE.set(bool(allowed))
+    try:
+        yield
+    finally:
+        _INTERACTIVE_SOLVE.reset(token)
+
+
+def allow_interactive_solving_for_this_run() -> None:
+    """Grant the permission for the REST OF THIS CONTEXT, with no way to undo it.
+
+    For an entry point that owns its whole process and has no enclosing scope to
+    hang a `finally` on — i.e. exactly one caller, aio-dl.py's main(), which runs
+    to EOF and returns from many points. Everything else must use
+    `interactive_solving()` so the grant is scoped.
+
+    Safe despite being unscoped because the two hosts bound it themselves:
+    desktop runs one download per PROCESS, and Android wraps every main() call
+    in `interactive_solving(False)` (grep _cf_interactive_solving in
+    aio_android.py), whose reset() discards whatever was set inside it.
+    """
+    _INTERACTIVE_SOLVE.set(True)
+
+
+def interactive_solve_allowed() -> bool:
+    """May this call block on a human solving a challenge? See the block above.
+
+    Named for the question it answers, not for the mechanism. The old name at
+    this check site (`cf_solver_available`) asked about the INSTALL and read as
+    though it had already settled the permission question, which is a large part
+    of why a background search reached an interactive solve.
+    """
+    return bool(_INTERACTIVE_SOLVE.get())
+
+
+def cf_solver_available(*, embedder_only: bool = False) -> bool:
+    """True when SOMETHING in this process can get a caller past a CF interstitial.
+
+    CAPABILITY ONLY — it does not ask whether using that solver is appropriate
+    here. Pair it with interactive_solve_allowed() at any site that would open a
+    window; get_cf_session enforces that pairing itself, so the common path
+    cannot forget.
+
+    Gate every rescue on this, never on ZENDRIVER_AVAILABLE. get_cf_session has
+    preferred an embedder-supplied backend over zendriver since the Android
+    port, so the import flag stopped being the right question — and four
+    handlers kept asking it, inside `except Exception: pass`, which meant the
+    interstitial HTML was parsed as the page with nothing logged. The visible
+    symptom was never Cloudflare: a challenge page yields no title and no
+    chapters, so the run died on "No chapters selected."
+
+    embedder_only=True asks the narrower "did an embedder install a backend via
+    sites/browser_backend.set_backend_factory". sites/weebcentral.py needs the
+    distinction to order its ladder: on Android that backend is the ONLY rescue
+    (impit is not installed there), while on desktop impit is a fast headless
+    fetch that must keep winning over a solver which opens a visible Chrome
+    window in the user's face.
+    """
+    try:
+        from . import browser_backend as _bb
+
+        backend = _bb.custom_backend("cf")
+        if backend is not None and backend.supports_challenge_solving:
+            return True
+    except Exception:
+        pass
+    if embedder_only:
+        return False
+    return ZENDRIVER_AVAILABLE
+
+
+def rescue_cf_html(
+    url: str,
+    *,
+    base_url: Optional[str] = None,
+    scraper=None,
+    timeout: float = 20.0,
+) -> str:
+    """Re-fetch *url* through whichever solver this process has, and hand the
+    clearance to *scraper*.
+
+    The sync_cf_cookies half is not optional bookkeeping: the handler's own
+    later requests (chapter pages, image URLs) go through `scraper`, so without
+    it every one of them is challenged again and only the single rescued page
+    ever succeeds.
+
+    Raises whatever the solve raises. Callers decide what a failed rescue
+    means — for madara/manhwaread/mangathemesia it means "keep the body we
+    already had and warn", for weebcentral it means "try the next rung".
+
+    THREE RESCUE TIERS, and only the last two can cost a human anything:
+
+      1. impit — headless TLS impersonation, no window, no wait. Always tried
+         first and NEVER gated, which is what keeps the interactive gate from
+         being a capability regression: a background search on desktop still
+         rescues itself here, silently, exactly as it did before the gate.
+      2. an embedder browser (Android) — shows a ChallengeActivity.
+      3. zendriver (desktop) — opens a visible Chrome window.
+
+    Tiers 2 and 3 both run through get_cf_session, which is where the gate sits,
+    so this function does not re-check permission — one check, one place.
+    """
+    # Tier 1. A challenged body coming back from impit is not a rescue, so it
+    # falls through rather than being returned as the page (the exact mistake
+    # this seam exists to stop). Status 200 is the right argument here: impit
+    # raises on transport failure, so anything returned WAS a 200 body.
+    if IMPIT_AVAILABLE:
+        try:
+            html = fetch_html_impit(url, browser="chrome", timeout=timeout)
+            if html and not is_cf_challenge(200, html):
+                return html
+        except Exception:
+            pass
+
+    # Tiers 2-3.
+    html = fetch_html_with_cf_cookies(url, base_url=base_url, timeout=timeout)
+    if scraper is not None:
+        sync_cf_cookies(scraper, url)
+    return html
+
+
+# One line per (host, kind) per process. These are standing conditions, not
+# per-request events: a fully-blocked site would otherwise print the same line
+# once per chapter for a 200-chapter run.
+_cf_warn_seen: set = set()
+
+
+def warn_cf_rescue(url: str, reason: str, *, kind: str = "failed") -> None:
+    """Report a Cloudflare rescue that did not happen, on **stderr**.
+
+    stderr, not stdout, because aio_search_cli.py writes its JSON to stdout and
+    a network-noise line there corrupts the whole `--search-json` payload (same
+    reason sites/hardening.py moved its cooldown lines; grep sys.stderr there).
+
+    `kind` is the dedup key, so a host that has no solver at all says so once
+    rather than once per chapter.
+    """
+    host = ""
+    try:
+        host = _urlparse(url).netloc
+    except Exception:
+        pass
+    key = (host, kind)
+    if key in _cf_warn_seen:
+        return
+    _cf_warn_seen.add(key)
+    try:
+        import sys as _sys
+
+        print(
+            f"[!] Cloudflare challenge on {host or url}: {reason}",
+            file=_sys.stderr,
+        )
+    except Exception:
+        pass
+
+
+def warn_cf_no_solver(url: str) -> None:
+    """The challenge was detected and nothing in this process can solve it.
+
+    Split out from warn_cf_rescue only so the wording lives in one place — it
+    is the message a user hits on a bare `pip install`-less environment, and it
+    has to name the fix rather than the symptom.
+    """
+    warn_cf_rescue(
+        url,
+        "no solver available — install zendriver (pip install zendriver) or run "
+        "inside the Android app, which solves challenges in its own WebView. "
+        "Serving the challenge page as-is; expect a missing title and no chapters.",
+        kind="no-solver",
+    )
 
 
 async def _fetch_html_zendriver_async(

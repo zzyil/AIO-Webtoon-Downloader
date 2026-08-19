@@ -22,6 +22,23 @@ def fetch_html_playwright(url: str, wait_selector: str = None, wait_time: int = 
     Returns:
         HTML content string
     """
+    # Embedder-supplied browser (Android's WebView) wins when one is installed.
+    # Desktop never installs one, so the Patchright path below is unchanged —
+    # including its ignore_https_errors and pinned UA, which some MangaThemesia
+    # sites depend on. Cross-file: sites/browser_backend.py:custom_backend.
+    from . import browser_backend as _bb
+
+    _backend = _bb.custom_backend("fetch")
+    if _backend is not None:
+        _backend.goto(url, wait_until="domcontentloaded", timeout_ms=60000)
+        if wait_selector:
+            # Same "don't raise on timeout" contract as the wait below: the
+            # selector may simply never render, and the caller still wants
+            # whatever HTML did arrive.
+            _backend.wait_for_selector(wait_selector, timeout_ms=10000)
+        time.sleep(wait_time)  # let JS settle, mirroring wait_for_timeout below
+        return _backend.content()
+
     if not PLAYWRIGHT_AVAILABLE:
         raise ImportError("Playwright is not available. Please install it.")
 

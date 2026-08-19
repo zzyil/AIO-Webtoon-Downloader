@@ -9,7 +9,10 @@ import os
 import queue
 import sys
 import threading
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from . import browser_identity as _bid
 
 # ---------------------------------------------------------------------------
 # MangaFire `vrf` request signer.
@@ -54,6 +57,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # That is why mangafire keeps EXPENSIVE_PROBE=False and stays a normal search
 # participant, instead of paying comix's ~30-90s per-series browser cost.
 #
+# THE SECOND THING THIS BROWSER NOW DOES: get past Cloudflare, and then serve
+# the API reads too. mangafire.to went behind a Managed Challenge sitewide
+# (including /api/*) around 2026-08-16, and no headless client can pass it, so
+# the browser is the only client that can read this site at all while the
+# challenge is up. `fetch_api` does that read same-origin from the cleared page
+# — see its docstring for why the alternative (transplanting cf_clearance into
+# cloudscraper) is the thing comix already proved does not work. When Cloudflare
+# is off, sites/mangafire.py never calls it and the fast path is unchanged.
+#
 # Cross-file: the daemon-thread + queue bridge below mirrors
 # sites/comix.py:_ComixBrowserBridge (grep `_comix_worker_loop`) — Patchright's
 # sync API demands that every call run on the one thread that started it, and
@@ -78,6 +90,84 @@ _BASE_URL = "https://mangafire.to"
 # module probe) is the slow one; steady-state signing is milliseconds.
 _SIGN_TIMEOUT_S = 90.0
 _BOOTSTRAP_TIMEOUT_S = 120.0
+
+# ---------------------------------------------------------------------------
+# Cloudflare. mangafire.to went behind a Managed Challenge sitewide — including
+# every /api/* path — around 2026-08-16 (measured 2026-08-19: plain requests,
+# impit chrome, curl_cffi chrome and cloudscraper ALL get the interstitial, so
+# no headless tier this repo owns can reach the site).
+#
+# That is what produced the original bug report: _bootstrap navigated to the
+# homepage, landed on the interstitial, ran its module scan against it and
+# truthfully reported "no vrf signer among 0 module candidates" — blaming the
+# signer for a network-level block. Nothing here probes the DOM until
+# _ensure_cleared says the page is real.
+_CF_AUTO_CLEAR_TIMEOUT_S = 20.0
+_CF_SOLVE_TIMEOUT_ENV = "AIO_MANGAFIRE_CF_SOLVE_TIMEOUT"
+_CF_DEFAULT_SOLVE_TIMEOUT_S = 180.0
+# Set by tests so a regression into prompting fails instead of hanging; mirrors
+# sites/comix.py's AIO_COMIX_NO_INTERACTIVE_WAF.
+_NO_INTERACTIVE_CF_ENV = "AIO_MANGAFIRE_NO_INTERACTIVE_CF"
+# Debug seam: forces the detector to fire ONCE (popped, not read, so one run
+# tests one challenge). Mirrors AIO_COMIX_FORCE_WAF.
+_FORCE_CF_ENV = "AIO_MANGAFIRE_FORCE_CF"
+
+# Handoff budget, same shape and reasoning as comix's: a SUCCESS must not count
+# against the allowance (one run can legitimately need more than one solve),
+# while a decline must stop us nagging. Grep _may_prompt.
+_CF_MAX_SOLVES = 3
+_CF_MAX_FAILURES = 1
+_CF_MIN_PROMPT_INTERVAL_S = 20.0
+_CF_HANDOFF_LOCK = threading.Lock()
+_CF_SOLVES_DONE = 0
+_CF_FAILURES = 0
+_CF_LAST_PROMPT_AT = 0.0
+
+# How many times to try the channel launch before downgrading the identity.
+#
+# WHY THIS IS NOT 1: Chromium locks its user-data-dir, and this profile is shared
+# by every process the app runs (the Electron app spawns searcher.js and
+# downloader.js separately, both carrying PLAYWRIGHT_BROWSERS_PATH). When another
+# process holds it, Chrome starts and immediately self-exits — Playwright surfaces
+# that as TargetClosedError with `exitCode=21`, which looks nothing like "this
+# build doesn't know the channel" but hit the same except branch. The first cut
+# downgraded the whole process to channel-less headless on that one transient
+# collision, permanently reintroducing the HeadlessChrome client-hint leak for the
+# rest of the run. Observed live 2026-08-20; the same launch succeeded on every
+# retry afterwards.
+_CHANNEL_LAUNCH_ATTEMPTS = 3
+_CHANNEL_RETRY_DELAY_S = 0.75
+
+# Substrings that mean the CHANNEL itself is the problem, so retrying is pointless
+# and downgrading is correct. Everything else is treated as transient.
+_CHANNEL_UNSUPPORTED_MARKERS = (
+    "unsupported channel",
+    "unknown channel",
+    "is not supported",
+    "executable doesn't exist",
+    "executable does not exist",
+    "unexpected keyword argument",
+)
+
+
+def _channel_unsupported(exc: BaseException) -> bool:
+    """True when the failure says this Playwright/Chromium can't do `channel=`.
+
+    Deliberately a whitelist: an unrecognised error is treated as transient and
+    retried, because the cost of retrying a real incompatibility is one extra
+    launch attempt, while the cost of misreading a transient collision as an
+    incompatibility is running the whole process with a detectable identity.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _CHANNEL_UNSUPPORTED_MARKERS)
+
+
+# The reader's default viewport is fine for a headless scrape but hands a HUMAN
+# a window whose content sits below the bottom of any real display — see the
+# "Playwright viewport vs OS window" note: viewport= is device-metrics
+# EMULATION and holds regardless of window size, so a window a person must use
+# needs the EMULATED viewport shrunk to fit or it reads as blank + unscrollable.
+_INTERACTIVE_VIEWPORT = {"width": 1280, "height": 720}
 
 
 # Why the signer is unusable, if it is. Written by the worker thread when it
@@ -180,6 +270,50 @@ async (specs) => {
 """
 
 
+_FETCH_API_JS = r"""
+async (url) => {
+  const r = await fetch(url, {
+    credentials: 'include',
+    headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+  });
+  const body = await r.text();
+  return { status: r.status, body: body };
+}
+"""
+
+
+def _may_prompt() -> Optional[str]:
+    """None when a verification window may be opened right now, else the reason
+    it may not. CLAIMS the slot as a side effect, so a None return means "you
+    are prompting now" — don't call it speculatively."""
+    global _CF_LAST_PROMPT_AT
+    if (os.environ.get(_NO_INTERACTIVE_CF_ENV) or "").strip() not in ("", "0"):
+        return "disabled"
+    with _CF_HANDOFF_LOCK:
+        if _CF_FAILURES >= _CF_MAX_FAILURES:
+            return "already_declined"
+        if _CF_SOLVES_DONE >= _CF_MAX_SOLVES:
+            return "solve_limit"
+        waited = time.monotonic() - _CF_LAST_PROMPT_AT
+        if _CF_LAST_PROMPT_AT and waited < _CF_MIN_PROMPT_INTERVAL_S:
+            return "too_soon"
+        _CF_LAST_PROMPT_AT = time.monotonic()
+    return None
+
+
+def _record_prompt_outcome(solved: bool) -> None:
+    """A success spends one solve and RESETS the failure count; a failure spends
+    the (deliberately tiny) failure allowance, so someone who declines once is
+    not asked again this run."""
+    global _CF_SOLVES_DONE, _CF_FAILURES
+    with _CF_HANDOFF_LOCK:
+        if solved:
+            _CF_SOLVES_DONE += 1
+            _CF_FAILURES = 0
+        else:
+            _CF_FAILURES += 1
+
+
 def _profile_dir() -> str:
     """App-owned Chromium user-data dir. Persisted (not throwaway) so Cloudflare
     cookies for mangafire.to survive across runs and processes — a virgin
@@ -207,14 +341,11 @@ def _cache_path() -> str:
     return os.path.join(_profile_dir(), "vrf-cache.json")
 
 
-def _signer_alive(page) -> bool:
-    """True when the live page still carries a bootstrapped signer. A SPA
-    navigation (or a crash-and-reload) wipes window globals, so the fast path
-    has to verify rather than assume."""
-    try:
-        return bool(page.evaluate("typeof window.__aioMfSign === 'function'"))
-    except Exception:
-        return False
+# Distinguishes "no argument" from "the argument None" in _SignerSession._eval.
+# Same role as sites/browser_backend.NOARG; kept local so this module doesn't
+# import the backend at module scope (a run that never touches mangafire must
+# not pay for it).
+_EVAL_NOARG = object()
 
 
 def _cache_key(path: str, pairs: Sequence[Tuple[str, Any]]) -> str:
@@ -237,6 +368,23 @@ class _SignerSession:
         self._pw = None
         self._context = None
         self._page = None
+        # Launch mode of the live context. A mode switch (the verification
+        # handoff) forces a teardown: Chromium fixes headless at launch time and
+        # the profile dir can only be held by ONE context at a time.
+        self._headless: Optional[bool] = None
+        # Sticky per-process Cloudflare verdict, so a blocked run doesn't re-pay
+        # the auto-clear poll on every later call. Deliberately NOT _unavailable:
+        # that flag also disables the browser for the in-page API fetch, which is
+        # the very thing that works once clearance exists.
+        self._cf_blocked: Optional[str] = None
+        # Was that verdict reached only because we weren't ALLOWED to prompt?
+        # If so it is provisional — see _ensure_cleared's re-open rule.
+        self._cf_blocked_background = False
+        self._cf_cookie_ts = 0.0
+        # Embedder-supplied browser (Android WebView). When set, every browser
+        # touchpoint below routes here instead of through Patchright; the
+        # Patchright fields above stay None and _cleanup skips them.
+        self._backend = None
         # Identity of the bundle the live page bootstrapped against. Namespaces
         # the disk cache: a deploy that rotates the key or the cipher must not
         # serve stale tokens.
@@ -340,7 +488,18 @@ class _SignerSession:
         self._unavailable = flat
         _LAST_UNAVAILABLE_REASON = flat
 
-    def _start(self) -> bool:
+    def _start(self, headless: Optional[bool] = None, *, _ua_relaunch: bool = False) -> bool:
+        """Bring up (or reuse) the persistent Patchright context.
+
+        ``headless`` defaults to the AIO_MANGAFIRE_HEADFUL env knob. It is fixed
+        at launch time by Chromium and the profile dir can only be held by one
+        context, so switching modes for the verification handoff means a full
+        teardown + relaunch — hence the mode comparison on the fast path.
+
+        ``_ua_relaunch`` marks the single permitted self-relaunch after the
+        probed UA turns out to differ from the pin, so termination is provable
+        here rather than resting on cache state.
+        """
         # Already decided there's no browser here — don't re-pay the launch.
         if self._unavailable:
             return False
@@ -352,6 +511,21 @@ class _SignerSession:
         if (os.environ.get("AIO_MANGAFIRE_NO_SIGNER") or "").strip() == "1":
             self._mark_unavailable("disabled via AIO_MANGAFIRE_NO_SIGNER")
             return False
+        # Embedder backend, checked AFTER the kill-switch above so
+        # AIO_MANGAFIRE_NO_SIGNER still wins everywhere (tests rely on that
+        # precedence) and BEFORE the Patchright launch so Android never tries
+        # to start a Chromium it doesn't have.
+        if self._backend is None:
+            from . import browser_backend as _bb
+
+            self._backend = _bb.custom_backend("mangafire")
+        if self._backend is not None:
+            return True
+
+        if headless is None:
+            headless = (os.environ.get("AIO_MANGAFIRE_HEADFUL") or "").strip() != "1"
+        if self._page is not None and self._headless != headless:
+            self._cleanup()
         if self._page is not None:
             try:
                 if not self._page.is_closed():
@@ -379,15 +553,71 @@ class _SignerSession:
             self._mark_unavailable(f"Playwright start failed: {e}")
             print(f"[!] MangaFire: Playwright start failed: {e}")
             return False
+
+        profile = _profile_dir()
+        ctx_kwargs: Dict[str, Any] = {}
+        cf_ua: Optional[str] = None
         try:
-            profile = _profile_dir()
             os.makedirs(profile, exist_ok=True)
-            headless = (os.environ.get("AIO_MANGAFIRE_HEADFUL") or "").strip() != "1"
-            self._context = self._pw.chromium.launch_persistent_context(
-                profile,
-                headless=headless,
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
-            )
+
+            def _launch(**extra):
+                return self._pw.chromium.launch_persistent_context(
+                    profile,
+                    headless=headless,
+                    args=["--no-sandbox", "--disable-setuid-sandbox"],
+                    **extra,
+                )
+
+            # Pin the UA. A cf_clearance cookie is bound to the UA that earned
+            # it, so a solve captured by the shared zendriver solver outranks
+            # matching the local browser — same priority order as
+            # sites/comix.py:_resolve_stable_user_agent.
+            cf_ua = self._cached_cf_user_agent()
+            pinned_ua = cf_ua or _bid.cached_stable_user_agent(profile)
+            if pinned_ua:
+                ctx_kwargs["user_agent"] = pinned_ua
+
+            # channel= is what aligns headless's client hints with the headed
+            # handoff window; the pin alone only moves the UA header and leaves
+            # Sec-CH-UA saying HeadlessChrome. BOTH levers are required — see
+            # the measured table in sites/browser_identity.py. Degrade rather
+            # than die if this Patchright build rejects the channel.
+            self._context = None
+            for _attempt in range(_CHANNEL_LAUNCH_ATTEMPTS):
+                try:
+                    self._context = _launch(
+                        channel=_bid.BROWSER_CHANNEL, **ctx_kwargs
+                    )
+                    break
+                except Exception as channel_exc:
+                    fatal = _channel_unsupported(channel_exc)
+                    last = _attempt == _CHANNEL_LAUNCH_ATTEMPTS - 1
+                    if not fatal and not last:
+                        # Almost always the shared profile being held by another
+                        # of the app's processes; it clears in well under a second.
+                        time.sleep(_CHANNEL_RETRY_DELAY_S * (_attempt + 1))
+                        continue
+                    why = (
+                        "this build doesn't support the channel"
+                        if fatal
+                        else f"still failing after {_CHANNEL_LAUNCH_ATTEMPTS} attempts "
+                        f"(usually the browser profile being held by another "
+                        f"AIO process)"
+                    )
+                    print(
+                        f"[!] MangaFire: channel={_bid.BROWSER_CHANNEL!r} launch "
+                        f"failed — {why}: {type(channel_exc).__name__}: "
+                        f"{str(channel_exc).splitlines()[0]}"
+                    )
+                    print(
+                        "[!] MangaFire: falling back to default headless, which "
+                        "advertises HeadlessChrome in Sec-CH-UA. Downloads still "
+                        "work while the saved Cloudflare clearance lasts; expect "
+                        "the check to fire more often once it expires."
+                    )
+                    self._context = _launch(**ctx_kwargs)
+                    break
+            self._headless = headless
             existing = list(getattr(self._context, "pages", None) or [])
             self._page = existing[0] if existing else self._context.new_page()
         except Exception as e:
@@ -398,7 +628,415 @@ class _SignerSession:
             print(f"[!] MangaFire: Playwright launch failed: {e}")
             self._cleanup()
             return False
+
+        # Reconcile the pin against what this browser REALLY is, via CDP — once
+        # an override is applied navigator.userAgent only reads our own pin
+        # back, so a stale cached UA would otherwise re-pin itself forever.
+        true_ua = _bid.probe_true_user_agent(self._context, self._page)
+        stable_ua = _bid.stabilize_user_agent(true_ua)
+        if stable_ua:
+            _bid.remember_stable_user_agent(profile, stable_ua)
+            # A CF pin is exempt: that value is bound to a cf_clearance cookie
+            # and deliberately outranks matching the local browser.
+            if (
+                ctx_kwargs.get("user_agent") != stable_ua
+                and not cf_ua
+                and not _ua_relaunch
+            ):
+                self._cleanup()
+                return self._start(headless, _ua_relaunch=True)
         return True
+
+    # ----------------------------- Cloudflare -----------------------------
+
+    def _cached_cf_user_agent(self) -> Optional[str]:
+        """The User-Agent from any cached CF solve for mangafire.to, or None.
+
+        Using THAT exact UA in the Patchright context is what keeps an injected
+        cf_clearance valid — Cloudflare treats a cookie/UA mismatch as a bot
+        signal. Cache written by sites/crawlee_utils.py:_solve_cf_async via
+        get_cf_session; key is the bare netloc.
+        """
+        try:
+            from . import crawlee_utils as _cu
+
+            with _cu._cf_cookie_lock:
+                cached = _cu._cf_cookie_cache.get("mangafire.to")
+            if cached:
+                return cached.get("user_agent") or None
+        except Exception:
+            pass
+        return None
+
+    def _page_html(self) -> str:
+        try:
+            if self._backend is not None:
+                return self._backend.content() or ""
+            return self._page.content() or ""
+        except Exception:
+            return ""
+
+    def _page_title(self) -> str:
+        try:
+            if self._backend is not None:
+                return ""
+            return self._page.title() or ""
+        except Exception:
+            return ""
+
+    def _challenged(self) -> bool:
+        """True when Cloudflare's interstitial is in front of the live page.
+
+        Cross-file: sites/crawlee_utils.py:looks_like_cf_interstitial — the
+        DOM-shaped detector (no status code, no length gate), as opposed to
+        is_cf_challenge which judges an HTTP response.
+        """
+        if os.environ.pop(_FORCE_CF_ENV, None):
+            return True
+        try:
+            from .crawlee_utils import looks_like_cf_interstitial
+        except Exception:
+            return False
+        return looks_like_cf_interstitial(self._page_html(), self._page_title())
+
+    def _apply_viewport(self, size: Dict[str, int]) -> None:
+        """Best-effort viewport re-emulation; never raises. See
+        _INTERACTIVE_VIEWPORT for why a human-facing window needs it."""
+        if self._page is None:
+            return
+        try:
+            self._page.set_viewport_size(dict(size))
+        except Exception:
+            pass
+
+    def _mark_cf_blocked(self, reason: str, *, background: bool = False) -> None:
+        """Record a Cloudflare wall in both places: on the session (so later
+        calls fail fast instead of re-polling) and in the module global that
+        sign_api_query's error message reads, so the user is told about
+        Cloudflare rather than about a missing signer.
+
+        ``background`` marks a verdict that only holds because this call was not
+        allowed to interrupt anyone — provisional, not final.
+        """
+        global _LAST_UNAVAILABLE_REASON
+        flat = " ".join(str(reason).split())
+        self._cf_blocked = flat
+        self._cf_blocked_background = bool(background)
+        _LAST_UNAVAILABLE_REASON = flat
+
+    def _await_auto_clear(self, timeout_s: float = _CF_AUTO_CLEAR_TIMEOUT_S) -> bool:
+        """Poll for Cloudflare's JS challenge to pass on its own.
+
+        Worth the wait now in a way it never was before: with channel= + the UA
+        pin the context no longer announces HeadlessChrome in either the UA or
+        the client hints, which is the difference between a Managed Challenge
+        that can clear itself and one that cannot.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                if self._backend is None and self._page.is_closed():
+                    return False
+            except Exception:
+                return False
+            time.sleep(1.0)
+            if not self._challenged():
+                print("[*] MangaFire: Cloudflare check cleared on its own.")
+                return True
+        return False
+
+    def _inject_cf_cookies(self) -> bool:
+        """Copy the shared solver's captured cookies into this context."""
+        if self._context is None:
+            return False
+        try:
+            from . import crawlee_utils as _cu
+
+            with _cu._cf_cookie_lock:
+                cached = _cu._cf_cookie_cache.get("mangafire.to")
+        except Exception:
+            return False
+        if not cached:
+            return False
+        raw = cached.get("cookies") or []
+        pw_cookies = [
+            {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain") or "mangafire.to",
+                "path": c.get("path") or "/",
+            }
+            for c in raw
+            if isinstance(c, dict) and c.get("name")
+        ]
+        if not pw_cookies:
+            return False
+        try:
+            self._context.add_cookies(pw_cookies)
+        except Exception as e:
+            print(f"[!] MangaFire: could not inject Cloudflare cookies: {e}")
+            return False
+        self._cf_cookie_ts = float(cached.get("ts", 0) or 0)
+        print(
+            f"[*] MangaFire: injected {len(pw_cookies)} Cloudflare cookie(s) "
+            f"into the browser profile."
+        )
+        return True
+
+    def _solve_cf_via_zendriver(self) -> bool:
+        """Tier 1 of the handoff: let the shared solver open a visible Chrome.
+
+        zendriver's verify_cf clicks the Turnstile checkbox itself, so this is
+        usually a glance rather than a task. The context is then RELAUNCHED
+        before the cookies are injected, because _start pins the solver's UA
+        (via _cached_cf_user_agent) and a clearance presented under a different
+        UA is worthless.
+
+        Cross-file: sites/crawlee_utils.py:get_cf_session — which owns the
+        interactive gate, so this cannot prompt from a background operation.
+        """
+        try:
+            from .crawlee_utils import get_cf_session
+        except Exception:
+            return False
+        try:
+            get_cf_session(_BASE_URL + "/")
+        except Exception as e:
+            print(f"[!] MangaFire: Cloudflare solve failed: {e}")
+            return False
+        if not self._cached_cf_user_agent():
+            return False
+        self._cleanup()
+        if not self._start():
+            return False
+        if not self._inject_cf_cookies():
+            return False
+        try:
+            self._goto(_BASE_URL + "/")
+        except Exception:
+            return False
+        return not self._challenged()
+
+    def _solve_cf_headed(self) -> bool:
+        """Tier 2: show the user OUR OWN persistent profile, headed.
+
+        Better than tier 1 in one important way — the clearance is earned by the
+        exact profile the rest of the run uses, so nothing is transplanted. It
+        is the fallback only because it always costs a human a click, whereas
+        zendriver usually clicks for them.
+
+        Restoring the original mode afterwards is safe precisely because of the
+        channel= + UA pin: headed and headless present the identical UA and
+        client hints (see sites/browser_identity.py), which is what makes a
+        headed solve survive the relaunch. Without the channel it would not.
+        """
+        # An embedder owns its own UI — Android shows the challenge in its
+        # WebView via the backend's solve_challenge, which tier 1 already
+        # reached through get_cf_session. Tearing down and "relaunching headed"
+        # means nothing there, and self._page is None, so the poll below would
+        # fall out on an AttributeError and merely LOOK like a decline.
+        if self._backend is not None:
+            return False
+        if sys.platform not in ("win32", "darwin") and not (
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        ):
+            print(
+                "[!] MangaFire: no display available, so the verification "
+                "window cannot be shown."
+            )
+            return False
+        try:
+            timeout_s = float(
+                os.environ.get(_CF_SOLVE_TIMEOUT_ENV) or _CF_DEFAULT_SOLVE_TIMEOUT_S
+            )
+        except (TypeError, ValueError):
+            timeout_s = _CF_DEFAULT_SOLVE_TIMEOUT_S
+
+        was_headless = self._headless
+        self._cleanup()
+        if not self._start(headless=False):
+            print("[!] MangaFire: could not open a visible browser for verification.")
+            self._cleanup()
+            self._start(headless=was_headless)
+            return False
+        self._apply_viewport(_INTERACTIVE_VIEWPORT)
+
+        solved = False
+        try:
+            try:
+                self._goto(_BASE_URL + "/")
+            except Exception as e:
+                print(f"[!] MangaFire: could not load the verification page ({e}).")
+
+            # Every line is [!]-prefixed on purpose: the Electron LogPanel
+            # classifies by line shape (UI-source/electron/log-filter.js:
+            # classifyLogLevel), and a line starting with 2+ spaces is demoted
+            # to "verbose" — which would dim the one instruction that must be
+            # read.
+            print("[!] " + "=" * 68)
+            print("[!] ACTION NEEDED - mangafire.to is behind a Cloudflare check.")
+            print("[!] A browser window just opened. Complete the check in it")
+            print("[!] (usually one click on the 'Verify you are human' box).")
+            print(
+                f"[!] The download resumes by itself once it passes (waiting up "
+                f"to {int(timeout_s)}s)."
+            )
+            print("[!] The session is saved to disk, so this should be rare.")
+            print("[!] " + "=" * 68)
+
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                try:
+                    if self._page.is_closed():
+                        print(
+                            "[!] MangaFire: verification window was closed before "
+                            "the check completed."
+                        )
+                        break
+                except Exception:
+                    break
+                if not self._challenged():
+                    time.sleep(1.5)  # let the Set-Cookie land before teardown
+                    solved = True
+                    break
+                time.sleep(1.0)
+        except Exception as e:
+            print(f"[!] MangaFire: verification window failed: {e}")
+
+        # Put the browser back the way the run wants it, whatever happened —
+        # context.close() is also what FLUSHES the freshly-solved cookies to the
+        # profile dir, so this is not just tidiness.
+        self._cleanup()
+        if not self._start(headless=was_headless):
+            return False
+        if not solved:
+            return False
+        try:
+            self._goto(_BASE_URL + "/")
+        except Exception:
+            return False
+        return not self._challenged()
+
+    def _ensure_cleared(self) -> bool:
+        """Leave the live page on real mangafire content, or explain why not.
+
+        Callers must not touch the DOM before this returns True. The original
+        bug was exactly that: _bootstrap ran its module scan against the
+        interstitial and faithfully reported "no vrf signer among 0 module
+        candidates", blaming the signer for a network-level block.
+        """
+        if self._cf_blocked:
+            # A verdict reached ONLY because we weren't allowed to prompt is
+            # provisional: one process legitimately holds both contexts. A
+            # --multi-source download probes with the permission explicitly OFF
+            # (search_orchestrator.py:_probe_one) and then downloads with it ON,
+            # and there is one _SignerSession per process — so a sticky
+            # background verdict would poison the download that follows it.
+            # Re-open the question only when the answer could actually differ.
+            if not self._cf_blocked_background:
+                return False
+            try:
+                from .crawlee_utils import interactive_solve_allowed
+            except Exception:
+                return False
+            if not interactive_solve_allowed():
+                return False
+            self._cf_blocked = None
+            self._cf_blocked_background = False
+        if not self._challenged():
+            return True
+
+        print("[!] MangaFire: mangafire.to is behind a Cloudflare check.")
+        if self._await_auto_clear():
+            return True
+
+        # A human is the only thing left, so BOTH gates apply: does this process
+        # own a solver at all (capability), and may it interrupt someone right
+        # now (permission)? The permission is context-scoped, so search,
+        # --list-chapters and the library update-check never reach a window.
+        # Cross-file: sites/crawlee_utils.py's "TWO SEPARATE QUESTIONS" block.
+        try:
+            from .crawlee_utils import (
+                cf_solver_available,
+                interactive_solve_allowed,
+                warn_cf_rescue,
+            )
+        except Exception:
+            self._mark_cf_blocked(
+                "mangafire.to is behind a Cloudflare check and no solver is available"
+            )
+            return False
+
+        if not interactive_solve_allowed():
+            warn_cf_rescue(
+                _BASE_URL,
+                "needs a human to solve it, and this is a background operation "
+                "(search / probe / update-check). Not opening a browser; re-run "
+                "this series as a download to solve it once.",
+                kind="background",
+            )
+            self._mark_cf_blocked(
+                "mangafire.to is behind a Cloudflare check that needs a human, and "
+                "this is a background operation",
+                background=True,
+            )
+            return False
+
+        why_not = _may_prompt()
+        if why_not:
+            self._mark_cf_blocked(
+                f"mangafire.to is behind a Cloudflare check ({why_not})"
+            )
+            return False
+
+        solved = False
+        if cf_solver_available():
+            solved = self._solve_cf_via_zendriver()
+        if not solved:
+            solved = self._solve_cf_headed()
+        _record_prompt_outcome(solved)
+        if not solved:
+            self._mark_cf_blocked(
+                "the Cloudflare check on mangafire.to was not completed"
+            )
+            return False
+        print("[*] MangaFire: Cloudflare check passed - thanks. Resuming.")
+        return True
+
+    # -------------------- driver-agnostic touchpoints --------------------
+    # The four operations this signer needs, routed to whichever driver _start
+    # established. Everything below here is written against these, so adding a
+    # driver means implementing BrowserBackend — not editing _bootstrap/sign.
+
+    def _eval(self, script: str, arg=_EVAL_NOARG):
+        if self._backend is not None:
+            from . import browser_backend as _bb
+
+            return (
+                self._backend.evaluate(script)
+                if arg is _EVAL_NOARG
+                else self._backend.evaluate(script, arg)
+            )
+        return (
+            self._page.evaluate(script)
+            if arg is _EVAL_NOARG
+            else self._page.evaluate(script, arg)
+        )
+
+    def _goto(self, url: str) -> None:
+        if self._backend is not None:
+            self._backend.goto(url, wait_until="domcontentloaded", timeout_ms=45000)
+            return
+        self._page.goto(url, wait_until="domcontentloaded", timeout=45000)
+
+    def _alive(self) -> bool:
+        """True when the live page still carries a bootstrapped signer. A SPA
+        navigation (or a crash-and-reload) wipes window globals, so the fast
+        path has to verify rather than assume."""
+        try:
+            return bool(self._eval("() => typeof window.__aioMfSign === 'function'"))
+        except Exception:
+            return False
 
     def _bootstrap(self) -> bool:
         """Load a mangafire.to page and install window.__aioMfSign.
@@ -414,17 +1052,22 @@ class _SignerSession:
         if not self._start():
             return False
         try:
-            if _signer_alive(self._page) and self._namespace:
+            if self._alive() and self._namespace:
                 return True
         except Exception:
             pass
         try:
-            self._page.goto(_BASE_URL + "/", wait_until="domcontentloaded", timeout=45000)
+            self._goto(_BASE_URL + "/")
         except Exception as e:
             print(f"[!] MangaFire: could not load {_BASE_URL} for signing: {e}")
             return False
+        # Cloudflare first. Probing the DOM while the interstitial is up finds
+        # zero module candidates and reports it as a signer fault — the exact
+        # misdiagnosis this guard exists to prevent.
+        if not self._ensure_cleared():
+            return False
         try:
-            info = self._page.evaluate(_BOOTSTRAP_JS)
+            info = self._eval(_BOOTSTRAP_JS)
         except Exception as e:
             print(f"[!] MangaFire: vrf signer bootstrap failed: {e}")
             return False
@@ -499,7 +1142,7 @@ class _SignerSession:
 
         payload = [[specs[i][0], [list(p) for p in specs[i][1]]] for i in still]
         try:
-            signed = self._page.evaluate(_SIGN_BATCH_JS, payload)
+            signed = self._eval(_SIGN_BATCH_JS, payload)
         except Exception as e:
             print(f"[!] MangaFire: vrf signing call failed: {e}")
             return results
@@ -513,7 +1156,43 @@ class _SignerSession:
         self._flush_cache()
         return results
 
+    def fetch_api(self, url: str) -> Optional[Dict[str, Any]]:
+        """GET *url* from inside the live mangafire page.
+
+        Same-origin, so it carries the profile's cf_clearance, the browser's own
+        TLS fingerprint and its client hints — which is the entire point.
+        Handing that clearance to cloudscraper instead is the transplant comix
+        already proved cannot work (grep _waf_recover_once in sites/comix.py):
+        the cookie is bound to the client that earned it, and OpenSSL/urllib3 is
+        not that client by any measure the edge uses.
+
+        Returns {"status": int, "body": str}, or None when no browser could be
+        brought up. Callers: sites/mangafire.py:_api_get, only once a plain HTTP
+        attempt has come back challenged.
+        """
+        if not self._bootstrap():
+            return None
+        try:
+            out = self._eval(_FETCH_API_JS, url)
+        except Exception as e:
+            print(f"[!] MangaFire: in-page API fetch failed: {e}")
+            return None
+        if not isinstance(out, dict):
+            return None
+        try:
+            return {
+                "status": int(out.get("status") or 0),
+                "body": str(out.get("body") or ""),
+            }
+        except Exception:
+            return None
+
     def _cleanup(self) -> None:
+        # Drop the reference only — the backend instance is owned by
+        # sites/browser_backend.py's registry (and closed by its atexit hook),
+        # not by this session. Closing it here would tear down a browser other
+        # consumers are still using.
+        self._backend = None
         for attr, closer in (("_context", "close"), ("_pw", "stop")):
             obj = getattr(self, attr, None)
             if obj is None:
@@ -524,6 +1203,7 @@ class _SignerSession:
                 pass
             setattr(self, attr, None)
         self._page = None
+        self._headless = None
 
     def close(self) -> None:
         self._flush_cache()
@@ -639,6 +1319,21 @@ def sign_api_query(path: str, pairs: Sequence[Tuple[str, Any]] = ()) -> Dict[str
             f"a per-request vrf token ({why})"
         )
     return signed
+
+
+def fetch_api_json(url: str) -> Optional[Dict[str, Any]]:
+    """Fetch *url* through the signer's browser page. See _SignerSession.fetch_api.
+
+    Returns None rather than raising: sites/mangafire.py:_api_get has already
+    tried plain HTTP by the time it calls this, and treats None as "that
+    attempt produced nothing" so its existing non-200 handling applies.
+    """
+    timeout = _BOOTSTRAP_TIMEOUT_S if not _WORKER_STARTED else _SIGN_TIMEOUT_S
+    try:
+        return _call("fetch_api", url, _timeout_s=timeout)
+    except Exception as e:
+        print(f"[!] MangaFire: browser-backed API fetch unavailable: {e}")
+        return None
 
 
 def invalidate() -> None:
