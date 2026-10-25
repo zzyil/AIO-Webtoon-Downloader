@@ -13286,6 +13286,7 @@ def main():
             # carry the primary's flag in. Kept because mislabelling a decode
             # failure as "No downloadable content" is exactly the diagnosis this
             # detector exists to prevent, and the cost is four lines.
+            _dropped_pages = ch.get("_decode_dropped")
             if _dropped_pages:
                 _miss_reason = 'decode_dropped_pages'
                 _miss_error = (
