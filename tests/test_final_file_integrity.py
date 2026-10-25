@@ -689,6 +689,13 @@ def test_decode_drop_state_is_reset_before_each_fetch():
     assert 'ch.pop("_decode_dropped", None)' in src
 
 
+def test_empty_content_branch_binds_the_decode_drop_count():
+    """`--format none` returns no chapter_content for image chapters, so every
+    chapter reaches the main loop's empty-content branch, which read an unbound
+    name and ended the run with NameError (#74)."""
+    assert "_dropped_pages" in aio.main.__code__.co_varnames
+
+
 def test_complete_chapter_still_accepted_despite_deadline_or_poison():
     """The 2026-07-03 fix (grep "accepting despite") must survive: the download
     completeness gate accepts any pages_ok == pages_total chapter regardless of
