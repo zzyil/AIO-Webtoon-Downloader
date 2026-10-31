@@ -100,6 +100,17 @@ def test_prediction_without_pairs_uses_labels_then_numbers():
     assert rp.predict(alt, 0, prim, []) == 0           # number 1 -> alt "1"
 
 
+def test_prediction_reports_a_list_that_does_not_reach_the_number():
+    # A MangaDex group that only scanned 262-264: the nearest number to our 72
+    # is 190 away, which the rescue search treats as "this list lacks it".
+    late = rp.build_catalog([_rec("md:late", _chs(["262", "263", "264"]))])[0]
+    full = rp.build_catalog([_rec("md:full", _chs([str(i) for i in range(1, 90)]))])[0]
+    prim = _primary(80)
+    assert rp.predict_ex(late, 71, prim, []) == (0, "number", 190.0)
+    assert rp.predict_ex(full, 71, prim, [])[1:] == ("number", 0.0)
+    assert rp.predict_ex(late, 71, prim, [rp.Pair(70, 1, "own-pages")])[1:] == ("pair", None)
+
+
 def test_pair_cache_round_trip_keeps_strong_tiers_and_drops_stale_urls(tmp_path):
     path = str(tmp_path / ".aio_fp" / "p" / "pairings.json")
     st = rp.PairStore(path)

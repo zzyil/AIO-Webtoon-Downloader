@@ -139,6 +139,43 @@ def test_head_check_rules_out_wrong_candidates_and_abstains_when_it_cannot_tell(
     assert cf.head_matches(_cp(_slice(chapters[1], 1280), keep={1, 2, 5, 6}), wrong_head) is None
 
 
+def _manga_pages(strip: Image.Image, width: int = W) -> list:
+    """Book pages cut from a strip: page-shaped (h/w 1.5), the content inset with
+    a white binding gutter that alternates sides, as in a scanned tankobon.
+    `width` re-scales the whole page (another site's copy of the same scan)."""
+    out = []
+    cw, ch, gut = W - 40, 540, 40
+    for k, y in enumerate(range(0, strip.size[1] - ch + 1, ch)):
+        page = Image.new("L", (W, 600), 255)
+        page.paste(strip.crop((0, y, W, y + ch)).resize((cw, ch)), (gut if k % 2 == 0 else 0, 30))
+        if width != W:
+            page = page.resize((width, round(600 * width / W)))
+        buf = io.BytesIO()
+        page.convert("RGB").save(buf, "JPEG", quality=88)
+        out.append(buf.getvalue())
+    return out
+
+
+def test_manga_pages_with_alternating_gutters_prove_with_a_page_missing(chapters):
+    # HxH Ch 72 (2026-11-01): the primary lost page 3, so its pages 4-20 were
+    # compared against the alt's pages 1-20 of the same scan. The old median
+    # frame sat between the two gutter sides and moved with the page set, so
+    # nothing matched; the outer content extent is the same for both page sets.
+    own = _cp(_manga_pages(chapters[1]), keep=set(range(1, 21)) - {3})
+    same = _cp(_manga_pages(chapters[1], width=W + 1)).fingerprint()
+    other = _cp(_manga_pages(chapters[2], width=W + 1)).fingerprint()
+    proof = cf.prove_partial(own, same)
+    assert proof.ok, proof.why
+    assert not cf.prove_partial(own, other).ok
+
+
+def test_head_check_knows_up_front_when_it_cannot_judge(chapters):
+    pages = _slice(chapters[1], 1280)
+    assert cf.head_can_judge(_cp(pages, keep=set(range(1, 9))))
+    assert not cf.head_can_judge(_cp(pages, keep=set(range(2, 9))))      # no page 1
+    assert not cf.head_can_judge(_cp(pages, keep={1, 2} | set(range(4, 9))))  # opening too short
+
+
 def test_pages_round_trip_and_a_resliced_retry_resets(tmp_path, chapters):
     cp = _cp(_slice(chapters[1], 1280), keep={1, 2, 3})
     cp.meta = {"site": "s", "chap": "12.5"}

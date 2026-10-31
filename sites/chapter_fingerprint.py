@@ -301,26 +301,48 @@ def _cols(sm: np.ndarray) -> Optional[Tuple[int, int]]:
     return int(c[0]), int(c[-1]) + 1
 
 
+def _frame(box: Optional[Tuple[int, int]]) -> Tuple[int, int]:
+    """A content box usable as a crop: too narrow (a lone bubble, a page number)
+    or absent (a blank page) means the full width."""
+    if box is None or box[1] - box[0] < SMALL_W // 4:
+        return 0, SMALL_W
+    return box
+
+
 def from_smalls(smalls: Sequence[np.ndarray], natives: Sequence[Tuple[int, int]]) -> Fingerprint:
-    """Stitch pages into the strip profile. Side margins are trimmed by the MEDIAN
-    content columns over all pages (one wide credit page must not set the frame),
-    and each page lands at its exact fractional row so rounding never accumulates
-    down a 300-page chapter (same rule as strip_match.build_window)."""
+    """Stitch pages into the strip profile, each page landing at its exact
+    fractional row so rounding never accumulates down a 300-page chapter (same
+    rule as strip_match.build_window).
+
+    Side margins: every page is cropped to ONE frame, the content's outer extent
+    over the pages (leftmost content column to rightmost), with the n//10 most
+    extreme pages each side dropped so one wide credit page cannot set it.
+    Outer extent, not the median frame used before: manga gutters alternate
+    sides page to page, so the median sat between two modes and moved with the
+    page set. A failed attempt's pages 4-20 and the alt's pages 1-20 of the same
+    scan were cropped 2 columns apart and every band peaked below BAND_T (HxH
+    Ch 72, tcbscans vs weebcentral, 2026-11-01); the outer extent of a run
+    holding both gutter sides is the same in every copy. Tried and killed: each
+    page cropped to its own frame (fixes manga, but short webtoon slices, e.g.
+    mangakatana's, then take a frame from wherever the slice was cut: unOrdinary
+    84 -> 56 of 85 proven) and a median per alternate-page group (manga only
+    half fixed). Regression harness + numbers: local bench/ms-offset/trim_regress.py,
+    bench/hxh-ch72/regress_*.log."""
     boxes = [b for b in (_cols(s) for s in smalls) if b]
     if boxes:
-        ls = int(np.median([b[0] for b in boxes]))
-        rs = int(np.median([b[1] for b in boxes]))
+        k = len(boxes) // 10
+        frame = _frame((sorted(b[0] for b in boxes)[k], sorted(b[1] for b in boxes)[-1 - k]))
     else:
-        ls, rs = 0, SMALL_W
-    if rs - ls < SMALL_W // 4:
-        ls, rs = 0, SMALL_W
-    s = PROFILE_W / (rs - ls)          # profile rows per small row
+        frame = (0, SMALL_W)
+    ls, rs = frame
     rows, spans, y = [], [], 0.0
     for sm, (nw, nh) in zip(smalls, natives):
-        hs = nh * SMALL_W / max(1, nw)  # exact small-row height
-        a, b = int(round(y * s)), int(round((y + hs) * s))
-        spans.append((y * s, (y + hs) * s))
-        y += hs
+        # profile rows this page spans: its small-row height scaled so its
+        # cropped width becomes PROFILE_W
+        hp = nh * SMALL_W / max(1, nw) * PROFILE_W / (rs - ls)
+        a, b = int(round(y)), int(round(y + hp))
+        spans.append((y, y + hp))
+        y += hp
         if b <= a:
             continue
         rows.append(np.asarray(Image.fromarray(sm[:, ls:rs]).resize((PROFILE_W, b - a), Image.BOX),
@@ -483,6 +505,17 @@ def prove_partial(partial: ChapterPages, cand: Fingerprint) -> Proof:
     return Proof(True, f"own pages found in order ({len(useful)} run(s), {total} bands)", out)
 
 
+def head_can_judge(partial: ChapterPages) -> bool:
+    """Can `head_matches` ever answer for this chapter's own pages, whatever the
+    candidate? Needs page 1 and an opening run informative and longer than the
+    credit-page slack. False lets the rescue search skip fetching candidate
+    heads it could only answer None for (aio-dl.py, grep head_can_judge)."""
+    if 1 not in partial.pages:
+        return False
+    b = partial.fingerprint(partial.runs()[0])
+    return b.informative and b.length_widths >= PREFIX_SLACK / PROFILE_W
+
+
 def head_matches(partial: ChapterPages, head: ChapterPages) -> Optional[bool]:
     """Cheap pre-check before downloading a whole alt candidate: do the candidate's
     first pages appear in the opening run of this chapter's own pages? None when it
@@ -492,12 +525,11 @@ def head_matches(partial: ChapterPages, head: ChapterPages) -> Optional[bool]:
     content is absent from this chapter's opening, which no neighbouring chapter
     and no recap passes (P0: other chapters <= 0.09 coverage). No offset rule: a
     title card one copy has and the other lacks shifts the start legitimately."""
-    if 1 not in partial.pages or not head.pages:
+    if not head.pages or not head_can_judge(partial):
         return None
-    first = partial.runs()[0]
     a = head.fingerprint()
-    b = partial.fingerprint(first)
-    if not a.informative or not b.informative:
+    b = partial.fingerprint(partial.runs()[0])
+    if not a.informative:
         return None
     # The head can only be absent from the opening run if that run is long enough
     # to have held it; a run cut short by a gap says nothing (plus slack for the

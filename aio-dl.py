@@ -13893,6 +13893,14 @@ def main():
     # median 1 probe, p90 3, max 14 (bench/ms-offset/data/replay_w15.jsonl).
     _RESCUE_PROBES_PER_SITE = 10
     _RESCUE_FULL_PER_SITE = 3
+    # A list with no saved pair and no episode label for the chapter, with NO
+    # entry numbered within this of ours, does not carry the chapter (a MangaDex
+    # group that only scanned late chapters); its search is skipped. This is a
+    # hole in the list's numbers, not a numbering offset: offsets (up to 19 on
+    # unOrdinary's atsumaru:Webtoon) leave entries numbered near ours, gap ~0.
+    # The outward walk reaches ~5 entries either side, so a list whose nearest
+    # number is this far off could only be probed at unrelated chapters.
+    _RESCUE_NUM_RADIUS = 15
     # Placement's veto: no primary chapter this far either side whose content we
     # hold may be found in the candidate.
     _VETO_RADIUS = 15
@@ -14028,9 +14036,12 @@ def main():
         (grep _place).
 
         Search: per list, outward from the predicted position (grep
-        rescue_pairing.predict). Each candidate first gets a cheap check of its
-        first pages; only candidates that pass, or that the check cannot judge,
-        are downloaded in full. The full download runs through the normal chapter
+        rescue_pairing.predict_ex); a list with no entry numbered near ours is
+        skipped (_RESCUE_NUM_RADIUS). Each candidate first gets a cheap check of
+        its first pages when our own opening pages can judge one
+        (head_can_judge); only candidates that pass, or that the check cannot
+        judge, are downloaded in full, at most _RESCUE_FULL_PER_SITE unjudged
+        ones per list. The full download runs through the normal chapter
         routine with the proof as a gate before anything is processed or saved.
         """
         n = ch.get("chap")
@@ -14058,22 +14069,34 @@ def main():
             f"the chapter holding its {len(partial.pages)}/{partial.pages_total} "
             f"delivered page(s)..."
         )
+        # The opening-pages pre-check needs a long enough opening run of our own
+        # pages; without one every candidate head would be fetched only to answer
+        # "can't tell", so none is fetched and the full-download budget decides.
+        can_judge_head = _cfp.head_can_judge(partial)
         for alt in _ms_catalog:
             if run_cancelled():
                 break
             if not len(alt):
                 continue
-            start = _rp.predict(alt, i, _primary_full, _pairs(alt), _extract_chapter_num)
+            start, how, gap = _rp.predict_ex(alt, i, _primary_full, _pairs(alt), _extract_chapter_num)
+            if how == "number" and gap is not None and gap > _RESCUE_NUM_RADIUS:
+                notes.append(f"{alt.key}: nearest chapter is {alt.entries[start].chap}, "
+                             f"too far from {n} to hold it")
+                log_verbose(f"    [Multi-source] {alt.key}: skipped, nearest chapter "
+                            f"{alt.entries[start].chap} is too far from {n}")
+                continue
             probes = full = 0
             for pos in _rp.outward(start, len(alt)):
                 if probes >= _RESCUE_PROBES_PER_SITE or run_cancelled():
+                    break
+                if not can_judge_head and full >= _RESCUE_FULL_PER_SITE:
                     break
                 probes += 1
                 ent = alt.entries[pos]
                 alt_chapter = ent.chapter
                 label = f"{alt.key} chapter {ent.chap}"
                 with _as_alt(alt):
-                    head = _alt_head(alt, ent)
+                    head = _alt_head(alt, ent) if can_judge_head else None
                     verdict = _cfp.head_matches(partial, head) if head else None
                     if verdict is False:
                         notes.append(f"{label}: opening pages differ")

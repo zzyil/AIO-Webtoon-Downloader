@@ -314,24 +314,38 @@ def predict(alt: AltList, i: int, primary: Sequence[Dict[str, Any]], pairs: Sequ
     offset restarts at every pair, so drift at notices/recaps costs at most
     the distance to the last pair); else the alt entry carrying i's episode
     label; else i's number; else the nearest number; else proportional position."""
+    return predict_ex(alt, i, primary, pairs, num_of)[0]
+
+
+def predict_ex(alt: AltList, i: int, primary: Sequence[Dict[str, Any]], pairs: Sequence[Pair],
+               num_of: Callable[[Any], Optional[float]] = first_number
+               ) -> Tuple[int, str, Optional[float]]:
+    """`predict` plus how it chose: (pos, "pair" | "label" | "number" |
+    "proportional", number gap). The gap is |alt entry's number - i's number|
+    for "number", else None. A large gap means the list does not reach i's
+    number at all (a scanlation group that only did late chapters: MangaDex
+    "Binktopia" starting at 262 for our Ch 72), so walking outward from it can
+    only probe unrelated chapters; the rescue search skips such a list
+    (aio-dl.py, grep _RESCUE_NUM_RADIUS)."""
     n = len(alt)
     if n == 0:
-        return 0
+        return 0, "proportional", None
     clamp = lambda q: max(0, min(n - 1, q))
     if pairs:
         p = min(pairs, key=lambda p: (abs(p.primary_idx - i), -TIER_RANK[p.tier]))
-        return clamp(p.alt_pos + (i - p.primary_idx))
+        return clamp(p.alt_pos + (i - p.primary_idx)), "pair", None
     ch = primary[i] if 0 <= i < len(primary) else {}
     lab = episode_label(ch.get("title"))
     if lab is not None:
         hits = [e.pos for e in alt.entries if e.label == lab]
         if len(hits) == 1:
-            return hits[0]
+            return hits[0], "label", None
     num = num_of(ch.get("chap"))
     numbered = [e for e in alt.entries if e.num is not None]
     if num is not None and numbered:
-        return min(numbered, key=lambda e: (abs(e.num - num), e.pos)).pos
-    return clamp(int(round(i * n / max(1, len(primary)))))
+        e = min(numbered, key=lambda e: (abs(e.num - num), e.pos))
+        return e.pos, "number", abs(e.num - num)
+    return clamp(int(round(i * n / max(1, len(primary))))), "proportional", None
 
 
 def outward(start: int, n: int) -> List[int]:
