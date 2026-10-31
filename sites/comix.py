@@ -351,10 +351,13 @@ def _cached_stable_user_agent() -> str:
 def _comix_http_headers() -> Dict[str, str]:
     """One COHERENT modern-Chrome header set for the plain-HTTP session.
 
-    THE PROBLEM THIS SOLVES (measured 2026-08-02). aio-dl builds the scraper as
-    `cloudscraper.create_scraper(browser={"browser":"chrome","platform":
-    "windows"})`, and cloudscraper answers that by picking a RANDOM entry from
-    its bundled profile list — every one of which is 2016-2019:
+    THE PROBLEM THIS SOLVED (measured 2026-08-02). aio-dl built the scraper as
+    `cloudscraper.create_scraper(browser={"browser":"chrome",...})`, and
+    cloudscraper answers that by picking a RANDOM entry from its bundled
+    profile list — every one of which is 2016-2019. (Since 2026-10-31 the
+    shared session pins a modern UA + Accept for every site — grep
+    create_http_session — but this fuller set, client hints included, still
+    layers on top for comix.) Measured samples:
 
         Chrome/56.0.2924.87 ... OPR/43.0.2442.1144 (Edition Yx)   (Win 7, 2017)
         Chrome/55.0.2883.87 UBrowser/7.0.125.1629

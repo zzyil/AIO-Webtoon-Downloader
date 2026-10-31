@@ -10,7 +10,6 @@ import uuid
 from typing import Optional
 from urllib.parse import urlparse
 
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -20,6 +19,7 @@ from aio_config import resolve_output_dir
 from library_state import scan_library, to_jsonable
 from metadata_editor import read_metadata, update_metadata
 from sites import get_handler_by_name, get_handler_for_url
+from sites.http_session import create_http_session
 
 app = FastAPI(title="AIO Downloader API")
 
@@ -54,12 +54,7 @@ threading.Thread(target=cleanup_temp_files, daemon=True).start()
 
 
 def get_scraper():
-    try:
-        import cloudscraper
-
-        return cloudscraper.create_scraper()
-    except Exception:
-        return requests.Session()
+    return create_http_session()
 
 
 def make_request(url: str, scraper):

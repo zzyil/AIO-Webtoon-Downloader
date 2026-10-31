@@ -67,6 +67,7 @@ from sites.base import (
     readable_chapters,
 )
 from sites.group_quality import MTL_CONFIRMED, classify_mtl
+from sites.http_session import create_http_session
 from sites._image_io import (
     sniff_image_extension as _sniff_image_extension,
     image_magic_extension as _image_magic_extension,
@@ -1176,12 +1177,6 @@ def allocate_series_output_dir(
         os.makedirs(preferred, exist_ok=True)
         _write_marker(preferred)
         return preferred
-
-# cloudscraper is optional; fall back to requests.Session if unavailable
-try:
-    import cloudscraper  # type: ignore
-except Exception:  # pragma: no cover
-    cloudscraper = None
 
 import requests
 
@@ -8484,18 +8479,9 @@ def _refresh_library_metadata(args) -> int:
     rewrite_cbz = bool(getattr(args, "refresh_rewrite_cbz", False))
     # Cover normalization (user-chosen "always re-download" on refresh): one
     # shared HTTP session reused for every matched series' cover.jpg fetch.
-    # cloudscraper when available (a site-cover fallback may sit behind
+    # The run's standard session (a site-cover fallback may sit behind
     # Cloudflare); AniList's own CDN is plain and works with either.
-    cover_scraper = None
-    try:
-        if cloudscraper is not None and sys.version_info >= (3, 7):
-            cover_scraper = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "darwin", "mobile": False}
-            )
-    except Exception:
-        cover_scraper = None
-    if cover_scraper is None:
-        cover_scraper = requests.Session()
+    cover_scraper = create_http_session()
     print(
         f"[*] Refreshing AniList metadata for {len(entries)} series in {root}"
         + (" (+CBZ ComicInfo rewrite)" if rewrite_cbz else "")
@@ -10431,27 +10417,9 @@ def main():
     _VERBOSE = args.verbose
     _DEBUG = args.debug
 
-    # Create HTTP session:
-    # - Prefer cloudscraper on Python >= 3.7
-    # - On Python < 3.7 or any init error, fall back to requests.Session
-    use_cloudscraper = cloudscraper is not None and sys.version_info >= (3, 7)
-    if use_cloudscraper:
-        try:
-            scraper = cloudscraper.create_scraper(
-                browser={
-                    "browser": "chrome",
-                    "platform": "darwin",
-                    "mobile": False,
-                }
-            )
-        except Exception as e:
-            log_verbose(
-                f"  Warning: cloudscraper init failed ({e}). "
-                "Falling back to requests.Session()"
-            )
-            scraper = requests.Session()
-    else:
-        scraper = requests.Session()
+    # The shared session and its pinned modern identity; why it is pinned (a
+    # random decade-old UA got atsu.moe 403s) lives in sites/http_session.py.
+    scraper = create_http_session()
     if args.cookies:
         scraper.cookies.update(
             dict(kv.split("=", 1) for kv in args.cookies.split(";") if "=" in kv)

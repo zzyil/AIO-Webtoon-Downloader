@@ -51,12 +51,6 @@ except Exception:
 import time
 from typing import Any, Callable, Optional
 
-# cloudscraper is optional (matches aio-dl.py:362–366)
-try:
-    import cloudscraper  # type: ignore
-except Exception:  # pragma: no cover
-    cloudscraper = None  # type: ignore
-
 import requests
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -66,6 +60,7 @@ from sites import get_handler_by_name
 from sites.base import SearchHit, readable_chapters
 from sites.chapter_merger import _classify_main_chapters, align_chapter_lists
 from sites.fetch_memo import FetchMemo
+from sites.http_session import create_http_session
 from sites.search_orchestrator import (
     DEFAULT_MIN_MATCH,
     DEFAULT_PER_SITE_TIMEOUT_S,
@@ -281,18 +276,9 @@ def _search_make_request_factory(timeout: float, attempts: int = 2):
 
 
 def _build_scraper(args: Any) -> Any:
-    """Mirror of aio-dl.py main()'s scraper creation. Single-source; if you
-    change the policy there, change here too."""
-    use_cloudscraper = cloudscraper is not None and sys.version_info >= (3, 7)
-    if use_cloudscraper:
-        try:
-            scraper = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "darwin", "mobile": False}
-            )
-        except Exception:
-            scraper = requests.Session()
-    else:
-        scraper = requests.Session()
+    """The same session aio-dl.py main() builds (sites/http_session.py), plus
+    the --cookies jar."""
+    scraper = create_http_session()
     cookies = getattr(args, "cookies", "") or ""
     if cookies:
         try:
