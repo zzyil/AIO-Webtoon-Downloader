@@ -41,9 +41,15 @@ import { cn } from "@/lib/utils";
 // The chip is a <button> for the tick with a SIBLING button for the cross-out —
 // nested buttons are invalid HTML and swallow the inner click, so the two live
 // side by side inside a bordered span instead.
-function ChapterChip({ chapter, state, onToggle, onCrossOut, onRestore, disabled }) {
+// `noun` is "chapter" or "volume" (the volume rows of the update check reuse
+// these chips); it only changes the words.
+// No `onCrossOut` → no cross-out button: LibraryTab's "Get volumes" browse
+// view passes none, because a cross-out there would write a volume block and
+// so make a chapter-only series track volumes (series-ledger.js trackedKinds).
+function ChapterChip({ chapter, state, onToggle, onCrossOut, onRestore, disabled, noun = "chapter" }) {
   const ignored = state === "ignored";
   const on = state === "on";
+  const Noun = noun.charAt(0).toUpperCase() + noun.slice(1);
   return (
     <span
       className={cn(
@@ -68,10 +74,10 @@ function ChapterChip({ chapter, state, onToggle, onCrossOut, onRestore, disabled
         // can't tell them apart.
         title={
           ignored
-            ? `Chapter ${chapter} is crossed out — left out of every check until you restore it`
+            ? `${Noun} ${chapter} is crossed out — left out of every check until you restore it`
             : on
-            ? `Chapter ${chapter} will download. Click to skip it in this download only.`
-            : `Chapter ${chapter} is skipped for this download. Click to put it back in.`
+            ? `${Noun} ${chapter} will download. Click to skip it in this download only.`
+            : `${Noun} ${chapter} is skipped for this download. Click to put it back in.`
         }
         className={cn(
           "flex items-center gap-1 px-1.5 py-1 tabular-nums transition-colors",
@@ -90,16 +96,17 @@ function ChapterChip({ chapter, state, onToggle, onCrossOut, onRestore, disabled
           ))}
         {chapter}
       </button>
+      {onCrossOut && (
       <button
         type="button"
         disabled={disabled}
         onClick={ignored ? onRestore : onCrossOut}
         title={
           ignored
-            ? `Restore chapter ${chapter} — makes it downloadable again`
-            : `Cross out chapter ${chapter} — saved to this series, so every future check leaves it out until you restore it`
+            ? `Restore ${noun} ${chapter} — makes it downloadable again`
+            : `Cross out ${noun} ${chapter} — saved to this series, so every future check leaves it out until you restore it`
         }
-        aria-label={ignored ? `Restore chapter ${chapter}` : `Cross out chapter ${chapter}`}
+        aria-label={ignored ? `Restore ${noun} ${chapter}` : `Cross out ${noun} ${chapter}`}
         className={cn(
           "px-1 py-1 border-l transition-colors",
           ignored
@@ -110,6 +117,7 @@ function ChapterChip({ chapter, state, onToggle, onCrossOut, onRestore, disabled
       >
         {ignored ? <RotateCcw className="w-2.5 h-2.5" /> : <X className="w-2.5 h-2.5" />}
       </button>
+      )}
     </span>
   );
 }
@@ -124,14 +132,15 @@ function ChapterChip({ chapter, state, onToggle, onCrossOut, onRestore, disabled
 // screen is worse than saying nothing.
 // `actions` is an optional node pinned to the right of the first line (the
 // callers put their "all / none" shortcuts there).
-export function ChapterChipsLegend({ hasChapters = true, actions, className }) {
+// `crossOut` false drops the cross-out line, for chips rendered without one.
+export function ChapterChipsLegend({ hasChapters = true, actions, className, noun = "chapter", crossOut = true }) {
   return (
     <div className={cn("space-y-1 text-[10px] leading-snug text-muted-foreground", className)}>
       {hasChapters ? (
         <div className="flex items-start gap-1.5">
           <CheckSquare className="w-3 h-3 mt-px shrink-0 text-orange-400/80" aria-hidden />
           <span className="flex-1">
-            <span className="text-foreground/80">Click a chapter</span> to include or skip it —{" "}
+            <span className="text-foreground/80">Click a {noun}</span> to include or skip it —{" "}
             <span className="text-foreground/80">this download only</span>.
           </span>
           {actions}
@@ -139,6 +148,7 @@ export function ChapterChipsLegend({ hasChapters = true, actions, className }) {
       ) : (
         actions && <div className="flex items-start justify-end gap-1.5">{actions}</div>
       )}
+      {crossOut && (
       <div className="flex items-start gap-1.5">
         <X className="w-3 h-3 mt-px shrink-0 text-red-400/80" aria-hidden />
         <span className="flex-1">
@@ -149,6 +159,7 @@ export function ChapterChipsLegend({ hasChapters = true, actions, className }) {
           any time.
         </span>
       </div>
+      )}
     </div>
   );
 }
@@ -161,8 +172,10 @@ export function ChapterChipsLegend({ hasChapters = true, actions, className }) {
 //   deselected — Set of `chapters` entries the user has unticked. Owned by the
 //                caller, because "queue all" has to read every row's ticks.
 //   onToggle(chapter)      — flip one tick
-//   onSetIgnored(chapters, ignored) — cross out / restore (array = one write)
+//   onSetIgnored(chapters, ignored) — cross out / restore (array = one write);
+//                omit it to render chips with no cross-out button
 //   busy       — disables everything while a write is in flight
+//   noun       — "chapter" (default) or "volume": wording only
 //
 // ORDER: crossed-out chapters are interleaved in numeric order rather than
 // pushed to the end, so the list still reads as the series' chapter sequence
@@ -174,6 +187,7 @@ export default function ChapterChips({
   onToggle,
   onSetIgnored,
   busy = false,
+  noun = "chapter",
 }) {
   const ignoredSet = React.useMemo(() => new Set(ignored), [ignored]);
   const ordered = React.useMemo(() => {
@@ -198,9 +212,10 @@ export default function ChapterChips({
             chapter={ch}
             state={isIgnored ? "ignored" : deselected?.has(ch) ? "off" : "on"}
             disabled={busy}
+            noun={noun}
             onToggle={() => onToggle?.(ch)}
-            onCrossOut={() => onSetIgnored?.([ch], true)}
-            onRestore={() => onSetIgnored?.([ch], false)}
+            onCrossOut={onSetIgnored ? () => onSetIgnored([ch], true) : undefined}
+            onRestore={onSetIgnored ? () => onSetIgnored([ch], false) : undefined}
           />
         );
       })}

@@ -89,6 +89,12 @@ function phaseLabel(phase) {
   return labels[phase] || phase || "Preparing…";
 }
 
+// "Vol." for a --download-volumes run, "Ch." otherwise. itemKind is stamped
+// on progress by electron/downloader.js at spawn.
+function itemAbbr(dl) {
+  return dl?.progress?.itemKind === "volume" ? "Vol." : "Ch.";
+}
+
 export default function QueueTab({
   activeDownloads,
   queue,
@@ -155,13 +161,13 @@ export default function QueueTab({
                   {dl.progress?.processedChapters > 0 && !dl.progress?.batchCurrent && (
                     <span className="ml-1">
                       {dl.progress.totalChapters > 0
-                        ? `— Ch. ${dl.progress.processedChapters}/${dl.progress.totalChapters}`
-                        : `— ${dl.progress.processedChapters} ch. processed`}
+                        ? `— ${itemAbbr(dl)} ${dl.progress.processedChapters}/${dl.progress.totalChapters}`
+                        : `— ${dl.progress.processedChapters} ${itemAbbr(dl).toLowerCase()} processed`}
                     </span>
                   )}
                   {/* Show current chapter number */}
                   {dl.progress?.currentChapter > 0 && !dl.progress?.processedChapters && (
-                    <span className="ml-1">— Ch. {dl.progress.currentChapter}</span>
+                    <span className="ml-1">— {itemAbbr(dl)} {dl.progress.currentChapter}</span>
                   )}
                 </p>
               </div>
@@ -188,7 +194,9 @@ export default function QueueTab({
             <div className="flex gap-1.5 mt-2 flex-wrap">
               {dl.args?.format && <Badge variant="secondary">{dl.args.format.toUpperCase()}</Badge>}
               {dl.args?.quality && <Badge variant="secondary">Q{dl.args.quality}</Badge>}
-              {dl.args?.keepChapters && <Badge variant="secondary">Chapters</Badge>}
+              {dl.progress?.itemKind === "volume"
+                ? <Badge variant="secondary">Volumes</Badge>
+                : dl.args?.keepChapters && <Badge variant="secondary">Chapters</Badge>}
             </div>
           </Card>
         ))}
@@ -303,6 +311,13 @@ export default function QueueTab({
                   <span className="text-xs text-muted-foreground">{formatDuration(dl.result.duration)}</span>
                 )}
               </div>
+              {/* A known engine refusal (e.g. "no volumes") in plain words;
+                  set by electron/downloader.js failureReasonFor. */}
+              {dl.status === "failed" && (dl.result?.failureReason || dl.progress?.failureReason) && (
+                <p className="text-xs text-destructive mt-1">
+                  {dl.result?.failureReason || dl.progress?.failureReason}
+                </p>
+              )}
             </Card>
           ))}
         </div>

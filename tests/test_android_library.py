@@ -490,6 +490,128 @@ def test_update_check_forwards_language_and_collapse(library, fake_listing):
     ]
 
 
+# Volumes (native volume releases; series_ledger keeps them under "volumes").
+# The device has no volume UI, but the library is synced from the desktop, so
+# a volume series must not read as "every chapter is new".
+
+
+@pytest.fixture
+def fake_listings(monkeypatch):
+    """Stub `list_chapters` with a function of the argv extras; records every call."""
+    calls = []
+
+    def install(respond):
+        def fake(url, extra_args=None):
+            extra = list(extra_args or [])
+            calls.append(extra)
+            return json.dumps(respond(extra))
+
+        monkeypatch.setattr(aio_android, "list_chapters", fake)
+        return calls
+
+    return install
+
+
+ONE_PIECE = "https://mangafire.to/title/dkw-one-piece"
+
+
+def test_update_check_volume_only_series_offers_no_chapters(library, fake_listings):
+    root, _cache = library
+    folder = make_series(root, "VolOnly", meta={
+        "url": ONE_PIECE, "site": "mangafire", "title": "VolOnly",
+        "volumes": {"schema": 1, "downloaded": ["1", "2"], "ignored": ["4"]},
+    })
+    calls = fake_listings(lambda extra: {"volumes": ["1", "2", "3", "4", "5"], "chapters": ["1", "2"]})
+
+    result = json.loads(check_series_updates(str(folder), collapse_splits=True))
+    assert calls == [["--download-volumes", "--site", "mangafire"]]
+    assert result["trackedKinds"] == ["volume"]
+    assert result["newChapters"] == [] and result["total"] == 0
+    assert result["newVolumes"] == ["3", "5"]
+    assert result["ignoredVolumes"] == ["4"]
+    assert result["volumesTotal"] == 5 and result["volumesDownloaded"] == 2
+
+
+def test_update_check_chapter_series_lists_no_volumes(library, fake_listings):
+    root, _cache = library
+    folder = make_series(root, "ChOnly", meta={"url": ONE_PIECE, "chapters_downloaded": ["1"]})
+    calls = fake_listings(lambda extra: {"chapters": ["1", "2"]})
+
+    result = json.loads(check_series_updates(str(folder)))
+    assert calls == [[]]
+    assert result["trackedKinds"] == ["chapter"]
+    assert "newVolumes" not in result
+
+
+def test_update_check_both_kinds_one_listing(library, fake_listings):
+    root, _cache = library
+    folder = make_series(root, "Both", meta={
+        "url": ONE_PIECE, "title": "Both", "chapters_downloaded": ["1"],
+        "volumes": {"schema": 1, "downloaded": ["1"]},
+    })
+    calls = fake_listings(lambda extra: {"chapters": ["1", "2"], "volumes": ["1", "2"]})
+
+    result = json.loads(check_series_updates(str(folder)))
+    assert calls == [["--with-volumes"]]
+    assert result["trackedKinds"] == ["chapter", "volume"]
+    assert result["newChapters"] == ["2"] and result["newVolumes"] == ["2"]
+
+
+def test_update_check_volume_listing_failure_keeps_the_chapter_half(library, fake_listings):
+    root, _cache = library
+    folder = make_series(root, "VolFail", meta={
+        "url": ONE_PIECE, "chapters_downloaded": ["1"], "volumes": {"downloaded": ["1"]},
+    })
+    fake_listings(lambda extra: {"chapters": ["1", "2"], "volumes": None})
+
+    result = json.loads(check_series_updates(str(folder)))
+    assert result["ok"] is True and result["newChapters"] == ["2"]
+    assert result["newVolumes"] == [] and result["volumesError"]
+
+
+def test_update_check_volume_language_gets_its_own_listing(library, fake_listings):
+    root, _cache = library
+    folder = make_series(root, "TwoLangs", meta={
+        "url": ONE_PIECE, "language": "en", "chapters_downloaded": ["1"],
+        "volumes": {"downloaded": ["1"], "language": "fr"},
+    })
+    calls = fake_listings(
+        lambda extra: {"volumes": ["1", "2"]} if "--download-volumes" in extra else {"chapters": ["1"]}
+    )
+
+    result = json.loads(check_series_updates(str(folder)))
+    assert calls == [[], ["--download-volumes", "--language", "fr"]]
+    assert result["newChapters"] == [] and result["newVolumes"] == ["2"]
+
+
+def test_update_check_volume_files_without_a_block_still_track_volumes(library, fake_listings):
+    """An older build rewrote the ledger and dropped the volumes block; the
+    files are the record (series_ledger.tracked_kinds self-heal)."""
+    root, _cache = library
+    folder = make_series(root, "Healed", meta={"url": ONE_PIECE, "title": "Healed"})
+    (folder / "Healed Vol.01.cbz").write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+    calls = fake_listings(lambda extra: {"volumes": ["1", "2"]})
+
+    result = json.loads(check_series_updates(str(folder)))
+    assert calls == [["--download-volumes"]]
+    assert result["newChapters"] == [] and result["newVolumes"] == ["2"]
+
+
+def test_update_check_unreadable_peer_does_not_turn_chapters_on(library, fake_listings):
+    root, _cache = library
+    folder = make_series(root, "VolPrimary", meta={
+        "url": ONE_PIECE, "volumes": {"downloaded": ["1"]},
+    })
+    peer = root / "VolPeer"
+    peer.mkdir()
+    (peer / ".aio_series.json").write_text("{broken", encoding="utf-8")
+    calls = fake_listings(lambda extra: {"volumes": ["1"]})
+
+    result = json.loads(check_series_updates(str(folder), peer_folders=[str(peer)]))
+    assert calls == [["--download-volumes"]]
+    assert result["trackedKinds"] == ["volume"]
+
+
 def test_update_check_error_vocabulary(library, fake_listing):
     """Same error names as _checkSeriesUpdates, so both UIs can say the same things."""
     root, _cache = library

@@ -1,0 +1,25 @@
+{
+  "_comment": "Shared cases for series_ledger.py (tests/test_series_ledger.py) and its JS twin UI-source/electron/series-ledger.js. Change both sides together.",
+  "tracked_kinds": [
+    {"name": "no ledger", "meta": {}, "expected": ["chapter"]},
+    {"name": "legacy chapters", "meta": {"chapters_downloaded": ["1", "2"]}, "expected": ["chapter"]},
+    {"name": "legacy false flag", "meta": {"chapters_downloaded": ["1"], "download_volumes": false}, "expected": ["chapter"]},
+    {"name": "volumes only", "meta": {"volumes": {"schema": 1, "downloaded": ["1"]}}, "expected": ["volume"]},
+    {"name": "empty volume block", "meta": {"volumes": {"schema": 1, "downloaded": []}}, "expected": ["volume"]},
+    {"name": "both", "meta": {"chapters_downloaded": ["1"], "volumes": {"downloaded": ["1"]}}, "expected": ["chapter", "volume"]},
+    {"name": "self-heal, files only", "meta": {"chapters_downloaded": []}, "volume_files_present": true, "expected": ["volume"]},
+    {"name": "self-heal with chapters", "meta": {"chapters_downloaded": ["3"]}, "volume_files_present": true, "expected": ["chapter", "volume"]},
+    {"name": "malformed block ignored", "meta": {"chapters_downloaded": ["1"], "volumes": ["1"]}, "expected": ["chapter"]}
+  ],
+  "kind_view": [
+    {"name": "chapter view normalizes", "kind": "chapter",
+     "meta": {"chapters_downloaded": ["4.0", 5], "format": "pdf", "language": "en"},
+     "expected": {"downloaded": ["4", "5"], "ignored": [], "format": "pdf", "language": "en"}},
+    {"name": "volume view own settings", "kind": "volume",
+     "meta": {"format": "pdf", "language": "en", "volumes": {"downloaded": ["1"], "ignored": ["2"], "format": "cbz", "language": "fr"}},
+     "expected": {"downloaded": ["1"], "ignored": ["2"], "format": "cbz", "language": "fr"}},
+    {"name": "volume view falls back to series language, never chapter format", "kind": "volume",
+     "meta": {"format": "pdf", "language": "es", "volumes": {"downloaded": []}},
+     "expected": {"downloaded": [], "format": null, "language": "es"}}
+  ]
+}

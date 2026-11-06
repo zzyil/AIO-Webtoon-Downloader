@@ -34,11 +34,13 @@ const {
 const { HistoryManager } = require("./history");
 const { PythonSetup, isSetupComplete, deleteEnv, PYTHON_VERSION } = require("./setup");
 const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice, getImageChaptersOnDevice, groupEntriesBySeries } = require("./library");
-// chapterLabel/compareChapterLabels live there rather than here because the
-// merge and set-chapters-ignored write the SAME file, so a single definition
-// is the only way they can't drift into different spellings of a chapter.
-const { mergeSeriesFolders, chapterLabel, compareChapterLabels } = require("./series-merge");
+// Label spelling for set-chapters-ignored and the merge comes from ONE place,
+// series-ledger.js (required below), so the two writers can't drift.
+const { mergeSeriesFolders } = require("./series-merge");
 const { createUpdateCheckRecord, resultRow: updateCheckResultRow } = require("./update-check-record");
+// Per-kind ledger views (chapters top-level, volumes under "volumes") and the
+// volume file-name rules. Twin of series_ledger.py / item_kinds.py.
+const seriesLedger = require("./series-ledger");
 // App self-update (opt-OUT, settings.appAutoUpdate) — cheap require; the
 // heavy electron-updater load is deferred inside updater.js. NOT the manga
 // chapter update-check family below (check-for-updates etc.). Polarity is
@@ -1218,6 +1220,22 @@ function setupIPC() {
   //     aborted, the in-flight Python proc is killed and the promise
   //     rejects with an aborted-shape error that the caller normalizes
   //     into { error: "aborted" }.
+  //
+  // VOLUMES. A series tracks chapters, volumes or both (series-ledger.js
+  // trackedKinds, from the ledger plus Vol files on disk). Each kind is listed
+  // and diffed against ITS OWN namespace, so a MangaFire chapter series never
+  // gets volume noise and a volume-only series never shows "+300 chapters":
+  //   chapters only → the old single spawn, byte-identical
+  //   volumes only  → one spawn with --download-volumes
+  //   both          → one spawn with --with-volumes when both kinds use the
+  //                   same language, else one spawn per kind
+  // The volume half's "on device" set is ALWAYS ledger ∪ files on disk,
+  // whatever useFileBasedChapterCheck says: an older build that rewrote the
+  // ledger drops the volume block, and the files are then the only record.
+  //
+  //   includeVolumes — list volumes even if the series doesn't track them
+  //     yet. The Library page's "Get volumes" uses it on a chapter-only
+  //     MangaFire series; chapter tracking is unaffected.
   //   peerFolders — OTHER folders holding the SAME series (the forks a site
   //     rename used to create; grep seriesIdentityKey). Everything read off
   //     disk is unioned across the primary + peers, because a series split
@@ -1225,6 +1243,31 @@ function setupIPC() {
   //     reports "5 new" while its 5-chapter fork reports "59 new", and
   //     neither number is true. Empty/absent for the ordinary lone series,
   //     which then costs exactly what it always did.
+  // Volume labels on disk for one series folder: "<base> Vol.NN.<ext>" at the
+  // root plus images/Volume_N dirs. `title` gives the exact base a volume run
+  // writes (series-ledger.js volumeFileBase); the folder name stands in when
+  // the ledger has none. Async twin of the sync scan in library.js.
+  async function _volumeLabelsOnDisk(folderPath, title) {
+    const base =
+      seriesLedger.volumeFileBase(title) || seriesLedger.volumeFileBase(path.basename(folderPath));
+    const out = [];
+    try {
+      for (const f of await fs.promises.readdir(folderPath, { withFileTypes: true })) {
+        if (!f.isFile()) continue;
+        const n = seriesLedger.parseVolumeNumberFromName(f.name, base);
+        if (n !== null) out.push(n);
+      }
+    } catch {}
+    try {
+      const imagesDir = path.join(folderPath, "images");
+      for (const d of await fs.promises.readdir(imagesDir, { withFileTypes: true })) {
+        const n = d.isDirectory() ? seriesLedger.parseRawVolumeDir(d.name) : null;
+        if (n !== null) out.push(n);
+      }
+    } catch {}
+    return out;
+  }
+
   async function _checkSeriesUpdates(folderPath, opts = {}) {
     const metaPath = path.join(folderPath, ".aio_series.json");
     // fs.promises.access throws on missing — translate to the no-metadata
@@ -1270,19 +1313,38 @@ function setupIPC() {
       return { error: "no_script", message: "aio-dl.py not found at " + scriptPath };
     }
 
+    // Which kinds to list (see VOLUMES above), unioned across fork members.
+    const kindsTracked = new Set();
+    const volumeDiskLabels = new Set();
+    for (const member of members) {
+      const onDisk = await _volumeLabelsOnDisk(member.folderPath, member.meta?.title || meta.title);
+      for (const v of onDisk) volumeDiskLabels.add(v);
+      for (const k of seriesLedger.trackedKinds(member.meta, { volumeFilesPresent: onDisk.length > 0 })) {
+        kindsTracked.add(k);
+      }
+    }
+    if (opts.includeVolumes) kindsTracked.add("volume");
+    const wantChapters = kindsTracked.has("chapter");
+    const wantVolumes = kindsTracked.has("volume");
+    const chapterLang = meta.language || "en";
+    const volumeLang = seriesLedger.kindView(meta, "volume").language || chapterLang;
+
     try {
-      const result = await new Promise((resolve, reject) => {
+      // One `--list-chapters` spawn. `extraFlags` picks the kind
+      // (--download-volumes / --with-volumes); `language` is that kind's own.
+      const runList = (extraFlags, language) => new Promise((resolve, reject) => {
         const args = [
           "-u", scriptPath,
           "--list-chapters",
           "--verbose",
         ];
-        if (meta.language && meta.language !== "en") {
-          args.push("--language", meta.language);
+        if (language && language !== "en") {
+          args.push("--language", language);
         }
         if (meta.site) {
           args.push("--site", meta.site);
         }
+        args.push(...extraFlags);
         // Collapse-splits forwarding: when the user has the global
         // collapseSplits setting on, --list-chapters now applies the same
         // group_chapters_for_download filter the download path uses
@@ -1292,7 +1354,9 @@ function setupIPC() {
         // under collapse, causing the diff against meta.chapters_downloaded
         // to flag them as new forever. Cross-file: settings.collapseSplits
         // is the source of truth (SettingsTab.jsx default true).
-        if (opts.collapseSplits) {
+        // Volume numbers have no fragments; the engine forces collapse off in
+        // volume mode anyway, so the flag is only sent with a chapter list.
+        if (opts.collapseSplits && !extraFlags.includes("--download-volumes")) {
           args.push("--collapse-splits");
         }
         args.push(meta.url);
@@ -1377,6 +1441,34 @@ function setupIPC() {
           reject(err);
         });
       });
+
+      // ── Spawn plan (see VOLUMES in the header) ──
+      // `result` is the chapter listing (and the series fields: status, cover…);
+      // `volumeList` is the volume labels, or null when listing them failed.
+      let result;
+      let volumeList = null;
+      let volumesError = null;
+      if (!wantVolumes) {
+        result = await runList([], chapterLang);
+      } else if (!wantChapters) {
+        result = await runList(["--download-volumes"], volumeLang);
+        volumeList = result.volumes || [];
+      } else if (volumeLang === chapterLang) {
+        result = await runList(["--with-volumes"], chapterLang);
+        // --with-volumes reports volumes:null when listing them raised, and
+        // still returns the chapter half (aio-dl.py _series_listing_head).
+        if (Array.isArray(result.volumes)) volumeList = result.volumes;
+        else volumesError = "Couldn't list volumes";
+      } else {
+        result = await runList([], chapterLang);
+        try {
+          volumeList = (await runList(["--download-volumes"], volumeLang)).volumes || [];
+        } catch (err) {
+          if (opts?.signal?.aborted) throw err;
+          volumesError = err?.message || "Couldn't list volumes";
+        }
+      }
+      if (!wantChapters) result = { ...result, chapters: [] };
 
       // ── Determine which chapters are "on device" ──
       // Two modes controlled by settings.useFileBasedChapterCheck:
@@ -1481,10 +1573,33 @@ function setupIPC() {
       // next download of this series.
       const ignoredChapters = missingChapters.filter((ch) => ignoredSet.has(ch)).sort(byNumber);
 
+      // ── Volume diff (own namespace; see VOLUMES in the header) ──
+      let volumeFields = {};
+      if (wantVolumes) {
+        const haveVolumes = new Set(volumeDiskLabels);
+        const ignoredVolSet = new Set();
+        for (const member of members) {
+          const view = seriesLedger.kindView(member.meta, "volume");
+          for (const v of view.downloaded) haveVolumes.add(v);
+          for (const v of view.ignored) ignoredVolSet.add(v);
+        }
+        const siteVolumes = (volumeList || []).map(seriesLedger.itemLabel);
+        const missingVolumes = siteVolumes.filter((v) => !haveVolumes.has(v));
+        volumeFields = {
+          newVolumes: missingVolumes.filter((v) => !ignoredVolSet.has(v)).sort(byNumber),
+          ignoredVolumes: missingVolumes.filter((v) => ignoredVolSet.has(v)).sort(byNumber),
+          volumesTotal: siteVolumes.length,
+          volumesDownloaded: haveVolumes.size,
+          ...(volumesError ? { volumesError } : {}),
+        };
+      }
+
       return {
         ok: true,
+        trackedKinds: [...kindsTracked],
         newChapters,
         ignoredChapters,
+        ...volumeFields,
         total: relevantSiteChapters.length,
         downloaded: downloadedChapters.size,
         checkMode,
@@ -1510,15 +1625,66 @@ function setupIPC() {
     }
   }
 
+  // ── Which sites offer native volumes ──
+  // `aio-dl.py --site-capabilities` prints [{name, domains, volumes}] from
+  // sites.handler_capabilities(). Spawned ONCE per app session and cached:
+  // the answer only changes with a Python update, and the renderer asks on
+  // every URL edit. The renderer matches a URL's host against `domains`
+  // (src/lib/siteCapabilities.js) instead of probing the URL, because a
+  // MangaFire probe would launch its signer browser on every paste.
+  // A failed spawn is NOT cached, so the next ask retries.
+  let _siteCapabilitiesPromise = null;
+  ipcMain.handle("site-capabilities", async () => {
+    if (!_siteCapabilitiesPromise) {
+      _siteCapabilitiesPromise = new Promise((resolve, reject) => {
+        const settings = history.getSettings();
+        const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
+        const proc = spawn(pythonCmd, ["-u", scriptPath, "--site-capabilities"], {
+          cwd: workingDir,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          env: { ...process.env, ...buildPythonEnv({ unbuffered: true }) },
+        });
+        let out = "";
+        proc.stdout.on("data", (c) => { out += c.toString("utf8"); });
+        const timer = setTimeout(() => { try { proc.kill(); } catch {} }, 60000);
+        proc.on("error", (err) => { clearTimeout(timer); reject(err); });
+        proc.on("close", (code) => {
+          clearTimeout(timer);
+          // The JSON is the last line; handler registration may log before it.
+          const line = out.trim().split("\n").reverse().find((l) => l.trim().startsWith("["));
+          try {
+            if (code !== 0 || !line) throw new Error(`site-capabilities exited ${code}`);
+            resolve(JSON.parse(line));
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }).catch((err) => {
+        _siteCapabilitiesPromise = null;
+        throw err;
+      });
+    }
+    try {
+      return { ok: true, sites: await _siteCapabilitiesPromise };
+    } catch (err) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
   // ── Check for new chapters for a single series ──
-  ipcMain.handle("check-for-updates", async (_event, folderPath) => {
+  // opts.includeVolumes: see _checkSeriesUpdates (Library "Get volumes").
+  ipcMain.handle("check-for-updates", async (_event, folderPath, checkOpts = {}) => {
     // Single-series Check uses the global collapseSplits setting so the
     // result matches what a "Download Missing Chapters" click would produce.
     // No abort signal here — single check completes fast and can't be
     // user-cancelled from the DetailView (just close the panel).
     const settings = history.getSettings();
     const collapseSplits = settings.collapseSplits === true;
-    return _checkSeriesUpdates(folderPath, { collapseSplits });
+    return _checkSeriesUpdates(folderPath, {
+      collapseSplits,
+      includeVolumes: !!checkOpts?.includeVolumes,
+    });
   });
 
   // ── Check for updates on all ongoing series (parallel) ──
@@ -1844,7 +2010,12 @@ function setupIPC() {
   //
   // Batched (`chapters` is an array) so "cross out the rest" is one write.
   // Returns the new list for the renderer to mirror into its library entry.
-  ipcMain.handle("set-chapters-ignored", async (_event, folderPath, chapters, ignored) => {
+  //
+  // `kind` ("chapter" default, or "volume") picks the namespace: volume
+  // cross-outs go to volumes.ignored and never touch chapters_ignored
+  // (series-ledger.js applyIgnored). Returned as `ignoredItems` too;
+  // `chaptersIgnored` keeps its old meaning for chapter calls.
+  ipcMain.handle("set-chapters-ignored", async (_event, folderPath, chapters, ignored, kind = "chapter") => {
     try {
       const metaPath = path.join(folderPath, ".aio_series.json");
       let meta;
@@ -1858,28 +2029,20 @@ function setupIPC() {
       }
       if (!meta || typeof meta !== "object") return { ok: false, error: "invalid_metadata" };
 
-      // Module-scope so the folder merge writes the same spelling; see
-      // chapterLabel's header.
-      const label = chapterLabel;
+      if (kind !== "chapter" && kind !== "volume") return { ok: false, error: "bad_kind" };
 
-      const next = new Set((meta.chapters_ignored || []).map(label));
-      for (const c of Array.isArray(chapters) ? chapters : [chapters]) {
-        // Skip blanks before labelling: Number("") and Number(null) are both 0,
-        // so an empty entry would be written as a cross-out of chapter 0.
-        if (c === null || c === undefined || String(c).trim() === "") continue;
-        if (ignored) next.add(label(c));
-        else next.delete(label(c));
-      }
-      const chaptersIgnored = [...next].sort(compareChapterLabels);
+      // Labels, blank-skipping and the "emptied → key removed" rule live in
+      // series-ledger.js applyIgnored (same spelling as the folder merge and
+      // aio-dl.py's merged_ignored).
+      const { meta: next, ignored: list } = seriesLedger.applyIgnored(meta, kind, chapters, ignored);
 
-      // Emptied back out → drop the key entirely, so a series the user fully
-      // un-crossed reads the same on disk as one that never had a cross-out.
-      // aio-dl.py writes it under the same rule (grep merged_ignored).
-      if (chaptersIgnored.length > 0) meta.chapters_ignored = chaptersIgnored;
-      else delete meta.chapters_ignored;
-
-      await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
-      return { ok: true, chaptersIgnored };
+      await fs.promises.writeFile(metaPath, JSON.stringify(next, null, 2), "utf8");
+      return {
+        ok: true,
+        kind,
+        ignoredItems: list,
+        ...(kind === "chapter" ? { chaptersIgnored: list } : {}),
+      };
     } catch (err) {
       return { ok: false, error: err.message };
     }

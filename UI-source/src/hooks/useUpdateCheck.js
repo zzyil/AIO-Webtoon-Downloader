@@ -56,6 +56,16 @@ const hasAPI = () => typeof window !== "undefined" && !!window.electronAPI;
 // copy) on every reset — a mutation would corrupt the reset itself.
 const IDLE_STATS = Object.freeze({ completed: 0, total: 0, durationMs: 0, aborted: false });
 
+// What a row's "+N new" badge counts: new chapters plus new volumes (a
+// series that tracks volumes reports them as row.newVolumes; electron/
+// update-check-record.js). One definition so the sweep, the snapshot and a
+// local cross-out can't disagree.
+function rowNewCount(row) {
+  return row && row.state === "found"
+    ? (row.newChapters?.length || 0) + (row.newVolumes?.length || 0)
+    : 0;
+}
+
 export function useUpdateCheck({ setLibraryEntries }) {
   // Map<folderPath, row>. Rows are stored verbatim as main built them; see
   // preload.js:onUpdateCheckProgress for the shape. Immutable-on-write (a
@@ -97,9 +107,8 @@ export function useUpdateCheck({ setLibraryEntries }) {
     for (const row of snap.rows || []) {
       if (!row || !row.folderPath) continue;
       map.set(row.folderPath, row);
-      if (row.state === "found" && row.newChapters?.length) {
-        counts[row.folderPath] = row.newChapters.length;
-      }
+      const n = rowNewCount(row);
+      if (n > 0) counts[row.folderPath] = n;
     }
     setRows(map);
     setNewChapterCounts(counts);
@@ -157,7 +166,7 @@ export function useUpdateCheck({ setLibraryEntries }) {
     // up to date on the next sweep has to lose its badge, or the fix that
     // made state persistent would just make staleness persistent.
     setNewChapterCounts((prev) => {
-      const n = row.state === "found" ? row.newChapters?.length || 0 : 0;
+      const n = rowNewCount(row);
       if (n > 0) {
         return prev[row.folderPath] === n ? prev : { ...prev, [row.folderPath]: n };
       }
@@ -286,7 +295,8 @@ export function useUpdateCheck({ setLibraryEntries }) {
       for (const p of paths) {
         const row = next.get(p);
         if (!row || row.state !== "found") continue;
-        next.set(p, { ...row, state: "uptodate", newChapters: undefined });
+        // Queue / dismiss covers both kinds the row offered.
+        next.set(p, { ...row, state: "uptodate", newChapters: undefined, newVolumes: undefined });
         changed = true;
       }
       return changed ? next : prev;
@@ -318,14 +328,21 @@ export function useUpdateCheck({ setLibraryEntries }) {
   // electron/update-check-record.js:resultRow uses (empty list ⇒ key absent),
   // so a locally-patched row and one that arrives from a later sweep are
   // indistinguishable.
-  const setRowIgnored = useCallback(async (folderPath, chapters, ignored) => {
+  //
+  // `kind` "volume" crosses out VOLUMES: it writes volumes.ignored and moves
+  // labels between the row's newVolumes / ignoredVolumes instead. The chapter
+  // lists are never touched by a volume call, and vice versa.
+  const setRowIgnored = useCallback(async (folderPath, chapters, ignored, kind = "chapter") => {
     if (!hasAPI() || !window.electronAPI.setChaptersIgnored) return { ok: false };
     const list = (Array.isArray(chapters) ? chapters : [chapters]).map(String);
     if (list.length === 0) return { ok: true };
+    const isVolume = kind === "volume";
+    const newKey = isVolume ? "newVolumes" : "newChapters";
+    const ignoredKey = isVolume ? "ignoredVolumes" : "ignoredChapters";
 
     let res;
     try {
-      res = await window.electronAPI.setChaptersIgnored(folderPath, list, !!ignored);
+      res = await window.electronAPI.setChaptersIgnored(folderPath, list, !!ignored, kind);
     } catch (err) {
       console.error("Cross out chapters failed:", err);
       return { ok: false, error: err?.message };
@@ -347,8 +364,8 @@ export function useUpdateCheck({ setLibraryEntries }) {
     if (row && (row.state === "found" || row.state === "uptodate")) {
       const moved = new Set(list);
       const byNumber = (a, b) => parseFloat(a) - parseFloat(b);
-      const wasNew = row.newChapters || [];
-      const wasIgnored = row.ignoredChapters || [];
+      const wasNew = row[newKey] || [];
+      const wasIgnored = row[ignoredKey] || [];
       // Filter-the-source / concat-into-the-target, so clicking a chapter the
       // row already has on the target side is a no-op rather than a duplicate.
       const nextNew = ignored
@@ -358,17 +375,20 @@ export function useUpdateCheck({ setLibraryEntries }) {
         ? [...wasIgnored, ...wasNew.filter((c) => moved.has(c))].sort(byNumber)
         : wasIgnored.filter((c) => !moved.has(c));
 
-      const patched = { ...row, state: nextNew.length > 0 ? "found" : "uptodate" };
-      delete patched.newChapters;
-      delete patched.ignoredChapters;
-      if (nextNew.length > 0) patched.newChapters = nextNew;
-      if (nextIgnored.length > 0) patched.ignoredChapters = nextIgnored;
+      const patched = { ...row };
+      delete patched[newKey];
+      delete patched[ignoredKey];
+      if (nextNew.length > 0) patched[newKey] = nextNew;
+      if (nextIgnored.length > 0) patched[ignoredKey] = nextIgnored;
+      // Found while EITHER kind still has something new.
+      const anyNew = (patched.newChapters?.length || 0) + (patched.newVolumes?.length || 0) > 0;
+      patched.state = anyNew ? "found" : "uptodate";
       setRows((prev) => new Map(prev).set(folderPath, patched));
 
       // The grid badge counts what is actually downloadable, so crossing out
       // the last new chapter must clear it exactly as an up-to-date sweep does.
       setNewChapterCounts((prev) => {
-        const n = nextNew.length;
+        const n = rowNewCount(patched);
         if (n > 0) return prev[folderPath] === n ? prev : { ...prev, [folderPath]: n };
         if (!(folderPath in prev)) return prev;
         const next = { ...prev };
@@ -382,7 +402,24 @@ export function useUpdateCheck({ setLibraryEntries }) {
     // new list, so this is an assignment, not another merge — but only when it
     // actually sent one: treating a missing field as "the list is now empty"
     // would let an older main.js silently wipe the entry's cross-outs.
-    if (setLibraryEntriesRef.current && Array.isArray(res.chaptersIgnored)) {
+    if (isVolume && setLibraryEntriesRef.current && Array.isArray(res.ignoredItems)) {
+      setLibraryEntriesRef.current((entries) => {
+        if (!Array.isArray(entries)) return entries;
+        return entries.map((e) => {
+          if (e.folderPath !== folderPath) return e;
+          // Same rule as main's write (series-ledger.js applyIgnored): an
+          // empty list never creates the block, which would mean "tracks
+          // volumes".
+          if (!e.seriesMeta?.volumes && res.ignoredItems.length === 0) return e;
+          const meta = { ...e.seriesMeta };
+          const block = { ...(meta.volumes || { schema: 1, downloaded: [] }) };
+          if (res.ignoredItems.length > 0) block.ignored = res.ignoredItems;
+          else delete block.ignored;
+          meta.volumes = block;
+          return { ...e, seriesMeta: meta };
+        });
+      });
+    } else if (!isVolume && setLibraryEntriesRef.current && Array.isArray(res.chaptersIgnored)) {
       setLibraryEntriesRef.current((entries) => {
         if (!Array.isArray(entries)) return entries;
         return entries.map((e) => {

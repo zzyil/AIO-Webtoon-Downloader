@@ -169,7 +169,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // ── Library update checking ──
   // Check a single series for new chapters (spawns Python --list-chapters).
   // Now honors settings.collapseSplits so the diff matches the download path.
-  checkForUpdates: (folderPath) => ipcRenderer.invoke("check-for-updates", folderPath),
+  // opts.includeVolumes lists volumes for a series that doesn't track them
+  // yet (Library "Get volumes"); results then carry newVolumes etc.
+  checkForUpdates: (folderPath, opts) => ipcRenderer.invoke("check-for-updates", folderPath, opts || {}),
   // Check ALL ongoing series for new chapters. Runs in a bounded parallel
   // worker pool (default 4 slots, settings.checkAllConcurrency-overridable)
   // with provider-aware scheduling — same-site jobs don't pile onto the
@@ -209,9 +211,16 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // `newChapters` and reports as `ignoredChapters` instead — so a crossed-out
   // chapter keeps showing up (struck through, undoable) but no download button
   // ever queues it. Main re-reads the file per call, so rapid clicks can't
-  // clobber each other. Returns { ok, chaptersIgnored } — the new full list.
-  setChaptersIgnored: (folderPath, chapters, ignored) =>
-    ipcRenderer.invoke("set-chapters-ignored", folderPath, chapters, ignored),
+  // clobber each other. Returns { ok, kind, ignoredItems, chaptersIgnored? }.
+  // `kind` "volume" writes volumes.ignored instead (check results report those
+  // as `ignoredVolumes`); omitted means "chapter", the old behaviour.
+  setChaptersIgnored: (folderPath, chapters, ignored, kind) =>
+    ipcRenderer.invoke("set-chapters-ignored", folderPath, chapters, ignored, kind || "chapter"),
+  // [{name, domains, volumes, ...}] for every site handler, cached in main for
+  // the session. The New tab and Library use it to offer volume downloads
+  // only where the site has them (src/lib/siteCapabilities.js).
+  // Returns { ok, sites } or { ok:false, error }.
+  siteCapabilities: () => ipcRenderer.invoke("site-capabilities"),
   // Progress events during check-all-updates. Every event carries `runId`
   // (main drops emissions from a superseded run, so the renderer can treat
   // a changed runId as "a new sweep started"). Payload by `kind`:

@@ -143,8 +143,13 @@ function _restoreQueueItems(snap, resumableList, mintId) {
     // hid is the tmp folder's own key; url is the fallback for a run that
     // died before the "Title (hid=…)" line landed. main.js's scan-resumable
     // handler back-fills BOTH fields from download history, so either can hit.
+    // A series can have a chapter run AND a volume run in flight (tmp_<hid> /
+    // tmpvol_<hid>, same hid), so the kind must agree too. A snapshot saved
+    // before `kind` existed was always a chapter run.
+    const kind = r?.kind || "chapter";
     const match = live.find(
-      (x) => (r?.hid && x.hid === r.hid) || (r?.url && x.url === r.url)
+      (x) => (x.kind || "chapter") === kind
+        && ((r?.hid && x.hid === r.hid) || (r?.url && x.url === r.url))
     );
     if (!match) continue;
     // Two processes writing one tmp_ folder corrupts the resume state — same
@@ -628,6 +633,7 @@ export function useDownloader() {
         running.push({
           downloadId: id,
           hid: dl.progress?.hid || null,
+          kind: dl.progress?.itemKind || "chapter",
           url: Array.isArray(dl.url) ? dl.url[0] : dl.url || null,
           displayUrl: dl.displayUrl || null,
           title: dl.progress?.title || null,

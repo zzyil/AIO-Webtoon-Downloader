@@ -39,6 +39,8 @@ import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
 import { searchDialogInitial } from "@/lib/downloadArgs";
 import { applyEdits } from "@/lib/downloadForm";
+import { useSiteCapabilities, volumesSupportedForUrl } from "@/lib/siteCapabilities";
+import ItemKindSwitch from "./ItemKindSwitch";
 import SearchSourceCard from "./SearchSourceCard";
 import SearchChapterMap from "./SearchChapterMap";
 import FindBanner from "./sync/FindBanner";
@@ -1019,10 +1021,25 @@ function SlowSitesCallout({ sites, eligibleCount, onDisable, onDismiss, onManage
 // and follows Settings for every other field until the download starts
 // (lib/queueRecipe.js). A Settings save while the dialog is open updates the
 // unedited fields and leaves the edited ones alone.
+//
+// CHAPTERS | VOLUMES. When the clicked source's URL is on a site with native
+// volumes (MangaFire; lib/siteCapabilities.js), the range field's label
+// becomes an ItemKindSwitch (placement chosen by the user 2026-11-06: on the
+// field it relabels). Only the clicked source counts, never another source of
+// the same result. Volume mode greys out what aio-dl.py forces or ignores for
+// volumes (grep "[Volumes] Forcing"): Group, Multi-source, and Keep chapters /
+// No final file (shown ticked, since every volume is its own file).
+// lib/downloadArgs.js searchDialogArgs turns it into the args.
 function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) {
   const initial = searchDialogInitial(settings, pending?.args?.multiSource);
   const [edits, setEdits] = useState({});
   const form = { ...initial, ...edits };
+
+  // `volumeMode` is what the job will do: Komikku on means chapters, whatever
+  // the switch says (same rule as DownloadTab.jsx volumeMode).
+  const sites = useSiteCapabilities();
+  const volumesOffered = volumesSupportedForUrl(pending?.url, sites);
+  const volumeMode = volumesOffered && !!form.downloadVolumes && !form.komikku;
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -1049,9 +1066,12 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
   };
 
   // Hands back the EDITS only; confirmSearchDownload wraps them in a recipe.
+  // downloadVolumes rides only when volume mode is actually in effect, so a
+  // switch left on Volumes before Komikku was turned on queues chapters.
   const submit = (event) => {
     event?.preventDefault();
-    onConfirm?.(edits);
+    const { downloadVolumes: _dv, ...rest } = edits;
+    onConfirm?.(volumeMode ? { ...rest, downloadVolumes: true } : rest);
   };
 
   const title =
@@ -1061,12 +1081,16 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
     "Search result";
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm px-4">
+    // Sized off the viewport rather than a fixed max-w-lg so it grows with the
+    // window: width tracks 60vw between 32rem and 64rem, height caps at 90vh
+    // with only the body scrolling (header/footer stay put). The field grid
+    // below goes 2→4 columns at lg so the extra width is used, not padded.
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm p-4">
       <form
         onSubmit={submit}
-        className="w-full max-w-lg rounded-lg border bg-card shadow-xl animate-slide-up"
+        className="flex w-full max-w-[clamp(32rem,60vw,64rem)] max-h-[90vh] flex-col rounded-lg border bg-card shadow-xl animate-slide-up"
       >
-        <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b px-4 py-3">
           <div className="flex items-center gap-2 min-w-0">
             <SlidersHorizontal className="w-4 h-4 text-primary shrink-0" />
             <div className="min-w-0">
@@ -1088,7 +1112,7 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
           </Button>
         </div>
 
-        <div className="max-h-[70vh] overflow-y-auto px-4 py-3 space-y-4">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 space-y-4">
           <div>
             <Label className="text-xs">Format</Label>
             <div className="grid grid-cols-4 gap-2 mt-1">
@@ -1107,6 +1131,46 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
                   {format.label}
                 </button>
               ))}
+            </div>
+
+            {/* Same per-job Komikku toggle as DownloadTab.jsx (grep
+                "Komikku-compatible output"); defaults to settings.defaults.komikku
+                via searchDialogInitial. --komikku forces CBZ on the Python side,
+                so the format buttons above are ignored while it's on. */}
+            <div
+              className={cn(
+                "flex items-center justify-between gap-3 mt-2 rounded-md border p-3 transition-colors",
+                form.komikku ? "border-primary/50 bg-primary/5" : "border-border bg-background"
+              )}
+            >
+              <div className="flex-1">
+                <Label htmlFor="search-komikku" className="text-xs cursor-pointer">
+                  Komikku-compatible output
+                </Label>
+                <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug">
+                  {form.komikku ? (
+                    <>
+                      Overrides format → <span className="font-mono">CBZ</span>. Writes
+                      per-chapter CBZs with their own{" "}
+                      <span className="font-mono">ComicInfo.xml</span>, plus{" "}
+                      <span className="font-mono">cover.jpg</span> +{" "}
+                      <span className="font-mono">details.json</span> at the
+                      series-folder root.
+                    </>
+                  ) : (
+                    <>
+                      Enable for Mihon/Tachiyomi/Komikku readers. Each chapter
+                      becomes its own CBZ with per-chapter metadata, plus
+                      series-level cover.jpg + details.json. Forces format=CBZ.
+                    </>
+                  )}
+                </p>
+              </div>
+              <Switch
+                id="search-komikku"
+                checked={!!form.komikku}
+                onCheckedChange={(value) => set("komikku", value)}
+              />
             </div>
           </div>
 
@@ -1133,19 +1197,29 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
             </div>
           )}
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div>
-              <Label htmlFor="search-download-chapters" className="text-xs">
-                Chapters
-              </Label>
+              {volumesOffered ? (
+                <ItemKindSwitch
+                  compact
+                  volumes={volumeMode}
+                  disabled={!!form.komikku}
+                  onChange={(v) => set("downloadVolumes", v)}
+                />
+              ) : (
+                <Label htmlFor="search-download-chapters" className="text-xs">
+                  Chapters
+                </Label>
+              )}
               <Input
                 id="search-download-chapters"
+                aria-label={volumeMode ? "Volume range" : "Chapter range"}
                 value={form.chapters}
                 onChange={(e) => set("chapters", e.target.value)}
                 onFocus={(e) => {
                   if (e.target.value === "all") e.target.select();
                 }}
-                placeholder="all, 1-20, 44"
+                placeholder={volumeMode ? "all, 1-5, 8" : "all, 1-20, 44"}
                 className="mt-1 h-8 text-xs font-mono"
               />
             </div>
@@ -1166,10 +1240,7 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
                 ))}
               </Select>
             </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
+            <div className={cn(volumeMode && "opacity-40")}>
               <Label htmlFor="search-download-group" className="text-xs">
                 Group
               </Label>
@@ -1178,6 +1249,7 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
                 value={form.group}
                 onChange={(e) => set("group", e.target.value)}
                 placeholder="optional"
+                disabled={volumeMode}
                 className="mt-1 h-8 text-xs"
               />
             </div>
@@ -1200,12 +1272,13 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div className="flex items-center gap-2">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className={cn("flex items-center gap-2", volumeMode && "opacity-40")}>
               <Checkbox
                 id="search-keep-chapters"
-                checked={form.keepChapters}
+                checked={volumeMode || form.keepChapters}
                 onCheckedChange={(value) => set("keepChapters", value)}
+                disabled={volumeMode}
               />
               <Label htmlFor="search-keep-chapters" className="text-xs cursor-pointer">
                 Keep chapters
@@ -1221,25 +1294,26 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
                 Keep images
               </Label>
             </div>
-            <div className="flex items-center gap-2">
+            <div className={cn("flex items-center gap-2", volumeMode && "opacity-40")}>
               <Checkbox
                 id="search-no-final-file"
-                checked={form.noFinalFile}
+                checked={volumeMode || form.noFinalFile}
                 onCheckedChange={(value) => set("noFinalFile", value)}
-                disabled={!form.keepChapters}
+                disabled={volumeMode || !form.keepChapters}
               />
               <Label
                 htmlFor="search-no-final-file"
-                className={cn("text-xs cursor-pointer", !form.keepChapters && "opacity-40")}
+                className={cn("text-xs cursor-pointer", !volumeMode && !form.keepChapters && "opacity-40")}
               >
                 No final file
               </Label>
             </div>
-            <div className="flex items-center gap-2">
+            <div className={cn("flex items-center gap-2", volumeMode && "opacity-40")}>
               <Switch
                 id="search-multi-source-download"
-                checked={form.multiSource}
+                checked={!volumeMode && form.multiSource}
                 onCheckedChange={(value) => set("multiSource", value)}
+                disabled={volumeMode}
               />
               <Label
                 htmlFor="search-multi-source-download"
@@ -1249,9 +1323,26 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
               </Label>
             </div>
           </div>
+
+          {volumesOffered && (form.komikku || volumeMode) && (
+            <p className="text-[11px] leading-snug text-muted-foreground animate-slide-up">
+              {form.komikku ? (
+                <span className="text-yellow-500 dark:text-yellow-400">
+                  Volumes are unavailable with Komikku output, which is per chapter.
+                  Turn Komikku off to download volumes.
+                </span>
+              ) : (
+                <>
+                  One file per volume (<span className="font-mono">Title Vol.01</span>) in
+                  the series folder, next to any chapters. Group and multi-source
+                  don't apply to volumes.
+                </>
+              )}
+            </p>
+          )}
         </div>
 
-        <div className="flex items-center justify-end gap-2 border-t px-4 py-3">
+        <div className="flex shrink-0 items-center justify-end gap-2 border-t px-4 py-3">
           <Button type="button" variant="outline" size="sm" onClick={onClose}>
             Cancel
           </Button>

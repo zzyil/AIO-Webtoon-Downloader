@@ -67,28 +67,18 @@ const METADATA_FILES = new Set([
   SERIES_META_FILE, ".series_hid", ".mangafire_hid", ".DS_Store",
 ]);
 
-// Match aio-dl.py's _chap_label_str: numeric labels normalize to their shortest
-// form ("4.0" → "4", matching --list-chapters' f"{num:g}"); anything
-// non-numeric passes through. main.js imports this rather than keeping its own
-// copy for set-chapters-ignored — both write .aio_series.json, and one
-// definition is the only way they can't drift into spelling a chapter
+// Label rules (aio-dl.py _chap_label_str twin) now live in series-ledger.js,
+// which also owns the volume namespace; re-exported below under the old names
+// because main.js and the tests import them from here. One definition is the
+// only way the writers of .aio_series.json can't drift into spelling an item
 // differently.
-function chapterLabel(c) {
-  const n = Number(c);
-  return Number.isFinite(n) ? String(n) : String(c);
-}
-
-// Non-numeric labels sort last among themselves rather than poisoning the
-// comparator with NaN (which makes Array#sort order-dependent).
-function compareChapterLabels(a, b) {
-  const fa = parseFloat(a);
-  const fb = parseFloat(b);
-  if (Number.isNaN(fa) || Number.isNaN(fb)) {
-    if (Number.isNaN(fa) && Number.isNaN(fb)) return a < b ? -1 : a > b ? 1 : 0;
-    return Number.isNaN(fa) ? 1 : -1;
-  }
-  return fa - fb;
-}
+const {
+  itemLabel: chapterLabel,
+  compareItemLabels: compareChapterLabels,
+  volumeBlock,
+  VOLUMES_KEY,
+  VOLUME_SCHEMA,
+} = require("./series-ledger");
 
 async function pathExists(p) {
   try {
@@ -336,6 +326,41 @@ function mergeSeriesMetaObjects(targetMeta, sourceMetas) {
     .map((m) => m.total_available_at_download)
     .filter((v) => typeof v === "number");
   merged.total_available_at_download = totals.length ? Math.max(...totals) : null;
+
+  // Volume namespace (series-ledger.js header). Only written when some member
+  // has a block, so a chapter-only merge stays byte-identical to before.
+  // Same rules as the chapter side: labels unioned, ignored kept disjoint from
+  // downloaded, the target's own format/language win (it is where the series
+  // lives now), the freshest stamp and the largest known total are kept.
+  const blocks = all.map(volumeBlock).filter(Boolean);
+  if (blocks.length > 0) {
+    const vUnion = (key) => {
+      const out = new Set();
+      for (const b of blocks) for (const c of b[key] || []) out.add(chapterLabel(c));
+      return [...out].sort(compareChapterLabels);
+    };
+    const own = volumeBlock(targetMeta) || {};
+    const firstWith = (key) => blocks.find((b) => b[key] != null)?.[key];
+    const vDownloaded = vUnion("downloaded");
+    const vDownloadedSet = new Set(vDownloaded);
+    const vIgnored = vUnion("ignored").filter((c) => !vDownloadedSet.has(c));
+    const vTotals = blocks
+      .map((b) => b.total_available_at_download)
+      .filter((v) => typeof v === "number");
+    const vStamps = blocks.map((b) => b.last_downloaded_at).filter(Boolean).map(String).sort();
+    const block = {
+      ...own,
+      schema: own.schema ?? VOLUME_SCHEMA,
+      downloaded: vDownloaded,
+      format: own.format ?? firstWith("format") ?? null,
+      language: own.language ?? firstWith("language") ?? null,
+      total_available_at_download: vTotals.length ? Math.max(...vTotals) : null,
+    };
+    if (vStamps.length) block.last_downloaded_at = vStamps[vStamps.length - 1];
+    if (vIgnored.length) block.ignored = vIgnored;
+    else delete block.ignored;
+    merged[VOLUMES_KEY] = block;
+  }
 
   return merged;
 }

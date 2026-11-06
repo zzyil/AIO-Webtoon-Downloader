@@ -62,6 +62,13 @@ import {
 import { Button } from "@/components/ui/primitives";
 import { cn, chaptersToRangeString, getInitials, naturalCompare } from "@/lib/utils";
 import ChapterChips, { ChapterChipsLegend, selectedChapters } from "./ChapterChips";
+import { KOMIKKU_VOLUMES_MESSAGE } from "@/lib/downloadArgs";
+
+// Volume ticks share the panel's `deselections` Map under a second key per
+// series. NUL can't occur in a path, so it can't collide with a folderPath.
+function volumeKey(folderPath) {
+  return `${folderPath}\u0000vol`;
+}
 
 // ── Section state → presentational metadata ──
 // Single source for the per-section accent so the chip, the section header,
@@ -178,6 +185,14 @@ function SeriesRow({
   onSetIgnored,
   onSelectAll,
   busy,
+  // Volume half (series that track MangaFire volumes): its own deselections,
+  // tick, cross-out (kind "volume") and select-all. `komikku` blocks queueing
+  // volumes and says why (lib/downloadArgs.js KOMIKKU_VOLUMES_MESSAGE).
+  volumeDeselected,
+  onToggleVolume,
+  onSetVolumesIgnored,
+  onSelectAllVolumes,
+  komikku = false,
 }) {
   const isRunning = row.state === "running";
   const isQueued = row.state === "queued";
@@ -188,8 +203,14 @@ function SeriesRow({
   const newChapters = row.newChapters || [];
   const ignoredChapters = row.ignoredChapters || [];
   const selected = selectedChapters(newChapters, deselected);
-  const crossedOut = ignoredChapters.length;
-  const expandable = (isFound || isUpToDate) && newChapters.length + crossedOut > 0;
+  const newVolumes = row.newVolumes || [];
+  const ignoredVolumes = row.ignoredVolumes || [];
+  // Volumes can't be queued under Komikku, so none count as selected then.
+  const selectedVolumes = komikku ? [] : selectedChapters(newVolumes, volumeDeselected);
+  const selectedTotal = selected.length + selectedVolumes.length;
+  const crossedOut = ignoredChapters.length + ignoredVolumes.length;
+  const expandable =
+    (isFound || isUpToDate) && newChapters.length + newVolumes.length + crossedOut > 0;
   const isOpen = expandable && expanded;
 
   // "3 crossed out" tail, shared by the found and up-to-date sublines — it is
@@ -211,9 +232,19 @@ function SeriesRow({
       <>
         <span>{siteLabel(row.site)}</span>
         <span className="text-orange-400/80">·</span>
-        <span className="text-orange-300/90">
-          {newChapters.length} new
-        </span>
+        {newChapters.length > 0 && (
+          <span className="text-orange-300/90">
+            {newChapters.length} new
+          </span>
+        )}
+        {newVolumes.length > 0 && (
+          <>
+            {newChapters.length > 0 && <span className="text-zinc-600">·</span>}
+            <span className="text-sky-300/90">
+              {newVolumes.length} new vol
+            </span>
+          </>
+        )}
         {range && (
           <>
             <span className="text-zinc-600">·</span>
@@ -335,17 +366,19 @@ function SeriesRow({
             <span
               className={cn(
                 "text-[10px] font-bold font-mono px-1.5 py-0.5 rounded-sm border",
-                selected.length > 0
+                selectedTotal > 0
                   ? "bg-orange-500/15 text-orange-300 border-orange-500/30"
                   : "bg-zinc-700/30 text-zinc-500 border-zinc-600/40"
               )}
               title={
-                selected.length === newChapters.length
+                newVolumes.length > 0
+                  ? `${selected.length} of ${newChapters.length} chapters, ${selectedVolumes.length} of ${newVolumes.length} volumes selected`
+                  : selected.length === newChapters.length
                   ? `${newChapters.length} new chapter${newChapters.length === 1 ? "" : "s"}`
                   : `${selected.length} of ${newChapters.length} selected`
               }
             >
-              +{selected.length}
+              +{selectedTotal}
             </span>
           )}
           {isRunning && (
@@ -369,12 +402,15 @@ function SeriesRow({
               variant="ghost"
               size="sm"
               onClick={() => onQueue(row)}
-              disabled={selected.length === 0}
+              disabled={selectedTotal === 0}
               className="h-7 w-7 p-0 hover:bg-orange-500/15 hover:text-orange-300 disabled:opacity-40"
               title={
-                selected.length === 0
+                selectedTotal === 0
                   ? "Nothing selected to queue"
-                  : `Queue ${selected.length} chapter${selected.length === 1 ? "" : "s"}`
+                  : [
+                      selected.length > 0 && `${selected.length} chapter${selected.length === 1 ? "" : "s"}`,
+                      selectedVolumes.length > 0 && `${selectedVolumes.length} volume${selectedVolumes.length === 1 ? "" : "s"}`,
+                    ].filter(Boolean).join(" + ").replace(/^/, "Queue ")
               }
             >
               <Download className="w-3.5 h-3.5" />
@@ -437,6 +473,39 @@ function SeriesRow({
             onSetIgnored={onSetIgnored}
             busy={busy}
           />
+          {/* Volume half: same gestures, own namespace. */}
+          {newVolumes.length + ignoredVolumes.length > 0 && (
+            <div className="pt-1 space-y-1.5">
+              <div className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.1em] text-sky-300/80">
+                <span>Volumes</span>
+                {newVolumes.length > 1 && !komikku && (
+                  <span className="ml-auto flex items-center gap-1.5 normal-case tracking-normal text-zinc-400">
+                    <button type="button" onClick={() => onSelectAllVolumes(true)}
+                      className="hover:text-zinc-200 transition-colors"
+                      title="Include every volume in this download">all</button>
+                    <span className="text-zinc-700">|</span>
+                    <button type="button" onClick={() => onSelectAllVolumes(false)}
+                      className="hover:text-zinc-200 transition-colors"
+                      title="Skip every volume in this download (nothing is crossed out)">none</button>
+                  </span>
+                )}
+              </div>
+              {komikku && newVolumes.length > 0 && (
+                <p className="text-[10px] text-yellow-500/90 leading-snug">
+                  {KOMIKKU_VOLUMES_MESSAGE}
+                </p>
+              )}
+              <ChapterChips
+                chapters={newVolumes}
+                ignored={ignoredVolumes}
+                deselected={komikku ? new Set(newVolumes) : volumeDeselected}
+                onToggle={komikku ? undefined : onToggleVolume}
+                onSetIgnored={onSetVolumesIgnored}
+                busy={busy}
+                noun="volume"
+              />
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -456,6 +525,7 @@ function Section({
   onDismiss,
   chapterCtl,
   count, // override for the chip count when it differs from rows.length
+  komikku = false,
 }) {
   const [open, setOpen] = useState(defaultOpen);
 
@@ -525,6 +595,13 @@ function Section({
               }
               onSelectAll={(on) => chapterCtl?.selectAll(row, on)}
               busy={chapterCtl?.isBusy(row.folderPath)}
+              volumeDeselected={chapterCtl?.deselectedFor(volumeKey(row.folderPath))}
+              onToggleVolume={(v) => chapterCtl?.toggleChapter(volumeKey(row.folderPath), v)}
+              onSetVolumesIgnored={(vs, ignored) =>
+                chapterCtl?.setIgnored(row.folderPath, vs, ignored, "volume")
+              }
+              onSelectAllVolumes={(on) => chapterCtl?.selectAllVolumes(row, on)}
+              komikku={komikku}
             />
           ))}
         </div>
@@ -587,6 +664,8 @@ export default function UpdatesCenter({
   onSetChaptersIgnored,
   // True iff there are checkable series (parent computes from libraryEntries)
   hasCheckableSeries,
+  // settings.defaults.komikku: volumes are shown but can't be queued.
+  komikku = false,
 }) {
   // The panel keeps a tiny render-only flag for the slide-in animation; the
   // mount itself is gated by `open` from the parent. When `open` flips to
@@ -661,15 +740,26 @@ export default function UpdatesCenter({
     });
   }, []);
 
+  // Volume twin of selectAll; volume ticks live under volumeKey(folderPath).
+  const selectAllVolumes = useCallback((row, on) => {
+    setDeselections((prev) => {
+      const next = new Map(prev);
+      if (on) next.delete(volumeKey(row.folderPath));
+      else next.set(volumeKey(row.folderPath), new Set(row.newVolumes || []));
+      return next;
+    });
+  }, []);
+
   // Cross out / restore. The row itself is updated by the hook once the write
   // lands; all this owns is the in-flight flag that greys the chips, so a
   // double click can't fire two writes for the same series.
+  // `kind` "volume" writes the volume namespace (useUpdateCheck setRowIgnored).
   const setIgnored = useCallback(
-    async (folderPath, chapters, ignored) => {
+    async (folderPath, chapters, ignored, kind = "chapter") => {
       if (!onSetChaptersIgnored) return;
       setBusyRows((prev) => new Set(prev).add(folderPath));
       try {
-        await onSetChaptersIgnored(folderPath, chapters, ignored);
+        await onSetChaptersIgnored(folderPath, chapters, ignored, kind);
       } finally {
         setBusyRows((prev) => {
           const next = new Set(prev);
@@ -680,15 +770,16 @@ export default function UpdatesCenter({
       // A crossed-out chapter leaves newChapters, so any deselection of it is
       // now dead weight; dropping it keeps "all/none" honest if it comes back.
       if (ignored) {
+        const key = kind === "volume" ? volumeKey(folderPath) : folderPath;
         setDeselections((prev) => {
-          const set = prev.get(folderPath);
+          const set = prev.get(key);
           if (!set) return prev;
           const nextSet = new Set(set);
           for (const c of chapters) nextSet.delete(c);
           if (nextSet.size === set.size) return prev;
           const next = new Map(prev);
-          if (nextSet.size === 0) next.delete(folderPath);
-          else next.set(folderPath, nextSet);
+          if (nextSet.size === 0) next.delete(key);
+          else next.set(key, nextSet);
           return next;
         });
       }
@@ -703,10 +794,17 @@ export default function UpdatesCenter({
       deselectedFor: (folderPath) => deselections.get(folderPath),
       toggleChapter,
       selectAll,
+      selectAllVolumes,
       setIgnored,
       isBusy: (folderPath) => busyRows.has(folderPath),
     }),
-    [expandedRows, deselections, busyRows, toggleExpand, toggleChapter, selectAll, setIgnored]
+    [expandedRows, deselections, busyRows, toggleExpand, toggleChapter, selectAll, selectAllVolumes, setIgnored]
+  );
+
+  // The row's ticked volumes ([] under Komikku: they can't be queued then).
+  const volumesFor = useCallback(
+    (row) => (komikku ? [] : selectedChapters(row.newVolumes || [], deselections.get(volumeKey(row.folderPath)))),
+    [deselections, komikku]
   );
 
   // The ticks are panel state, so the panel — not LibraryTab — is what turns a
@@ -716,10 +814,11 @@ export default function UpdatesCenter({
   const queueRow = useCallback(
     (row) => {
       const chapters = selectedChapters(row.newChapters || [], deselections.get(row.folderPath));
-      if (chapters.length === 0) return;
-      onQueueRow(row, chapters);
+      const volumes = volumesFor(row);
+      if (chapters.length === 0 && volumes.length === 0) return;
+      onQueueRow(row, chapters, volumes);
     },
-    [deselections, onQueueRow]
+    [deselections, onQueueRow, volumesFor]
   );
 
   // Group rows by state for the section rendering. We sort each bucket so
@@ -737,7 +836,11 @@ export default function UpdatesCenter({
       else if (row.state === "error") errors.push(row);
     }
     // Found: most chapters first (most "noticeable")
-    found.sort((a, b) => (b.newChapters?.length || 0) - (a.newChapters?.length || 0));
+    found.sort(
+      (a, b) =>
+        (b.newChapters?.length || 0) + (b.newVolumes?.length || 0)
+        - ((a.newChapters?.length || 0) + (a.newVolumes?.length || 0))
+    );
     // Active: running before queued, then enqueue order
     active.sort((a, b) => {
       if (a.state === b.state) return (a.enqueuedAt || 0) - (b.enqueuedAt || 0);
@@ -763,12 +866,17 @@ export default function UpdatesCenter({
         .map((row) => ({
           row,
           chapters: selectedChapters(row.newChapters || [], deselections.get(row.folderPath)),
+          volumes: volumesFor(row),
         }))
-        .filter((item) => item.chapters.length > 0),
-    [groups.found, deselections]
+        .filter((item) => item.chapters.length + item.volumes.length > 0),
+    [groups.found, deselections, volumesFor]
   );
   const queueAllChapterCount = useMemo(
     () => queueAllPlan.reduce((n, item) => n + item.chapters.length, 0),
+    [queueAllPlan]
+  );
+  const queueAllVolumeCount = useMemo(
+    () => queueAllPlan.reduce((n, item) => n + item.volumes.length, 0),
     [queueAllPlan]
   );
   const queueAll = useCallback(() => {
@@ -956,6 +1064,7 @@ export default function UpdatesCenter({
                 onQueue={queueRow}
                 onDismiss={(row) => onDismiss([row.folderPath])}
                 chapterCtl={chapterCtl}
+                komikku={komikku}
               />
               <Section
                 theme={SECTION_THEME.active}
@@ -971,6 +1080,7 @@ export default function UpdatesCenter({
                 rows={groups.uptodate}
                 defaultOpen={false}
                 chapterCtl={chapterCtl}
+                komikku={komikku}
               />
               <Section
                 theme={SECTION_THEME.errors}
@@ -996,9 +1106,12 @@ export default function UpdatesCenter({
                   "disabled:opacity-50 disabled:shadow-none"
                 )}
                 title={
-                  queueAllChapterCount === 0
+                  queueAllChapterCount + queueAllVolumeCount === 0
                     ? "Every new chapter is unticked or crossed out"
-                    : `${queueAllChapterCount} chapter${queueAllChapterCount === 1 ? "" : "s"} across ${queueAllPlan.length} series`
+                    : `${[
+                        queueAllChapterCount > 0 && `${queueAllChapterCount} chapter${queueAllChapterCount === 1 ? "" : "s"}`,
+                        queueAllVolumeCount > 0 && `${queueAllVolumeCount} volume${queueAllVolumeCount === 1 ? "" : "s"}`,
+                      ].filter(Boolean).join(" + ")} across ${queueAllPlan.length} series`
                 }
               >
                 <Download className="w-3.5 h-3.5" />

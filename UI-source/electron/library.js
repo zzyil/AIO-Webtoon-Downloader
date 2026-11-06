@@ -30,6 +30,15 @@
 //       images/                ← always present for --format none
 //         Chapter_1/
 //           0001.webp ...
+//     One Piece/               ← chapters AND native volumes (MangaFire)
+//       One Piece Ch 1.cbz
+//       One Piece Vol.01.cbz   ← --download-volumes; ledger under "volumes"
+//       images/Volume_1/       ← raw volume pages (--keep-images / none)
+//
+// VOLUMES: a volume file is never a chapter here (no " Ch ", and
+// KOMIKKU_CH_RE needs "Ch."), so chapter parsing ignores it. scanLibrary
+// reports volumes separately (volumeNumbers / trackedKinds) using the name
+// rules in series-ledger.js, the twin of library_state.py's volume scan.
 //
 // IMAGE-ONLY SERIES: a --format none download produces no pdf/epub/cbz, only
 // the images/ tree above. The scanner treats such a folder as a first-class
@@ -40,6 +49,14 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const {
+  trackedKinds,
+  kindView,
+  volumeFileBase,
+  parseVolumeNumberFromName,
+  parseRawVolumeDir,
+  sortedLabels,
+} = require("./series-ledger");
 
 // File extensions we care about (the final output files)
 const OUTPUT_EXTENSIONS = new Set(["pdf", "epub", "cbz"]);
@@ -689,9 +706,20 @@ function scanLibrary(mangasDir, thumbCacheDir) {
     let coverImagePath = null;
     let imageChapters = null;
 
+    // Raw volume page dirs (images/Volume_N). Read before the payload gate so
+    // a volume-only --format none series still counts as a series.
+    const rawVolumeLabels = [];
+    try {
+      for (const d of fs.readdirSync(imagesDir, { withFileTypes: true })) {
+        const n = d.isDirectory() ? parseRawVolumeDir(d.name) : null;
+        if (n !== null) rawVolumeLabels.push(n);
+      }
+    } catch {}
+
     if (isImageOnly) {
       const tree = scanImagesTree(imagesDir);
-      if (tree.chapterCount === 0) continue; // no payload → not a series
+      // no payload → not a series
+      if (tree.chapterCount === 0 && rawVolumeLabels.length === 0) continue;
       chapterCount = tree.chapterCount;
       imageCount = tree.imageCount;
       totalSize = tree.imageBytes;
@@ -718,6 +746,26 @@ function scanLibrary(mangasDir, thumbCacheDir) {
         seriesMeta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
       } catch {}
     }
+
+    // ── Volumes ──
+    // Union of the ledger's volume block, "<base> Vol.NN" archives and raw
+    // Volume_N dirs. `base` is the name a volume run writes (the ledger title,
+    // sanitized); passing it is what stops a combined archive of a series
+    // TITLED "... Vol.3" from reading as volume 3. Without a ledger title the
+    // folder name stands in, which is what allocate_series_output_dir uses.
+    const volBase = volumeFileBase(seriesMeta?.title) || volumeFileBase(folder.name);
+    const volumeLabelsOnDisk = [...rawVolumeLabels];
+    for (const f of files) {
+      const n = parseVolumeNumberFromName(f.name, volBase);
+      if (n !== null) volumeLabelsOnDisk.push(n);
+    }
+    const volumeNumbers = sortedLabels([
+      ...kindView(seriesMeta || {}, "volume").downloaded,
+      ...volumeLabelsOnDisk,
+    ]);
+    const seriesTrackedKinds = trackedKinds(seriesMeta || {}, {
+      volumeFilesPresent: volumeLabelsOnDisk.length > 0,
+    });
 
     // Image-only series can have undatable pages (rare). Fall back to the
     // metadata download stamp so sort-by-date and "Modified …" still work.
@@ -788,6 +836,12 @@ function scanLibrary(mangasDir, thumbCacheDir) {
       imageCount,
       coverImagePath,
       imageChapters,
+      // Native volumes (see VOLUMES in the header). volumeNumbers is sorted
+      // labels; trackedKinds is ["chapter"], ["volume"] or both, and decides
+      // which lists the update check asks for (main.js _checkSeriesUpdates).
+      volumeNumbers,
+      volumeCount: volumeNumbers.length,
+      trackedKinds: seriesTrackedKinds,
     });
   }
 

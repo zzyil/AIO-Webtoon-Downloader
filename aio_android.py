@@ -71,7 +71,7 @@ import queue
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 _CONFIG_LOCK = threading.Lock()
@@ -2185,6 +2185,16 @@ def series_files(folder: str) -> str:
     return json.dumps({"files": files, "chapter_dirs": chapter_dirs})
 
 
+class _ListError(Exception):
+    """A failed --list-chapters call inside check_series_updates: `code` is the
+    payload's error (or "check_failed"), reported to Kotlin unchanged."""
+
+    def __init__(self, code: str, message: str = ""):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
 def check_series_updates(
     folder: str,
     collapse_splits: bool = False,
@@ -2214,8 +2224,32 @@ def check_series_updates(
     downloaded before that key existed, or one copied onto the device by hand,
     and there the desktop's default reports every chapter as new. A union can
     only ever suppress a false "new", never hide a real one.
+
+    VOLUMES (native volume releases, MangaFire; series_ledger / item_kinds).
+    The ledger keeps them in their own namespace, and a series tracks chapters,
+    volumes or both (series_ledger.tracked_kinds, from the ledger plus volume
+    files on disk). Each kind is diffed only against its own downloads, with
+    the same spawn plan as the desktop (main.js, grep "Spawn plan"):
+      chapters only -> the plain listing, exactly as before
+      volumes only  -> one --download-volumes listing; newChapters stays EMPTY,
+                       since a chapter listing diffed against a volume-only
+                       ledger would offer every chapter of the series
+      both          -> one --with-volumes listing when both kinds use the same
+                       language, else one listing per kind
+    The volume half is reported as newVolumes / ignoredVolumes / volumesTotal /
+    volumesDownloaded (plus volumesError when only that listing failed), the
+    desktop's keys. The Kotlin app has no volume UI yet (deferred) and reads
+    only the chapter keys, so on the device a volume-only series simply shows
+    no chapter updates. No volume download is ever queued from here.
     """
-    from library_state import format_chapter_number, scan_downloaded_chapters
+    import series_ledger
+    from item_kinds import CHAPTER, VOLUME
+    from library_state import (
+        format_chapter_number,
+        scan_downloaded_chapters,
+        scan_downloaded_volumes,
+        volume_file_base,
+    )
 
     meta_path = os.path.join(folder, ".aio_series.json")
     if not os.path.isfile(meta_path):
@@ -2232,44 +2266,99 @@ def check_series_updates(
     if not url:
         return json.dumps({"error": "no_url"})
 
-    extra: List[str] = []
-    language = str(meta.get("language") or "").strip()
-    if language and language != "en":
-        extra.extend(["--language", language])
+    # The series' folders, `folder` first so a lone series (the overwhelmingly
+    # common case) costs exactly what it used to. Loaded up front because the
+    # kinds a series tracks decide what to list.
+    members: List[Tuple[str, Dict[str, Any]]] = [(folder, meta)]
+    for member in peer_folders or []:
+        member_path = os.path.join(member, ".aio_series.json")
+        try:
+            with open(member_path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            members.append((member, loaded if isinstance(loaded, dict) else {}))
+        except (OSError, ValueError):
+            # An unreadable peer contributes nothing rather than failing the
+            # check — the primary's own answer is still worth reporting.
+            members.append((member, {}))
+
+    # Volume files on disk count as "tracks volumes" too: an older build that
+    # rewrote the ledger drops the volumes block, and the files are then the
+    # only record (series_ledger.tracked_kinds, volume_files_present).
+    volume_disk: Set[str] = set()
+    kinds: Set[str] = set()
+    for member, member_meta in members:
+        base = volume_file_base(member_meta.get("title") or meta.get("title"))
+        on_disk = scan_downloaded_volumes(member, base=base)
+        volume_disk.update(format_chapter_number(n) for n in on_disk)
+        # An unreadable peer ({}) would read as a legacy chapter series and
+        # turn chapter tracking on for a volume-only series; its volume files
+        # still count. The primary always counts, as before.
+        if member_meta or member == folder:
+            kinds |= series_ledger.tracked_kinds(member_meta, volume_files_present=bool(on_disk))
+        elif on_disk:
+            kinds.add(VOLUME)
+    want_chapters = CHAPTER in kinds
+    want_volumes = VOLUME in kinds
+
     site = str(meta.get("site") or "").strip()
-    if site:
-        extra.extend(["--site", site])
-    if collapse_splits:
-        extra.append("--collapse-splits")
+    chapter_lang = str(meta.get("language") or "").strip() or "en"
+    volume_lang = series_ledger.kind_view(meta, VOLUME)["language"] or chapter_lang
 
+    def run_list(flags: List[str], lang: str) -> Dict[str, Any]:
+        """One --list-chapters call; raises _ListError with the payload's error."""
+        extra = list(flags)
+        if lang and lang != "en":
+            extra.extend(["--language", lang])
+        if site:
+            extra.extend(["--site", site])
+        # Volume numbers have no fragments, and the engine forces collapse off
+        # in volume mode, so the flag rides only on a chapter listing.
+        if collapse_splits and "--download-volumes" not in flags:
+            extra.append("--collapse-splits")
+        try:
+            result = json.loads(list_chapters(url, extra))
+        except (TypeError, ValueError) as exc:
+            raise _ListError("check_failed", str(exc))
+        if not isinstance(result, dict):
+            raise _ListError("check_failed", "unexpected payload")
+        if result.get("error"):
+            raise _ListError(str(result["error"]), str(result.get("message") or ""))
+        return result
+
+    # `payload` carries the chapter listing and the series fields (status,
+    # cover…); `volume_list` is the volume labels, or None when listing them
+    # failed while the chapter half succeeded.
+    volume_list: Optional[List[Any]] = None
+    volumes_error: Optional[str] = None
     try:
-        payload = json.loads(list_chapters(url, extra))
-    except (TypeError, ValueError) as exc:
-        return json.dumps({"error": "check_failed", "message": str(exc)})
-    if not isinstance(payload, dict):
-        return json.dumps({"error": "check_failed", "message": "unexpected payload"})
-    if payload.get("error"):
-        return json.dumps(
-            {"error": str(payload["error"]), "message": str(payload.get("message") or "")}
-        )
+        if not want_volumes:
+            payload = run_list([], chapter_lang)
+        elif not want_chapters:
+            payload = run_list(["--download-volumes"], volume_lang)
+            volume_list = payload.get("volumes") or []
+        elif volume_lang == chapter_lang:
+            payload = run_list(["--with-volumes"], chapter_lang)
+            # --with-volumes reports volumes: null when listing them raised and
+            # still returns the chapter half (aio-dl.py _series_listing_head).
+            if isinstance(payload.get("volumes"), list):
+                volume_list = payload["volumes"]
+            else:
+                volumes_error = "Couldn't list volumes"
+        else:
+            payload = run_list([], chapter_lang)
+            try:
+                volume_list = run_list(["--download-volumes"], volume_lang).get("volumes") or []
+            except _ListError as exc:
+                volumes_error = exc.message or exc.code
+    except _ListError as exc:
+        return json.dumps({"error": exc.code, "message": exc.message})
+    if not want_chapters:
+        payload = {**payload, "chapters": []}
 
-    # Union across the series' folders. `folder` is always first so a lone
-    # series (the overwhelmingly common case) costs exactly what it used to.
     downloaded: Set[str] = set()
     skipped: Set[str] = set()
     crossed_out: Set[str] = set()
-    for index, member in enumerate([folder, *(peer_folders or [])]):
-        member_meta = meta
-        if index:
-            member_path = os.path.join(member, ".aio_series.json")
-            try:
-                with open(member_path, "r", encoding="utf-8") as handle:
-                    loaded = json.load(handle)
-                member_meta = loaded if isinstance(loaded, dict) else {}
-            except (OSError, ValueError):
-                # An unreadable peer contributes nothing rather than failing the
-                # check — the primary's own answer is still worth reporting.
-                member_meta = {}
+    for member, member_meta in members:
         downloaded.update(str(c) for c in (member_meta.get("chapters_downloaded") or []))
         for number in scan_downloaded_chapters(member):
             downloaded.add(format_chapter_number(number))
@@ -2296,10 +2385,38 @@ def check_series_updates(
         except (TypeError, ValueError):
             group.sort()
 
+    # Volume diff, in the volume namespace only (ledger ∪ files on disk).
+    volume_fields: Dict[str, Any] = {}
+    if want_volumes:
+        have_volumes = set(volume_disk)
+        crossed_volumes: Set[str] = set()
+        for _member, member_meta in members:
+            view = series_ledger.kind_view(member_meta, VOLUME)
+            have_volumes.update(view["downloaded"])
+            crossed_volumes.update(view["ignored"])
+        site_volumes = [series_ledger.label_str(v) for v in (volume_list or [])]
+        absent_volumes = [v for v in site_volumes if v not in have_volumes]
+        new_volumes = sorted(
+            (v for v in absent_volumes if v not in crossed_volumes), key=series_ledger.label_sort_key
+        )
+        ignored_volumes = sorted(
+            (v for v in absent_volumes if v in crossed_volumes), key=series_ledger.label_sort_key
+        )
+        volume_fields = {
+            "newVolumes": new_volumes,
+            "ignoredVolumes": ignored_volumes,
+            "volumesTotal": len(site_volumes),
+            "volumesDownloaded": len(have_volumes),
+        }
+        if volumes_error:
+            volume_fields["volumesError"] = volumes_error
+
     return json.dumps(
         {
             "ok": True,
             "folder": folder,
+            "trackedKinds": [k for k in (CHAPTER, VOLUME) if k in kinds],
+            **volume_fields,
             "newChapters": missing,
             "ignoredChapters": ignored,
             "range": chapters_to_range(missing),

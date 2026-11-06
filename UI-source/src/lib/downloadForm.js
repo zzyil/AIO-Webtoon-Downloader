@@ -20,6 +20,8 @@
 // esbuild outside Vite.
 // ============================================================
 
+import { KOMIKKU_VOLUMES_MESSAGE } from "./downloadArgs.js";
+
 // ── DEFAULT VALUES ──
 // Match aio-dl.py's defaults so you can start a basic download
 // without changing anything.
@@ -118,12 +120,18 @@ export const DEFAULT_FORM = {
   // writes per-chapter ComicInfo.xml inside each CBZ, plus cover.jpg +
   // details.json at the series-folder root.
   komikku: false,
+  // Chapters | Volumes switch (DownloadTab). JOB DATA, not a setting: it is
+  // only valid for a URL on a site with native volumes, so it never belongs
+  // in settings.defaults (SettingsTab has no control for it, and
+  // formDefaults below forces it back to false whatever a saved dict holds).
+  downloadVolumes: false,
 };
 
 // What an untouched New tab shows: the hardcoded form defaults under the
 // user's saved download defaults (SettingsTab owns those).
 export function formDefaults(settings) {
-  return { ...DEFAULT_FORM, ...(settings?.defaults || {}) };
+  // downloadVolumes is job data (see DEFAULT_FORM); never inherited.
+  return { ...DEFAULT_FORM, ...(settings?.defaults || {}), downloadVolumes: false };
 }
 
 // Value equality for form fields (strings, numbers, booleans; arrays/objects
@@ -233,6 +241,15 @@ export function buildNewTabArgs(form, settings, { edits = {}, urlCount = 1 } = {
   // Komikku output. One boolean — Python does all the coercion.
   if (form.komikku) {
     args.komikku = true;
+  }
+  // Native volumes. Refused under Komikku rather than sent: aio-dl.py's
+  // --komikku turns --download-volumes off, so the job would quietly download
+  // CHAPTERS with the volume numbers. DownloadTab disables the switch while
+  // Komikku is on; this catches Komikku being switched on in Settings while
+  // the item waits in the queue (the recipe is resolved at start).
+  if (form.downloadVolumes) {
+    if (form.komikku) throw new Error(KOMIKKU_VOLUMES_MESSAGE);
+    args.downloadVolumes = true;
   }
   // Content-aware JXL/AVIF transcode. downloader.js:buildCliArgs strips the
   // whole family if the effective args can't ride the CBZ fast-path, so only

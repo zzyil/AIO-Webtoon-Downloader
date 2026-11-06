@@ -5,6 +5,39 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
+### 11.06.26
+
+**Native volume downloads (MangaFire):**
+- `--download-volumes` works again. MangaFire is the only site with native volume releases. Its implementation was lost when the handler moved to MangaFire's `/api/*` endpoints, so every volume run exited with "does not expose volume listing". It now lists and downloads volumes through `/api/titles/{id}/volumes` and `/api/volumes/{id}`.
+- Volumes and chapters of the same series share one folder and one Library entry, and can never overwrite each other:
+  - each volume is its own file, `Title Vol.01.cbz`;
+  - volume progress is recorded under a separate `volumes` key in `.aio_series.json`;
+  - an interrupted volume run resumes from its own `tmpvol_<id>` folder.
+- `--komikku` turns volume mode off (Komikku output is per chapter). Volume updates are skipped for series saved in Komikku mode, so a request for volumes 1-3 can't silently download chapters 1-3.
+- A volume run forces or ignores the chapter-only options, and says so in the log:
+  - forced: keep-chapters and no-final-file;
+  - ignored: multi-source, groups and MTL;
+  - refused: `--split`, which is an error.
+- `--list-chapters --download-volumes` lists volumes; `--with-volumes` lists both kinds.
+- `--site-capabilities` reports which sites offer volumes.
+- `--update-all` updates each kind a series tracks, using that kind's own format and language.
+
+**Desktop app:**
+- A Chapters | Volumes switch:
+  - on the New tab, for a single MangaFire URL;
+  - in the Search download dialog, on a MangaFire result.
+- The Library series page offers "Get volumes" on a MangaFire series that only has chapters. Check for Updates and the Updates panel show new volumes separately from new chapters.
+
+**Other front ends:**
+- REST API:
+  - `/api/chapters?type=volume` lists volumes, and returns an empty list when the site has none in that language;
+  - `/api/chapter_images` takes the same `type` and a `language`;
+  - `/api/handlers` reports `volumes_capable`.
+- Tk GUI: "Download volumes" is a per-download choice and is no longer saved as a preference. "Update Selected" updates volumes on series that have them.
+- Android: the update check compares each kind only against its own downloads. A series with volumes downloaded on the desktop no longer shows every chapter as new on the device.
+
+---
+
 ### 05.24.26
 
 **AIO-merged integration:**

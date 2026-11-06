@@ -7,6 +7,11 @@ import zipfile
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Set
 
+# Both stdlib-only at import time (series_ledger loads `sites` lazily, and only
+# to WRITE), so this module stays cheap for the Android and CLI scanners.
+import series_ledger
+from item_kinds import CHAPTER, RAW_VOLUME_DIR_RE, VOLUME, parse_volume_number_from_name
+
 
 SAVED_PARAMS_FILE = "download_params.json"
 SERIES_META_FILE = ".aio_series.json"
@@ -112,6 +117,76 @@ def scan_downloaded_chapters(folder: str) -> Set[Decimal]:
     return chapter_numbers
 
 
+def volume_file_base(title: object) -> Optional[str]:
+    """The file-name base a volume run writes for *title*, or None.
+
+    Same rule as aio-dl.py main()'s sanitize_filename (grep it there): drop
+    Windows-illegal characters, underscores become spaces, whitespace collapses,
+    no trailing dots or spaces. A volume run always clears --group (grep
+    "[Volumes] Forcing"), so its files are "<this> Vol.NN" with nothing in
+    between. Keep the two in step.
+    """
+    s = re.sub(r'[\\/*?:"<>|]', "", str(title or "")).replace("_", " ")
+    s = re.sub(r"\s+", " ", s).strip().rstrip(" .")
+    return s or None
+
+
+def scan_downloaded_volumes(folder: str, base: Optional[str] = None) -> Set[Decimal]:
+    """Volume numbers on disk: `<base> Vol.NN.<ext>` archives at the folder
+    root, plus `images/Volume_N` raw-image dirs (--keep-images / --format none).
+
+    The volume twin of scan_downloaded_chapters, and disjoint from it by
+    construction: a volume name has no "Ch", and the volume pattern is anchored
+    at the end of the stem, so Komikku's "Vol.01 Ch.005" is a chapter
+    (tests/test_item_kinds.py holds both directions).
+
+    *base* (volume_file_base of the ledger title) should be passed whenever it
+    is known. Without it, a combined archive of a series whose TITLE ends in
+    "Vol.3" reads as volume 3, and the update check would then start tracking
+    volumes for a chapter series.
+    """
+    numbers: Set[Decimal] = set()
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return numbers
+    for name in names:
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            if os.path.splitext(name)[1].lower() in SUPPORTED_BOOK_EXTS:
+                label = parse_volume_number_from_name(name, base=base)
+                parsed = parse_chapter_number(label) if label else None
+                if parsed is not None:
+                    numbers.add(parsed)
+            continue
+        if name != "images" or not os.path.isdir(path):
+            continue
+        try:
+            children = os.listdir(path)
+        except OSError:
+            continue
+        for child in children:
+            m = RAW_VOLUME_DIR_RE.match(child)
+            if m and os.path.isdir(os.path.join(path, child)):
+                parsed = parse_chapter_number(m.group(1))
+                if parsed is not None:
+                    numbers.add(parsed)
+    return numbers
+
+
+def _volume_format_from_files(folder: str, base: Optional[str] = None) -> Optional[str]:
+    # Fallback for a volume block that lacks `format` (rebuilt by the
+    # self-heal, or written by hand): the extension the volume files carry.
+    try:
+        for name in sorted(os.listdir(folder)):
+            ext = os.path.splitext(name)[1].lower()
+            if ext in SUPPORTED_BOOK_EXTS and parse_volume_number_from_name(name, base=base):
+                return ext[1:]
+    except OSError:
+        pass
+    return None
+
+
 def highest_contiguous_whole_chapter(chapter_numbers: Set[Decimal]) -> int:
     whole_numbers = {
         int(chapter)
@@ -132,6 +207,39 @@ def build_update_chapters_arg(chapter_numbers: Set[Decimal]) -> str:
     if _is_integral(latest):
         return f"{int(latest) + 1}-"
     return f"{format_chapter_number(latest)}-"
+
+
+def volume_update_argv(entry: Dict, output_dir: str) -> Optional[List[str]]:
+    """aio-dl.py flags (no interpreter, script or URL) that fetch the volumes a
+    scan_library *entry* is missing, or None when Komikku blocks it.
+
+    The one builder for a volume update, shared by aio-dl.py
+    _build_update_children (--update-all) and gui.py _update_selected, so the
+    two can't drift. Only the volume block's own format/language plus the
+    series' site and cookies ride along: groups, split, collapse, multi-source
+    and the image-size knobs are chapter-run settings (download_params.json is
+    written by chapter runs only), and a volume run coerces its layout flags
+    itself (grep "[Volumes] Forcing" in aio-dl.py).
+
+    None under Komikku (the series was saved with --komikku): --komikku turns
+    --download-volumes off, so the run would download CHAPTERS 1-3 where the
+    user tracked VOLUMES 1-3, silently. Callers say "skipped" instead.
+    """
+    params = entry.get("params") or {}
+    if params.get("komikku"):
+        return None
+    argv = [
+        "--download-volumes",
+        "--chapters", entry.get("next_volume_update") or "all",
+        "--format", entry.get("volume_format") or "cbz",
+        "--language", entry.get("volume_language") or entry.get("language") or "en",
+        "--output-dir", output_dir,
+    ]
+    if params.get("site"):
+        argv.extend(["--site", str(params["site"])])
+    if params.get("cookies"):
+        argv.extend(["--cookies", str(params["cookies"])])
+    return argv
 
 
 def load_saved_params(folder: str) -> tuple[bool, Dict]:
@@ -323,9 +431,17 @@ def list_saved_books(folder: str) -> List[str]:
             mtime = 0.0
         books.append((path, mtime))
 
+    # Combined archive first, then per-volume books, then per-chapter files:
+    # callers take books[0] as the series' representative book.
+    def _tier(path: str) -> int:
+        name = os.path.basename(path)
+        if CHAPTER_FILE_RE.search(name):
+            return 2
+        return 1 if parse_volume_number_from_name(name) else 0
+
     books.sort(
         key=lambda item: (
-            1 if CHAPTER_FILE_RE.search(os.path.basename(item[0])) else 0,
+            _tier(item[0]),
             -item[1],
             os.path.basename(item[0]).lower(),
         )
@@ -485,6 +601,20 @@ def scan_library(root: str) -> List[Dict]:
                 chapter_numbers.add(parsed)
         latest = max(chapter_numbers) if chapter_numbers else None
 
+        # Volumes (native volume releases; item_kinds / series_ledger). Kept
+        # apart from chapter_numbers: a volume number is not a chapter number.
+        vol_base = volume_file_base(series_meta.get("title"))
+        volume_files = scan_downloaded_volumes(folder, base=vol_base)
+        volume_numbers = set(volume_files)
+        volume_view = series_ledger.kind_view(series_meta, VOLUME)
+        for number in volume_view["downloaded"]:
+            parsed = parse_chapter_number(number)
+            if parsed is not None:
+                volume_numbers.add(parsed)
+        tracked = series_ledger.tracked_kinds(
+            series_meta, volume_files_present=bool(volume_files)
+        )
+
         book_files = list_saved_books(folder)
         total_size = 0
         for path in book_files:
@@ -519,6 +649,15 @@ def scan_library(root: str) -> List[Dict]:
                 "latest_chapter": format_chapter_number(latest) if latest is not None else "",
                 "chapter_numbers": chapter_numbers,
                 "next_update": build_update_chapters_arg(chapter_numbers),
+                # Which kinds an update should fetch, chapter first (grep
+                # _build_update_children in aio-dl.py). A volume-only series
+                # has no chapter entry here, so it never gets a chapter update.
+                "tracked_kinds": [k for k in (CHAPTER, VOLUME) if k in tracked],
+                "volumes": len(volume_numbers),
+                "volume_numbers": volume_numbers,
+                "next_volume_update": build_update_chapters_arg(volume_numbers),
+                "volume_format": volume_view["format"] or _volume_format_from_files(folder, vol_base),
+                "volume_language": volume_view["language"],
                 "files": len(book_files),
                 "size": total_size,
                 "cover": cover_path,

@@ -18,8 +18,10 @@
 //   kind          input                                   who queues it
 //   defaultsPlus  { jobArgs }                             Sync (App.jsx onQueueDownload)
 //   library       { meta:{format,language,site},          LibraryTab (update downloads)
-//                   chapters, folderPath }
+//                   chapters, folderPath, kind? }         kind "volume" = volume run;
+//                                                         absent = chapters (old items)
 //   search        { searchArgs, dialogEdits, extraArgs }  SearchTab dialog; App.startFoundDownload
+//                                                         dialogEdits.downloadVolumes = volume run
 //   newTab        { formEdits, urlCount }                 DownloadTab
 //
 // Decisions the user may flip (2026-10-17): a search's / Sync row's
@@ -138,8 +140,13 @@ export function resolveRecipe(recipe, s) {
         input.chapters,
         s?.verboseAlways,
         input.folderPath,
+        input.kind === "volume" ? "volume" : "chapter",
       );
-      return { ...defaults, ...built };
+      // The kind is the recipe's, never a setting: drop any downloadVolumes a
+      // defaults dict carries (downloadForm.js DEFAULT_FORM explains why it is
+      // job data).
+      const { downloadVolumes: _ignored, ...rest } = defaults;
+      return { ...rest, ...built };
     }
     case "search": {
       const searchArgs = _obj(input.searchArgs, "searchArgs");
@@ -147,8 +154,11 @@ export function resolveRecipe(recipe, s) {
         ...searchDialogInitial(s, searchArgs.multiSource),
         ..._obj(input.dialogEdits, "dialogEdits"),
       };
+      // Same as "library": the kind is the dialog's (searchDialogArgs sets
+      // downloadVolumes only in volume mode), never a defaults leftover.
+      const { downloadVolumes: _dv, ...rest } = defaults;
       return {
-        ...defaults,
+        ...rest,
         ...confirmSearchArgs(searchArgs, searchDialogArgs(form)),
         ..._obj(input.extraArgs, "extraArgs"),
       };
@@ -170,8 +180,27 @@ export function resolveRecipe(recipe, s) {
 // Recipe for a library update download. Keeps only the three series fields
 // buildLibraryDownloadArgs reads, so a queued item doesn't carry (or persist)
 // the whole .aio_series.json.
-export function libraryRecipe(meta, chapters, folderPath) {
+//
+// kind "volume": `chapters` holds VOLUME labels, and format/language come from
+// the ledger's "volumes" block (never the chapter format: series_ledger.py
+// kind_view). A block without a format leaves it undefined, so the builder
+// falls back to the shared default format (user decision 2026-11-06: one
+// format setting for both kinds). `kind` is only written for volumes, so a
+// chapter recipe persists exactly as before.
+export function libraryRecipe(meta, chapters, folderPath, kind = "chapter") {
   const m = meta || {};
+  if (kind === "volume") {
+    const v = m.volumes && typeof m.volumes === "object" && !Array.isArray(m.volumes) ? m.volumes : {};
+    return {
+      kind: "library",
+      input: {
+        meta: { format: v.format || undefined, language: v.language || m.language, site: m.site },
+        chapters,
+        folderPath: folderPath || undefined,
+        kind: "volume",
+      },
+    };
+  }
   return {
     kind: "library",
     input: {

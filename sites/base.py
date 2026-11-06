@@ -1477,10 +1477,99 @@ class BaseSiteHandler:
     ) -> List[Dict]:
         raise NotImplementedError
 
+    # --- Native volume releases ---------------------------------------------
+    # Some sites publish whole-volume scans as releases separate from their
+    # chapters (MangaFire: /api/titles/{hid}/volumes + /api/volumes/{id}).
+    # Volumes are NOT built here by grouping chapters by their volume tag.
+    # That was decided against (2026-11-06; memory volume-downloads.md).
+    #
+    # Override contract for a volume-capable handler:
+    #   get_volumes        -> chapter-shaped dicts, with "chap" = volume number
+    #   get_volume_images  -> page URLs of one volume
+    #   has_volumes        -> optional cheap per-series hint
+    # Callers never call these two fetchers directly. They go through
+    # list_volumes (stamps the kind tag) and get_item_images (routes by it), so
+    # a volume can't reach get_chapter_images. On a site whose volume and
+    # chapter ids overlap, that call would silently return a different
+    # chapter's pages.
+    #
+    # The kind tag is the literal "volume", the value of item_kinds.VOLUME.
+    # sites/ does not import that root module. Keep the two in step:
+    # grep _ITEM_KIND_VOLUME.
+    _ITEM_KIND_VOLUME = "volume"
+
     def get_volumes(
         self, context: SiteComicContext, scraper, language: str, make_request
     ) -> List[Dict]:
+        """Override: this series' native volume releases in *language*.
+        [] means none, which is also the default for every site without volumes."""
         return []
+
+    def get_volume_images(self, volume: Dict, scraper, make_request) -> List[str]:
+        """Override alongside get_volumes: the page URLs of one volume."""
+        raise NotImplementedError(
+            f"{type(self).__name__} lists volumes but cannot fetch their pages"
+        )
+
+    def has_volumes(self, context: SiteComicContext) -> Optional[bool]:
+        """Cheap per-series hint read from data the context fetch already has.
+        None = unknown; ask get_volumes. Used for --list-chapters --with-volumes
+        and for a clear `no_volumes` message."""
+        return None
+
+    @classmethod
+    def supports_volumes(cls) -> bool:
+        """True when the class overrides get_volumes. Derived from the code, not
+        declared, so it can't drift from the implementation. Same pattern as
+        api.py's search_capable. The UI's capability list reads it (grep
+        handler_capabilities)."""
+        return cls.get_volumes is not BaseSiteHandler.get_volumes
+
+    def list_volumes(
+        self, context: SiteComicContext, scraper, language: str, make_request
+    ) -> List[Dict]:
+        """get_volumes, normalized. Do not override.
+
+        Each item comes back with ``_kind="volume"``, ``vol`` = ``chap``, and
+        ``chap`` in the ``:g`` label form that --list-chapters and the ledger
+        use. Two kinds of item are dropped with a warning:
+          - a non-numeric number: the pipeline buckets, filters and names by
+            the number, and a label it can't parse would be dropped silently
+            further down anyway;
+          - a duplicate number: the LAST one wins, which for MangaFire is the
+            newest release.
+        """
+        out: Dict[str, Dict] = {}
+        for raw in self.get_volumes(context, scraper, language, make_request) or []:
+            item = dict(raw)
+            try:
+                num = float(item.get("chap"))
+                if not math.isfinite(num):
+                    raise ValueError
+            except (TypeError, ValueError):
+                # stderr: --list-chapters prints its JSON on stdout.
+                import sys
+
+                print(f"[!] {self.name}: skipping volume with no usable number: "
+                      f"{item.get('title') or item.get('chap')!r}", file=sys.stderr)
+                continue
+            label = f"{num:g}"
+            item["chap"] = label
+            item["vol"] = label
+            item["_kind"] = self._ITEM_KIND_VOLUME
+            out[label] = item
+        return sorted(out.values(), key=lambda v: float(v["chap"]))
+
+    def get_item_images(self, item: Dict, scraper, make_request) -> List[str]:
+        """THE entry point for fetching one item's pages. Do not override.
+
+        Routes on the ``_kind`` tag that list_volumes stamps. Untagged items
+        are chapters, so every existing chapter path behaves exactly as
+        before.
+        """
+        if item.get("_kind") == self._ITEM_KIND_VOLUME:
+            return self.get_volume_images(item, scraper, make_request)
+        return self.get_chapter_images(item, scraper, make_request)
 
     def get_group_infos(self, chapter_version: Dict) -> List[GroupInfo]:
         """Read a chapter's scanlation groups. THE canonical accessor.
@@ -2117,7 +2206,7 @@ class BaseSiteHandler:
         n = int(n_pages or self.MATCH_WINDOW_PAGES)
         out: Dict[str, Any] = {"pages": [], "n_total": 0, "attempted": 0, "failed": 0, "timed_out": 0}
         try:
-            items = self.get_chapter_images(chapter, scraper, make_request)
+            items = self.get_item_images(chapter, scraper, make_request)
         except (_PROBE_TIMEOUT_EXCEPTIONS, SiteBusyError):
             # SiteBusyError: this machine failed the call, not the site
             out.update(attempted=1, timed_out=1)

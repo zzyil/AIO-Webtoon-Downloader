@@ -14,6 +14,23 @@ const fs = require("fs");
 // copies in searcher.js before the dedup sweep; classifyLogLevel's
 // success branch is caller-specific, injected below via DOWNLOAD_SUCCESS_RE.
 const { NOISY_LINE_RE, stripAnsi, classifyLogLevel } = require("./log-filter");
+// tmp_<hid> vs tmpvol_<hid>: the resume scan and the ui_meta.json write both
+// need the run's item kind (grep parseTmpDirName).
+const { parseTmpDirName, tmpDirName, VOLUME, CHAPTER } = require("./series-ledger");
+
+// The engine's "this series has no volumes" exit (aio-dl.py, grep
+// "Volumes unavailable"). sys.exit prints it to STDERR, so both stream
+// handlers check it. Mapped to a sentence the Queue tab shows on the failed
+// card; the log line itself stays in the log as before.
+const VOLUMES_UNAVAILABLE_RE = /\[!\]\s*Volumes unavailable \((no_volumes|volumes_unsupported)\)/;
+const VOLUME_FAILURE_TEXT = {
+  no_volumes: "This series has no volumes in the selected language on this site.",
+  volumes_unsupported: "This site doesn't offer volume downloads.",
+};
+function failureReasonFor(line) {
+  const m = VOLUMES_UNAVAILABLE_RE.exec(line || "");
+  return m ? VOLUME_FAILURE_TEXT[m[1]] : null;
+}
 
 // Download-stream "this line is a success" markers (green in the LogPanel).
 // Passed to the shared classifyLogLevel; searcher.js supplies its own set.
@@ -187,6 +204,12 @@ function buildCliArgs(args) {
     // bypasses the cached-AniList-ID fast path and re-runs the fuzzy
     // title-match search on every download. See sites/external_metadata.py.
     metadataRefresh: "--metadata-refresh",
+    // Native volume run (MangaFire only). Job data, never a saved default:
+    // set by the New tab's Chapters | Volumes switch and by
+    // buildLibraryDownloadArgs(kind="volume"). Python announces and applies the
+    // volume coercions itself (grep "[Volumes] Forcing" in aio-dl.py), and
+    // --komikku turns it back off there, so nothing else is stripped here.
+    downloadVolumes: "--download-volumes",
   };
 
   // Add valued arguments
@@ -402,7 +425,9 @@ function parseProgressLine(line) {
   // "Filtered list down to 45 chapters."
   // "Selected 45 chapters."
   // "--no-partials: Filtered out 3 partial chapters."
-  const totalMatch = line.match(/(?:down to|Selected)\s+(\d+)\s+chapter/i);
+  // "volumes" too: a --download-volumes run prints "Selected 3 volumes." (the
+  // engine names the item kind; grep _noun_pl in aio-dl.py).
+  const totalMatch = line.match(/(?:down to|Selected)\s+(\d+)\s+(?:chapter|volume)/i);
   if (totalMatch) {
     progress.totalChapters = parseInt(totalMatch[1], 10);
   }
@@ -412,7 +437,9 @@ function parseProgressLine(line) {
   // "Chapter 8 (No Group)" or "Chapter 8 (SomeScan)" → downloading
   // "Chapter 8.5 (Official)" → partial chapter
   // These lines start with \n in the script, so after splitting they start with "Chapter"
-  const chapterMatch = line.match(/^Chapter\s+(\d+(?:[.~]\d+)?)\s+\((.+?)\)/);
+  // "Volume 3 (No Group)" in a volume run: same progress tick, the number
+  // is the volume's (grep space.noun in aio-dl.py).
+  const chapterMatch = line.match(/^(?:Chapter|Volume)\s+(\d+(?:[.~]\d+)?)\s+\((.+?)\)/);
   if (chapterMatch) {
     progress.currentChapter = parseFloat(chapterMatch[1].replace("~", "."));
     // "already processed" means it's a cached/resumed chapter
@@ -629,6 +656,7 @@ class Downloader {
       url,
       args: downloadArgs,
       prefetchedTempPath,
+      kind: downloadArgs?.downloadVolumes === true ? VOLUME : CHAPTER,
     });
 
     return downloadId;
@@ -690,6 +718,13 @@ class Downloader {
     // -u flag: unbuffered Python output (same as start())
     const cliArgs = ["-u", scriptPath, "--restore-parameters", "--format", format];
 
+    // A volume run resumes from tmpvol_<hid>, and aio-dl.py picks that dir from
+    // the CLI BEFORE --restore-parameters reads anything (grep "resume
+    // launchers must forward --download-volumes"). So the kind comes from the
+    // dir name here, not from the restored params.
+    const tmpKind = parseTmpDirName(path.basename(tmpDir || ""))?.kind || CHAPTER;
+    if (tmpKind === VOLUME) cliArgs.push("--download-volumes");
+
     // Add EPUB layout if format is epub
     if (format === "epub" && epubLayout) {
       cliArgs.push("--epub-layout", epubLayout);
@@ -710,7 +745,7 @@ class Downloader {
     const cmdString = `${pythonCmd} ${cliArgs.join(" ")}`;
     this._onLog(downloadId, `$ ${cmdString}`, "info");
 
-    this._spawn(downloadId, pythonCmd, cliArgs, workingDir, { url, resumed: true });
+    this._spawn(downloadId, pythonCmd, cliArgs, workingDir, { url, resumed: true, kind: tmpKind });
 
     return downloadId;
   }
@@ -718,6 +753,16 @@ class Downloader {
   /**
    * Internal: actually spawn the child process and wire up stdout/stderr.
    */
+  // Stderr twin of the stdout failure-reason check (sys.exit messages land on
+  // stderr). Publishes through the normal progress channel so the reason is
+  // part of the completion result and the Queue tab's failed card.
+  _noteFailureReason(downloadId, entry, rawLine) {
+    const reason = failureReasonFor(stripAnsi(rawLine || ""));
+    if (!reason || entry.progress.failureReason === reason) return;
+    entry.progress.failureReason = reason;
+    this._onProgress(downloadId, { ...entry.progress });
+  }
+
   _spawn(downloadId, pythonCmd, cliArgs, workingDir, meta) {
     // spawn() creates a new process. We pipe stdout and stderr so we
     // can read them line by line.
@@ -743,7 +788,12 @@ class Downloader {
       meta,
       startTime: Date.now(),
       // Accumulated progress data (gets updated as we parse log lines)
-      progress: { phase: "starting", title: "", totalChapters: 0, currentChapter: 0 },
+      // itemKind: "volume" for a --download-volumes run, so the Queue tab and
+      // the history entry say "Vol." instead of "Ch." (QueueTab.jsx itemAbbr).
+      progress: {
+        phase: "starting", title: "", totalChapters: 0, currentChapter: 0,
+        itemKind: meta?.kind || CHAPTER,
+      },
       // Running counter: how many "Chapter N" lines we've seen so far
       processedChapters: 0,
       // ETA estimator state — see applyChapterEta above. _lastTickCached is
@@ -832,7 +882,7 @@ class Downloader {
           // download history is cleared.
           if (progressUpdate.hid && !entry._metaSaved) {
             entry._metaSaved = true;
-            const tmpDir = path.join(workingDir, `tmp_${progressUpdate.hid}`);
+            const tmpDir = path.join(workingDir, tmpDirName(progressUpdate.hid, meta.kind));
             const metaPath = path.join(tmpDir, "ui_meta.json");
             try {
               // Only write if the tmp folder exists (created by aio-dl.py)
@@ -850,6 +900,8 @@ class Downloader {
             }
           }
 
+          const reason = failureReasonFor(line);
+          if (reason) progressUpdate.failureReason = reason;
           Object.assign(entry.progress, progressUpdate);
           this._onProgress(downloadId, { ...entry.progress });
         }
@@ -870,6 +922,7 @@ class Downloader {
 
       for (const rawLine of lines) {
         emit(rawLine);
+        this._noteFailureReason(downloadId, entry, rawLine);
       }
     });
 
@@ -893,6 +946,7 @@ class Downloader {
         // a trailing line without a final newline shouldn't auto-error.
         this._onLog(downloadId, tailStderr, classifyLogLevel(tailStderr, DOWNLOAD_SUCCESS_RE));
       }
+      this._noteFailureReason(downloadId, entry, tailStderr);
 
       // Clean up the prefetched-alts temp file (best-effort; see finalize).
       finalize();
@@ -1036,7 +1090,11 @@ class Downloader {
 
       for (const entry of entries) {
         // Only look at folders named tmp_<something>
-        if (!entry.isDirectory() || !entry.name.startsWith("tmp_")) continue;
+        // tmp_<hid> (chapters) or tmpvol_<hid> (volumes); one series can have
+        // both at once, so `kind` is part of every result and consumers key
+        // on tmpDir, not hid.
+        const parsedTmp = entry.isDirectory() ? parseTmpDirName(entry.name) : null;
+        if (!parsedTmp) continue;
 
         const tmpPath = path.join(workingDir, entry.name);
         const paramsPath = path.join(tmpPath, "run_params.json");
@@ -1081,7 +1139,7 @@ class Downloader {
           }
 
           // Extract the hid from the folder name: tmp_<hid> → <hid>
-          const hid = entry.name.replace(/^tmp_/, "");
+          const hid = parsedTmp.hid;
 
           results.push({
             hid,
@@ -1089,6 +1147,9 @@ class Downloader {
             params,
             cachedChapters,
             folderName: entry.name,
+            // The dir name, not run_meta.kind: it is what aio-dl.py reads and
+            // what resume() derives the flag from, so the two always agree.
+            kind: parsedTmp.kind,
             // From metadata files (may be empty if neither exists)
             url: meta.url || null,
             title: meta.title || null,

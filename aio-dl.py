@@ -56,6 +56,11 @@ from aio_config import (
     supported_hid_markers,
     write_hid_marker,
 )
+# item_kinds / series_ledger: chapter-vs-volume naming and the per-kind
+# .aio_series.json namespaces. Root-level siblings, so they are listed in
+# UI-source/scripts/prepare-src.js and android/app/build.gradle.kts too.
+import item_kinds
+import series_ledger
 from sites import get_handler_by_name, get_handler_for_url
 from sites.chapter_merger import group_chapters_for_download, _extract_chapter_num
 from sites.base import (
@@ -1843,6 +1848,85 @@ _HOST_CAP_LOCK = threading.Lock()
 # return early so the chapter aborts within seconds of the deadline.
 # None outside the chapter loop (e.g. during cover download).
 _CHAPTER_CANCEL: Optional[threading.Event] = None
+
+# Pages one --chapter-deadline-seconds budget is meant to cover. A chapter is
+# usually 20-60 pages, so the flat default fits it; a native volume is 150-250
+# pages and would always blow the flat budget. _ChapterDeadline stretches the
+# budget to n_pages * base / this once the page count is known.
+_DEADLINE_PAGES_PER_BASE = 60
+
+
+class _ChapterDeadline:
+    """The per-chapter watchdog: sets the chapter's cancel event after a
+    wall-clock budget, and can be stretched once the page count is known.
+
+    Owned by _process_chapter (one per attempt); the impl stretches it through
+    _extend_chapter_deadline_for_pages right after the page list comes back.
+    The budget only ever grows, never past the point it already fired (a fired
+    deadline has cancelled in-flight work, and re-arming would not undo that),
+    and is measured from the attempt's start, so a stretch adds the
+    difference, not a fresh full budget. Replaces a bare threading.Timer, which
+    cannot be moved once started.
+    """
+
+    def __init__(self, seconds: float, fire: Callable[[], None]) -> None:
+        self._base = float(seconds)
+        self._total = float(seconds)
+        self._fire = fire
+        self._start = time.monotonic()
+        self._lock = threading.Lock()
+        self._fired = False
+        self._closed = False
+        self._timer: Optional[threading.Timer] = None
+        self._arm(self._total)
+
+    def _on_timer(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._fired = True
+        self._fire()
+
+    def _arm(self, remaining: float) -> None:
+        self._timer = threading.Timer(max(0.0, remaining), self._on_timer)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def extend_for_pages(self, n_pages: int) -> float:
+        """Grow the budget to cover *n_pages*; returns the budget now in force."""
+        target = max(self._base, n_pages * self._base / _DEADLINE_PAGES_PER_BASE)
+        with self._lock:
+            if self._fired or self._closed or target <= self._total:
+                return self._total
+            if self._timer is not None:
+                self._timer.cancel()
+            self._total = target
+            self._arm(target - (time.monotonic() - self._start))
+            return self._total
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._closed = True
+            if self._timer is not None:
+                self._timer.cancel()
+
+
+# The deadline of the chapter attempt in progress, or None (no chapter running,
+# or --chapter-deadline-seconds 0). Same lifetime as _CHAPTER_CANCEL.
+_CHAPTER_DEADLINE_CTL: Optional[_ChapterDeadline] = None
+
+
+def _extend_chapter_deadline_for_pages(n_pages: int) -> None:
+    ctl = _CHAPTER_DEADLINE_CTL
+    if ctl is None or n_pages <= _DEADLINE_PAGES_PER_BASE:
+        return
+    before = ctl._total
+    after = ctl.extend_for_pages(n_pages)
+    if after > before:
+        log_verbose(
+            f"  Deadline stretched to {after:.0f}s for {n_pages} pages "
+            f"(--chapter-deadline-seconds covers {_DEADLINE_PAGES_PER_BASE})."
+        )
 
 # RUN-level cancel — "the user pressed stop", not "this chapter ran long".
 #
@@ -6786,6 +6870,8 @@ _RESUME_TRANSIENT_DESTS = frozenset({
     # rediscovered against current site state, so this stays
     # transient and the multi-source path re-runs the lookup.
     "multi_source_prefetched", "list_chapters", "build_final_file",
+    # Listing / capability modes (no download, so nothing to resume).
+    "with_volumes", "site_capabilities",
     "prompt_urls",
     # Internal re-entry guard set by the placeholder-only primary switch
     # (grep _argv_for_primary_switch); describes one spawn, never a setting.
@@ -6829,7 +6915,6 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         "mix_by_upvote": bool(getattr(args, "mix_by_upvote", False)),
         "no_group_fallback": bool(getattr(args, "no_group_fallback", False)),
         "no_partials": bool(getattr(args, "no_partials", False)),
-        "download_volumes": bool(getattr(args, "download_volumes", False)),
         "keep_chapters": bool(getattr(args, "keep_chapters", False)),
         "keep_images": bool(getattr(args, "keep_images", False)),
         "no_final_file": bool(getattr(args, "no_final_file", False)),
@@ -7038,7 +7123,6 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         ("mix_by_upvote", "--mix-by-upvote"),
         ("no_group_fallback", "--no-group-fallback"),
         ("no_partials", "--no-partials"),
-        ("download_volumes", "--download-volumes"),
         ("keep_images", "--keep-images"),
         ("no_final_file", "--no-final-file"),
         ("no_processing", "--no-processing"),
@@ -7123,6 +7207,66 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
             child_cmd.extend(["--modernize-avif-speed", str(int(ms))])
     if params.get("metadata_refresh"):
         child_cmd.append("--metadata-refresh")
+
+
+def _build_update_children(
+    entry: Dict[str, Any], scan_root: str, *, komikku: bool = False
+) -> List[Tuple[str, List[str]]]:
+    """--update-all: one child command per item kind this series tracks.
+
+    *entry* is a library_state.scan_library row. Returns [(label, argv)], the
+    chapter child first; the caller runs them in order (the two kinds share a
+    series folder and its ledger, which series_ledger locks, but running them
+    one after another keeps the log readable).
+
+    - chapter child: exactly the command --update-all always built, replaying
+      download_params.json (which only chapter runs write).
+    - volume child: --download-volumes with the volume block's own format and
+      language. None of the chapter replay applies: groups, split, collapse,
+      multi-source and the image-size knobs are chapter-run settings, and the
+      volume run coerces the layout flags itself.
+
+    *komikku* (the series was saved under --komikku, or this --update-all run
+    has it): no volume child. --komikku forces volume mode off, so the child
+    would download CHAPTERS 1-3 where the user tracked VOLUMES 1-3, silently.
+    """
+    title = entry.get("name", "series")
+    params = dict(entry.get("params") or {})
+    kinds = set(entry.get("tracked_kinds") or [item_kinds.CHAPTER])
+    children: List[Tuple[str, List[str]]] = []
+    base = [sys.executable, os.path.abspath(__file__), entry["url"]]
+    if item_kinds.CHAPTER in kinds:
+        chapters_arg = entry.get("next_update") or "all"
+        if chapters_arg == "all":
+            print(f"  {title}: downloading all chapters")
+        else:
+            print(f"  {title}: resuming from chapter {chapters_arg[:-1]}")
+        cmd = base + [
+            "--chapters", chapters_arg,
+            "--format", params.get("format") or entry.get("format") or "epub",
+            "--language", params.get("language") or entry.get("language") or "en",
+            "--output-dir", scan_root,
+            "--save-params",
+            "--keep-chapters",
+        ]
+        _append_saved_update_options(cmd, params)
+        children.append((title, cmd))
+    if item_kinds.VOLUME in kinds:
+        # library_state.volume_update_argv is shared with gui.py; it returns
+        # None when the SAVED params have Komikku on.
+        from library_state import volume_update_argv
+
+        vol_argv = None if komikku else volume_update_argv(entry, scan_root)
+        if vol_argv is None:
+            print(f"  {title}: volume updates skipped: Komikku mode is on")
+        else:
+            volumes_arg = entry.get("next_volume_update") or "all"
+            if volumes_arg == "all":
+                print(f"  {title}: downloading all volumes")
+            else:
+                print(f"  {title}: resuming from volume {volumes_arg[:-1]}")
+            children.append((f"{title} (volumes)", base + vol_argv))
+    return children
 
 
 def get_resumable_params(args, parser, calculated_width, calculated_aspect_ratio):
@@ -7697,7 +7841,7 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
             media_entries: List[Any] = []
             for part in merged_parts:
                 try:
-                    part_entries = handler.get_chapter_images(
+                    part_entries = handler.get_item_images(
                         part, scraper, make_request
                     ) or []
                     media_entries.extend(part_entries)
@@ -7708,7 +7852,7 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                     return
         else:
             try:
-                media_entries = handler.get_chapter_images(
+                media_entries = handler.get_item_images(
                     next_chapter, scraper, make_request
                 ) or []
             except Exception as exc:
@@ -8437,7 +8581,7 @@ def _refresh_library_metadata(args) -> int:
     library_state.scan_library, _rewrite_cbz_comicinfo,
     _komikku_status_to_digit, _serialize_anilist_tag.
     """
-    from library_state import scan_library, SERIES_META_FILE
+    from library_state import scan_library
     from sites.external_metadata import enrich_from_anilist
 
     root = os.path.abspath(args.output_dir)
@@ -8617,33 +8761,35 @@ def _refresh_library_metadata(args) -> int:
             continue
 
         # Rewrite .aio_series.json enrichment fields (preserve the rest).
-        meta["genres"] = list(comic_data.get("genres") or [])
-        # authors: AniList overwrites these on a confident match ("always wins",
-        # grep _staff_names_by_role). comic_data["authors"] is AniList's staff, or
-        # the seeded meta value when the match carried no staff — never blank, so
-        # the unconditional assign is safe and keeps the live-download writer's
-        # behavior (aio-dl.py:12375). (.aio_series.json has no "artists" key by
-        # schema; the artist credit lives in details.json + ComicInfo only.)
-        meta["authors"] = list(comic_data.get("authors") or [])
-        if comic_data.get("status"):
-            meta["status"] = comic_data["status"]
-        # Repoint the cover URL to AniList's when enrichment supplied one so
-        # .aio_series.json + the UI thumbnail (library.js keys on
-        # seriesMeta.cover) normalize too. comic_data["cover"] is the AniList
-        # URL after enrich, or the unchanged site cover when AniList had none
-        # — safe to assign unconditionally.
-        meta["cover"] = comic_data.get("cover")
-        # Same seven AniList fields the live-download .aio_series.json writer
-        # emits; .update overwrites the loaded meta's existing keys in place
-        # (order preserved), matching the prior sequential assignments byte-for-
-        # byte. grep _anilist_meta_fields.
-        meta.update(_anilist_meta_fields(comic_data))
+        # Applied to a copy re-read UNDER the series lock (series_ledger.
+        # update_series_meta), not to the scan-time `meta` snapshot, so a
+        # download finishing on this series meanwhile keeps its labels.
+        def _apply_enrichment(meta):
+            meta["genres"] = list(comic_data.get("genres") or [])
+            # authors: AniList overwrites these on a confident match ("always wins",
+            # grep _staff_names_by_role). comic_data["authors"] is AniList's staff, or
+            # the seeded meta value when the match carried no staff — never blank, so
+            # the unconditional assign is safe and keeps the live-download writer's
+            # behavior (aio-dl.py:12375). (.aio_series.json has no "artists" key by
+            # schema; the artist credit lives in details.json + ComicInfo only.)
+            meta["authors"] = list(comic_data.get("authors") or [])
+            if comic_data.get("status"):
+                meta["status"] = comic_data["status"]
+            # Repoint the cover URL to AniList's when enrichment supplied one so
+            # .aio_series.json + the UI thumbnail (library.js keys on
+            # seriesMeta.cover) normalize too. comic_data["cover"] is the AniList
+            # URL after enrich, or the unchanged site cover when AniList had none
+            # — safe to assign unconditionally.
+            meta["cover"] = comic_data.get("cover")
+            # Same seven AniList fields the live-download .aio_series.json writer
+            # emits; .update overwrites the loaded meta's existing keys in place
+            # (order preserved), matching the prior sequential assignments byte-for-
+            # byte. grep _anilist_meta_fields.
+            meta.update(_anilist_meta_fields(comic_data))
+            return meta
         try:
-            with open(
-                os.path.join(folder, SERIES_META_FILE), "w", encoding="utf-8"
-            ) as f:
-                json.dump(meta, f, indent=2)
-        except OSError as exc:
+            series_ledger.update_series_meta(folder, _apply_enrichment)
+        except (OSError, ValueError) as exc:
             print(f"  [!] {title}: .aio_series.json write failed: {exc}")
             failed.append(title)
             continue
@@ -9197,16 +9343,35 @@ def main():
         action="store_true",
         help="Skip chapters with partial numbers (e.g., 1.5, 60.1).",
     )
-    p.add_argument("--chapters", default="all")
+    p.add_argument(
+        "--chapters",
+        default="all",
+        help="Which items to download: 'all', ranges like '1-10,15', or '-3' for the "
+        "last three. With --download-volumes these are VOLUME numbers.",
+    )
     p.add_argument(
         "--list-chapters",
         action="store_true",
-        help="Fetch the chapter list and series metadata as JSON, then exit. No downloading.",
+        help="Fetch the chapter list and series metadata as JSON, then exit. No downloading. "
+        "With --download-volumes, lists volumes instead (under a 'volumes' key).",
+    )
+    p.add_argument(
+        "--with-volumes",
+        action="store_true",
+        help="With --list-chapters: also list the site's native volume releases "
+        "('volumes', 'volumes_supported', 'has_volumes' keys).",
     )
     p.add_argument(
         "--download-volumes",
         action="store_true",
-        help="Download volumes instead of chapters, if the selected site exposes volume listing.",
+        help="Download the site's native volume releases instead of chapters (MangaFire). "
+        "Each volume is saved as '<Title> Vol.NN.<format>' in the series folder. "
+        "Implies --keep-chapters --no-final-file; ignored under --komikku.",
+    )
+    p.add_argument(
+        "--site-capabilities",
+        action="store_true",
+        help="Print every supported site with what it can do (search, volumes) as JSON, then exit.",
     )
     p.add_argument(
         "--scan-library",
@@ -9728,6 +9893,16 @@ def main():
         uvicorn.run("api:app", host=args.api_host, port=args.api_port, reload=False)
         return
 
+    if getattr(args, "site_capabilities", False):
+        # The UI's per-site feature list (Chapters | Volumes switch). Derived
+        # from the handler classes, so it needs no network and no URL.
+        # Consumers: UI-source/electron/main.js (grep site-capabilities),
+        # api.py /api/handlers.
+        from sites import handler_capabilities
+
+        print(json.dumps(handler_capabilities()))
+        return
+
     if args.scan_library:
         from library_state import scan_library, to_jsonable
 
@@ -9745,34 +9920,19 @@ def main():
         if not entries:
             sys.exit(f"No saved series metadata found in {scan_root}.")
         print(f"[*] Found {len(entries)} saved series in {scan_root}")
-        child_procs = []
+        # One job per SERIES, holding one child per tracked kind (grep
+        # _build_update_children). A series' chapter and volume children run in
+        # sequence inside its job, so --jobs parallelism is across series only.
+        series_jobs: List[List[Tuple[str, List[str]]]] = []
         for entry in entries:
-            chapters_arg = entry.get("next_update") or "all"
-            title = entry.get("name", "series")
-            if chapters_arg == "all":
-                print(f"  {title}: downloading all chapters")
-            else:
-                print(f"  {title}: resuming from chapter {chapters_arg[:-1]}")
-            params = dict(entry.get("params") or {})
-            child_cmd = [
-                sys.executable,
-                os.path.abspath(__file__),
-                entry["url"],
-                "--chapters",
-                chapters_arg,
-                "--format",
-                params.get("format") or entry.get("format") or "epub",
-                "--language",
-                params.get("language") or entry.get("language") or "en",
-                "--output-dir",
-                scan_root,
-                "--save-params",
-                "--keep-chapters",
-            ]
-            _append_saved_update_options(child_cmd, params)
-            child_procs.append((title, child_cmd))
+            kids = _build_update_children(
+                entry, scan_root, komikku=bool(getattr(args, "komikku", False))
+            )
+            if kids:
+                series_jobs.append(kids)
+        child_procs = [kid for kids in series_jobs for kid in kids]
 
-        def _run_saved_update(title: str, cmd: List[str]) -> Tuple[str, int, str, str]:
+        def _run_one(title: str, cmd: List[str]) -> Tuple[str, int, str, str]:
             proc = subprocess.run(
                 cmd,
                 cwd=os.path.dirname(os.path.abspath(__file__)),
@@ -9780,6 +9940,9 @@ def main():
                 text=True,
             )
             return title, proc.returncode, proc.stdout, proc.stderr
+
+        def _run_saved_update(kids: List[Tuple[str, List[str]]]) -> List[Tuple[str, int, str, str]]:
+            return [_run_one(title, cmd) for title, cmd in kids]
 
         failed = []
         up_to_date = []
@@ -9793,33 +9956,35 @@ def main():
             sys.stderr.write(stderr)
             if returncode != 0:
                 combined = stdout + stderr
-                if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
+                # A volume child reports "No volumes selected." (grep that
+                # string in main()), a chapter child "No chapters selected".
+                if (
+                    "No chapters selected" in combined
+                    or "No volumes selected" in combined
+                    or "Filtered list down to 0 " in combined
+                ):
                     up_to_date.append(title)
                     print("  Already up to date.")
                 else:
                     failed.append(title)
 
+        def _report(results: List[Tuple[str, int, str, str]]) -> None:
+            for title, returncode, stdout, stderr in results:
+                print(f"\n{'=' * 60}")
+                print(f"Updating: {title}")
+                print(f"{'=' * 60}")
+                _classify_update_result(title, returncode, stdout, stderr)
+
         jobs = max(1, int(getattr(args, "jobs", 1) or 1))
         if jobs > 1:
             print(f"[*] Running updates with up to {jobs} worker(s)...")
             with ThreadPoolExecutor(max_workers=jobs) as executor:
-                futures = [
-                    executor.submit(_run_saved_update, title, cmd)
-                    for title, cmd in child_procs
-                ]
+                futures = [executor.submit(_run_saved_update, kids) for kids in series_jobs]
                 for future in as_completed(futures):
-                    title, returncode, stdout, stderr = future.result()
-                    print(f"\n{'=' * 60}")
-                    print(f"Updating: {title}")
-                    print(f"{'=' * 60}")
-                    _classify_update_result(title, returncode, stdout, stderr)
+                    _report(future.result())
         else:
-            for title, cmd in child_procs:
-                print(f"\n{'=' * 60}")
-                print(f"Updating: {title}")
-                print(f"{'=' * 60}")
-                _, returncode, stdout, stderr = _run_saved_update(title, cmd)
-                _classify_update_result(title, returncode, stdout, stderr)
+            for kids in series_jobs:
+                _report(_run_saved_update(kids))
         print(f"\n{'=' * 60}")
         updated = len(child_procs) - len(failed) - len(up_to_date)
         print(f"Update complete: {updated} updated, {len(up_to_date)} up-to-date, {len(failed)} failed")
@@ -9918,6 +10083,15 @@ def main():
         if not args.no_final_file:
             coerced_bits.append("--no-final-file")
             args.no_final_file = True
+        # Komikku has no volume file layout (user decision 2026-11-06), so a
+        # Komikku run is always a chapter run. Coerced here, before the item
+        # space is chosen below. The update paths refuse to build a volume
+        # job under Komikku instead of relying on this (grep
+        # _build_update_children), because this coercion would turn
+        # "volumes 1-3" into "chapters 1-3".
+        if getattr(args, "download_volumes", False):
+            coerced_bits.append("off --download-volumes")
+            args.download_volumes = False
         if coerced_bits:
             print(
                 f"[Komikku] Forcing { ' '.join(coerced_bits) } for spec-"
@@ -9925,6 +10099,52 @@ def main():
             )
         else:
             print("[Komikku] Per-chapter CBZ output enabled (spec-compliant).")
+
+    # --download-volumes: one file per native volume, nothing else. Each
+    # coercion below exists because the stage it switches off keys on the item
+    # number, or only makes sense for chapters (see item_kinds.ItemSpace):
+    #   keep_chapters + no_final_file: a volume is already a whole book; the
+    #     combined "{title}.{fmt}" archive would collide with the chapter one.
+    #   collapse_splits: chapter-fragment merging; volumes have no fragments.
+    #   multi-source: other sites list chapters, not this site's volume scans.
+    #   group / exclude-group / mtl / mix-by-upvote: chapter version
+    #     selection; a volume number has one release. --group would also
+    #     add the group name to the file name.
+    # Same one-line notice as --komikku's.
+    if getattr(args, "download_volumes", False):
+        if args.split:
+            p.error(
+                "--split cannot be used with --download-volumes: each volume is "
+                "already saved as its own file."
+            )
+        vol_bits: List[str] = []
+        for dest, flag, off in (
+            ("keep_chapters", "--keep-chapters", True),
+            ("no_final_file", "--no-final-file", True),
+            ("collapse_splits", "off --collapse-splits", False),
+            ("multi_source", "off --multi-source", False),
+            ("multi_source_lazy", "off --multi-source-lazy", False),
+            ("mix_by_upvote", "off --mix-by-upvote", False),
+        ):
+            if bool(getattr(args, dest, False)) != off:
+                vol_bits.append(flag)
+                setattr(args, dest, off)
+        for dest, flag in (("group", "--group"), ("exclude_group", "--exclude-group")):
+            if getattr(args, dest, None):
+                vol_bits.append(f"off {flag}")
+                setattr(args, dest, [])
+        if getattr(args, "mtl", "avoid") != "avoid":
+            vol_bits.append(f"--mtl avoid (was {args.mtl})")
+            args.mtl = "avoid"
+        # Silent for --list-chapters, which downloads nothing: there the
+        # notice would only be noise on the stdout that carries the JSON.
+        if vol_bits and not getattr(args, "list_chapters", False):
+            print(f"[Volumes] Forcing {' '.join(vol_bits)} for per-volume output.")
+
+    # The run's item kind, fixed from here on: every storage key (tmp dir,
+    # file name, images/ folder, ledger namespace) is derived from it. See
+    # item_kinds.py's header for why one kind per run.
+    space = item_kinds.space_for(bool(getattr(args, "download_volumes", False)))
 
     if args.no_final_file and (not args.keep_chapters):
         p.error("--no-final-file requires --keep-chapters.")
@@ -10477,14 +10697,20 @@ def main():
     # to exclude that suffix.
     title = re.sub(r"\s*\(hid=[^)]+\)\s*$", "", str(title or "")).strip() or "comic"
     print(f"{title} (hid={hid})")
-    _emit("series", title=title, hid=hid, url=getattr(args, "comic_url", None))
+    _emit("series", title=title, hid=hid, url=getattr(args, "comic_url", None), item_kind=space.kind)
 
+    # tmp_<hid> for chapters, tmpvol_<hid> for volumes: run_params.json, the
+    # per-item ch_<n>/ dirs and missed_chapters.json all live in here, so the
+    # two kinds of one series resume independently instead of wiping each
+    # other's partial progress on a gating-hash mismatch. Chosen from the CLI,
+    # before --restore-parameters reads anything, which is why resume launchers
+    # must forward --download-volumes (grep parse_tmp_dir_name).
     temp_dir_base = getattr(args, "temp_dir", None)
     if temp_dir_base:
         os.makedirs(temp_dir_base, exist_ok=True)
-        main_tmp_dir = os.path.abspath(os.path.join(temp_dir_base, f"tmp_{hid}"))
+        main_tmp_dir = os.path.abspath(os.path.join(temp_dir_base, space.tmp_dir_name(hid)))
     else:
-        main_tmp_dir = os.path.abspath(f"tmp_{hid}")
+        main_tmp_dir = os.path.abspath(space.tmp_dir_name(hid))
 
     if args.restore_parameters:
         params_path = os.path.join(main_tmp_dir, "run_params.json")
@@ -10722,32 +10948,82 @@ def main():
         safe_group = sanitize_filename(" ".join(args.group))
         base_filename = join_name(base_filename, safe_group)
 
-    # Advisory early-stop hint for handlers with expensive paginated chapter
-    # listing (comix's browser DOM scrape walks up to ~360 pager pages on a
-    # long multi-group series). Set on the INSTANCE just before the call; see
-    # BaseSiteHandler.chapter_floor_hint for the contract. None whenever the
-    # floor isn't provably safe, so this can never drop a wanted chapter — the
-    # real --chapters filter still runs over the returned pool below either way.
-    chapter_floor = _chapter_range_floor(getattr(args, "chapters", "all"))
-    try:
-        handler.chapter_floor_hint = chapter_floor
-    except Exception:
-        # Handlers are plain objects, but never let a hint break the run.
-        chapter_floor = None
+    def _series_listing_head() -> Dict[str, Any]:
+        # The series half of every --list-chapters payload, both kinds.
+        return {
+            "hid": hid,
+            "title": title,
+            "url": args.comic_url,
+            "site": handler.name,
+            "status": comic_data.get("status"),
+            "authors": comic_data.get("authors", []),
+            "cover": comic_data.get("cover"),
+            "genres": comic_data.get("genres", []),
+        }
 
-    if getattr(args, "download_volumes", False):
-        pool = handler.get_volumes(context, scraper, args.language, make_request)
-        if not pool:
-            sys.exit("This site handler does not expose volume listing.")
+    def _volumes_unavailable(code: str, message: str) -> None:
+        # Two distinct outcomes the UI words differently: the SITE has no
+        # volume support (`volumes_unsupported`), or THIS series has none in
+        # this language (`no_volumes`). The bracketed code is the stable
+        # marker for log parsers (UI-source/electron/downloader.js).
+        _emit("error", code=code, message=message)
+        sys.exit(f"[!] Volumes unavailable ({code}): {message}")
+
+    chapter_floor = None
+    if space.is_volume:
+        if not handler.supports_volumes():
+            _volumes_unavailable(
+                "volumes_unsupported",
+                f"{handler.name} does not publish volume releases. Download chapters instead.",
+            )
+        pool = handler.list_volumes(context, scraper, args.language, make_request)
+        if not pool and not getattr(args, "list_chapters", False):
+            _volumes_unavailable(
+                "no_volumes",
+                f"{handler.name} lists no volumes of '{title}' in language "
+                f"'{args.language}'.",
+            )
     else:
+        # Advisory early-stop hint for handlers with expensive paginated
+        # chapter listing (comix's browser DOM scrape walks up to ~360 pager
+        # pages on a long multi-group series). Set on the INSTANCE just before
+        # the call; see BaseSiteHandler.chapter_floor_hint for the contract.
+        # None whenever the floor isn't provably safe, so this can never drop a
+        # wanted chapter — the real --chapters filter still runs over the
+        # returned pool below either way. Chapter runs only: in a volume run
+        # --chapters holds VOLUME numbers.
+        chapter_floor = _chapter_range_floor(getattr(args, "chapters", "all"))
+        try:
+            handler.chapter_floor_hint = chapter_floor
+        except Exception:
+            # Handlers are plain objects, but never let a hint break the run.
+            chapter_floor = None
         pool = handler.get_chapters(context, scraper, args.language, make_request)
 
     # A floored listing is a PARTIAL view of the series by design, so the
     # "how many chapters existed at download time" stat below must not report
     # it as the total. Volumes never take the hint.
-    pool_is_partial = bool(chapter_floor is not None) and not getattr(
-        args, "download_volumes", False
-    )
+    pool_is_partial = chapter_floor is not None
+
+    # --list-chapters --download-volumes: the volume half of the protocol.
+    # Volumes go under `volumes`, never under `chapters`: the update check
+    # diffs `chapters` against chapters_downloaded, and volume numbers there
+    # would read as "+N new chapters". `chapters` stays present and empty for
+    # readers that expect the key. Cross-file: main.js _checkSeriesUpdates,
+    # aio_android.py check_series_updates.
+    if space.is_volume and getattr(args, "list_chapters", False):
+        print(json.dumps({
+            **_series_listing_head(),
+            "kind": space.kind,
+            "total": 0,
+            "chapters": [],
+            "volumes": [v["chap"] for v in pool],
+            "volume_titles": {v["chap"]: v.get("title") for v in pool},
+            "volumes_total": len(pool),
+            "volumes_supported": True,
+            "has_volumes": bool(pool),
+        }))
+        sys.exit(0)
 
     # ── Multi-source: find alternatives for fallback ──
     # When --multi-source is set, find the series on other handlers and
@@ -11111,14 +11387,7 @@ def main():
             })
 
         result = {
-            "hid": hid,
-            "title": title,
-            "url": args.comic_url,
-            "site": handler.name,
-            "status": comic_data.get("status"),
-            "authors": comic_data.get("authors", []),
-            "cover": comic_data.get("cover"),
-            "genres": comic_data.get("genres", []),
+            **_series_listing_head(),
             "total": len(unique_chapters),
             "chapters": unique_chapters,
             # Placeholder-only numbers (tapas premium, MangaDex publisher
@@ -11128,6 +11397,26 @@ def main():
             "collapse_applied": collapse_splits_enabled,
             "groups": group_rows,
         }
+        # --with-volumes: the update check of a series that tracks BOTH kinds
+        # lists both in one spawn (one context fetch, one signer boot on
+        # MangaFire). A volume-listing failure must not cost the chapter
+        # listing, which is the half every update check needs, so it degrades
+        # to "unknown" (volumes None) rather than failing the spawn.
+        if getattr(args, "with_volumes", False):
+            supported = handler.supports_volumes()
+            result["volumes_supported"] = supported
+            result["has_volumes"] = handler.has_volumes(context) if supported else False
+            vols: Optional[List[Dict[str, Any]]] = []
+            if supported and result["has_volumes"] is not False:
+                try:
+                    vols = handler.list_volumes(context, scraper, args.language, make_request)
+                except Exception as exc:
+                    print(f"[!] Volume listing failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    vols = None
+            result["volumes"] = None if vols is None else [v["chap"] for v in vols]
+            result["volumes_total"] = None if vols is None else len(vols)
+            if vols:
+                result["has_volumes"] = True
         print(json.dumps(result))
         sys.exit(0)
 
@@ -11553,6 +11842,11 @@ def main():
             f"  --no-partials: Filtered out {original_count - len(chapters)} partial chapters."
         )
 
+    # "chapters" / "volumes" in the selection log lines. The Electron progress
+    # parser reads "Selected N <noun>" (UI-source/electron/downloader.js,
+    # grep totalMatch), so both nouns must stay plain English plurals.
+    _noun_pl = space.noun.lower() + "s"
+
     if args.chapters.lower() != "all":
         # Check for negative indexing (e.g. "-1" for last chapter, "-3" for last 3)
         is_negative_index = False
@@ -11566,7 +11860,7 @@ def main():
                     chapters = chapters[val:]
                     is_negative_index = True
                     log_verbose(
-                        f"  --chapters '{args.chapters}': Interpreted as last {-val} chapters. Selected {len(chapters)} chapters."
+                        f"  --chapters '{args.chapters}': Interpreted as last {-val} {_noun_pl}. Selected {len(chapters)} {_noun_pl}."
                     )
         except ValueError:
             pass
@@ -11580,15 +11874,17 @@ def main():
                 return cf is not None and is_chapter_wanted(cf, args.chapters)
             chapters = [c for c in chapters if _wanted(c)]
             log_verbose(
-                f"  --chapters '{args.chapters}': Filtered list down to {len(chapters)} chapters."
+                f"  --chapters '{args.chapters}': Filtered list down to {len(chapters)} {_noun_pl}."
             )
 
     if not chapters:
-        sys.exit("No chapters selected.")
+        # "No chapters selected" / "No volumes selected": --update-all's child
+        # classifier reads both as "nothing new" (grep _classify_update_result).
+        sys.exit(f"No {_noun_pl} selected.")
     # Always print the final chapter count so the UI can show a progress bar.
     # This is parsed by the Electron app to determine the total for the
     # "Chapter X/Y" progress indicator (regex: /Selected \d+ chapters/).
-    print(f"  Selected {len(chapters)} chapters.")
+    print(f"  Selected {len(chapters)} {_noun_pl}.")
     _emit("chapters_selected", total=len(chapters))
     # --- End of Chapter Selection Logic ---
 
@@ -11596,7 +11892,11 @@ def main():
     out_dir = getattr(args, "output_dir", DEFAULT_OUTPUT_DIR)
     os.makedirs(out_dir, exist_ok=True)
 
-    if getattr(args, "save_params", False):
+    # download_params.json is the CHAPTER namespace's replay record (read by
+    # --update-all and the UI's library recipe). A volume run must not
+    # overwrite it: its format and flags would be replayed onto the next
+    # chapter update.
+    if getattr(args, "save_params", False) and not space.is_volume:
         _save_download_params(out_dir, args.comic_url, args, title)
 
     resume_mode = False
@@ -11679,6 +11979,9 @@ def main():
             "format": args.format,
             "title": title,
             "hid": hid,
+            # Resume launchers must re-pass --download-volumes for a
+            # tmpvol_ dir; this saves them parsing the dir name.
+            "kind": space.kind,
         }
         with open(meta_path, "w") as f:
             json.dump(meta_data, f, indent=4)
@@ -12025,7 +12328,7 @@ def main():
         # handler/scraper to an alternative source (Phase 4b multi-source
         # fallback). When set, the inter-chapter image prefetch (Phase G7)
         # is suppressed because next_chapter is from the PRIMARY source's
-        # chapter list — alt_handler.get_chapter_images(primary_chapter)
+        # chapter list — alt_handler.get_item_images(primary_chapter)
         # would silently fail and waste a worker pool. The prefetch only
         # makes sense on the primary path; subsequent chapters resume on
         # the primary (strict wrapper restores it via finally).
@@ -12069,7 +12372,7 @@ def main():
 
 
         if resume_mode and os.path.exists(marker_path):
-            print(f"\nChapter {n} (already processed, collecting files)")
+            print(f"\n{space.noun} {n} (already processed, collecting files)")
             # resumed=True is the signal the ETA estimator needs: these ticks
             # cost no network time and would otherwise poison the moving
             # average. Mirrors downloader.js:applyChapterEta's skip rule.
@@ -12243,7 +12546,7 @@ def main():
             _sel_note = ""
             if _why and _avail and "," in _avail:
                 _sel_note = f" — chosen on {_why} from: {_avail}"
-            print(f"\nChapter {n} ({grp_name or 'No Group'}){_sel_note}")
+            print(f"\n{space.noun} {n} ({grp_name or 'No Group'}){_sel_note}")
             _emit("chapter_start", chapter=n, group=grp_name or None, resumed=False)
             _t0_imageurls = time.monotonic()
             # Phase 8 (2026-05-08): split-cluster collapse — when this chapter
@@ -12297,7 +12600,7 @@ def main():
                         f"  [collapse-splits] part {part_idx + 1}/{len(merged_parts)} (chap {part_label})"
                     )
                     try:
-                        part_entries = handler.get_chapter_images(
+                        part_entries = handler.get_item_images(
                             part, scraper, make_request
                         ) or []
                     except IncompleteChapterError as ice:
@@ -12334,7 +12637,7 @@ def main():
                         ch.setdefault("_aux_assets", []).extend(part_aux)
             else:
                 try:
-                    media_entries = handler.get_chapter_images(
+                    media_entries = handler.get_item_images(
                         ch, scraper, make_request
                     ) or []
                 except IncompleteChapterError as ice:
@@ -12374,6 +12677,9 @@ def main():
                         pages_total=0,
                     ) from exc
             _timing["imageurls"] += time.monotonic() - _t0_imageurls
+            # Now that the page count is known, size the watchdog to it. A
+            # no-op for chapters of normal length; a volume gets n/60 budgets.
+            _extend_chapter_deadline_for_pages(len(media_entries))
 
             raw_image_paths: List[str] = []
             text_blocks: List[Dict[str, Any]] = []
@@ -12876,7 +13182,10 @@ def main():
             # multi-source rescue run the content proof FIRST. An unproven
             # rescue is wiped and reported as reason "rescue_unproven"; the
             # strict wrapper then tries the next candidate (grep _rescue_search).
-            if raw_image_paths and not _fingerprint_chapter(
+            # Volumes write none (item_kinds.VOLUMES.fingerprints): the only
+            # reader is multi-source rescue, and .aio_fp/<site>/<n> would
+            # overwrite chapter n's evidence.
+            if raw_image_paths and space.fingerprints and not _fingerprint_chapter(
                 n, ident, ch, all_images, pages_total, rescue
             ):
                 rm_tree(tdir)
@@ -12890,7 +13199,7 @@ def main():
             if args.keep_images and raw_image_paths:
                 # When --keep-images is enabled, keep raw downloads inside the manga's
                 # output folder to avoid mixing different series in the same directory.
-                dest_dir = os.path.join(out_dir, "images", f"Chapter_{n}")
+                dest_dir = os.path.join(out_dir, "images", space.raw_image_dir_name(n))
                 log_verbose(f"  Copying original images to: {dest_dir}")
                 # Python 3.7 doesn't support dirs_exist_ok. Fallback if needed.
                 try:
@@ -13027,6 +13336,7 @@ def main():
                 and depth > 0
                 and not force_redownload
                 and not is_alt_source
+                and space.prefetch_next
             ):
                 # Prefer the windowed upcoming_chapters list, falling
                 # back to [next_chapter]
@@ -13510,11 +13820,14 @@ def main():
                         # normal site. Grep _materialize_chapter_aux.
                         for _arc, _data in ch.get("_aux_members") or []:
                             zf.writestr(_arc, _data)
-                        if getattr(args, "komikku", False):
+                        # Volumes get the per-item ComicInfo too, with
+                        # <Volume> and NO <Number>: a reader (Komga, Kavita)
+                        # would otherwise file "Vol.03" as chapter 3.
+                        if getattr(args, "komikku", False) or space.is_volume:
                             per_chap_xml = build_per_chapter_comic_info_xml(
                                 series_title=title,
                                 chapter_title=ident.get("title") or "",
-                                chapter_num=n,
+                                chapter_num=None if space.is_volume else n,
                                 volume=ident.get("vol"),
                                 scanlator=grp_name,
                                 web_url=ident.get("url") or args.comic_url,
@@ -13657,6 +13970,13 @@ def main():
                 )
                 ch_suffix = f"Ch {format_chap_for_filename(n)}"  # logging only
                 active_out_dir = None  # Komikku always uses out_dir
+            elif space.is_volume:
+                # "<base> Vol.NN.<fmt>": no "Ch" anywhere, so no chapter parser
+                # reads it as one (item_kinds.ItemSpace.item_filename; the
+                # cross-parser test is tests/test_item_kinds.py).
+                ch_filename = space.item_filename(base_filename, n, args.format)
+                ch_suffix = os.path.splitext(ch_filename)[0][len(base_filename):].strip()
+                active_out_dir = getattr(args, "epub_dir", None) if args.format == "epub" else None
             else:
                 ch_suffix = f"Ch {format_chap_for_filename(n)}"
                 ch_filename = f"{join_name(base_filename, ch_suffix)}.{args.format}"
@@ -13717,11 +14037,11 @@ def main():
                         if item.get("type") == "image"
                     ]
                     chapter_xml = None
-                    if getattr(args, "komikku", False):
+                    if getattr(args, "komikku", False) or space.is_volume:
                         chapter_xml = build_per_chapter_comic_info_xml(
                             series_title=title,
                             chapter_title=ident.get("title") or "",
-                            chapter_num=n,
+                            chapter_num=None if space.is_volume else n,
                             volume=ident.get("vol"),
                             scanlator=grp_name,
                             web_url=ident.get("url") or args.comic_url,
@@ -13776,7 +14096,7 @@ def main():
         attempts (where handler/scraper have been rebound to an alt and
         next_chapter is still in the primary's chapter list).
         """
-        global _CHAPTER_CANCEL
+        global _CHAPTER_CANCEL, _CHAPTER_DEADLINE_CTL
         # Join any in-flight background prefetch for this chapter BEFORE
         # arming the watchdog (2026-07-03). The join can block up to 300s on
         # a backlogged prefetch queue (grep _consume_image_prefetch) — time
@@ -13803,14 +14123,17 @@ def main():
             # chance. Origin is often less flaky a few minutes later.
             deadline_s *= 2.0
 
-        timer: Optional[threading.Timer] = None
+        # Re-armable: the impl stretches it once the page count is known
+        # (grep _extend_chapter_deadline_for_pages), so a 200-page volume gets
+        # a budget in proportion instead of the flat per-chapter one.
+        timer: Optional[_ChapterDeadline] = None
         if deadline_s > 0:
-            timer = threading.Timer(deadline_s, _CHAPTER_CANCEL.set)
-            timer.daemon = True
-            timer.start()
+            timer = _ChapterDeadline(deadline_s, _CHAPTER_CANCEL.set)
+        _CHAPTER_DEADLINE_CTL = timer
         try:
             return _process_chapter_impl(ch, force_redownload=force_redownload, next_chapter=next_chapter, is_alt_source=is_alt_source, upcoming_chapters=upcoming_chapters, store_as=store_as, rescue=rescue, resume_pages=resume_pages)
         finally:
+            _CHAPTER_DEADLINE_CTL = None
             if timer is not None:
                 timer.cancel()
             # Clear the global so dl_image calls outside a chapter (e.g. the
@@ -13918,7 +14241,7 @@ def main():
             parts = chapter.get("_merged_parts") or [chapter]
             entries: List[Any] = []
             for part in (parts[:1] if isinstance(which, int) else parts):
-                entries += handler.get_chapter_images(part, scraper, make_request) or []
+                entries += handler.get_item_images(part, scraper, make_request) or []
             entries = [e for e in entries if not (isinstance(e, dict) and e.get("type") == "text")]
         except Exception:
             return None
@@ -15458,8 +15781,6 @@ def main():
     # series info so the UI can later check for new chapters without the
     # user having to re-enter the URL.
     try:
-        series_meta_path = os.path.join(out_dir, ".aio_series.json")
-
         # Figure out which chapters were actually downloaded successfully.
         # Start with all chapters we attempted, then subtract any that are
         # still in the missed list after retries.
@@ -15477,178 +15798,212 @@ def main():
             attempted_chapter_labels, missed_entries
         )
 
-        # If a previous .aio_series.json exists (from an earlier download),
-        # merge the chapter lists so partial/split downloads accumulate. Loaded
-        # once above the final-file gate (grep existing_series_meta) because the
-        # overwrite guard has to read it BEFORE the build.
-        existing_meta = existing_series_meta
+        # The prior ledger is re-read UNDER the series lock (series_ledger.
+        # update_series_meta), not taken from the early existing_series_meta
+        # snapshot. That snapshot is minutes old by now, and a peer job on the
+        # same series (a volume run, or a second queue entry) may have written
+        # since. The overwrite guard above still uses the snapshot, which is
+        # correct: it has to describe the archive as it was BEFORE this run's
+        # build. Partial and split downloads accumulate through the unions below.
+        def _build_chapter_ledger(existing_meta):
+            # Re-normalize any legacy "4.0"-style entries from an older writer so a
+            # once-polluted file self-heals to "4" on this write (else the union
+            # keeps BOTH "4.0" and "4"). Safe sort key (grep _chap_as_float).
+            prev_downloaded = set(
+                _chap_label_str(x) for x in existing_meta.get("chapters_downloaded", [])
+            )
+            # Withhold this run's labels when its chapters never reached a durable
+            # file (grep final_build_stranded): the combined build was declined and
+            # --keep-chapters is off, so the only copies live in tmp_<hid>/. Recording
+            # them would make the library update-check report the series complete
+            # while the bytes sit in a temp folder — the concealment half of D1.
+            # Prior labels are still preserved, so this only ever withholds, never
+            # forgets.
+            merged_downloaded = sorted(
+                prev_downloaded
+                if final_build_stranded
+                else prev_downloaded | set(actually_downloaded),
+                key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+            )
 
-        # Re-normalize any legacy "4.0"-style entries from an older writer so a
-        # once-polluted file self-heals to "4" on this write (else the union
-        # keeps BOTH "4.0" and "4"). Safe sort key (grep _chap_as_float).
-        prev_downloaded = set(
-            _chap_label_str(x) for x in existing_meta.get("chapters_downloaded", [])
-        )
-        # Withhold this run's labels when its chapters never reached a durable
-        # file (grep final_build_stranded): the combined build was declined and
-        # --keep-chapters is off, so the only copies live in tmp_<hid>/. Recording
-        # them would make the library update-check report the series complete
-        # while the bytes sit in a temp folder — the concealment half of D1.
-        # Prior labels are still preserved, so this only ever withholds, never
-        # forgets.
-        merged_downloaded = sorted(
-            prev_downloaded
-            if final_build_stranded
-            else prev_downloaded | set(actually_downloaded),
-            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
-        )
-
-        # Fragment labels this (or a prior eager) run dropped under multi-source
-        # consensus — the UI update-check subtracts these so duplicate .1-.4
-        # fragments don't show as a perpetual "+N new" (see _skipped_fragment_labels
-        # at the group_chapters_for_download site). UNION with any prior set so a
-        # later lazy "Download Missing" run (no consensus → empty THIS run) can't
-        # wipe an eager run's set; MINUS merged_downloaded so a force-downloaded
-        # fragment counts as present rather than skipped (the two on-disk sets stay
-        # disjoint). Same normalized :g labels as chapters_downloaded so the main.js
-        # Set difference matches. grep chapters_skipped_fragments.
-        prev_skipped = set(
-            _chap_label_str(x)
-            for x in existing_meta.get("chapters_skipped_fragments", [])
-        )
-        merged_skipped = sorted(
-            (prev_skipped | {_chap_label_str(x) for x in _skipped_fragment_labels})
-            - set(merged_downloaded),
-            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
-        )
-
-        # Chapters the USER crossed out in the Library update-check panel.
-        # Purely carried forward here — nothing in this file ever ADDS to it;
-        # the only writer is electron/main.js's set-chapters-ignored IPC. It
-        # needs a line anyway because this writer rebuilds series_meta from
-        # scratch rather than merging over existing_meta, so a key it does not
-        # name is silently dropped on the next download.
-        #
-        # DISTINCT FROM chapters_skipped_fragments, which is machine-owned and
-        # subtracted from the update-check's chapter list entirely. These stay
-        # VISIBLE in the panel (struck through) so the user can undo them; they
-        # are only excluded from what the download buttons queue. grep
-        # chapters_ignored.
-        #
-        # MINUS merged_downloaded for the same reason as merged_skipped: once a
-        # chapter is actually on disk it is no longer something to offer or
-        # withhold, so leaving it here would just accumulate dead labels. That
-        # also means a deliberate re-download (--chapters, --update-all) clears
-        # the cross-out, which is the intuitive direction.
-        merged_ignored = sorted(
-            {
+            # Fragment labels this (or a prior eager) run dropped under multi-source
+            # consensus — the UI update-check subtracts these so duplicate .1-.4
+            # fragments don't show as a perpetual "+N new" (see _skipped_fragment_labels
+            # at the group_chapters_for_download site). UNION with any prior set so a
+            # later lazy "Download Missing" run (no consensus → empty THIS run) can't
+            # wipe an eager run's set; MINUS merged_downloaded so a force-downloaded
+            # fragment counts as present rather than skipped (the two on-disk sets stay
+            # disjoint). Same normalized :g labels as chapters_downloaded so the main.js
+            # Set difference matches. grep chapters_skipped_fragments.
+            prev_skipped = set(
                 _chap_label_str(x)
-                for x in existing_meta.get("chapters_ignored", [])
-            }
-            - set(merged_downloaded),
-            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
-        )
+                for x in existing_meta.get("chapters_skipped_fragments", [])
+            )
+            merged_skipped = sorted(
+                (prev_skipped | {_chap_label_str(x) for x in _skipped_fragment_labels})
+                - set(merged_downloaded),
+                key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+            )
 
-        # What each combined archive on disk actually contains, as of the last
-        # build of THAT FORMAT that really ran. DISTINCT from
-        # chapters_downloaded, which is a running UNION across runs ON PURPOSE
-        # (split/incremental downloads depend on that) and therefore can never
-        # answer "would rebuilding lose something" — the very question the
-        # overwrite guard asks. Read back by _final_file_recorded_coverage,
-        # which falls back to chapters_downloaded so pre-2026-08 files without
-        # the key still work, and migrates the pre-map single-list shape.
-        #
-        # Carried forward unchanged when this run built nothing (--no-final-file,
-        # --format none, komikku, split, or a guard-skipped build): recording the
-        # current run's chapters there would assert coverage no file has.
-        # KEYED BY FORMAT. A series folder holds one archive per format and one
-        # metadata file for all of them, so an unqualified list let an EPUB
-        # export describe the CBZ and the guard cleared a truncating rebuild.
-        # This run may only ever replace ITS OWN format's entry; the others are
-        # carried through untouched, because they still describe files that are
-        # still on disk. See _final_file_recorded_coverage for the read rules.
-        final_file_chapters = {}
-        _prev_ffc = existing_meta.get("final_file_chapters")
-        if isinstance(_prev_ffc, dict):
-            for _fmt, _labels in _prev_ffc.items():
-                if isinstance(_labels, (list, tuple)) and isinstance(_fmt, str):
-                    final_file_chapters[_fmt] = [
-                        _chap_label_str(x) for x in _labels
+            # Chapters the USER crossed out in the Library update-check panel.
+            # Purely carried forward here — nothing in this file ever ADDS to it;
+            # the only writer is electron/main.js's set-chapters-ignored IPC. It
+            # needs a line anyway because this writer rebuilds series_meta from
+            # scratch rather than merging over existing_meta, so a key it does not
+            # name is silently dropped on the next download.
+            #
+            # DISTINCT FROM chapters_skipped_fragments, which is machine-owned and
+            # subtracted from the update-check's chapter list entirely. These stay
+            # VISIBLE in the panel (struck through) so the user can undo them; they
+            # are only excluded from what the download buttons queue. grep
+            # chapters_ignored.
+            #
+            # MINUS merged_downloaded for the same reason as merged_skipped: once a
+            # chapter is actually on disk it is no longer something to offer or
+            # withhold, so leaving it here would just accumulate dead labels. That
+            # also means a deliberate re-download (--chapters, --update-all) clears
+            # the cross-out, which is the intuitive direction.
+            merged_ignored = sorted(
+                {
+                    _chap_label_str(x)
+                    for x in existing_meta.get("chapters_ignored", [])
+                }
+                - set(merged_downloaded),
+                key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+            )
+
+            # What each combined archive on disk actually contains, as of the last
+            # build of THAT FORMAT that really ran. DISTINCT from
+            # chapters_downloaded, which is a running UNION across runs ON PURPOSE
+            # (split/incremental downloads depend on that) and therefore can never
+            # answer "would rebuilding lose something" — the very question the
+            # overwrite guard asks. Read back by _final_file_recorded_coverage,
+            # which falls back to chapters_downloaded so pre-2026-08 files without
+            # the key still work, and migrates the pre-map single-list shape.
+            #
+            # Carried forward unchanged when this run built nothing (--no-final-file,
+            # --format none, komikku, split, or a guard-skipped build): recording the
+            # current run's chapters there would assert coverage no file has.
+            # KEYED BY FORMAT. A series folder holds one archive per format and one
+            # metadata file for all of them, so an unqualified list let an EPUB
+            # export describe the CBZ and the guard cleared a truncating rebuild.
+            # This run may only ever replace ITS OWN format's entry; the others are
+            # carried through untouched, because they still describe files that are
+            # still on disk. See _final_file_recorded_coverage for the read rules.
+            final_file_chapters = {}
+            _prev_ffc = existing_meta.get("final_file_chapters")
+            if isinstance(_prev_ffc, dict):
+                for _fmt, _labels in _prev_ffc.items():
+                    if isinstance(_labels, (list, tuple)) and isinstance(_fmt, str):
+                        final_file_chapters[_fmt] = [
+                            _chap_label_str(x) for x in _labels
+                        ]
+            elif isinstance(_prev_ffc, list):
+                # Legacy single-format shape, migrated in place. meta["format"] is
+                # the format that wrote it; without that we cannot say which archive
+                # it described, so it is dropped rather than misfiled onto this run's
+                # format (the reader then falls back to chapters_downloaded, which
+                # overstates — the safe direction).
+                _prev_fmt = existing_meta.get("format")
+                if isinstance(_prev_fmt, str) and _prev_fmt:
+                    final_file_chapters[_prev_fmt] = [
+                        _chap_label_str(x) for x in _prev_ffc
                     ]
-        elif isinstance(_prev_ffc, list):
-            # Legacy single-format shape, migrated in place. meta["format"] is
-            # the format that wrote it; without that we cannot say which archive
-            # it described, so it is dropped rather than misfiled onto this run's
-            # format (the reader then falls back to chapters_downloaded, which
-            # overstates — the safe direction).
-            _prev_fmt = existing_meta.get("format")
-            if isinstance(_prev_fmt, str) and _prev_fmt:
-                final_file_chapters[_prev_fmt] = [
-                    _chap_label_str(x) for x in _prev_ffc
-                ]
-        if final_file_built_labels is not None:
-            final_file_chapters[args.format] = list(final_file_built_labels)
-        if not final_file_chapters:
-            final_file_chapters = None
+            if final_file_built_labels is not None:
+                final_file_chapters[args.format] = list(final_file_built_labels)
+            if not final_file_chapters:
+                final_file_chapters = None
 
-        # Serialize AniList tags via the module-level _serialize_anilist_tag —
-        # the same serializer the refresh writer + _build_aio_reader_extras use,
-        # so the on-disk schema stays identical across all three writers (the
-        # AnilistTag dataclass itself doesn't survive json.dump). Empty lists
-        # when enrichment was off / no confident match keep the field always
-        # present. Cross-file: sites/external_metadata.py:AnilistTag is the
-        # source; aio-dl.py:_load_cached_anilist_id reads "anilist_id" back on resume.
-        series_meta = {
-            "url": args.comic_url,
-            "hid": hid,
-            "title": title,
-            "site": handler.name,
-            "format": args.format,
-            "language": args.language,
-            "download_volumes": bool(getattr(args, "download_volumes", False)),
-            "status": comic_data.get("status"),
-            "authors": comic_data.get("authors", []),
-            "cover": comic_data.get("cover"),
-            "genres": comic_data.get("genres", []),
-            "chapters_downloaded": merged_downloaded,
-            # Consensus-dropped duplicate fragments; subtracted by the UI
-            # update-check (main.js:_checkSeriesUpdates). Empty for single-source
-            # / lazy / collapse-off series. grep chapters_skipped_fragments.
-            "chapters_skipped_fragments": merged_skipped,
-            # User-crossed-out chapters, carried forward from existing_meta (see
-            # merged_ignored above). Written only when non-empty: it is opt-in
-            # per series, and an always-present empty list would add a key to
-            # every .aio_series.json in the library for nothing. Readers must
-            # therefore treat absent as empty — main.js and aio_android.py both
-            # do. grep chapters_ignored.
-            **({"chapters_ignored": merged_ignored} if merged_ignored else {}),
-            # Absent (not null) when no build has ever been recorded — readers
-            # must treat "missing" as "unknown", never as "covers nothing".
-            **(
-                {"final_file_chapters": final_file_chapters}
-                if final_file_chapters is not None
-                else {}
-            ),
-            # None when the chapter listing was deliberately cut short by
-            # chapter_floor_hint (grep pool_is_partial): reporting a floored
-            # pool as the series total would be a lie, and "unknown" is the
-            # honest answer. Nothing reads this field today; keep it truthful
-            # anyway so anything that starts to can trust it.
-            "total_available_at_download": None if pool_is_partial else len(pool),
-            "last_downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            # --- AniList enrichment fields (--metadata-source=anilist) ---
-            # Populated when enrichment matched a series confidently;
-            # null/empty when no match or feature disabled. The cached
-            # IDs let resume + --update-all runs short-circuit the
-            # fuzzy title-match step. See sites/external_metadata.py.
-            # Same seven fields as the refresh writer + _build_aio_reader_extras
-            # (grep _anilist_meta_fields), appended in canonical order so the
-            # on-disk key sequence is unchanged.
-            **_anilist_meta_fields(comic_data),
-        }
+            # Serialize AniList tags via the module-level _serialize_anilist_tag —
+            # the same serializer the refresh writer + _build_aio_reader_extras use,
+            # so the on-disk schema stays identical across all three writers (the
+            # AnilistTag dataclass itself doesn't survive json.dump). Empty lists
+            # when enrichment was off / no confident match keep the field always
+            # present. Cross-file: sites/external_metadata.py:AnilistTag is the
+            # source; aio-dl.py:_load_cached_anilist_id reads "anilist_id" back on resume.
+            series_meta = {
+                "url": args.comic_url,
+                "hid": hid,
+                "title": title,
+                "site": handler.name,
+                "format": args.format,
+                "language": args.language,
+                "status": comic_data.get("status"),
+                "authors": comic_data.get("authors", []),
+                "cover": comic_data.get("cover"),
+                "genres": comic_data.get("genres", []),
+                "chapters_downloaded": merged_downloaded,
+                # Consensus-dropped duplicate fragments; subtracted by the UI
+                # update-check (main.js:_checkSeriesUpdates). Empty for single-source
+                # / lazy / collapse-off series. grep chapters_skipped_fragments.
+                "chapters_skipped_fragments": merged_skipped,
+                # User-crossed-out chapters, carried forward from existing_meta (see
+                # merged_ignored above). Written only when non-empty: it is opt-in
+                # per series, and an always-present empty list would add a key to
+                # every .aio_series.json in the library for nothing. Readers must
+                # therefore treat absent as empty — main.js and aio_android.py both
+                # do. grep chapters_ignored.
+                **({"chapters_ignored": merged_ignored} if merged_ignored else {}),
+                # Absent (not null) when no build has ever been recorded — readers
+                # must treat "missing" as "unknown", never as "covers nothing".
+                **(
+                    {"final_file_chapters": final_file_chapters}
+                    if final_file_chapters is not None
+                    else {}
+                ),
+                # None when the chapter listing was deliberately cut short by
+                # chapter_floor_hint (grep pool_is_partial): reporting a floored
+                # pool as the series total would be a lie, and "unknown" is the
+                # honest answer. Nothing reads this field today; keep it truthful
+                # anyway so anything that starts to can trust it.
+                "total_available_at_download": None if pool_is_partial else len(pool),
+                "last_downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                # --- AniList enrichment fields (--metadata-source=anilist) ---
+                # Populated when enrichment matched a series confidently;
+                # null/empty when no match or feature disabled. The cached
+                # IDs let resume + --update-all runs short-circuit the
+                # fuzzy title-match step. See sites/external_metadata.py.
+                # Same seven fields as the refresh writer + _build_aio_reader_extras
+                # (grep _anilist_meta_fields), appended in canonical order so the
+                # on-disk key sequence is unchanged.
+                **_anilist_meta_fields(comic_data),
+            }
+            # The chapter writer rebuilds the top level from scratch (that is
+            # how stale keys get dropped). The volume namespace is not its to drop.
+            return series_ledger.carry_other_namespaces(existing_meta, series_meta)
 
-        with open(series_meta_path, "w", encoding="utf-8") as f:
-            json.dump(series_meta, f, indent=2)
+        def _build_volume_ledger(existing_meta):
+            # A volume run owns only meta["volumes"] plus the series identity
+            # keys (series_ledger.SHARED_KEYS); merge_volume_run raises on a
+            # chapter-namespace key, so this can't rewrite the chapter format.
+            shared = {
+                # Keep the URL a chapter run recorded: a volume run may have
+                # been started from a volume reader URL.
+                "url": existing_meta.get("url") or args.comic_url,
+                "hid": hid,
+                "title": title,
+                "site": handler.name,
+                "status": comic_data.get("status"),
+                "authors": comic_data.get("authors", []),
+                "cover": comic_data.get("cover"),
+                "genres": comic_data.get("genres", []),
+            }
+            # AniList fields only when THIS run matched: an un-enriched volume
+            # run would otherwise null out the ids a chapter run cached.
+            if comic_data.get("anilist_id"):
+                shared.update(_anilist_meta_fields(comic_data))
+            return series_ledger.merge_volume_run(
+                existing_meta,
+                shared=shared,
+                downloaded=[] if final_build_stranded else actually_downloaded,
+                fmt=args.format,
+                language=args.language,
+                total_available=len(pool),
+            )
+
+        series_ledger.update_series_meta(
+            out_dir, _build_volume_ledger if space.is_volume else _build_chapter_ledger
+        )
     except Exception as e:
         log_verbose(f"  Warning: Failed to write .aio_series.json: {e}")
 

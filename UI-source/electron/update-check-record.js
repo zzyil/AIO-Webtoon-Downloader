@@ -66,16 +66,34 @@ function resultRow(base, r) {
     result.ignoredChapters && result.ignoredChapters.length > 0
       ? { ignoredChapters: result.ignoredChapters }
       : null;
-  if (result.newChapters && result.newChapters.length > 0) {
+  // Volume half (main.js _checkSeriesUpdates, series that track volumes).
+  // Same spread-when-present rule, so a chapter-only row is unchanged. A row
+  // is "found" when EITHER kind has new items; the panel shows each kind.
+  const hasNewVolumes = !!(result.newVolumes && result.newVolumes.length > 0);
+  const volumes = Array.isArray(result.trackedKinds) && result.trackedKinds.includes("volume")
+    ? {
+        trackedKinds: result.trackedKinds,
+        ...(hasNewVolumes ? { newVolumes: result.newVolumes } : {}),
+        ...(result.ignoredVolumes && result.ignoredVolumes.length > 0
+          ? { ignoredVolumes: result.ignoredVolumes }
+          : {}),
+        volumesTotal: result.volumesTotal ?? 0,
+        ...(result.volumesError ? { volumesError: result.volumesError } : {}),
+      }
+    : null;
+  if ((result.newChapters && result.newChapters.length > 0) || hasNewVolumes) {
     return {
       ...base,
       state: "found",
-      newChapters: result.newChapters,
+      ...(result.newChapters && result.newChapters.length > 0
+        ? { newChapters: result.newChapters }
+        : {}),
       ...ignored,
+      ...volumes,
       total: result.total,
     };
   }
-  return { ...base, state: "uptodate", ...ignored, total: result.total };
+  return { ...base, state: "uptodate", ...ignored, ...volumes, total: result.total };
 }
 
 // `send(channel, payload)` is injected (main.js passes sendToUI) so this

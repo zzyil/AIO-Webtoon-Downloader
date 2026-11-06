@@ -13,6 +13,15 @@
 // follows Settings for the rest. The draft App.jsx holds across tab switches
 // is the same edits object (plus the URL text).
 //
+// CHAPTERS | VOLUMES. A single URL on a site with native volumes (MangaFire;
+// lib/siteCapabilities.js) shows a switch under the URL box. Volume mode is
+// job data (downloadForm.js DEFAULT_FORM.downloadVolumes), is greyed out while
+// Komikku is on (Python turns volumes off under --komikku), and disables the
+// chapter-only controls the engine would override anyway (grep "[Volumes]
+// Forcing" in aio-dl.py): keep/skip chapter files, multi-source, splitting,
+// scanlation groups. The format choice is shared with chapters (user decision
+// 2026-11-06).
+//
 // SCROLL FIX: The form area uses flex-1 + overflow-y-auto so
 // it scrolls when content is taller than the window. The Start
 // button stays pinned at the bottom with flex-shrink-0.
@@ -31,6 +40,8 @@ import {
   applyEdits,
   recompressAllowed as isRecompressAllowed,
 } from "@/lib/downloadForm";
+import { useSiteCapabilities, volumesSupportedForUrl } from "@/lib/siteCapabilities";
+import ItemKindSwitch from "./ItemKindSwitch";
 
 const FORMATS = [
   { value: "pdf", label: "PDF", desc: "Tablet reading" },
@@ -289,14 +300,25 @@ export default function DownloadTab({
   // format, never written into the form — see lib/downloadForm.js.
   const recompressAllowed = isRecompressAllowed(form);
 
+  // Volume mode is offered for exactly one URL on a site with native volumes.
+  // `volumeMode` is what the job will actually do; a leftover downloadVolumes
+  // edit from an earlier URL is ignored (and stripped at Start) once the URL
+  // no longer qualifies.
+  const sites = useSiteCapabilities();
+  const urlList = form.urls.split("\n").map((u) => u.trim()).filter(Boolean);
+  const volumesOffered = urlList.length === 1 && volumesSupportedForUrl(urlList[0], sites);
+  const volumeMode = volumesOffered && !!form.downloadVolumes && !form.komikku;
+
   // Queue a "newTab" recipe: the args are built when the download starts
   // (lib/queueRecipe.js), from these edits over the settings at that moment.
   const handleStart = () => {
     const urls = form.urls.split("\n").map((u) => u.trim()).filter(Boolean);
     if (urls.length === 0) return;
 
-    // The URL text is the job, not a setting.
-    const { urls: _urls, ...formEdits } = edits;
+    // The URL text is the job, not a setting. downloadVolumes rides only when
+    // the switch is actually in effect (see volumeMode).
+    const { urls: _urls, downloadVolumes: _dv, ...formEdits } = edits;
+    if (volumeMode) formEdits.downloadVolumes = true;
     const recipe = { kind: "newTab", input: { formEdits, urlCount: urls.length } };
 
     // Single URL: one download. Multiple URLs: one aio-dl.py process with
@@ -355,6 +377,31 @@ export default function DownloadTab({
               onEnable={() => update({ multiSource: true, multiSourceLazy: true })}
               onLogin={() => window.electronAPI?.comixLogin?.()}
             />
+          )}
+          {volumesOffered && (
+            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 animate-slide-up">
+              <ItemKindSwitch
+                volumes={volumeMode}
+                disabled={!!form.komikku}
+                onChange={(v) => set("downloadVolumes", v)}
+              />
+              <p className="text-[10px] leading-snug text-muted-foreground flex-1 min-w-[12rem]">
+                {form.komikku ? (
+                  <span className="text-yellow-500 dark:text-yellow-400">
+                    Volumes are unavailable with Komikku output, which is per chapter.
+                    Turn Komikku off to download volumes.
+                  </span>
+                ) : volumeMode ? (
+                  <>
+                    One file per volume (<span className="font-mono">Title Vol.01</span>) in
+                    the series folder, next to any chapters. Chapter-only options
+                    below are off.
+                  </>
+                ) : (
+                  <>This site also offers whole volumes.</>
+                )}
+              </p>
+            </div>
           )}
         </div>
 
@@ -504,11 +551,12 @@ export default function DownloadTab({
           </div>
         </div>
 
-        {/* Chapters */}
-        <SectionHeader>Chapters</SectionHeader>
+        {/* Chapters (volume numbers in volume mode: --chapters selects
+            volumes then, grep "--chapters" help in aio-dl.py) */}
+        <SectionHeader>{volumeMode ? "Volumes" : "Chapters"}</SectionHeader>
         <div className="grid grid-cols-2 gap-x-6 gap-y-3">
           <div>
-            <Label htmlFor="chapters" className="text-xs">Chapter Range</Label>
+            <Label htmlFor="chapters" className="text-xs">{volumeMode ? "Volume Range" : "Chapter Range"}</Label>
             <Input
               id="chapters"
               value={form.chapters}
@@ -516,7 +564,7 @@ export default function DownloadTab({
               onFocus={(e) => {
                 if (e.target.value === "all") e.target.select();
               }}
-              placeholder="all, or 1-50, 75, 80-100"
+              placeholder={volumeMode ? "all, or 1-5, 8" : "all, or 1-50, 75, 80-100"}
               className="mt-1"
             />
           </div>
@@ -529,14 +577,19 @@ export default function DownloadTab({
             </Select>
           </div>
         </div>
-        <div className="flex items-center gap-2 pt-2">
-          <Checkbox id="noPartials" checked={form.noPartials} onCheckedChange={(v) => set("noPartials", v)} />
-          <Label htmlFor="noPartials" className="text-xs cursor-pointer">Skip partial chapters (1.5, 60.1, etc.)</Label>
-        </div>
+        {!volumeMode && (
+          <div className="flex items-center gap-2 pt-2">
+            <Checkbox id="noPartials" checked={form.noPartials} onCheckedChange={(v) => set("noPartials", v)} />
+            <Label htmlFor="noPartials" className="text-xs cursor-pointer">Skip partial chapters (1.5, 60.1, etc.)</Label>
+          </div>
+        )}
 
         {/* Output Options */}
         <SectionHeader>Output Options</SectionHeader>
         <div className="space-y-2">
+          {/* Volume runs always write one file per volume and never a combined
+              file; the engine forces both, so the controls are frozen. */}
+          <fieldset disabled={volumeMode} className={cn("space-y-2", volumeMode && "opacity-40")}>
           <div className="flex items-center gap-2">
             <Checkbox id="keepChapters" checked={form.keepChapters} onCheckedChange={(v) => update({ keepChapters: v, ...(!v ? { noFinalFile: false } : {}) })} />
             <Label htmlFor="keepChapters" className="text-xs cursor-pointer">Keep individual chapter files</Label>
@@ -547,6 +600,7 @@ export default function DownloadTab({
               Skip combined final file (chapters only)
             </Label>
           </div>
+          </fieldset>
           <div className="flex items-center gap-2">
             <Checkbox id="keepImages" checked={form.keepImages} onCheckedChange={(v) => set("keepImages", v)} />
             <Label htmlFor="keepImages" className="text-xs cursor-pointer">Keep original unprocessed images</Label>
@@ -651,7 +705,9 @@ export default function DownloadTab({
             poisons. The same toggle is exposed in the Search tab; this
             duplicate lives here for direct-URL pastes that bypass Search. */}
         <SectionHeader>Multi-source fallback</SectionHeader>
-        <div className="space-y-3">
+        {/* Other sites list chapters, not this site's volume scans: nothing to
+            fall back to in volume mode (item_kinds.py VOLUMES.multi_source). */}
+        <fieldset disabled={volumeMode} className={cn("space-y-3", volumeMode && "opacity-40")}>
           <div className="flex items-start gap-3">
             <Switch
               id="multiSource"
@@ -721,11 +777,13 @@ export default function DownloadTab({
               </div>
             </div>
           )}
-        </div>
+        </fieldset>
 
         {/* Splitting */}
         <SectionHeader>Splitting</SectionHeader>
-        <div className="flex items-center gap-3">
+        {/* --split is an error with --download-volumes (each volume is
+            already its own file). */}
+        <fieldset disabled={volumeMode} className={cn("flex items-center gap-3", volumeMode && "opacity-40")}>
           <Select value={form.splitMode} onChange={(e) => update({ splitMode: e.target.value, splitValue: "" })} className="w-40">
             <option value="none">No splitting</option>
             <option value="size">By file size</option>
@@ -739,13 +797,15 @@ export default function DownloadTab({
               className="w-32 animate-slide-in"
             />
           )}
-        </div>
+        </fieldset>
 
         {/* Advanced */}
         <SectionHeader>Advanced</SectionHeader>
         <div className="space-y-2">
           <Collapsible title="Scanlation Groups">
-            <div className="space-y-3">
+            {/* A volume is the site's own scan; the engine clears group,
+                exclude-group and the MTL policy in volume mode. */}
+            <fieldset disabled={volumeMode} className={cn("space-y-3", volumeMode && "opacity-40")}>
               <div className="space-y-1.5">
                 <Label htmlFor="group" className="text-xs">Preferred groups (comma-separated, priority order)</Label>
                 <Input id="group" value={form.group} onChange={(e) => set("group", e.target.value)} placeholder='e.g. "Official, GroupA"' />
@@ -779,7 +839,7 @@ export default function DownloadTab({
                   costs you a chapter; "Exclude" leaves gaps where only MTL exists.
                 </p>
               </div>
-            </div>
+            </fieldset>
           </Collapsible>
 
           <Collapsible title="Network Tuning">

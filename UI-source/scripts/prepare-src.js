@@ -99,6 +99,8 @@ for (const file of [
   "aio_search_cli.py",
   "aio_config.py",
   "library_state.py",
+  "item_kinds.py",
+  "series_ledger.py",
   "metadata_editor.py",
   "metadata_cli.py",
   "migrate_library.py",

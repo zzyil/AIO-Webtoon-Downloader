@@ -50,6 +50,17 @@
 // child's _user_set_quality True and disables the CBZ byte-passthrough
 // fast-path (silent lossy re-encode). Keep it 100.
 //
+// KIND ("chapter" default | "volume"). A volume download (MangaFire native
+// volumes) passes the series' VOLUME format/language in `meta` (libraryRecipe
+// reads them from the ledger's "volumes" block) and sets downloadVolumes:true.
+// A chapter build omits the key, so its args stay identical to before; the
+// recipe strips any downloadVolumes from the settings.defaults spread
+// (queueRecipe.js kind "library"), so a stray saved value can never flip a
+// chapter update into a volume run. It refuses (throws) while Komikku is on:
+// aio-dl.py's --komikku coerces --download-volumes OFF, which would turn
+// "volumes 1-3" into "chapters 1-3" without anyone noticing. A queued item
+// that throws here is dropped by useDownloader (grep _resolveQueueArgs).
+//
 // KEEP-CHAPTERS IS DELIBERATELY *NOT* SPECIAL-CASED HERE, and that is worth a
 // note because it briefly was. Every download this builder produces is a DELTA
 // — `chapters` is only the missing range — so its chapter set does not cover
@@ -64,15 +75,23 @@
 // here instead would mean every caller of the engine has to remember to
 // compensate for a decision only the engine can make — this builder AND
 // core/DownloadForm.kt's Android twin, forever.
+export const KOMIKKU_VOLUMES_MESSAGE =
+  "Volume downloads are off while Komikku mode is on (Komikku output is per chapter).";
+
 export function buildLibraryDownloadArgs(
   meta,
   d,
   chaptersStr,
   verboseAlways,
   folderPath,
+  kind = "chapter",
 ) {
   const m = meta || {};
   const def = d || {};
+  const isVolume = kind === "volume";
+  if (isVolume && def.komikku === true) {
+    throw new Error(KOMIKKU_VOLUMES_MESSAGE);
+  }
   const args = {
     format: m.format || def.format || "pdf",
     quality: def.quality ?? 100,
@@ -82,6 +101,7 @@ export function buildLibraryDownloadArgs(
     seriesDir: folderPath || undefined,
     verbose: verboseAlways ?? true,
   };
+  if (isVolume) args.downloadVolumes = true;
   if (def.scaling && def.scaling !== 100) args.scaling = def.scaling;
   if (def.keepChapters) args.keepChapters = true;
   if (def.noFinalFile) args.noFinalFile = true;
@@ -97,7 +117,8 @@ export function buildLibraryDownloadArgs(
   // never pays the ~30-80 s eager cross-site discovery. downloader.js gates
   // the actual --multi-source-lazy flag on args.multiSource, so this stays a
   // clean no-op when multi-source is off.
-  if (def.multiSource === true) {
+  // Volumes have no multi-source (aio-dl.py forces it off), so nothing to arm.
+  if (def.multiSource === true && !isVolume) {
     args.multiSourceLazy = true;
   }
   return args;
@@ -124,7 +145,15 @@ export function searchDialogInitial(settings, multiSource) {
     keepChapters: !!d.keepChapters,
     keepImages: !!d.keepImages,
     noFinalFile: !!d.noFinalFile,
+    // Follows settings.defaults.komikku like the New tab's toggle
+    // (downloadForm.js:formDefaults). Python's --komikku coerces format→cbz,
+    // keep-chapters and no-final-file itself, so the dialog leaves those alone.
+    komikku: !!d.komikku,
     multiSource: !!multiSource,
+    // Chapters | Volumes switch (ItemKindSwitch). Job data like the New tab's
+    // (downloadForm.js DEFAULT_FORM.downloadVolumes): always starts on
+    // chapters, never follows Settings.
+    downloadVolumes: false,
   };
 }
 
@@ -139,11 +168,27 @@ export function searchDialogArgs(form) {
     keepChapters: form.keepChapters,
     keepImages: form.keepImages,
     noFinalFile: form.noFinalFile,
+    // Always emitted (false included): queueRecipe.js spreads settings.defaults
+    // UNDER these args, so omitting it on "off" would let a Settings komikku:true
+    // win over the user switching it off in the dialog.
+    komikku: !!form.komikku,
     multiSource: form.multiSource,
   };
   if (form.format === "epub") args.epubLayout = form.epubLayout;
   if (chapters && chapters.toLowerCase() !== "all") args.chapters = chapters;
-  if (group) args.group = group;
+  // Volume mode (the dialog only offers it for a MangaFire source; `chapters`
+  // then holds VOLUME numbers). Refused under Komikku for the same reason as
+  // downloadForm.js buildNewTabArgs: --komikku turns --download-volumes off,
+  // so "volumes 1-3" would quietly become chapters 1-3. multiSource goes off
+  // so confirmSearchArgs drops the prefetched alternatives, and no group is
+  // sent: aio-dl.py ignores both for volumes ("[Volumes] Forcing").
+  if (form.downloadVolumes) {
+    if (form.komikku) throw new Error(KOMIKKU_VOLUMES_MESSAGE);
+    args.downloadVolumes = true;
+    args.multiSource = false;
+  } else if (group) {
+    args.group = group;
+  }
   return args;
 }
 

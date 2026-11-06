@@ -30,6 +30,8 @@ import {
 } from "lucide-react";
 import { cn, chaptersToRangeString, getInitials, naturalCompare } from "@/lib/utils";
 import { libraryRecipe } from "@/lib/queueRecipe";
+import { KOMIKKU_VOLUMES_MESSAGE } from "@/lib/downloadArgs";
+import { useSiteCapabilities, volumesSupportedForSite } from "@/lib/siteCapabilities";
 import UpdatesCenter from "./UpdatesCenter";
 import ChapterChips, { ChapterChipsLegend, selectedChapters } from "./ChapterChips";
 import LibraryFilterPanel, {
@@ -468,6 +470,13 @@ function MangaCard({ entry, newCount, onClick, onShowDuplicate, syncChip }) {
               <span>{entry.chapterCount} ch</span>
             </>
           )}
+          {/* Native volumes (electron/library.js volumeCount). */}
+          {entry.volumeCount > 0 && (
+            <>
+              <span>&middot;</span>
+              <span>{entry.volumeCount} vol</span>
+            </>
+          )}
         </div>
       </div>
     </button>
@@ -774,6 +783,182 @@ function mergeErrorText(code) {
 // ============================================================
 // UPDATE CHECKER SECTION (inside detail view)
 // ============================================================
+
+// The VOLUME half of a series' update check (MangaFire native volumes). Shown
+// when the check result carries volumes: the series tracks them, or the user
+// pressed "Get volumes" (`browse`). Own tick state, own cross-outs
+// (onSetChaptersIgnored(..., "volume") → volumes.ignored), own download
+// button (libraryRecipe kind "volume"). While Komikku is on the download is
+// refused, because the engine would turn the volume run into chapters
+// (lib/downloadArgs.js KOMIKKU_VOLUMES_MESSAGE).
+//
+// browse: every listed volume starts UNTICKED, because a series that never had
+// volumes reports all of them as missing (117 for One Piece) and an all-ticked
+// default would queue the whole run with one click. Browse also offers NO
+// cross-outs: writing volumes.ignored creates the volume block, and a block
+// alone makes the series track volumes, so every later check would list the
+// whole run as new. Cross-outs appear once a volume download made it tracked.
+function VolumeUpdateBlock({
+  entry, meta, result, browse, komikku, onStartDownload, onSwitchTab,
+  onSetChaptersIgnored, onResultChange, onError,
+}) {
+  const newVolumes = result?.newVolumes || [];
+  const ignoredVolumes = result?.ignoredVolumes || [];
+  const [deselected, setDeselected] = useState(() => new Set(browse ? newVolumes : []));
+  const [busy, setBusy] = useState(false);
+  const selected = selectedChapters(newVolumes, deselected);
+
+  const toggle = (v) =>
+    setDeselected((prev) => {
+      const next = new Set(prev);
+      if (next.has(v)) next.delete(v);
+      else next.add(v);
+      return next;
+    });
+
+  const setIgnored = async (vols, ignored) => {
+    setBusy(true);
+    try {
+      const res = await onSetChaptersIgnored?.(entry.folderPath, vols, ignored, "volume");
+      if (res && res.ok === false) {
+        onError(res.error || "Could not save the change");
+        return;
+      }
+      const moved = new Set(vols);
+      const byNumber = (a, b) => parseFloat(a) - parseFloat(b);
+      onResultChange((prev) => {
+        if (!prev) return prev;
+        const wasNew = prev.newVolumes || [];
+        const wasIgnored = prev.ignoredVolumes || [];
+        return {
+          ...prev,
+          newVolumes: ignored
+            ? wasNew.filter((c) => !moved.has(c))
+            : [...wasNew, ...wasIgnored.filter((c) => moved.has(c))].sort(byNumber),
+          ignoredVolumes: ignored
+            ? [...wasIgnored, ...wasNew.filter((c) => moved.has(c))].sort(byNumber)
+            : wasIgnored.filter((c) => !moved.has(c)),
+        };
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const download = () => {
+    if (!selected.length || !meta?.url || komikku) return;
+    const keep = new Set(selected);
+    const excluding = [...newVolumes.filter((c) => !keep.has(c)), ...ignoredVolumes];
+    const rangeStr = chaptersToRangeString(selected, { excluding });
+    onStartDownload(meta.url, {
+      recipe: libraryRecipe(meta, rangeStr, entry.folderPath, "volume"),
+    });
+    onSwitchTab("queue");
+  };
+
+  if (result?.volumesError) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-destructive">
+        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+        <span>Volumes: {result.volumesError}</span>
+      </div>
+    );
+  }
+
+  if (newVolumes.length === 0) {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2 text-xs text-emerald-400">
+          <span>&#10003;</span>
+          <span>
+            {result?.volumesTotal
+              ? `Volumes up to date (${result.volumesTotal} on site, ${result.volumesDownloaded ?? 0} on device)`
+              : "This series has no volumes on the site in this language"}
+          </span>
+        </div>
+        {ignoredVolumes.length > 0 && (
+          <div className="rounded-md border border-border/50 bg-muted/10 p-3 space-y-2">
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              <span className="text-foreground/80">
+                {ignoredVolumes.length} volume{ignoredVolumes.length === 1 ? "" : "s"} crossed out
+              </span>{" "}
+              — saved to this series. Restore to make {ignoredVolumes.length === 1 ? "it" : "them"} downloadable again.
+            </p>
+            <ChapterChips
+              chapters={[]}
+              ignored={ignoredVolumes}
+              deselected={deselected}
+              onToggle={toggle}
+              onSetIgnored={setIgnored}
+              busy={busy}
+              noun="volume"
+            />
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-md border border-sky-500/30 bg-sky-500/10 p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold text-sky-400">
+          {browse
+            ? `${newVolumes.length} volume${newVolumes.length !== 1 ? "s" : ""} on the site`
+            : `${newVolumes.length} new volume${newVolumes.length !== 1 ? "s" : ""} available`}
+        </span>
+        <span className="text-[10px] text-muted-foreground">
+          {result.volumesDownloaded ?? 0} / {result.volumesTotal ?? 0} volumes
+        </span>
+      </div>
+      <ChapterChipsLegend
+        noun="volume"
+        crossOut={!browse}
+        actions={
+          newVolumes.length > 1 && (
+            <span className="flex items-center gap-1.5 shrink-0">
+              <button type="button" onClick={() => setDeselected(new Set())}
+                className="hover:text-foreground transition-colors"
+                title="Include every volume in this download">all</button>
+              <span className="text-muted-foreground/40">|</span>
+              <button type="button" onClick={() => setDeselected(new Set(newVolumes))}
+                className="hover:text-foreground transition-colors"
+                title="Skip every volume in this download (nothing is crossed out)">none</button>
+            </span>
+          )
+        }
+      />
+      <ChapterChips
+        chapters={newVolumes}
+        ignored={ignoredVolumes}
+        deselected={deselected}
+        onToggle={toggle}
+        onSetIgnored={browse ? undefined : setIgnored}
+        busy={busy}
+        noun="volume"
+      />
+      {komikku && (
+        <p className="text-[10px] text-yellow-500 dark:text-yellow-400 leading-snug">
+          {KOMIKKU_VOLUMES_MESSAGE} Turn it off in Settings → Output to download volumes.
+        </p>
+      )}
+      <Button
+        size="sm"
+        onClick={download}
+        disabled={selected.length === 0 || komikku}
+        className="text-xs gap-1.5 w-full"
+      >
+        <Download className="w-3 h-3" />
+        {selected.length === 0
+          ? "Tick volumes to download"
+          : selected.length === newVolumes.length
+          ? `Download ${browse ? "All" : "Missing"} Volumes`
+          : `Download ${selected.length} Selected Volume${selected.length === 1 ? "" : "s"}`}
+      </Button>
+    </div>
+  );
+}
+
 // `onSetChaptersIgnored` is useUpdateCheck's setRowIgnored, threaded down from
 // the tab. Going through the hook rather than calling the IPC directly is what
 // keeps the Updates Center panel and the library entry in step when a chapter
@@ -789,20 +974,40 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings, onSetCha
   // deselections so chapters a later check adds arrive ticked.
   const [deselected, setDeselected] = useState(() => new Set());
   const [ignoreBusy, setIgnoreBusy] = useState(false);
+  // "Get volumes" was used for this result: the series doesn't track volumes
+  // yet, so the volume list is a browse, not a diff (VolumeUpdateBlock).
+  const [volumeBrowse, setVolumeBrowse] = useState(false);
+  // Bumped on every check so VolumeUpdateBlock remounts and re-seeds its ticks.
+  const [checkSeq, setCheckSeq] = useState(0);
+  const sites = useSiteCapabilities();
+  const komikku = settings?.defaults?.komikku === true;
+  const seriesTracksVolumes = (entry.trackedKinds || []).includes("volume");
+  const canGetVolumes =
+    !seriesTracksVolumes && volumesSupportedForSite(meta?.site, sites);
+  // A volume-only series has no chapter half to show (its result's
+  // trackedKinds omits "chapter"); results from before kinds existed do.
+  const showChapters = !result?.trackedKinds || result.trackedKinds.includes("chapter");
+  const showVolumes = !!result && (
+    (result.trackedKinds || []).includes("volume") || "newVolumes" in result || !!result.volumesError
+  );
 
   const newChapters = result?.newChapters || [];
   const ignoredChapters = result?.ignoredChapters || [];
   const selected = selectedChapters(newChapters, deselected);
 
-  const handleCheck = async () => {
+  // opts.includeVolumes: the "Get volumes" button (list volumes for a series
+  // that doesn't track them yet; main.js _checkSeriesUpdates).
+  const handleCheck = async (opts = {}) => {
     setChecking(true);
     setError(null);
     setResult(null);
+    setVolumeBrowse(!!opts.includeVolumes);
+    setCheckSeq((n) => n + 1);
     // A fresh check re-offers everything; carrying ticks across it would mean
     // silently dropping chapters the user unticked before a different result.
     setDeselected(new Set());
     try {
-      const res = await window.electronAPI.checkForUpdates(entry.folderPath);
+      const res = await window.electronAPI.checkForUpdates(entry.folderPath, opts);
       if (res.error) {
         setError(res.message || res.error);
       } else {
@@ -948,19 +1153,41 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings, onSetCha
               <span>{meta.chapters_downloaded.length} ch downloaded</span>
             </>
           )}
+          {entry.volumeCount > 0 && (
+            <>
+              <span>&middot;</span>
+              <span>{entry.volumeCount} vol downloaded</span>
+            </>
+          )}
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleCheck}
-          disabled={checking}
-          className="text-xs gap-1.5 shrink-0"
-        >
-          {checking
-            ? <Loader2 className="w-3 h-3 animate-spin" />
-            : <RefreshCw className="w-3 h-3" />}
-          {checking ? "Checking…" : "Check for Updates"}
-        </Button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {/* MangaFire series that has only chapters so far: list its volumes. */}
+          {canGetVolumes && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleCheck({ includeVolumes: true })}
+              disabled={checking}
+              className="text-xs gap-1.5"
+              title="List this series' volumes on the site and pick some to download"
+            >
+              <BookOpen className="w-3 h-3" />
+              Get volumes
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => handleCheck()}
+            disabled={checking}
+            className="text-xs gap-1.5"
+          >
+            {checking
+              ? <Loader2 className="w-3 h-3 animate-spin" />
+              : <RefreshCw className="w-3 h-3" />}
+            {checking ? "Checking…" : "Check for Updates"}
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -970,7 +1197,23 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings, onSetCha
         </div>
       )}
 
-      {result && (
+      {result && showVolumes && (
+        <VolumeUpdateBlock
+          key={checkSeq}
+          entry={entry}
+          meta={meta}
+          result={result}
+          browse={volumeBrowse}
+          komikku={komikku}
+          onStartDownload={onStartDownload}
+          onSwitchTab={onSwitchTab}
+          onSetChaptersIgnored={onSetChaptersIgnored}
+          onResultChange={setResult}
+          onError={setError}
+        />
+      )}
+
+      {result && showChapters && (
         <div className="space-y-2">
           {newChapters.length > 0 ? (
             <div className="rounded-md border border-orange-500/30 bg-orange-500/10 p-3 space-y-2">
@@ -1343,6 +1586,9 @@ function DetailView({
               <div>{formatSize(entry.totalSize)}</div>
               {meta?.chapters_downloaded?.length > 0 && (
                 <div>{meta.chapters_downloaded.length} chapters</div>
+              )}
+              {entry.volumeCount > 0 && (
+                <div>{entry.volumeCount} volume{entry.volumeCount === 1 ? "" : "s"}</div>
               )}
               {entry.lastModified && <div>Modified {formatDate(entry.lastModified)}</div>}
             </div>
@@ -1756,13 +2002,19 @@ export default function LibraryTab({
   // nothing" into "queue everything", which is the worst possible reading of a
   // user who just unticked the lot. Callers guard against empty before getting
   // here; omitting the argument entirely still means "the whole row".
-  const buildDownloadArgsForRow = useCallback((row, entry, chapters) => {
+  //
+  // kind "volume": the same, over the row's newVolumes / ignoredVolumes, and a
+  // volume recipe (the series' volume format/language; lib/queueRecipe.js).
+  const buildDownloadArgsForRow = useCallback((row, entry, chapters, kind = "chapter") => {
     const meta = entry?.seriesMeta || {};
-    const wanted = Array.isArray(chapters) ? chapters : row.newChapters || [];
+    const isVolume = kind === "volume";
+    const offered = (isVolume ? row.newVolumes : row.newChapters) || [];
+    const crossed = (isVolume ? row.ignoredVolumes : row.ignoredChapters) || [];
+    const wanted = Array.isArray(chapters) ? chapters : offered;
     const keep = new Set(wanted);
     const excluding = [
-      ...(row.newChapters || []).filter((c) => !keep.has(c)),
-      ...(row.ignoredChapters || []),
+      ...offered.filter((c) => !keep.has(c)),
+      ...crossed,
     ];
     const rangeStr = chaptersToRangeString(wanted, { excluding });
     // Same "library" recipe as the detail-view "Download Missing Chapters"
@@ -1775,42 +2027,65 @@ export default function LibraryTab({
       // bulk of it (main.js picks it; grep seriesIdentityKey). Passing it as
       // --series-dir is what stops the delta landing in the husk instead.
       row.folderPath || entry?.folderPath,
+      kind,
     );
     return { url: meta.url, args: { recipe } };
   }, []);
 
-  const handleQueueRow = useCallback((row, chapters) => {
+  // Volume downloads are refused under Komikku (lib/downloadArgs.js
+  // KOMIKKU_VOLUMES_MESSAGE); the panel shows why and never hands volumes
+  // over then, and this guards the same rule for the queue paths below.
+  const komikkuOn = settings?.defaults?.komikku === true;
+
+  // `volumes` (optional): the row's ticked VOLUMES, queued as a separate
+  // volume download after the chapter one. A row can carry both kinds.
+  const handleQueueRow = useCallback((row, chapters, volumes) => {
     const entry = entries.find((e) => e.folderPath === row.folderPath);
     if (!entry?.seriesMeta?.url) return;
     const wanted = Array.isArray(chapters) ? chapters : row.newChapters || [];
-    if (wanted.length === 0) return;
-    const { url, args } = buildDownloadArgsForRow(row, entry, wanted);
-    onStartDownload(url, args);
+    const wantedVolumes = komikkuOn || !Array.isArray(volumes) ? [] : volumes;
+    if (wanted.length === 0 && wantedVolumes.length === 0) return;
+    if (wanted.length > 0) {
+      const { url, args } = buildDownloadArgsForRow(row, entry, wanted);
+      onStartDownload(url, args);
+    }
+    if (wantedVolumes.length > 0) {
+      const { url, args } = buildDownloadArgsForRow(row, entry, wantedVolumes, "volume");
+      onStartDownload(url, args);
+    }
     // The user committed, so drop the badge and downgrade the row to
     // "uptodate" — it stays visible in the panel as feedback rather than
     // vanishing. If a later scan finds more, the count repopulates.
     resolveUpdateRows([row.folderPath]);
-  }, [entries, buildDownloadArgsForRow, onStartDownload, resolveUpdateRows]);
+  }, [entries, buildDownloadArgsForRow, onStartDownload, resolveUpdateRows, komikkuOn]);
 
-  // `plan` is [{ row, chapters }] built by the panel, which owns the ticks —
+  // `plan` is [{ row, chapters, volumes? }] built by the panel, which owns the ticks —
   // this no longer re-derives the found set from seriesStates, because that
   // would silently queue every new chapter of a row the user had partly
   // unticked.
   const handleQueueAll = useCallback((plan) => {
+    const volsOf = (item) => (komikkuOn ? [] : item.volumes || []);
     const items = (Array.isArray(plan) ? plan : []).filter(
-      (item) => item?.row && item.chapters?.length > 0
+      (item) => item?.row && ((item.chapters?.length || 0) + volsOf(item).length) > 0
     );
-    for (const { row, chapters } of items) {
+    for (const item of items) {
+      const { row, chapters } = item;
       const entry = entries.find((e) => e.folderPath === row.folderPath);
       if (!entry?.seriesMeta?.url) continue;
-      const { url, args } = buildDownloadArgsForRow(row, entry, chapters);
-      onStartDownload(url, args);
+      if (chapters?.length > 0) {
+        const { url, args } = buildDownloadArgsForRow(row, entry, chapters);
+        onStartDownload(url, args);
+      }
+      if (volsOf(item).length > 0) {
+        const { url, args } = buildDownloadArgsForRow(row, entry, volsOf(item), "volume");
+        onStartDownload(url, args);
+      }
     }
     // Bulk-clear all queued badges + downgrade rows to up-to-date.
     resolveUpdateRows(items.map(({ row }) => row.folderPath));
     onSwitchTab("queue");
     setUpdatesPanelOpen(false);
-  }, [entries, buildDownloadArgsForRow, onStartDownload, onSwitchTab, resolveUpdateRows]);
+  }, [entries, buildDownloadArgsForRow, onStartDownload, onSwitchTab, resolveUpdateRows, komikkuOn]);
 
   // Clear badges for the given folderPaths without queueing anything.
   // Used by the "Dismiss" buttons (per-row + bulk). The row itself stays in
@@ -2323,6 +2598,7 @@ export default function LibraryTab({
         onDismiss={handleDismiss}
         onSetChaptersIgnored={setRowIgnored}
         hasCheckableSeries={ongoingCount > 0}
+        komikku={komikkuOn}
       />
 
       {/* ── Merge duplicate folders ──

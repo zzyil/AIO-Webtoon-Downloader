@@ -266,6 +266,8 @@ val ROOT_PYTHON_MODULES = listOf(
     "aio_search_cli.py",
     "aio_config.py",
     "library_state.py",
+    "item_kinds.py",      // chapter/volume naming; imported by library_state + the engine
+    "series_ledger.py",   // .aio_series.json namespaces + locked writer
     "metadata_editor.py",
     "metadata_cli.py",
     "migrate_library.py",
