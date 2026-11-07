@@ -1,8 +1,31 @@
+"""MangaHub (mangahub.io) handler: search, series, chapter list and page list
+all come from one GraphQL endpoint (api.mghcdn.com), funnelled through
+_post_graphql; images are plain GETs on imgx.mghcdn.com.
+
+The API needs an `x-mhub-access` token, which the site hands every visitor as
+the `mhub_access` cookie. Each token carries a budget of 10 API calls, after
+which the API answers a GraphQL error "API rate limit excessed!", and a spent
+token did not refill within 12 minutes (measured 2026-11-06). The site's own
+reader recovers by reloading the page with `?reloadKey=1` while still sending
+the spent cookie; the server then sets a NEW token with a fresh budget
+(measured: 5 reloads in a row, 10 calls each, 50/50 succeeded). The handler
+does the same (grep _mint_token). Do NOT drop the cookie before the reload: a
+cookieless visit is dealt one of a 3-token shared pool, which was spent.
+This file used to send one hardcoded token; once that was spent (by early
+Nov 2026), every page list failed and the search ranker rated mangahub
+`unreachable` / `pages_failed`.
+Registered in sites/__init__.py; tests: tests/test_mangahub_retry.py.
+"""
+
 from __future__ import annotations
 
 import json
+import threading
+import time
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
+
+import requests
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
@@ -15,7 +38,22 @@ class MangaHubSiteHandler(BaseSiteHandler):
     _GRAPHQL_URL = "https://api.mghcdn.com/graphql"
     _IMAGE_BASE = "https://imgx.mghcdn.com/"
     _THUMB_BASE = "https://thumb.mghcdn.com/"
-    _ACCESS_TOKEN = "7d89de0ab95ce91ffa2621f124db8067"
+
+    # Access-token minting (see the module docstring). Any mangahub.io page sets
+    # the cookie, 404s included; /search is a ~22 KB 200 (the homepage is
+    # 1.8 MB). Without reloadKey the server just echoes back the cookie the
+    # client sends, so a plain revisit never replaces a spent token.
+    _TOKEN_COOKIE = "mhub_access"
+    _TOKEN_MINT_URL = _BASE_URL + "/search"
+    _TOKEN_RELOAD_URL = _BASE_URL + "/search?reloadKey=1"
+    _RATE_LIMIT_MARK = "rate limit"
+    # Re-mints per _post_graphql call. One reload normally clears it; the loop
+    # also stops when the server deals a token this call already spent.
+    _MAX_TOKEN_REFRESHES = 3
+    # One handler instance serves every scraper and thread (prefetch, match
+    # windows); serializing mints lets a thread that lost the race reuse the
+    # token the winner just minted instead of dropping it again.
+    _token_lock = threading.Lock()
 
     _MANGA_QUERY = """
     query MangaDetails($slug: String!) {
@@ -84,7 +122,8 @@ class MangaHubSiteHandler(BaseSiteHandler):
         scraper.headers.setdefault("Referer", self._BASE_URL + "/")
         scraper.headers.setdefault("Origin", self._BASE_URL)
         scraper.headers.setdefault("User-Agent", "Mozilla/5.0")
-        scraper.headers.setdefault("x-mhub-access", self._ACCESS_TOKEN)
+        # x-mhub-access is NOT set here: it is minted lazily on the first API
+        # call (no network in configure_session) and sent per request.
 
     # ------------------------------------------------------------------ helpers
     def _slug_from_url(self, url: str) -> str:
@@ -98,15 +137,101 @@ class MangaHubSiteHandler(BaseSiteHandler):
             return parts[1]
         return parts[-1]
 
-    def _post_graphql(self, scraper, query: str, variables: Dict) -> Dict:
-        payload = {"query": query, "variables": variables}
-        response = scraper.post(
-            self._GRAPHQL_URL,
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload),
-        )
+    # Transient-failure retry for the GraphQL POST. api.mghcdn.com sits behind
+    # Cloudflare and answers in BURSTS of 525 (CF could not handshake with the
+    # origin) that clear within seconds: measured 2026-11-06, two back-to-back
+    # searches failed in <1 s with 525, the next five succeeded. A single bare
+    # POST turned each burst into a hard failure everywhere this is called
+    # (search, series load, every chapter's page list), and two failed searches
+    # inside PROBE_FAILURE_TTL_S get the host blocked from search for an hour
+    # (grep ProbeFailureCache in search_orchestrator.py). aio-dl.py's
+    # make_request retries, but it is GET-only, so the POST retries here.
+    # Retried: 429, 5xx (incl. CF 520-527), connection errors. NOT retried: other
+    # 4xx and GraphQL `errors` (a bad slug / schema drift won't fix itself).
+    # Timeouts are not retried either: a slow origin (5-34 s measured) would
+    # just be waited on twice, and the search fan-out's soft barrier
+    # (--search-timeout, 20 s default) has already moved on by then.
+    _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527})
+    _MAX_ATTEMPTS = 4
+    _RETRY_BACKOFF_S = (1.0, 2.0, 4.0)   # sleep before attempt 2, 3, 4 (7 s total)
+    _TIMEOUT = (10.0, 40.0)              # (connect, read); the origin can take ~35 s
+
+    def _current_token(self, scraper) -> Optional[str]:
+        for c in getattr(scraper, "cookies", None) or ():
+            if c.name == self._TOKEN_COOKIE and c.value:
+                return c.value
+        return None
+
+    def _mint_token(self, scraper, spent: Optional[str]) -> Optional[str]:
+        """Return a usable token for `scraper`, visiting the site for one.
+
+        `spent` is the token the caller just saw refused (None on first use).
+        If another thread already replaced it, that newer token is returned
+        without a visit. On first use a plain visit sets the cookie; for a spent
+        token the reload page is fetched WITH the spent cookie still in the jar,
+        and the server replaces it with a fresh one. Returns None when the
+        visit set no cookie; network errors propagate."""
+        with self._token_lock:
+            current = self._current_token(scraper)
+            if current and current != spent:
+                return current
+            url = self._TOKEN_RELOAD_URL if spent else self._TOKEN_MINT_URL
+            scraper.get(url, timeout=self._TIMEOUT)
+            return self._current_token(scraper)
+
+    def _send_graphql(self, scraper, payload: str, token: Optional[str]) -> Dict:
+        """One logical POST with transient retries (see _RETRY_STATUSES);
+        returns the whole JSON body, `errors` included. Raises the last
+        HTTPError / ConnectionError when the failures persist, and requests'
+        Timeout at once on a stalled origin."""
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["x-mhub-access"] = token
+        response = None
+        for attempt in range(self._MAX_ATTEMPTS):
+            if attempt:
+                time.sleep(self._RETRY_BACKOFF_S[min(attempt - 1, len(self._RETRY_BACKOFF_S) - 1)])
+            try:
+                response = scraper.post(
+                    self._GRAPHQL_URL, headers=headers, data=payload, timeout=self._TIMEOUT,
+                )
+            except requests.exceptions.Timeout:
+                raise
+            except requests.exceptions.ConnectionError:
+                if attempt + 1 >= self._MAX_ATTEMPTS:
+                    raise
+                continue
+            if response.status_code in self._RETRY_STATUSES and attempt + 1 < self._MAX_ATTEMPTS:
+                continue
+            break
         response.raise_for_status()
-        data = response.json()
+        return response.json()
+
+    def _is_rate_limited(self, errors) -> bool:
+        return self._RATE_LIMIT_MARK in str(errors).lower()
+
+    def _post_graphql(self, scraper, query: str, variables: Dict) -> Dict:
+        """POST one GraphQL query and return its `data` object.
+
+        Mints the access token on first use and re-mints when the API reports
+        it spent (module docstring), stopping when the server deals a token this
+        call already spent (the pool is exhausted for now). Raises RuntimeError
+        on a GraphQL `errors` payload, the rate-limit one included once
+        re-minting can't clear it, plus whatever _send_graphql raises. Callers
+        rely on it raising (search() lets it propagate so the probe-failure
+        cache sees a dead host)."""
+        payload = json.dumps({"query": query, "variables": variables})
+        token = self._current_token(scraper) or self._mint_token(scraper, None)
+        spent: set = set()
+        for _ in range(self._MAX_TOKEN_REFRESHES + 1):
+            data = self._send_graphql(scraper, payload, token)
+            errors = data.get("errors")
+            if not (errors and self._is_rate_limited(errors)):
+                break
+            spent.add(token)
+            token = self._mint_token(scraper, token)
+            if not token or token in spent:
+                break
         if "errors" in data:
             raise RuntimeError(f"MangaHub API error: {data['errors']}")
         return data.get("data") or {}
