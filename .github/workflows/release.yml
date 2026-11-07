@@ -15,6 +15,12 @@
 #             `dist:<os>` script. macOS DMGs cannot be cross-built from
 #             Windows or Linux (Apple's hdiutil is required), which is
 #             why the matrix exists.
+#   android — the Chaquopy port's release APK plus its android-latest.json
+#             update feed. Its own job rather than a fourth matrix leg: it
+#             shares no step with the Electron builds (Gradle + the Android
+#             SDK + a build Python, not npm) and it is the only job that
+#             touches signing secrets. `release` NEEDS it, deliberately —
+#             see ANDROID below.
 #   release — fires on tag push AND on workflow_dispatch. Downloads the
 #             per-OS artifacts and attaches them to a draft release. The
 #             draft has to be manually published in the GitHub UI before
@@ -57,6 +63,23 @@
 #     the newest commit: versions grow with committer time, clients never
 #     downgrade, and GitHub's /releases/latest sorts by the tagged
 #     commit's created_at, not by publish time.
+#   - ANDROID (opt-in self-update, android/app/src/main/java/com/aio/downloader/
+#     core/AppUpdater.kt): the APK's own updater polls
+#     /releases/latest/download/android-latest.json on whichever repo built it,
+#     the same "feed = the building repo" rule the Electron half uses. That feed
+#     file is written by the `android` job below, and ONLY when a real release
+#     keystore was available — its absence is the signal that installed apps
+#     must not try to update, because a debug-signed APK can never install over
+#     a differently-signed one. Version and applicability facts all come from
+#     `./gradlew -q :app:printVersion`; this workflow never restates them.
+#
+#     `release` NEEDS the android job, so a red Android build blocks the draft.
+#     That is the same policy the desktop matrix already has (a failed macOS leg
+#     fails `build` and skips `release`) and it is chosen over shipping a
+#     release that silently lacks the APK. To ship around a broken Android
+#     build, remove `android` from the release job's `needs:` in a branch — do
+#     not add a skip input: a SKIPPED job in `needs` skips the dependent job
+#     too, so an input would take the draft down with it.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Release
@@ -256,14 +279,243 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # ───────────────────────────────────────────────────────────────────────
+  # The Chaquopy Android port. Gated on the SAME guard as `build` — without
+  # `needs: guard` this would reintroduce for Android exactly the double-build
+  # the guard job exists to prevent (see DOUBLE-RUN in the header).
+  #
+  # The toolchain traps this job walks around are documented once, in
+  # .github/workflows/android.yml's header (JDK 17-21 for AGP 8.13; Chaquopy's
+  # buildPython must be the 3.13 that `chaquopy { version }` names, not the
+  # runner's distro python3). That workflow is the pre-merge sibling of this
+  # job; keep the two toolchain step-sets in step.
+  # ───────────────────────────────────────────────────────────────────────
+  android:
+    needs: guard
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # JOB level, deliberately: Chaquopy reads the ABI set from
+      # android.defaultConfig, so it cannot be a per-build-type value (see the
+      # ABIs block in android/app/build.gradle.kts — the build-type version of
+      # this silently ships x86_64 native libs with no x86_64 Python runtime).
+      # Every step therefore has to see the same value, or assembleRelease and
+      # printVersion would disagree about what the feed's `abis` field means.
+      # Real devices are arm64; x86_64 is the emulator, and dropping it takes
+      # the APK from 76.79 MB to 50.24 MB (measured, both variants).
+      AIO_ABIS: arm64-v8a
+      # The Android half of "Point update feed at this repo": a fork-built APK
+      # polls the fork's releases, upstream's polls upstream's.
+      AIO_UPDATE_FEED_REPO: ${{ github.repository }}
+
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - uses: actions/setup-python@v6
+        id: buildpython
+        with:
+          python-version: "3.13"
+
+      - name: Ensure the compileSdk platform is installed
+        run: |
+          set -eu
+          SDKMANAGER="$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1 || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "No sdkmanager on this image; relying on AGP's own SDK download."
+            exit 0
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-36" || \
+            echo "::warning::sdkmanager could not install platforms;android-36 — AGP will try."
+
+      # ── signing ──────────────────────────────────────────────────────────
+      # There is no keystore in the repo and there never will be. Four secrets
+      # supply one; all four or none.
+      #
+      #   ANDROID_KEYSTORE_BASE64    base64 of a PKCS12 .jks
+      #   ANDROID_KEYSTORE_PASSWORD
+      #   ANDROID_KEY_ALIAS
+      #   ANDROID_KEY_PASSWORD
+      #
+      # Absent (an unconfigured repo, or any fork), the build falls back to the
+      # DEBUG key so the APK still installs — an unsigned APK cannot be
+      # installed at all, so "unsigned but honest" is just a broken artifact.
+      # What it loses is self-update, and that loss is enforced in two places:
+      # BuildConfig.RELEASE_SIGNED is false, and the feed-writing step below
+      # refuses to emit android-latest.json. Both are deliberate: AGP's debug
+      # keystore is generated per machine, so two runs produce two keys and
+      # Android refuses to replace an app signed with a different one.
+      - name: Decode the release keystore
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -eu
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret. The release APK will be DEBUG-SIGNED, no android-latest.json will be published, and installed apps will not offer an update to it."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/aio-release.jks"
+          # A truncated or mis-pasted secret decodes to garbage that only fails
+          # inside apksigner, with a message that reads like file corruption.
+          if [ ! -s "$RUNNER_TEMP/aio-release.jks" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 decoded to an empty file."
+            exit 1
+          fi
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Unit tests and release APK
+        env:
+          AIO_BUILD_PYTHON: ${{ steps.buildpython.outputs.python-path }}
+          # Empty string when unsigned — app/build.gradle.kts treats a blank or
+          # missing path as "no release keystore" and falls back to the debug
+          # signing config.
+          AIO_KEYSTORE_FILE: ${{ steps.keystore.outputs.signed == 'true' && format('{0}/aio-release.jks', runner.temp) || '' }}
+          AIO_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          AIO_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          AIO_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew --console=plain --no-daemon \
+            :app:testDebugUnitTest \
+            :app:assembleRelease
+
+      # Everything factual about the build comes from Gradle, never from a
+      # second implementation in bash — grep printVersion in
+      # android/app/build.gradle.kts for why. Read with grep rather than eval:
+      # Gradle may put its own notices on stdout and this must not execute them.
+      - name: Name the APK and write the update feed
+        id: package
+        env:
+          AIO_BUILD_PYTHON: ${{ steps.buildpython.outputs.python-path }}
+          AIO_KEYSTORE_FILE: ${{ steps.keystore.outputs.signed == 'true' && format('{0}/aio-release.jks', runner.temp) || '' }}
+          AIO_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          AIO_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          AIO_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          SIGNED: ${{ steps.keystore.outputs.signed }}
+        run: |
+          set -euo pipefail
+
+          ./gradlew -q --console=plain --no-daemon :app:printVersion > "$RUNNER_TEMP/version.txt"
+          field() { grep -m1 "^$1=" "$RUNNER_TEMP/version.txt" | cut -d= -f2-; }
+          VERSION="$(field versionName)"
+          VERSION_CODE="$(field versionCode)"
+          MIN_SDK="$(field minSdk)"
+          ABIS="$(field abis)"
+          [ -n "$VERSION" ] && [ -n "$VERSION_CODE" ]
+
+          SRC="$(ls app/build/outputs/apk/release/*.apk | head -n1)"
+          OUT="$RUNNER_TEMP/android-release"
+          mkdir -p "$OUT"
+
+          # Dash-separated, never spaces: GitHub rewrites spaces in release
+          # ASSET names to dots while any feed that recorded dashes keeps them,
+          # which 404s every download. Same rule as package.json's
+          # nsis.artifactName / appImage.artifactName.
+          APK="AIO-Downloader-${VERSION}.apk"
+          cp "$SRC" "$OUT/$APK"
+
+          SHA="$(sha256sum "$OUT/$APK" | cut -d' ' -f1)"
+          SIZE="$(stat -c%s "$OUT/$APK")"
+
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+
+          if [ "$SIGNED" != "true" ]; then
+            echo "::warning::Debug-signed build — android-latest.json is NOT being written, so no installed app will offer this as an update."
+          else
+            # apksigner, NOT `keytool -printcert -jarfile`. AGP turns v1 (JAR)
+            # signing OFF when minSdk >= 24, so the APK carries only the v2/v3
+            # APK Signature Scheme block — which keytool cannot read: it prints
+            # "Not a signed jar file" AND EXITS 0. apksigner reads the real
+            # block, fails the step if the APK is not properly signed, and
+            # already prints the digest as lowercase hex with no colons, which
+            # is exactly the form AppUpdater derives from PackageManager.
+            APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n1)"
+            if [ -z "$APKSIGNER" ]; then
+              echo "::error::No apksigner under \$ANDROID_HOME/build-tools — cannot record the signing certificate the update feed needs."
+              exit 1
+            fi
+            # Matched on the digest itself, not on the line's prefix, because
+            # the prefix is NOT stable across build-tools versions — 36.0.0
+            # prints "Signer #1 certificate SHA-256 digest: <hex>" and 37.0.0
+            # prints "V2 Signer: certificate SHA-256 digest: <hex>" (measured on
+            # both). Since the glob above takes the HIGHEST installed version,
+            # a prefix match silently yields an empty digest the day a runner
+            # image adds a newer build-tools. Extracting the 64-hex token is
+            # also self-validating. A single signing config produces the same
+            # certificate under every scheme, so the first match is the answer.
+            SIGNING="$("$APKSIGNER" verify --print-certs "$OUT/$APK" \
+              | grep -m1 -oE 'SHA-256 digest: *[0-9a-fA-F]{64}' \
+              | grep -oE '[0-9a-fA-F]{64}' | tr 'A-Z' 'a-z')"
+            if [ ${#SIGNING} -ne 64 ]; then
+              echo "::error::Could not read the signing certificate digest (got '${SIGNING}')."
+              exit 1
+            fi
+
+            # releaseDate is stamped at BUILD time, exactly like
+            # electron-builder's, so both apps' maturity delays share one clock
+            # and one caveat: a draft left unpublished eats into the window.
+            jq -n \
+              --argjson schema 1 \
+              --argjson versionCode "$VERSION_CODE" \
+              --arg versionName "$VERSION" \
+              --arg releaseDate "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --arg apk "$APK" \
+              --argjson size "$SIZE" \
+              --arg sha256 "$SHA" \
+              --argjson minSdk "$MIN_SDK" \
+              --arg abis "$ABIS" \
+              --arg signingSha256 "$SIGNING" \
+              '{schema:$schema, versionCode:$versionCode, versionName:$versionName,
+                releaseDate:$releaseDate, apk:$apk, size:$size, sha256:$sha256,
+                minSdk:$minSdk, abis:($abis | split(",")), signingSha256:$signingSha256}' \
+              > "$OUT/android-latest.json"
+            cat "$OUT/android-latest.json"
+          fi
+
+          {
+            echo "### Android"
+            echo "- version: \`${VERSION}\` (code \`${VERSION_CODE}\`)"
+            echo "- apk: \`${APK}\` ($(numfmt --to=iec "$SIZE"), abis \`${ABIS}\`, minSdk \`${MIN_SDK}\`)"
+            echo "- release-signed: \`${SIGNED}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-build
+          # The APK and, when it exists, the update feed. android-latest.json is
+          # the Android analogue of latest.yml and MUST ride the release or the
+          # in-app updater 404s on every check.
+          path: ${{ steps.package.outputs.out }}
+          if-no-files-found: error
+          retention-days: 14
+
   release:
-    needs: [guard, build]
+    needs: [guard, build, android]
     # Fire on tag pushes (the canonical release path) AND manual runs
     # (workflow_dispatch). Without the second clause, a manual run would
     # stop at `build` and leave the artifacts unattached to anything.
     # The guard clause is redundant on paper — a skipped `build` skips this
     # job too — but it is stated explicitly so the "never touch an already
     # published release" invariant is readable here rather than inferred.
+    # `android` joined `needs` for the same reason `build` is there: every
+    # artifact-producing job must succeed or no draft is cut. See ANDROID in
+    # the header for why that is a hard dependency rather than a skippable one.
     if: >-
       needs.guard.outputs.proceed == 'true' &&
       (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')

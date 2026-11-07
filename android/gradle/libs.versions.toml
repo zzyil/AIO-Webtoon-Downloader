@@ -1,0 +1,96 @@
+# Toolchain versions for the Android port. Every pin here was chosen against
+# Chaquopy 17.0's published compatibility table (Python 3.10-3.14, AGP 7.3-9.3,
+# minSdk 24) rather than by convention — see android/README.md for the reasoning
+# behind each one, especially why AGP is deliberately NOT the newest release.
+
+[versions]
+agp = "8.13.2"
+kotlin = "2.2.21"
+chaquopy = "17.0.0"
+
+# Compose comes from a BOM: it pins ~20 mutually-versioned artifacts at once, so
+# the individual compose-* libraries below carry NO version. Bump the BOM, not
+# them. The compose COMPILER is versioned by the Kotlin plugin above (since
+# Kotlin 2.0 it ships as `kotlin.plugin.compose`), which is why there is no
+# separate compiler-extension pin here — that pairing used to be the single most
+# common Compose build break.
+composeBom = "2025.09.00"
+activityCompose = "1.11.0"
+lifecycle = "2.9.4"
+coreKtx = "1.17.0"
+# Compose and lifecycle both pull coroutines in transitively; pinned explicitly
+# because the whole state layer (StateFlow in DownloadRepository / LogTail) is
+# built on it, and a dependency the architecture rests on should not arrive by
+# accident.
+coroutines = "1.10.2"
+# Cover loading. BOTH the compose artifact and a network fetcher are pulled.
+#
+# This used to take compose only, reasoning that "every image the library shows
+# is already a local file (CoverStore resolves archives and PDFs to one), so
+# `coil-network-*` would add an HTTP stack nothing calls." That was true of the
+# LIBRARY and false of the app: SearchScreen hands AsyncImage a remote site URL
+# (`SearchSource.cover`), and Coil 3 moved network fetching out of coil-compose
+# — the coil-core artifact ships fetchers for assets, files, content URIs and
+# byte arrays and NOTHING that accepts http/https. So every search-result cover
+# failed to load, and because the monogram is drawn underneath unconditionally,
+# a total fetch failure looked exactly like "this site has no cover".
+coil = "3.2.0"
+junit = "4.13.2"
+# org.json for JVM unit tests ONLY. Android ships its own copy, but the one in
+# the unit-test android.jar is a stub whose every method throws — so the library
+# parsers (which are all JSONObject) would be untestable off-device without it.
+json = "20250107"
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+chaquopy = { id = "com.chaquo.python", version.ref = "chaquopy" }
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+# collectAsStateWithLifecycle — the UI must stop collecting the download's
+# progress flow while backgrounded, or a screen-off download repaints forever.
+androidx-lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-compose-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+# The desktop uses lucide-react. Extended carries the closest equivalents for
+# every icon in the rail and the screens; the core set does not.
+androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
+
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+
+# AsyncImage for the library grid. Hand-rolling this was considered and dropped:
+# the fiddly part is not loading a file, it is SAMPLING it. A cover page is
+# ~1600x2400, which is 15 MB decoded at full size, and twenty of those visible
+# at once is an OOM. Coil sizes the decode from the composable's own measured
+# constraints and cancels in flight when a card scrolls away — both of which
+# would otherwise need onSizeChanged plumbing and a hand-tuned LruCache.
+coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
+# The http/https fetcher. Brings OkHttp transitively, which is also what lets
+# AioImageLoader attach the hotlink Referer through an interceptor rather than a
+# bespoke downloader — see core/AioImageLoader.kt.
+coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
+
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+json = { group = "org.json", name = "json", version.ref = "json" }
+
+# TWO DEPENDENCIES WERE CONSIDERED AND DROPPED, both worth recording so they are
+# not re-added on a hunch:
+#   material3-window-size-class — was going to drive the rail-vs-bottom-bar
+#     switch. BoxWithConstraints does it better: it measures the actual
+#     container, so split-screen and freeform windows get the right answer
+#     without the Activity having to be threaded into the composable.
+#   ui-text-google-fonts — was going to fetch DM Sans + JetBrains Mono, the two
+#     faces the desktop names. Downloadable fonts need Play Services AND a
+#     certificate resource array, and when either is missing they fall back to
+#     the platform faces anyway, after a visible load flicker. See Type.kt: the
+#     type SCALE carries the design language, and bundling real TTFs later is a
+#     two-constant change.

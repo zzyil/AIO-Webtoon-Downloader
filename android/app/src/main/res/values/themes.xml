@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Activity's window theme. Compose paints everything above this, so the ONLY
+  job here is the window background: without it the window is white for the frame
+  or two before the first composition, which on a dark device is a hard flash.
+
+  Parent is a PLATFORM theme, not a Material Components one — pulling in
+  com.google.android.material just to satisfy an XML parent would add a whole
+  view-system dependency the app never otherwise touches.
+
+  Day/night is split across values/ and values-night/ rather than using
+  Theme.DeviceDefault.DayNight, which only exists from API 29 (minSdk here is 26).
+-->
+<resources>
+    <style name="Theme.Aio" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/aio_window_background</item>
+    </style>
+</resources>

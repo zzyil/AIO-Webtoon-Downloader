@@ -542,16 +542,35 @@ def test_headless_user_agent_is_stabilized():
     `HeadlessChrome/147.0.7727.15`; the headed handoff window advertises
     `Chrome/147.0.0.0`. The WAF binds its clearance to the UA that earned it, so
     the relaunched headless context could not use what the user had just
-    passed — and got re-challenged instantly."""
+    passed — and got re-challenged instantly.
+
+    Stabilizing now closes BOTH halves of that mismatch, not just the product
+    token (changed 2026-08-20): the version is also reduced to the form Chrome
+    actually puts on the wire, so the fallback binary and the headed window
+    agree byte-for-byte. Measured — `channel="chromium"` and headed both report
+    `147.0.0.0`, while the channel-less fallback (a different binary,
+    chromium_headless_shell) reports the raw `147.0.7727.15`. Keeping that raw
+    build was the very desync this docstring describes, and it is additionally a
+    UA no genuine Chrome ever sends, since UA reduction freezes those fields.
+    """
     headless = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) HeadlessChrome/147.0.7727.15 Safari/537.36"
     )
+    headed = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+    )
     out = comix._stabilize_user_agent(headless)
     assert "HeadlessChrome" not in out
-    assert "Chrome/147.0.7727.15" in out
-    # Everything except the product token is left exactly as reported.
-    assert out == headless.replace("HeadlessChrome/", "Chrome/")
+    # The whole point: what the headless fallback presents must be exactly what
+    # the headed window that earned the clearance presented.
+    assert out == headed
+    # A UA already in reduced form is returned untouched, which is what makes
+    # applying this unconditionally safe.
+    assert comix._stabilize_user_agent(headed) == headed
+    # Only the Chrome token is normalized — the engine tokens are left alone.
+    assert "AppleWebKit/537.36" in out and "Safari/537.36" in out
 
 
 def test_stabilize_user_agent_tolerates_missing_input():

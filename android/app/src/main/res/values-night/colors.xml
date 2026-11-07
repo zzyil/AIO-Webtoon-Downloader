@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- KEEP IN SYNC with DarkTokens.background in ui/theme/Color.kt (`224 15% 10%`). -->
+<resources>
+    <color name="aio_window_background">#16181D</color>
+</resources>

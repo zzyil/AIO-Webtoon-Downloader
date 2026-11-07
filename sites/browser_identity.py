@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from typing import Dict, Optional
 
@@ -66,12 +67,46 @@ _UA_MEMO: Dict[str, str] = {}
 _UA_LOCK = threading.Lock()
 
 
-def stabilize_user_agent(raw: Optional[str]) -> Optional[str]:
-    """Return *raw* with the headless giveaway removed.
+_CHROME_VERSION_RE = re.compile(r"(Chrome/)(\d+)(?:\.\d+)*")
 
-    Only rewrites the product token — the version string and everything else
-    stay exactly as the real browser reports them, so the result is still a
-    truthful description of the engine actually making the request.
+
+def reduce_user_agent_build(raw: Optional[str]) -> Optional[str]:
+    """Collapse the Chrome version to its reduced, on-the-wire form.
+
+    Chrome's UA reduction freezes everything after the major version, so a real
+    Chrome 147 sends exactly `Chrome/147.0.0.0` and the true build survives only
+    in Sec-CH-UA-Full-Version-List. Reducing here is therefore MORE truthful on
+    the wire, not less — it is what a genuine browser would have sent.
+
+    WHY THIS IS NEEDED AT ALL (measured 2026-08-20): the two launches this repo
+    uses report different versions through CDP `Browser.getVersion` —
+
+        channel="chromium"  (full Chromium)         -> HeadlessChrome/147.0.0.0
+        default headless    (chromium_headless_shell) -> HeadlessChrome/147.0.7727.15
+
+    Both are cached by remember_stable_user_agent and re-pinned by the next
+    process, so without this the cached value OSCILLATES between the two shapes.
+    Each flip costs a full teardown + relaunch at the reconciliation check in
+    sites/mangafire_vrf.py:_start (that oscillation is what printed the
+    channel-failure banner twice per series in the 2026-08-20 report), and the
+    unreduced shape is a bot signal in its own right — see FALLBACK_UA below,
+    which names `147.0.7727.15` as the one UA no genuine Chrome ever sends.
+
+    Length-preserving in spirit: a UA already in reduced form comes back
+    byte-identical, which is what makes this safe to apply unconditionally.
+    """
+    if not raw:
+        return None
+    return _CHROME_VERSION_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}.0.0.0", raw)
+
+
+def stabilize_user_agent(raw: Optional[str]) -> Optional[str]:
+    """Return *raw* with the headless giveaway removed and the build reduced.
+
+    Rewrites the product token and normalizes the version to the form Chrome
+    actually puts on the wire; everything else stays exactly as the real browser
+    reported it, so the result is still a truthful description of the engine
+    making the request.
 
     NOT SUFFICIENT ON ITS OWN — see the table above. This rewrites the
     User-Agent STRING; the Sec-CH-UA client hints are generated independently by
@@ -79,7 +114,7 @@ def stabilize_user_agent(raw: Optional[str]) -> Optional[str]:
     """
     if not raw:
         return None
-    return raw.replace("HeadlessChrome/", "Chrome/")
+    return reduce_user_agent_build(raw.replace("HeadlessChrome/", "Chrome/"))
 
 
 def probe_true_user_agent(context, page) -> Optional[str]:

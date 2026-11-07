@@ -1,0 +1,18 @@
+package:
+  name: pillow
+  version: "11.0.0"
+
+build:
+  # Chaquopy's index publishes build 0 of this exact version. pip sorts
+  # candidates by build tag, so bumping to 1 is what makes --find-links win
+  # over the index when both are visible.
+  number: 1
+
+requirements:
+  host:
+    # PNG support is internal: libpng is not used.
+    - chaquopy-libjpeg 1.5.3
+    - chaquopy-freetype 2.9.1
+    # ADDED, not upstream. Without it the wheel has no PIL/_webp.so at all,
+    # which is the entire reason this recipe exists.
+    - chaquopy-libwebp 1.6.0

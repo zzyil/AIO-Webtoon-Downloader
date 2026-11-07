@@ -67,7 +67,7 @@ GIF_MAGIC = b"GIF8"                # both GIF87a and GIF89a
 # Pass PER REQUEST, never onto `session.headers` — the same session fetches
 # HTML pages, and a session-level image Accept would break those instead.
 # Callers: aio-dl.py:_try_download_url, sites/base.py (_fast_dl_build_headers,
-# _fetch_probe_item_bytes_ex, _probe_cover_image), sites/mangadex.py
+# _fetch_probe_item_bytes_ex), sites/mangadex.py
 # (_fetch_image_blob). grep IMAGE_ACCEPT.
 IMAGE_ACCEPT = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
 

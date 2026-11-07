@@ -10,7 +10,6 @@ import uuid
 from typing import Optional
 from urllib.parse import urlparse
 
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -20,6 +19,7 @@ from aio_config import resolve_output_dir
 from library_state import scan_library, to_jsonable
 from metadata_editor import read_metadata, update_metadata
 from sites import get_handler_by_name, get_handler_for_url
+from sites.http_session import create_http_session
 
 app = FastAPI(title="AIO Downloader API")
 
@@ -54,12 +54,7 @@ threading.Thread(target=cleanup_temp_files, daemon=True).start()
 
 
 def get_scraper():
-    try:
-        import cloudscraper
-
-        return cloudscraper.create_scraper()
-    except Exception:
-        return requests.Session()
+    return create_http_session()
 
 
 def make_request(url: str, scraper):
@@ -124,6 +119,9 @@ def list_handlers():
                 "base_url": getattr(handler, "base_url", None),
                 "domains": list(getattr(handler, "domains", ()) or ()),
                 "search_capable": type(handler).search is not sites.BaseSiteHandler.search,
+                # Native volume releases (MangaFire). Same override check as
+                # sites.handler_capabilities()["volumes"].
+                "volumes_capable": type(handler).supports_volumes(),
             }
         )
     return handlers
@@ -138,6 +136,26 @@ def get_comic_info(url: str, site: Optional[str] = None):
     return context.comic
 
 
+def _list_items(handler, context, scraper, language: str, kind: str):
+    """The series' chapters, or with kind="volume" its native volumes.
+    *kind* is the endpoints' ``type`` query parameter (named apart here so the
+    builtin stays usable).
+
+    Volumes go through list_volumes (normalized labels, ``_kind="volume"`` so
+    get_item_images routes to the volume endpoint). A handler without volume
+    support is a 501; a supported site with no volumes in *language* is an
+    empty list, not an error. Chapter and volume ids are separate id spaces
+    (MangaFire), which is why /api/chapter_images takes the same ``type``.
+    """
+    if kind == "volume":
+        if not handler.supports_volumes():
+            raise HTTPException(501, "This handler does not expose volume listing")
+        return handler.list_volumes(context, scraper, language, make_request)
+    if kind != "chapter":
+        raise HTTPException(400, 'type must be "chapter" or "volume"')
+    return handler.get_chapters(context, scraper, language, make_request)
+
+
 @app.get("/api/chapters")
 def get_chapters(
     url: str,
@@ -149,32 +167,33 @@ def get_chapters(
     scraper = get_scraper()
     handler.configure_session(scraper, None)
     context = handler.fetch_comic_context(url, scraper, make_request)
-    if type == "volume":
-        volumes = handler.get_volumes(context, scraper, language, make_request)
-        if not volumes:
-            raise HTTPException(501, "This handler does not expose volume listing")
-        return volumes
-    return handler.get_chapters(context, scraper, language, make_request)
+    return _list_items(handler, context, scraper, language, type)
 
 
 @app.get("/api/chapter_images")
-def get_chapter_images(url: str, chapter_id: str, site: Optional[str] = None):
+def get_chapter_images(
+    url: str,
+    chapter_id: str,
+    site: Optional[str] = None,
+    language: str = "en",
+    type: str = "chapter",
+):
     handler = _handler_for(url, site)
     scraper = get_scraper()
     handler.configure_session(scraper, None)
     context = handler.fetch_comic_context(url, scraper, make_request)
-    chapters = handler.get_chapters(context, scraper, "en", make_request)
-    chapter = next(
+    items = _list_items(handler, context, scraper, language, type)
+    item = next(
         (
             c
-            for c in chapters
+            for c in items
             if str(c.get("id") or c.get("hid") or c.get("url") or c.get("chap")) == str(chapter_id)
         ),
         None,
     )
-    if not chapter:
-        raise HTTPException(404, "Chapter not found")
-    return {"images": handler.get_chapter_images(chapter, scraper, make_request)}
+    if not item:
+        raise HTTPException(404, "Volume not found" if type == "volume" else "Chapter not found")
+    return {"images": handler.get_item_images(item, scraper, make_request)}
 
 
 @app.get("/api/search")

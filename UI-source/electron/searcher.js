@@ -22,6 +22,9 @@ const { spawn } = require("child_process");
 // the dedup sweep; classifyLogLevel's success branch is search-specific,
 // injected below via SEARCH_SUCCESS_RE.
 const { NOISY_LINE_RE, stripAnsi, classifyLogLevel } = require("./log-filter");
+// Tree kill (deviceSync P4): Python search spawns Playwright → Chromium, and a
+// plain proc.kill() leaves those grandchildren running. grep proc-kill.
+const { killTree, killTreeNow, trackChild } = require("./proc-kill");
 
 // Search-stream "this line is a success" markers (green in the LogPanel):
 // the auto-pick winner + the chapter-alignment summary. downloader.js
@@ -57,13 +60,10 @@ function buildSearchArgs(query, opts = {}) {
   // safer default). aio-dl.py's argparse keeps --no-collapse-splits as a
   // hidden alias for script users; we don't emit it.
   if (opts.collapseSplits === true) args.push("--collapse-splits");
-  // enableMlRating defaults FALSE (production default; matches argparse).
-  // Only emit the flag when explicitly enabled. Wiring this through so
-  // users can opt into torch-backed T2/T3 image-quality scoring (CLIP-IQA,
-  // NIQE, paired DISTS). Off by default because torch's Windows import
-  // can stall on WMI degraded states — see search_orchestrator.py's
-  // _ML_RATING_ENABLED docstring for the full rationale.
-  if (opts.enableMlRating) args.push("--enable-ml-rating");
+  // No ML-rating flag: the opt-in ML image rating was removed with the
+  // image-ranker rework (2026-10-21) and aio-dl.py no longer accepts
+  // --enable-ml-rating. An old saved searchOpts.enableMlRating is simply
+  // never read (this builder maps keys explicitly; nothing iterates opts).
 
   // User-disabled search sites (Settings → Search → "Search Sources", or the
   // SlowSitesCallout's "Disable & re-search"). Comma-joined handler names →
@@ -98,15 +98,25 @@ class Searcher {
     // Downloader._extraEnv — see main.js:initDownloader.
     this._extraEnv = extraEnv || {};
 
-    // The currently-running child process. Only one search at a time
-    // (the UI prevents concurrent invocations via searchState.status).
-    // Hold a reference so cancel() can SIGTERM it.
+    // The currently-running child process: one search at a time per
+    // Searcher. The UI does NOT prevent a second runSearch while one runs
+    // (a new query, a re-search, React StrictMode's double effect), so
+    // runSearch cancels the previous process; the renderer ignores the
+    // replaced call's answer (hooks/useSearch.js). Held so cancel() can kill it.
     this._proc = null;
 
     // Counter for log-correlation IDs (same shape as downloader's
     // downloadId). The UI uses this to scope stderr lines to the
     // current search invocation in the LogPanel.
     this._nextId = 1;
+
+    // Processes this Searcher cancelled (deviceSync P4). Tracked per process,
+    // not as one flag: runSearch's cancel-previous path starts a new process
+    // while the old one is still dying, and the old one's late close must
+    // still read as cancelled. Needed because a Windows taskkill /f ends the
+    // child with code 1 and signal null, which the close handler would
+    // otherwise report as "Search exited with code 1".
+    this._cancelled = new WeakSet();
   }
 
   /**
@@ -114,16 +124,19 @@ class Searcher {
    * parsed JSON on clean exit (code=0 + valid JSON), or rejects with an
    * Error on spawn failure / non-zero exit / JSON parse failure.
    *
-   * @param {object} cfg - { pythonCmd, scriptPath, workingDir, query, opts }
+   * @param {object} cfg - { pythonCmd, scriptPath, workingDir, query, opts, searchId? }
+   *   searchId: the id put on this search's log lines; minted here when absent.
    */
-  runSearch({ pythonCmd, scriptPath, workingDir, query, opts }) {
+  runSearch({ pythonCmd, scriptPath, workingDir, query, opts, searchId: givenId }) {
     if (this._proc) {
-      // Defense-in-depth: UI shouldn't allow a second search while one is
-      // running, but if it happens we cancel the prior before starting.
+      // A second search while one runs is normal (new query, re-search,
+      // StrictMode): the newest wins, the prior process is cancelled and its
+      // promise rejects with err.cancelled.
       this.cancel();
     }
 
-    const searchId = `srch_${this._nextId++}_${Date.now()}`;
+    const mintedId = `srch_${this._nextId++}_${Date.now()}`;
+    const searchId = typeof givenId === "string" && givenId ? givenId : mintedId;
     const cliArgs = ["-u", scriptPath, ...buildSearchArgs(query, opts)];
     const cmdString = `${pythonCmd} ${cliArgs.join(" ")}`;
 
@@ -142,6 +155,9 @@ class Searcher {
           // that use Playwright (comix, violetscans, rizzfables, etc.)
           // can find the bundled Chromium. Same merge order as downloader.js.
           env: { ...process.env, ...this._extraEnv, PYTHONUNBUFFERED: "1" },
+          // Own process group off Windows, so killTree's process.kill(-pid)
+          // reaches Playwright's children too (deviceSync P4).
+          detached: process.platform !== "win32",
         });
       } catch (err) {
         reject(new Error(`Failed to spawn search: ${err.message}`));
@@ -149,6 +165,7 @@ class Searcher {
       }
 
       this._proc = proc;
+      trackChild(proc);
 
       // Accumulate stdout — it's the JSON candidate list, parsed on close.
       // We don't try to parse mid-stream because aio-dl.py emits the JSON
@@ -199,7 +216,7 @@ class Searcher {
           this._onLog?.(searchId, tail, classifyLogLevel(tail, SEARCH_SUCCESS_RE));
         }
 
-        if (signal === "SIGTERM" || signal === "SIGKILL") {
+        if (this._cancelled.has(proc) || signal === "SIGTERM" || signal === "SIGKILL") {
           // User-initiated cancel — communicate as a benign rejection so
           // the UI can distinguish from genuine errors.
           const err = new Error("Search cancelled");
@@ -248,18 +265,45 @@ class Searcher {
   }
 
   /**
-   * Best-effort cancel of the in-flight search. SIGTERM the child; the
-   * `close` handler resolves with err.cancelled=true so the UI can
+   * Best-effort cancel of the in-flight search. Tree-kills the child; the
+   * `close` handler rejects with err.cancelled=true so the UI can
    * distinguish from real failures.
+   *
+   * Returns false when nothing is running, or when the child already exited
+   * and only its close is pending: its PID may already be recycled, so no
+   * taskkill is sent, and the close reports the natural result.
    */
   cancel() {
-    if (!this._proc) return false;
-    try {
-      this._proc.kill("SIGTERM");
-    } catch {
-      /* swallow — process may already be dead */
-    }
+    const proc = this._proc;
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return false;
+    this._cancelled.add(proc);
+    killTree(proc).catch(() => {});
     return true;
+  }
+
+  /**
+   * cancel(), then wait until the child's close event (≤ ~6 s). For callers
+   * that must not proceed while the tree is alive (reinstall-python's
+   * deleteEnv, app quit). Resolves {wasRunning}; never rejects.
+   */
+  async cancelAndWait({ timeoutMs = 5000 } = {}) {
+    const proc = this._proc;
+    if (!proc) return { wasRunning: false };
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      await trackChild(proc);
+      return { wasRunning: false };
+    }
+    this._cancelled.add(proc);
+    await killTree(proc, { timeoutMs });
+    return { wasRunning: true };
+  }
+
+  /** Synchronous fire-and-forget tree kill for app.on("quit") (shutdownNow). */
+  cancelNow() {
+    const proc = this._proc;
+    if (!proc) return false;
+    this._cancelled.add(proc);
+    return killTreeNow(proc);
   }
 
   /** Whether a search is currently running. */

@@ -12,6 +12,11 @@ Owns:
   - delegating to sites.search_orchestrator.search_all().
   - emitting JSON when --search is the only mode, OR returning the winner
     URL when --auto-pick is set.
+  - the multi-source discovery result aio-dl.py consumes (alternatives dict,
+    catalog, resume-cache sources), built in ONE place
+    (build_alternatives_from_records) for all four entry points: direct-URL
+    search, prefetched JSON, resume cache, and --search --auto-pick's own
+    fetched lists (alternatives_from_search_state).
 
 Cross-file:
   - sites/search_orchestrator.py — the actual ranking logic.
@@ -44,13 +49,7 @@ except Exception:
     pass
 
 import time
-from typing import Any, Callable, Optional
-
-# cloudscraper is optional (matches aio-dl.py:362–366)
-try:
-    import cloudscraper  # type: ignore
-except Exception:  # pragma: no cover
-    cloudscraper = None  # type: ignore
+from typing import Any, Callable, List, Optional
 
 import requests
 
@@ -58,15 +57,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 from sites import get_handler_by_name
-from sites.base import SearchHit
+from sites.base import SearchHit, readable_chapters
 from sites.chapter_merger import _classify_main_chapters, align_chapter_lists
 from sites.fetch_memo import FetchMemo
+from sites.http_session import create_http_session
 from sites.search_orchestrator import (
     DEFAULT_MIN_MATCH,
     DEFAULT_PER_SITE_TIMEOUT_S,
     ImageQualityCache,
     ProbeFailureCache,
+    best_title_of,
     search_all,
+    source_rank_key,
 )
 
 
@@ -106,7 +108,7 @@ def _try_extract_seed_hit(query: str, fetch_memo=None) -> Optional[SearchHit]:
 
     ``fetch_memo`` (sites/fetch_memo.py, 2026-07-12): when provided, the
     context (and, for mangafire, the chapter list) this resolution already
-    fetched is pre-registered so the probe / T3 / winner-fetch phases reuse
+    fetched is pre-registered so the probe and winner-fetch phases reuse
     it instead of re-fetching. The seed's bare requests.Session is
     deliberately NOT registered as the memo scraper — it was configured with
     args=None and would drift from the args-configured scrapers the other
@@ -197,7 +199,7 @@ def _try_extract_seed_hit(query: str, fetch_memo=None) -> Optional[SearchHit]:
 
     # Pre-populate the per-run fetch memo with data this resolution already
     # paid for. Keyed on the SAME url the SearchHit below carries
-    # (comic.get("url") or q) so probe/T3/winner lookups — which key on
+    # (comic.get("url") or q) so probe/winner lookups — which key on
     # src.url == hit.url — hit it. Best-effort: memo failures must never
     # break seed resolution.
     if fetch_memo is not None:
@@ -228,6 +230,24 @@ def _try_extract_seed_hit(query: str, fetch_memo=None) -> Optional[SearchHit]:
         raw_score=1.0,
         is_official=is_official,
     )
+
+
+def _primary_alt_names(context: Any) -> List[str]:
+    """The handler-scraped alt_names of a download's primary series, as strings.
+
+    Handlers store them on ``context.comic["alt_names"]`` (grep
+    `comic["alt_names"]` under sites/) — usually a list, occasionally a single
+    string. Anything else, or a context with no comic dict, gives [].
+    """
+    comic = getattr(context, "comic", None)
+    if not isinstance(comic, dict):
+        return []
+    raw = comic.get("alt_names")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(a) for a in raw if isinstance(a, str) and a.strip()]
 
 
 def _search_make_request_factory(timeout: float, attempts: int = 2):
@@ -274,18 +294,9 @@ def _search_make_request_factory(timeout: float, attempts: int = 2):
 
 
 def _build_scraper(args: Any) -> Any:
-    """Mirror of aio-dl.py main()'s scraper creation. Single-source; if you
-    change the policy there, change here too."""
-    use_cloudscraper = cloudscraper is not None and sys.version_info >= (3, 7)
-    if use_cloudscraper:
-        try:
-            scraper = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "darwin", "mobile": False}
-            )
-        except Exception:
-            scraper = requests.Session()
-    else:
-        scraper = requests.Session()
+    """The same session aio-dl.py main() builds (sites/http_session.py), plus
+    the --cookies jar."""
+    scraper = create_http_session()
     cookies = getattr(args, "cookies", "") or ""
     if cookies:
         try:
@@ -421,17 +432,16 @@ def _fetch_chapters_for_winner(
         if not isinstance(chapters, list):
             chapters = []
         # An ALT source must never OFFER a chapter it can't serve. tapas emits
-        # premium/wait-to-unlock episodes as `_locked` placeholders — meaningful
-        # only when tapas is the PRIMARY (where --multi-source fills them from
-        # peers). Acting as an alternative here, tapas can't deliver those pages,
-        # so drop them; otherwise the aligner would advertise a tapas-alt locked
-        # placeholder as a "fallback" that always fails when tried. Cross-file:
-        # grep _locked / _process_chapter_strict in aio-dl.py. No-op for sites
-        # that never emit _locked.
-        chapters = [
-            c for c in chapters
-            if not (isinstance(c, dict) and c.get("_locked"))
-        ]
+        # premium/wait-to-unlock episodes and MangaDex emits publisher link-outs
+        # as placeholders — meaningful only on the PRIMARY (where --multi-source
+        # fills them from peers). Acting as an alternative, such a site can't
+        # deliver those pages, so drop them; otherwise the aligner would
+        # advertise a placeholder as a "fallback" that always fails when tried
+        # (or, for a MangaDex `pages: 1` link-out, "rescue" a chapter with the
+        # EXTERNAL CHAPTER card). An empty list after this means the site has
+        # nothing readable — the primary switch reads that via readable_sites.
+        # Cross-file: sites/base.py is_placeholder_chapter.
+        chapters = readable_chapters(chapters)
         return {
             "site": source.site, "url": source.url,
             "chapters": chapters, "scraper": scraper, "handler": handler, "context": ctx,
@@ -478,6 +488,119 @@ def _fetch_chapters_for_winner(
     return [r for r in results if r is not None]
 
 
+def _readable_sites(source_records: list) -> list:
+    """Sites from _fetch_chapters_for_winner records that can serve as a
+    download primary: a context and a non-empty list (placeholders are
+    already stripped there, so non-empty means readable chapters exist)."""
+    return [
+        r["site"] for r in source_records
+        if r.get("chapters") and r.get("context") is not None and r.get("handler") is not None
+    ]
+
+
+def _catalog_from_records(source_records: list, primary_site: str) -> list:
+    """The full readable chapter list of every usable alt site, for the
+    multi-source rescue's alt catalog (aio-dl.py grep `_ms_catalog`;
+    sites/rescue_pairing.py builds the ordered lists). The per-number
+    alternatives dict keeps only the entries the aligner could pair by label,
+    which is exactly what sites that number differently break; content-proven
+    rescue needs every entry. Same records the dict is built from, so the live
+    handler/scraper/context refs are shared, not copied. The primary's own site
+    is left out, as in the dict."""
+    return [
+        {"site": r["site"], "url": r.get("url"), "chapters": list(r["chapters"]),
+         "handler": r["handler"], "scraper": r.get("scraper"), "context": r["context"]}
+        for r in source_records
+        if r.get("site") != primary_site and r.get("chapters")
+        and r.get("context") is not None and r.get("handler") is not None
+        and r.get("scraper") is not None
+    ]
+
+
+def build_alternatives_from_records(
+    source_records: list, alt_sources: list, primary_handler, primary_chapters, args,
+) -> dict:
+    """The discovery result every multi-source entry point returns, built from
+    alt chapter lists already in hand: the per-number alternatives dict
+    (aligned with the primary's REAL list as anchor), the consensus, the ranked
+    sources for the resume cache and the primary switch, and the full catalog.
+
+    `source_records` are _fetch_chapters_for_winner records; any for the
+    primary's own site are left out. `alt_sources` are the ranked sources the
+    records were fetched from (objects with .site / .url / .title / .cover),
+    echoed as `resolved_sources`. Callers: find_alternatives_for_direct_url,
+    build_alternatives_from_payload, alternatives_from_search_state.
+    """
+    primary_site = primary_handler.name
+    records = [r for r in source_records if r.get("site") != primary_site]
+    sources_with_chapters: list = [(primary_site, primary_chapters or [])]
+    for rec in records:
+        sources_with_chapters.append((rec["site"], rec["chapters"]))
+    alignment = align_chapter_lists(
+        sources_with_chapters,
+        collapse_splits=bool(getattr(args, "collapse_splits", False)),
+    )
+
+    records_by_site = {rec["site"]: rec for rec in records}
+    alternatives_by_chap_num: dict = {}
+    for entry in alignment.chapter_map:
+        alts = []
+        for site, ch_dict in entry.sources:
+            if site == primary_site:
+                continue
+            rec = records_by_site.get(site)
+            if not rec or not rec.get("context") or not rec.get("handler"):
+                continue
+            alts.append({
+                "site": site,
+                "url": rec["url"],
+                "chapter": ch_dict,
+                "scraper": rec["scraper"],
+                "handler": rec["handler"],
+                "context": rec["context"],
+            })
+        if alts:
+            alternatives_by_chap_num[entry.chapter_num] = alts
+
+    return {
+        "alternatives_by_chap_num": alternatives_by_chap_num,
+        # Consumed by aio-dl.py at the group_chapters_for_download call site
+        # (refined collapse-splits rules). None = no peer overlap.
+        "consensus_set": (
+            alignment.consensus_set if alignment.consensus_set else None
+        ),
+        "consensus_max": alignment.consensus_max,
+        # (site, url, title, cover) of the ranked alternatives. aio-dl.py
+        # persists these into run_params.json's `multi_source_cache` so a
+        # resume rebuilds the alternatives via build_alternatives_from_payload
+        # without a cross-site search (grep _build_multi_source_cache_payload).
+        "resolved_sources": [
+            {"site": s.site, "url": s.url,
+             "title": getattr(s, "title", "") or "",
+             "cover": getattr(s, "cover", None)}
+            for s in alt_sources if s.site != primary_site
+        ],
+        # Sites whose fetched list had readable chapters, in fetch order. The
+        # primary switch in aio-dl.py reads it (grep _pick_primary_switch).
+        "readable_sites": _readable_sites(records),
+        # Every alt site's full list, for the content-proven rescue.
+        "catalog": _catalog_from_records(records, primary_site),
+    }
+
+
+def alternatives_from_search_state(state: dict, primary_handler, primary_chapters, args) -> dict:
+    """The discovery result for a --search --multi-source --auto-pick run, from
+    the chapter lists the search already fetched (take_latest_multi_source_state),
+    so aio-dl.py gets the same alternatives, catalog and resume cache as a
+    direct-URL run without a second search or a second round of list fetches.
+    The primary is the handler main() actually resolved, not the search's
+    alignment anchor; its site is dropped from the alternatives."""
+    return build_alternatives_from_records(
+        state.get("source_records") or [], state.get("sources") or [],
+        primary_handler, primary_chapters, args,
+    )
+
+
 def run_search_mode(
     args: Any,
     make_request: Callable,
@@ -515,21 +638,8 @@ def run_search_mode(
     if not query:
         sys.exit("--search requires a non-empty title.")
 
-    # Set the ML-rating gate BEFORE the orchestrator imports torch-backed
-    # modules. When False (the default), all torch/pyiqa/torchmetrics
-    # imports stay deferred — search startup never loads torch. This
-    # avoids the Python 3.13 + Windows WMI hang that bricked --search
-    # before the 2026-05-20 lazy-import refactor. set_ml_rating_enabled
-    # is idempotent so direct-URL multi-source paths can also call it.
-    # Cross-file: aio-dl.py argparse defines --enable-ml-rating;
-    # UI-source/src/components/SearchTab.jsx writes enableMlRating to
-    # settings.searchOpts; UI-source/electron/searcher.js translates that
-    # back to --enable-ml-rating on the spawn line — grep enableMlRating.
-    from sites.search_orchestrator import set_ml_rating_enabled
-    set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
-
     # Per-run fetch memo (sites/fetch_memo.py, 2026-07-12): shared by the
-    # probe phase, T3 pairwise, and the winner chapter fetch so each
+    # matched-page probe phase and the winner chapter fetch so each
     # (site, url)'s context + chapter list is fetched from the network at
     # most once per run. In-process only — dies with this invocation.
     fetch_memo = FetchMemo()
@@ -581,15 +691,11 @@ def run_search_mode(
         probe_failure_cache=cache,
         img_quality_cache=img_cache,
         seed_hits=seed_hits or None,
-        # Search mode always probes ALL sources (including the seed
-        # source, when --search was given a URL) so the JSON output
-        # surfaces a real comparable img_quality_score for every
-        # candidate. Quality skip is reserved for direct-URL
-        # --multi-source (find_alternatives_for_direct_url below),
-        # where the primary is already committed and probing it is
-        # waste. The SKIP_QUALITY_PROBE class-attr opt-out is honored
-        # unconditionally in search_orchestrator's per-source loop (a
-        # generic hook — no handler sets it today) — no plumbing here.
+        # Search mode probes every eligible source (including the seed
+        # source, when --search was given a URL) so the JSON output carries
+        # comparable ratings. The SKIP_QUALITY_PROBE class-attr opt-out is
+        # honored in search_orchestrator._probe_eligible (a generic hook - no
+        # handler sets it today) - no plumbing here.
         on_status=_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
         # Probe scope (2026-07-12, user decision): --auto-pick only ever
@@ -608,11 +714,11 @@ def run_search_mode(
 
     multi_source = bool(getattr(args, "multi_source", False))
 
-    # Phase 4a/b — multi-source: fetch chapter lists for the winner's sources,
-    # align them, and (Phase 4b) build a per-chapter alternatives dict that
-    # aio-dl.py's _process_chapter_strict consumes for automatic fallback.
+    # Multi-source: fetch chapter lists for the winner's sources and align
+    # them, for the JSON chapter map and (--auto-pick) the primary choice; the
+    # fetched lists are handed to aio-dl.py for the rescue (search_ms_state).
     winner_chapter_map = None
-    multi_source_alternatives_payload = None  # exposed to aio-dl.py main() via the search-mode return
+    search_ms_state = None  # handed to aio-dl.py main() via take_latest_multi_source_state
     if multi_source and candidates:
         winner = candidates[0]
         # Apply quality threshold to the WHOLE candidate's sources before
@@ -626,6 +732,8 @@ def run_search_mode(
             winner.sources[1:],  # skip top
             primary_host="",  # no primary-host yet; --auto-pick uses winner.sources[0]
             quality_min=quality_min,
+            primary_edition=getattr(winner.sources[0], "edition", None),
+            rank_pool=winner.sources,
         )
         # The winner candidate is reduced to: top source + eligible alts.
         from sites.search_orchestrator import SeriesCandidate
@@ -707,53 +815,24 @@ def run_search_mode(
                 ],
                 "total_chapters_aligned": len(alignment.chapter_map),
             }
-            # Phase 4b: build per-chapter alternatives indexed by chapter number.
-            # Each entry includes the alternative source's handler+scraper+context
-            # so _process_chapter_strict can swap them in via nonlocal and call
-            # _process_chapter without re-running fetch_comic_context.
-            # The site picked as anchor in alignment is what aio-dl.py will use
-            # as primary; everything else becomes a fallback.
-            anchor_site = next(
-                (s for s, d in alignment.merge_diagnostics.items() if d.get("role") == "anchor"),
-                None,
-            )
-            records_by_site = {rec["site"]: rec for rec in source_records}
-            alternatives_by_chap_num: dict = {}
-            for entry in alignment.chapter_map:
-                alts = []
-                for site, ch_dict in entry.sources:
-                    if site == anchor_site:
-                        continue
-                    rec = records_by_site.get(site)
-                    if not rec or rec["context"] is None or rec["handler"] is None:
-                        continue
-                    alts.append({
-                        "site": site,
-                        "url": rec["url"],
-                        "chapter": ch_dict,
-                        # scraper/handler/context aren't JSON-serializable; the
-                        # search-mode runner stashes them on a side channel so
-                        # aio-dl.py main() can pick them up. See _MULTI_SOURCE_STATE
-                        # below.
-                        "_scraper_token": id(rec["scraper"]),
-                        "_handler_token": id(rec["handler"]),
-                        "_context_token": id(rec["context"]),
-                    })
-                if alts:
-                    alternatives_by_chap_num[entry.chapter_num] = alts
-            multi_source_alternatives_payload = {
-                "anchor_site": anchor_site,
-                "alternatives_by_chap_num": alternatives_by_chap_num,
-                "source_records": source_records,  # holds live scraper/handler/context refs
-                # consensus_set passed in-memory (real set, not list) so
-                # aio-dl.py's group_chapters_for_download call can refine
-                # Rule 2 / 3b / 6 with peer-source confirmation. None when
-                # alignment.consensus_set is empty (single source / no peer
-                # overlap), to keep downstream's "no peer data" check simple.
-                "consensus_set": (
-                    alignment.consensus_set if alignment.consensus_set else None
+            # The alignment anchor (most chapters) becomes the download
+            # primary below. The fetched records ride to aio-dl.py as they are
+            # (live scraper/handler/context refs): main() builds the
+            # alternatives, catalog and resume cache from them once it has
+            # resolved the primary and fetched ITS list (grep
+            # alternatives_from_search_state), the same as a direct-URL run.
+            # Alternatives keyed here would be keyed on the anchor's list as
+            # the search saw it, not on the list the download walks.
+            search_ms_state = {
+                "anchor_site": next(
+                    (s for s, d in alignment.merge_diagnostics.items()
+                     if d.get("role") == "anchor"),
+                    None,
                 ),
-                "consensus_max": alignment.consensus_max,
+                "source_records": source_records,
+                # Ranked as the search ranked them (top source first); the
+                # resume cache and the primary switch keep this order.
+                "sources": list(winner.sources),
             }
 
     if json_output and not auto_pick:
@@ -823,11 +902,11 @@ def run_search_mode(
     # remain available for per-chapter fallback.
     primary_url = top.url
     primary_site = top.site
-    if multi_source_alternatives_payload is not None:
-        anchor_site = multi_source_alternatives_payload.get("anchor_site")
+    if search_ms_state is not None:
+        anchor_site = search_ms_state.get("anchor_site")
         if anchor_site:
             anchor_record = next(
-                (r for r in multi_source_alternatives_payload["source_records"]
+                (r for r in search_ms_state["source_records"]
                  if r["site"] == anchor_site),
                 None,
             )
@@ -847,88 +926,87 @@ def run_search_mode(
         file=sys.stderr,
     )
 
-    # Phase 4b: stash the multi-source state on a module attribute so
-    # aio-dl.py main() can pick it up after run_search_mode returns. We can't
-    # JSON-serialize live scrapers/handlers/contexts, so a side-channel is
-    # the cleanest pass-through. main() consumes _LATEST_MULTI_SOURCE_STATE
-    # immediately after the call.
+    # Stash the fetched records on a module attribute so aio-dl.py main() can
+    # pick them up after run_search_mode returns: live scrapers/handlers/
+    # contexts can't ride the str return value.
     global _LATEST_MULTI_SOURCE_STATE
-    _LATEST_MULTI_SOURCE_STATE = multi_source_alternatives_payload
+    _LATEST_MULTI_SOURCE_STATE = search_ms_state
     return primary_url
 
 
-# Side-channel for passing multi-source state from run_search_mode to
-# aio-dl.py main() without JSON-serializing live scrapers/handlers/contexts.
-# Set inside run_search_mode (--auto-pick path with --multi-source); consumed
-# by main() right after the call. None when multi-source is off.
+# Side-channel from run_search_mode to aio-dl.py main(): {"anchor_site",
+# "source_records" (live refs), "sources" (ranked)}. Set on the --auto-pick
+# path with --multi-source; main() takes it right after the call and turns it
+# into alternatives once the primary is resolved (alternatives_from_search_state,
+# aio-dl.py grep _ms_search_state). None when multi-source is off.
 _LATEST_MULTI_SOURCE_STATE = None
 
 
 def take_latest_multi_source_state():
-    """One-shot getter: returns the multi-source state payload from the most
-    recent run_search_mode call and clears it. Side-channel for aio-dl.py
-    main() to retrieve scrapers/handlers/contexts that can't ride through
-    the str return value of run_search_mode."""
+    """One-shot getter: returns the multi-source state from the most recent
+    run_search_mode call and clears it."""
     global _LATEST_MULTI_SOURCE_STATE
     val = _LATEST_MULTI_SOURCE_STATE
     _LATEST_MULTI_SOURCE_STATE = None
     return val
 
 
-def _filter_and_rank_alt_sources(sources, *, primary_host: str = "", quality_min: float = 0.65) -> list:
-    """Filter winner candidate sources down to a quality-and-host-clean
-    alternatives list, ranked by quality DESC.
+# Bases whose source served pages to the matched-page probe (sites/
+# match_session.py). User decision 2026-10-18 ("all measured"): every such
+# source is a fallback whatever its rating, ordered by quality; the seed floor
+# only gates sources the probe never measured.
+_SERVED_BASES = frozenset({"matched", "partial", "solo", "unmatched"})
 
-    Why filter:
-      - Sources with no seed entry default to seed_quality=0.50, which is
-        a TIE among most Madara/MangaThemesia extras. Without filtering,
-        the parallel-search-completion order picks an arbitrary one as
-        first (e.g., klikmanga, an Indonesian site, ranking ahead of
-        weebcentral for an English-language download).
-      - Quality threshold (default 0.65) excludes unknown-quality sites
-        which empirically correlate with foreign-language and parse-quirky
-        handlers.
-      - User can lower the threshold via --multi-source-quality-min for
-        broader fallback coverage when willing to accept language drift.
 
-    Sort key prefers measured img_quality_score over seed_quality, so a
-    site that has been probed and scored well still wins even if its seed
-    entry is missing. img_quality_score=None (unprobed) yields seed_quality
-    as the comparison value; img_quality_score=0.0 (probed but every page
-    failed — CDN poisoned) IS used as the rank input so a broken-CDN site
-    correctly drops to the bottom.
+def _edition_of(s) -> str:
+    """'alternate' for a fan-colored / different edition, else 'original'
+    (undecided counts as original). Mirror: editionOf in
+    UI-source/src/lib/prefetchedAlts.js."""
+    return "alternate" if getattr(s, "edition", None) == "alternate" else "original"
+
+
+def _filter_and_rank_alt_sources(
+    sources, *, primary_host: str = "", quality_min: float = 0.65,
+    primary_edition: Optional[str] = None, rank_pool=None,
+) -> list:
+    """Filter a winner candidate's sources down to the fallback list, in the
+    search's own source order (search_orchestrator.source_rank_key). That
+    order is chapter_merger's alignment input order, so it also breaks a
+    chapter-coverage tie for the anchor in favour of the better copy (plan
+    decision E) and orders the primary switch's targets.
+
+    Kept:
+      - every source that served pages to the matched-page probe (basis in
+        _SERVED_BASES), whatever its rating (user decision "all measured");
+      - an unmeasured source (pending / seed) when seed_quality >= quality_min:
+        unknown-quality extras default to 0.50 and are mostly foreign-language
+        (raise or lower with --multi-source-quality-min).
+    Dropped: the primary's host, SKIP_MULTI_SOURCE handlers, `unreachable`
+    sources (every page fetch failed), and sources of another edition than
+    the primary's (decision: a colored copy never fills a B&W download, nor the
+    reverse; primary_edition None = original).
+
+    rank_pool: the whole candidate's sources, when `sources` is a slice of it,
+    so the title band is measured from the candidate's best title match.
     """
+    want = "alternate" if primary_edition == "alternate" else "original"
     eligible = []
     for s in sources:
         if primary_host and urlparse(s.url).netloc.lower() == primary_host:
             continue
-        # Handlers that opt out of multi-source merging entirely via the
-        # SKIP_MULTI_SOURCE class attribute. This is a generic opt-out hook
-        # for a site whose chapter-list fetch is wildly more expensive than
-        # other handlers in absolute wall-clock terms (e.g. a single-threaded
-        # browser bridge), where adding it to the alternatives pool would
-        # delay --multi-source alignment for the user's primary download
-        # without buying real fallback coverage. NO handler sets it today —
-        # comix used to, but it's now a full multi-source participant (see
-        # sites/comix.py). Kept because the trade-off it guards is real and a
-        # future handler may need it. Treat the flag as equivalent to
-        # primary_host exclusion: drop before the quality_min check so a
-        # flagged site never reaches _fetch_chapters_for_winner.
+        # Generic opt-out for a handler whose chapter-list fetch is far more
+        # expensive than its peers'; NO handler sets it today (comix used
+        # to). Same check in build_alternatives_from_payload.
         handler = get_handler_by_name(s.site)
         if handler is not None and getattr(handler, "SKIP_MULTI_SOURCE", False):
             continue
-        # Sources qualify by either explicit seed_quality OR a measured
-        # img_quality_score >= 0.4 (rough "ok quality" floor). A measured
-        # 0.0 (CDN-poisoned probe) does NOT qualify via the img_quality
-        # path — that's the whole point of the multi-page aggregate fix.
-        if s.seed_quality >= quality_min:
+        basis = getattr(s, "basis", None)
+        if basis == "unreachable" or _edition_of(s) != want:
+            continue
+        if basis in _SERVED_BASES or s.seed_quality >= quality_min:
             eligible.append(s)
-        elif s.img_quality_score is not None and s.img_quality_score >= 0.4:
-            eligible.append(s)
-    # Stable sort, quality DESC. _q: prefer measured over seed (incl. 0.0).
-    def _q(s):
-        return s.img_quality_score if s.img_quality_score is not None else s.seed_quality
-    eligible.sort(key=_q, reverse=True)
+    best = best_title_of(list(rank_pool) if rank_pool is not None else list(sources))
+    eligible.sort(key=lambda s: source_rank_key(s, best))
     return eligible
 
 
@@ -992,6 +1070,7 @@ def find_alternatives_for_direct_url(
         "consensus_set": None,
         "consensus_max": None,
         "resolved_sources": [],
+        "readable_sites": [],
     }
     # Step 1: title.
     title = (
@@ -1010,12 +1089,6 @@ def find_alternatives_for_direct_url(
 
     if on_status:
         on_status(f"[*] Multi-source: searching for alternatives to '{title}'...")
-
-    # Direct-URL multi-source enters here, separate from run_search_mode. Set
-    # the ML-rating gate here too so the orchestrator's lazy torch checks see
-    # the right state. Idempotent — calling twice in the same process is fine.
-    from sites.search_orchestrator import set_ml_rating_enabled
-    set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
 
     # Step 2: search.
     timeout = float(getattr(args, "search_timeout", DEFAULT_PER_SITE_TIMEOUT_S) or DEFAULT_PER_SITE_TIMEOUT_S)
@@ -1045,17 +1118,10 @@ def find_alternatives_for_direct_url(
         min_match=min_match,
         probe_failure_cache=cache,
         img_quality_cache=img_cache,
-        # Direct-URL --multi-source: the primary site is committed (we're
-        # downloading from primary_url regardless). Skip its image-quality
-        # probe — the score wouldn't affect our use of it, only ranking,
-        # and the primary_host filter below drops it from alternatives
-        # anyway so its score has no effect on the multi-source merge
-        # either. On the canonical primary, this cuts the chapter-list +
-        # image-fetch work that the probe would otherwise spend on the
-        # source we already chose.
-        skip_probe_sites=(
-            {primary_handler.name} if primary_handler is not None else None
-        ),
+        # Direct-URL --multi-source: the primary is committed (we download
+        # from primary_url regardless) but still probed, not skipped: its
+        # pages are what the alternatives are compared with, and its edition
+        # decides which alternatives qualify (_filter_and_rank_alt_sources).
         on_status=on_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
         # Only candidates[0] is consumed below — probing the sub-series
@@ -1068,6 +1134,14 @@ def find_alternatives_for_direct_url(
         # alternatives; aio-dl.py also guard-filters the assembled dict to catch
         # prefetched/cached alts that predate the disable.
         exclude_sites=parse_disable_sites(args),
+        # The primary page's own other names (the handler's alt_names, read off
+        # the series page this download already fetched — never AniList
+        # synonyms, which aren't written back into ctx.comic). Same role as a
+        # URL seed's alt_titles in run_search_mode: sites that list the series
+        # only under another name get searched AND scored by it. Without this,
+        # a MangaFire "Monster Tale" download found no alternative on the
+        # sites that list it as "Bakemonogatari". See search_all title_variants.
+        title_variants=_primary_alt_names(primary_context),
     )
     if not candidates:
         if on_status:
@@ -1086,10 +1160,16 @@ def find_alternatives_for_direct_url(
 
     quality_min = float(getattr(args, "multi_source_quality_min", 0.65) or 0.65)
     winner = candidates[0]
+    primary_entry = next(
+        (s for s in winner.sources
+         if primary_host and urlparse(s.url).netloc.lower() == primary_host),
+        None,
+    )
     alt_sources = _filter_and_rank_alt_sources(
         winner.sources,
         primary_host=primary_host,
         quality_min=quality_min,
+        primary_edition=getattr(primary_entry, "edition", None),
     )
     if not alt_sources:
         if on_status:
@@ -1116,64 +1196,11 @@ def find_alternatives_for_direct_url(
     if on_status:
         on_status(fetch_memo.stats_line())
 
-    # Step 5: align primary chapters with alt chapters. Primary is the anchor
-    # (the user picked this URL, so its chapter set is canonical for the
-    # download; alts are fallbacks for chapters the primary also has).
-    primary_site = primary_handler.name
-    sources_with_chapters: list = [(primary_site, primary_chapters or [])]
-    for rec in source_records:
-        sources_with_chapters.append((rec["site"], rec["chapters"]))
-
-    alignment = align_chapter_lists(
-        sources_with_chapters,
-        collapse_splits=bool(getattr(args, "collapse_splits", False)),
+    # Steps 5-6: align with the primary as anchor (the user picked this URL, so
+    # its chapter set is canonical for the download) and build the result.
+    return build_alternatives_from_records(
+        source_records, alt_sources, primary_handler, primary_chapters, args,
     )
-
-    # Step 6: build alternatives_by_chap_num.
-    records_by_site = {rec["site"]: rec for rec in source_records}
-    alternatives_by_chap_num: dict = {}
-    for entry in alignment.chapter_map:
-        alts = []
-        for site, ch_dict in entry.sources:
-            if site == primary_site:
-                continue
-            rec = records_by_site.get(site)
-            if not rec or not rec.get("context") or not rec.get("handler"):
-                continue
-            alts.append({
-                "site": site,
-                "url": rec["url"],
-                "chapter": ch_dict,
-                "scraper": rec["scraper"],
-                "handler": rec["handler"],
-                "context": rec["context"],
-            })
-        if alts:
-            alternatives_by_chap_num[entry.chapter_num] = alts
-
-    # consensus_set surfaced so the download path (group_chapters_for_download
-    # at aio-dl.py:6541) can refine Rule 2 / 3b / 6 with peer confirmation.
-    # None when alignment found no peer overlap (single eligible alt or all
-    # alts diverged via compatibility threshold) — downstream falls through
-    # to in-source-only heuristics.
-    return {
-        "alternatives_by_chap_num": alternatives_by_chap_num,
-        "consensus_set": (
-            alignment.consensus_set if alignment.consensus_set else None
-        ),
-        "consensus_max": alignment.consensus_max,
-        # The (site, url, title, cover) of the alternatives that survived
-        # host/quality filtering. aio-dl.py persists these into
-        # run_params.json's `multi_source_cache` so a later resume can rebuild
-        # the alternatives via build_alternatives_from_payload without re-running
-        # this cross-site search. grep _build_multi_source_cache_payload.
-        "resolved_sources": [
-            {"site": s.site, "url": s.url,
-             "title": getattr(s, "title", "") or "",
-             "cover": getattr(s, "cover", None)}
-            for s in alt_sources
-        ],
-    }
 
 
 def build_alternatives_from_prefetched(
@@ -1231,6 +1258,7 @@ def build_alternatives_from_prefetched(
         "consensus_set": None,
         "consensus_max": None,
         "resolved_sources": [],
+        "readable_sites": [],
     }
 
     if not prefetched_path or not _os.path.exists(prefetched_path):
@@ -1295,6 +1323,7 @@ def build_alternatives_from_payload(
         "consensus_set": None,
         "consensus_max": None,
         "resolved_sources": [],
+        "readable_sites": [],
     }
 
     if not isinstance(payload, dict):
@@ -1401,58 +1430,13 @@ def build_alternatives_from_payload(
         fetch_memo=fetch_memo,
     )
 
-    # Same alignment + alts-dict construction as find_alternatives_for_direct_url
-    # — primary is the anchor (user picked this URL).
-    primary_site = primary_handler.name
-    sources_with_chapters: list = [(primary_site, primary_chapters or [])]
-    for rec in source_records:
-        sources_with_chapters.append((rec["site"], rec["chapters"]))
-
-    alignment = align_chapter_lists(
-        sources_with_chapters,
-        collapse_splits=bool(getattr(args, "collapse_splits", False)),
+    # Same result as find_alternatives_for_direct_url — primary is the anchor
+    # (user picked this URL). resolved_sources echoes the sources that survived
+    # the SKIP_MULTI_SOURCE / validity filter, so aio-dl.py re-persists a
+    # cleaned resume cache.
+    return build_alternatives_from_records(
+        source_records, alt_sources, primary_handler, primary_chapters, args,
     )
-
-    records_by_site = {rec["site"]: rec for rec in source_records}
-    alternatives_by_chap_num: dict = {}
-    for entry in alignment.chapter_map:
-        alts = []
-        for site, ch_dict in entry.sources:
-            if site == primary_site:
-                continue
-            rec = records_by_site.get(site)
-            if not rec or not rec.get("context") or not rec.get("handler"):
-                continue
-            alts.append({
-                "site": site,
-                "url": rec["url"],
-                "chapter": ch_dict,
-                "scraper": rec["scraper"],
-                "handler": rec["handler"],
-                "context": rec["context"],
-            })
-        if alts:
-            alternatives_by_chap_num[entry.chapter_num] = alts
-
-    # Same consensus surfacing as find_alternatives_for_direct_url; consumed
-    # by aio-dl.py at the group_chapters_for_download call site.
-    return {
-        "alternatives_by_chap_num": alternatives_by_chap_num,
-        "consensus_set": (
-            alignment.consensus_set if alignment.consensus_set else None
-        ),
-        "consensus_max": alignment.consensus_max,
-        # Echo the sources that survived the SKIP_MULTI_SOURCE / validity
-        # filter so aio-dl.py can re-persist a cleaned resume cache. Same
-        # (site, url, title, cover) shape find_alternatives_for_direct_url
-        # returns. grep _build_multi_source_cache_payload.
-        "resolved_sources": [
-            {"site": s.site, "url": s.url,
-             "title": getattr(s, "title", "") or "",
-             "cover": getattr(s, "cover", None)}
-            for s in alt_sources
-        ],
-    }
 
 
 __all__ = [
@@ -1461,4 +1445,6 @@ __all__ = [
     "find_alternatives_for_direct_url",
     "build_alternatives_from_prefetched",
     "build_alternatives_from_payload",
+    "build_alternatives_from_records",
+    "alternatives_from_search_state",
 ]

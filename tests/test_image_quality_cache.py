@@ -1,377 +1,276 @@
-"""Tests for the v5 ImageQualityCache (sites/search_orchestrator.py).
+"""Tests for the v9 ImageQualityCache (sites/search_orchestrator.py).
 
-Covers:
-  - v5 schema round-trip with full T1+T2+T3 metadata
-  - Pre-v5 entry drop on load (the v4 → v5 invalidation)
-  - TTL expiry
-  - get_with_metadata returning paired/throttle fields
-  - Multiple concurrent reads/writes (thread safety)
+The cache stores, per (site, series_url), the matched-page probe's VERDICT for
+that source and its PAIR EDGES to peers (sites/match_session.py:SourceVerdict /
+PairEdge); ratings are recomputed at read time, so nothing here checks a score
+number. Covers: round trip of verdicts and edges (edges on both endpoints, each
+oriented from its owner), version gate, per-status TTLs, D7 (failure verdicts
+survive a reload), the pending-never-replaces-served rule, the one-shot purge
+mechanism, corrupt files and concurrent writers.
 
-Cross-file: targets sites/search_orchestrator.py:ImageQualityCache.
-Plan reference: ~/.claude/plans/how-robust-is-the-memoized-koala.md
-(Phase 6 section).
+End-to-end use with a real MatchSession lives in tests/test_match_session.py
+(test_cache_roundtrip).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 import time
-from unittest.mock import patch
 
 import pytest
 
+from sites import match_session as ms
 from sites.search_orchestrator import ImageQualityCache, IMG_QUALITY_TTL_S
 
 
 @pytest.fixture
 def tmp_cache(tmp_path, monkeypatch):
-    """Provide an ImageQualityCache pointed at a tmp file path. Patches the
-    `expanduser` so the cache writes inside the test's tmp dir instead of
-    polluting the real ~/.aio-dl/cache/."""
+    """An ImageQualityCache whose file lives in the test's tmp dir (expanduser
+    patched so the real ~/.aio-dl/cache/ is never touched)."""
     monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path))
-    cache = ImageQualityCache()
-    return cache
+    return ImageQualityCache()
 
 
-# ---------------------------------------------------------------------------
-# Schema version
-# ---------------------------------------------------------------------------
-
-def test_schema_version_is_8():
-    """v8 (2026-05-18) bumped SCHEMA_VERSION from 7 for the B&W rewrite:
-    new bw_signals primitives (screentone integrity, line quality,
-    upscaler, bilevel/chroma/bg) added to T1 for bw_manga content via
-    _compute_t1_score_bw; torchmetrics CLIP-IQA+ added to T2;
-    anchor-free _run_pairwise_ranking replaces v5.1 anchor-based
-    DISTS in T3. The new t1_score / t2_score / pairwise_adjustment
-    differ from v7 for the same source so v7 entries can't be mixed
-    with v8 entries — the bump forces a clean reprobe."""
-    assert ImageQualityCache.SCHEMA_VERSION == 8
+def _served(key, **kw):
+    kw.setdefault("attempted", 6)
+    kw.setdefault("succeeded", 6)
+    kw.setdefault("edition", "original")
+    kw.setdefault("chapters", [4, 9, 15])
+    return ms.SourceVerdict(key=key, status="served", **kw)
 
 
-# ---------------------------------------------------------------------------
-# Round-trip with full v5 metadata
-# ---------------------------------------------------------------------------
-
-def test_cache_round_trip_full_v5_metadata(tmp_cache):
-    """Write an entry with all v6 fields → reload → assert byte-equal.
-
-    Adds the v5.1 fields (content_type, tenengrad_clean, watermark_*,
-    usm_*, ghost, chroma_*, alignment_method, paired_perceptual_median,
-    etc.) on top of v5's. Test name kept for git-blame continuity even
-    though the contents now cover v6."""
-    metadata = {
-        # Probe provenance
-        "samples_attempted": 8,
-        "samples_succeeded": 8,
-        "chapter_indices_sampled": [1, 3, 5, 7, 9, 11, 13, 15],
-        # T1 components
-        "t1_score": 0.65,
-        "res_norm": 0.5,
-        "blockiness": 0.1,
-        "fft_hf_ratio": 0.55,
-        "tenengrad": 75.3,
-        "tenengrad_norm": 0.94,
-        "jpeg_qf": 85,
-        "jpeg_qf_norm": 0.85,
-        "jpeg_nse": 0.95,
-        # T2 components
-        "t2_available": True,
-        "t2_score": 0.47,
-        "niqe_score": 6.7,
-        "niqe_norm": 0.53,
-        "clip_iqa_scores": None,
-        "clip_iqa_mean": None,
-        # T3 components
-        "paired_quality_adjustment": 0.05,
-        "paired_anchor_site": "mangadex",
-        "paired_dists_median": 0.04,
-        "paired_pairs_compared": 3,
-        # Content
-        "is_grayscale": True,
-        "is_lossless": False,
-        "width": 1500,
-        "height": 2000,
-        "format": "JPEG",
-        "bpp": 0.25,
-        "size_bytes": 750000,
-        # Throttle
-        "cdn_reliability": 1.0,
-        # Outlier
-        "outlier": None,
-        # v5.1 (v6 schema) additions
-        "content_type": "bw_manga",
-        "res_norm_target": 2_000_000,
-        "tenengrad_clean": 0.94,
-        "usm_overshoot_score": 0.05,
-        "usm_n_edges": 35000,
-        "usm_edges_with_overshoot": 100,
-        "chroma_var": 0.0,
-        "chroma_penalty": 0.0,
-        "chroma_subsampling": None,
-        "chroma_complexity": None,
-        "watermark_score": 0.0,
-        "watermark_regions": [],
-        "watermark_detector_used": "easyocr",
-        "paired_perceptual_median": 0.04,
-        "paired_dists_alone_median": 0.05,
-        "paired_stlpips_median": 0.03,
-        "paired_ghost_score": 0.12,
-        "paired_alignment_method": "phase_correlate",
-        "paired_device": "cpu",
-    }
-    tmp_cache.set("mangafire", "https://x/series-1", 0.68, metadata=metadata)
-    # Reload from disk by constructing a new instance with the same path.
-    reloaded = ImageQualityCache()
-    result = reloaded.get_with_metadata("mangafire", "https://x/series-1")
-    assert result is not None
-    score, restored = result
-    assert score == 0.68
-    # Every metadata field round-trips.
-    for key, val in metadata.items():
-        assert restored[key] == val, f"field {key}: wrote {val}, got {restored[key]}"
+def _edge(a, b, score=0.2, n=3, same=False, at=None):
+    return ms.PairEdge(a, b, score, n, {"sharp": score, "res": 0.0, "blk": 0.0},
+                       time.time() if at is None else at, same)
 
 
-def test_cache_get_returns_just_score(tmp_cache):
-    """get() returns the score only (metadata not included). Useful for
-    consumers that only want the scalar."""
-    tmp_cache.set("foo", "https://x/1", 0.42, metadata={"width": 1000})
-    assert tmp_cache.get("foo", "https://x/1") == 0.42
-
-
-def test_cache_get_missing_returns_none(tmp_cache):
-    """Cache miss returns None for both get() and get_with_metadata()."""
-    assert tmp_cache.get("nonexistent", "https://x/1") is None
-    assert tmp_cache.get_with_metadata("nonexistent", "https://x/1") is None
-
-
-# ---------------------------------------------------------------------------
-# Pre-v5 entry drop
-# ---------------------------------------------------------------------------
-
-def test_cache_drops_v4_entries_on_load(tmp_cache):
-    """Manually write a v4-shaped entry; the cache must drop it on load."""
-    # Get the actual snapshot path the cache uses.
-    snapshot_path = tmp_cache._snapshot_path
-    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-    # Write a v4 entry directly to the file.
-    v4_data = {
-        "old:https://x/1": {
-            "score": 0.7,
-            "metadata": {"width": 1500, "format": "JPEG", "bpp": 0.3},
-            "expires_at": time.time() + 86400,
-            "schema_version": 4,
-        }
-    }
-    with open(snapshot_path, "w", encoding="utf-8") as f:
-        json.dump(v4_data, f)
-    # New instance loads and should drop the v4 entry.
-    fresh = ImageQualityCache()
-    assert fresh.get("old", "https://x/1") is None
-
-
-def test_cache_drops_unversioned_entries_on_load(tmp_cache):
-    """An entry with no schema_version field at all (very old caches)
-    is also dropped on load."""
-    snapshot_path = tmp_cache._snapshot_path
-    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-    data = {
-        "ancient:https://x/1": {
-            "score": 0.7,
-            "metadata": {},
-            "expires_at": time.time() + 86400,
-        }
-    }
-    with open(snapshot_path, "w", encoding="utf-8") as f:
+def _write_raw(cache, data):
+    os.makedirs(os.path.dirname(cache._snapshot_path), exist_ok=True)
+    with open(cache._snapshot_path, "w", encoding="utf-8") as f:
         json.dump(data, f)
-    fresh = ImageQualityCache()
-    assert fresh.get("ancient", "https://x/1") is None
 
 
-def test_cache_drops_partial_entries_missing_required_fields(tmp_cache):
-    """Catches the case where SCHEMA_VERSION was bumped BEFORE the
-    field-population code landed. Entries tagged with the current
-    SCHEMA_VERSION but lacking required v6+ fields are dropped on load
-    by the field-completeness gate (separate from the schema-version
-    gate). content_type and tenengrad_clean weren't present in v5
-    entries so they're the canonical "missing required field" proxy."""
-    snapshot_path = tmp_cache._snapshot_path
-    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-    # Tagged with the current version so the schema-version gate doesn't
-    # fire; the field-completeness gate is what we're exercising here.
-    data = {
-        "partial:https://x/1": {
-            "score": 0.6,
-            "metadata": {
-                "t1_score": 0.7, "res_norm": 0.5, "blockiness": 0.1,
-                "fft_hf_ratio": 0.55, "tenengrad_norm": 0.9,
-                "width": 1500, "format": "JPEG",
-                # Missing: content_type, tenengrad_clean — required fields.
-            },
-            "expires_at": time.time() + 86400,
-            "schema_version": ImageQualityCache.SCHEMA_VERSION,
-        }
-    }
-    with open(snapshot_path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    fresh = ImageQualityCache()
-    assert fresh.get("partial", "https://x/1") is None
+def test_schema_version_is_9():
+    """v9 (2026-10, plan sync-temp/plans/image-ranker-rework.md) stores verdicts
+    and pair edges instead of v8's per-source T1/T2/T3 scores."""
+    assert ImageQualityCache.SCHEMA_VERSION == 9
 
 
-def test_cache_drops_v5_entries_on_load(tmp_cache):
-    """v5 entries are dropped on load by the schema-version gate (every
-    bump invalidates the entire cache to keep score calibration
-    consistent across versions). First search after upgrade re-probes
-    everything."""
-    snapshot_path = tmp_cache._snapshot_path
-    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-    data = {
-        "v5entry:https://x/1": {
-            "score": 0.7,
-            "metadata": {
-                "t1_score": 0.7, "res_norm": 0.5, "blockiness": 0.1,
-                "fft_hf_ratio": 0.55, "tenengrad_norm": 0.9,
-                "width": 1500, "format": "JPEG",
-                "jpeg_qf": 85, "is_grayscale": True,
-            },
-            "expires_at": time.time() + 86400,
-            "schema_version": 5,
-        }
-    }
-    with open(snapshot_path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    fresh = ImageQualityCache()
-    assert fresh.get("v5entry", "https://x/1") is None
+def test_round_trip_verdicts_and_edges(tmp_cache):
+    a, b = "atsu:https://atsu.moe/m/1", "mangadex:https://mangadex.org/title/1"
+    va = _served(a, coverage=120, chroma=0.0123, truncated=False)
+    vb = _served(b, coverage=118, unmatched_against=["x:y"])
+    tmp_cache.put_records([va, vb], [_edge(a, b, score=0.4, same=False)])
+
+    again = ImageQualityCache()
+    got_a, edges_a = again.get_record("atsu", "https://atsu.moe/m/1")
+    got_b, edges_b = again.get_record("mangadex", "https://mangadex.org/title/1")
+    assert got_a == va
+    assert got_b == vb
+    # stored on both entries, each in its owner's favour
+    assert edges_a[b].score == pytest.approx(0.4)
+    assert edges_b[a].score == pytest.approx(-0.4)
+    assert edges_b[a].parts["sharp"] == pytest.approx(-0.4)
+    assert edges_a[b].n == 3 and edges_a[b].same is False
 
 
-def test_cache_drops_v6_entries_on_load(tmp_cache):
-    """v7 (2026-05-18) bumped SCHEMA_VERSION. v6 entries — even with
-    complete v6 metadata — are dropped on load because the watermark
-    detector recalibration changes t1_score and the outlier label for
-    the same source. Keep the cache calibration consistent by forcing
-    a full reprobe."""
-    snapshot_path = tmp_cache._snapshot_path
-    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-    data = {
-        "v6entry:https://x/1": {
-            "score": 0.7,
-            "metadata": {
-                "t1_score": 0.7, "res_norm": 0.5, "blockiness": 0.1,
-                "fft_hf_ratio": 0.55, "tenengrad_norm": 0.9,
-                "width": 1500, "format": "JPEG",
-                "content_type": "bw_manga", "tenengrad_clean": 0.9,
-            },
-            "expires_at": time.time() + 86400,
-            "schema_version": 6,
-        }
-    }
-    with open(snapshot_path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    fresh = ImageQualityCache()
-    assert fresh.get("v6entry", "https://x/1") is None
+def test_identical_flag_round_trips(tmp_cache):
+    a, b = "mangapill:https://p/1", "weebcentral:https://w/1"
+    tmp_cache.put_records([_served(a), _served(b)], [_edge(a, b, score=0.0, same=True)])
+    _, edges = ImageQualityCache().get_record("mangapill", "https://p/1")
+    assert edges[b].same is True
 
 
-def test_cache_keeps_complete_current_version_entries(tmp_cache):
-    """Counterpoint to the schema-drop tests: entries tagged with the
-    CURRENT SCHEMA_VERSION and carrying all required fields survive the
-    load filter."""
-    snapshot_path = tmp_cache._snapshot_path
-    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-    data = {
-        "complete:https://x/1": {
-            "score": 0.7,
-            "metadata": {
-                "t1_score": 0.7, "res_norm": 0.5, "blockiness": 0.1,
-                "fft_hf_ratio": 0.55, "tenengrad_norm": 0.9,
-                "width": 1500, "format": "JPEG",
-                "content_type": "bw_manga", "tenengrad_clean": 0.9,
-            },
-            "expires_at": time.time() + 86400,
-            "schema_version": ImageQualityCache.SCHEMA_VERSION,
-        }
-    }
-    with open(snapshot_path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    fresh = ImageQualityCache()
-    assert fresh.get("complete", "https://x/1") == 0.7
+def test_pair_psnr_round_trips_and_old_records_read_none(tmp_cache):
+    """psnr (the same-scan note's input) persists on both entries; a record
+    written before the field existed reads psnr=None (no same-scan claim)."""
+    a, b, c = "atsu:https://a/1", "mangapill:https://p/1", "weebcentral:https://w/1"
+    e = ms.PairEdge(a, b, 0.1, 3, {"sharp": 0.1, "res": 0.0, "blk": 0.0}, time.time(), False, 31.237)
+    tmp_cache.put_records([_served(a), _served(b), _served(c)], [e, _edge(a, c)])
+    _, edges_b = ImageQualityCache().get_record("mangapill", "https://p/1")
+    assert edges_b[a].psnr == pytest.approx(31.24)
+    _, edges_a = ImageQualityCache().get_record("atsu", "https://a/1")
+    assert edges_a[c].psnr is None
+    assert ms.edge_from_json(a, c, {"score": 0.1, "n": 2, "parts": {}}).psnr is None
 
 
-# ---------------------------------------------------------------------------
-# TTL expiry
-# ---------------------------------------------------------------------------
-
-def test_cache_expired_entry_evicted(tmp_cache):
-    """Entries past their expires_at are evicted on next read."""
-    # Force a short TTL by patching the constructor's ttl_s.
-    cache = tmp_cache
-    cache.set("a", "https://x/1", 0.5, metadata={"width": 1000})
-    # Backdate the entry's expires_at to past.
-    key = cache._key("a", "https://x/1")
-    cache._state[key]["expires_at"] = time.time() - 1
-    # Next read should evict.
-    assert cache.get("a", "https://x/1") is None
-    assert key not in cache._state
+def test_miss_and_empty_keys_return_none(tmp_cache):
+    assert tmp_cache.get_record("nope", "https://x/1") is None
+    assert tmp_cache.get_record("", "https://x/1") is None
+    assert tmp_cache.get_record("foo", "") is None
 
 
-def test_cache_set_persists_metadata_dict(tmp_cache):
-    """set() with metadata=None stores an empty dict (not crash)."""
-    tmp_cache.set("foo", "https://x/1", 0.5, metadata=None)
-    result = tmp_cache.get_with_metadata("foo", "https://x/1")
-    assert result is not None
-    _, meta = result
-    assert isinstance(meta, dict)
+def test_failure_verdicts_survive_reload(tmp_cache):
+    """D7: v8 rebuilt entries from scorer fields at load and so dropped every
+    failure verdict, re-probing dead sites on each search."""
+    dead = ms.SourceVerdict(key="dead:https://d/1", status="unreachable",
+                            reason="pages_failed", attempted=4)
+    tmp_cache.put_records([dead], [])
+    got, edges = ImageQualityCache().get_record("dead", "https://d/1")
+    assert got.status == "unreachable" and got.reason == "pages_failed"
+    assert edges == {}
 
 
-# ---------------------------------------------------------------------------
-# Edge cases
-# ---------------------------------------------------------------------------
-
-def test_cache_set_clamps_score_to_unit_interval(tmp_cache):
-    """Scores outside [0, 1] are clamped on write."""
-    tmp_cache.set("foo", "https://x/1", 1.5, metadata={})
-    assert tmp_cache.get("foo", "https://x/1") == 1.0
-    tmp_cache.set("foo", "https://x/2", -0.3, metadata={})
-    assert tmp_cache.get("foo", "https://x/2") == 0.0
+@pytest.mark.parametrize("version", [None, 4, 8])
+def test_other_versions_are_dropped_on_load(tmp_cache, version):
+    entry = {"expires_at": time.time() + 86400,
+             "verdict": {"status": "served"}, "pairs": {}}
+    if version is not None:
+        entry["schema_version"] = version
+    _write_raw(tmp_cache, {"old:https://x/1": entry})
+    assert ImageQualityCache().get_record("old", "https://x/1") is None
 
 
-def test_cache_set_handles_empty_keys(tmp_cache):
-    """Empty site or URL silently no-op (defensive)."""
-    tmp_cache.set("", "https://x/1", 0.5)  # no-op
-    tmp_cache.set("foo", "", 0.5)  # no-op
-    assert tmp_cache.get("", "https://x/1") is None
-    assert tmp_cache.get("foo", "") is None
+def test_current_version_entry_without_verdict_is_dropped(tmp_cache):
+    _write_raw(tmp_cache, {"bad:https://x/1": {
+        "schema_version": 9, "expires_at": time.time() + 86400, "score": 0.7}})
+    assert ImageQualityCache().get_record("bad", "https://x/1") is None
 
 
-def test_cache_corrupted_snapshot_recovers_gracefully(tmp_cache):
-    """If the snapshot file is corrupt JSON, the cache initializes empty
-    instead of crashing."""
-    snapshot_path = tmp_cache._snapshot_path
-    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
-    with open(snapshot_path, "w", encoding="utf-8") as f:
+def test_current_version_entry_is_kept(tmp_cache):
+    _write_raw(tmp_cache, {"ok:https://x/1": {
+        "schema_version": 9, "expires_at": time.time() + 86400,
+        "verdict": {"status": "served", "succeeded": 5}, "pairs": "not a dict"}})
+    got, edges = ImageQualityCache().get_record("ok", "https://x/1")
+    assert got.status == "served" and got.succeeded == 5
+    assert edges == {}   # a malformed pairs field reads as none
+
+
+@pytest.mark.parametrize("verdict,ttl", [
+    (_served("s:u"), ms.TTL_SERVED_S),
+    (_served("s:u", truncated=True), ms.TTL_TRUNCATED_S),
+    (ms.SourceVerdict(key="s:u", status="unreachable"), ms.TTL_UNREACHABLE_S),
+    (ms.SourceVerdict(key="s:u", status="pending"), ms.TTL_PENDING_S),
+])
+def test_expiry_follows_the_verdict(tmp_cache, verdict, ttl):
+    before = time.time()
+    tmp_cache.put_records([verdict], [])
+    exp = tmp_cache._state["s:u"]["expires_at"]
+    assert before + ttl - 1 <= exp <= time.time() + ttl + 1
+
+
+def test_constructor_ttl_caps_every_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path))
+    c = ImageQualityCache(ttl_s=60)
+    c.put_records([_served("s:u")], [])
+    assert c._state["s:u"]["expires_at"] <= time.time() + 61
+
+
+def test_expired_entry_reads_as_miss(tmp_cache):
+    tmp_cache.put_records([_served("a:u")], [])
+    tmp_cache._state["a:u"]["expires_at"] = time.time() - 1
+    assert tmp_cache.get_record("a", "u") is None
+
+
+def test_expired_edge_is_left_out(tmp_cache):
+    """Edges expire on their own clock (`at` + IMG_QUALITY_TTL_S), so a peer
+    compared long ago stops counting even while the entry itself is fresh."""
+    old = time.time() - IMG_QUALITY_TTL_S - 10
+    tmp_cache.put_records([_served("a:u"), _served("b:u"), _served("c:u")],
+                          [_edge("a:u", "b:u", at=old), _edge("a:u", "c:u")])
+    _, edges = tmp_cache.get_record("a", "u")
+    assert set(edges) == {"c:u"}
+
+
+def test_pending_never_replaces_fresh_served(tmp_cache):
+    tmp_cache.put_records([_served("a:u", succeeded=6)], [])
+    tmp_cache.put_records([ms.SourceVerdict(key="a:u", status="pending")], [])
+    got, _ = ImageQualityCache().get_record("a", "u")
+    assert got.status == "served" and got.succeeded == 6
+
+
+def test_a_failed_list_never_replaces_fresh_served(tmp_cache):
+    """list_failed is as often this machine as the site (no page evidence):
+    a re-probed anchor's one reset must not throw away its measured record."""
+    tmp_cache.put_records([_served("a:u", succeeded=6), _served("b:u")], [_edge("a:u", "b:u")])
+    tmp_cache.put_records([ms.SourceVerdict(key="a:u", status="unreachable", reason="list_failed")], [])
+    got, edges = ImageQualityCache().get_record("a", "u")
+    assert got.status == "served" and got.succeeded == 6 and set(edges) == {"b:u"}
+
+
+def test_pending_replaces_expired_served(tmp_cache):
+    tmp_cache.put_records([_served("a:u")], [])
+    tmp_cache._state["a:u"]["expires_at"] = time.time() - 1
+    tmp_cache.put_records([ms.SourceVerdict(key="a:u", status="pending")], [])
+    assert tmp_cache.get_record("a", "u")[0].status == "pending"
+
+
+def test_new_verdict_keeps_existing_pairs(tmp_cache):
+    """A re-probe that did not meet a peer this time keeps the old edge to it."""
+    tmp_cache.put_records([_served("a:u"), _served("b:u")], [_edge("a:u", "b:u")])
+    tmp_cache.put_records([_served("a:u", succeeded=3)], [])
+    got, edges = tmp_cache.get_record("a", "u")
+    assert got.succeeded == 3 and "b:u" in edges
+
+
+def test_shallow_reprobe_keeps_the_deeper_depth(tmp_cache):
+    """A top-candidate source (depth 3) re-probed at depth 1 as another
+    candidate's anchor must still count as probed at depth 3."""
+    tmp_cache.put_records([_served("a:u", depth=3)], [])
+    tmp_cache.put_records([_served("a:u", depth=1)], [])
+    assert tmp_cache.get_record("a", "u")[0].depth == 3
+    # a failure in between resets it: the deep pages are no longer vouched for
+    tmp_cache.put_records([ms.SourceVerdict(key="a:u", status="unreachable")], [])
+    tmp_cache.put_records([_served("a:u", depth=1)], [])
+    assert tmp_cache.get_record("a", "u")[0].depth == 1
+
+
+def test_edge_to_absent_endpoint_lands_only_on_the_present_one(tmp_cache):
+    tmp_cache.put_records([_served("a:u")], [_edge("a:u", "ghost:u")])
+    assert "ghost:u" in tmp_cache.get_record("a", "u")[1]
+    assert "ghost:u" not in tmp_cache._state
+
+
+def test_one_shot_purge_runs_once(tmp_cache):
+    """Mechanism: the first load with no marker drops the prefix's entries and
+    writes the marker; later loads keep entries written by the fixed code."""
+    marker = os.path.join(os.path.dirname(tmp_cache._snapshot_path),
+                          "img_quality.purged-mangadex-linkouts")
+    assert os.path.exists(marker)   # the fixture's load already ran it
+    os.remove(marker)
+    tmp_cache.put_records([_served("mangadex:https://m/a"), _served("atsu:https://a/a")], [])
+
+    first = ImageQualityCache()
+    assert first.get_record("mangadex", "https://m/a") is None
+    assert first.get_record("atsu", "https://a/a") is not None
+    assert os.path.exists(marker)
+    with open(first._snapshot_path, encoding="utf-8") as f:
+        assert list(json.load(f)) == ["atsu:https://a/a"]
+
+    first.put_records([_served("mangadex:https://m/a")], [])
+    assert ImageQualityCache().get_record("mangadex", "https://m/a") is not None
+
+
+def test_corrupt_snapshot_starts_empty(tmp_cache):
+    os.makedirs(os.path.dirname(tmp_cache._snapshot_path), exist_ok=True)
+    with open(tmp_cache._snapshot_path, "w", encoding="utf-8") as f:
         f.write("not json at all { }")
-    fresh = ImageQualityCache()
-    assert fresh.get("anything", "anywhere") is None
+    assert ImageQualityCache().get_record("anything", "anywhere") is None
 
 
-def test_cache_handles_concurrent_writes(tmp_cache):
-    """Concurrent set/get from multiple threads doesn't crash and produces
-    consistent results."""
-    import concurrent.futures
-    import random
-    rng = random.Random(42)
+def test_concurrent_writers_and_readers(tmp_cache):
+    errors = []
 
-    def _writer(i: int):
-        tmp_cache.set(f"site-{i % 5}", f"https://x/series-{i}",
-                     rng.random(), metadata={"width": 1000 + i})
+    def writer(i):
+        try:
+            k = f"site{i % 5}:https://x/{i}"
+            tmp_cache.put_records([_served(k)], [_edge(k, f"site{(i + 1) % 5}:https://x/{i + 1}")])
+        except Exception as e:   # pragma: no cover - reported below
+            errors.append(e)
 
-    def _reader(i: int):
-        return tmp_cache.get(f"site-{i % 5}", f"https://x/series-{i}")
+    def reader(i):
+        try:
+            r = tmp_cache.get_record(f"site{i % 5}", f"https://x/{i}")
+            assert r is None or r[0].status == "served"
+        except Exception as e:   # pragma: no cover
+            errors.append(e)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        # Write 100 entries concurrently.
-        list(pool.map(_writer, range(100)))
-        # Read them back; results may be None (key not written yet) or float.
-        results = list(pool.map(_reader, range(100)))
-        for r in results:
-            assert r is None or 0.0 <= r <= 1.0
+    ts = [threading.Thread(target=f, args=(i,)) for i in range(60) for f in (writer, reader)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errors
+    assert all(tmp_cache.get_record(f"site{i % 5}", f"https://x/{i}") for i in range(60))

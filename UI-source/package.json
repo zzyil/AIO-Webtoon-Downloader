@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "electron:dev": "node scripts/electron-dev.js",
     "electron:build": "node scripts/prepare-src.js && vite build && electron-builder --publish never",
     "electron:preview": "vite build && cross-env NODE_ENV=production electron .",
     "dist:win": "node scripts/prepare-src.js && vite build && electron-builder --win --publish never",

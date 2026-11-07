@@ -1,0 +1,25 @@
+--- aaa/setup.py
++++ src/setup.py
+@@ -820,13 +820,20 @@
+ 
+         if feature.want("webp"):
+             _dbg("Looking for webp")
+-            if all(
++            # Chaquopy: libwebp is always available (chaquopy-libwebp), and
++            # build-wheel passes its prefix through CFLAGS/LDFLAGS rather than
++            # through the dirs _find_include_file searches - same reason the
++            # zlib probe above is forced.
++            if True or all(
+                 _find_include_file(self, "webp/" + include)
+                 for include in ("encode.h", "decode.h", "mux.h", "demux.h")
+             ):
+                 # In Google's precompiled zip it is called "libwebp"
+                 for prefix in ("", "lib"):
+-                    if all(
++                    # Chaquopy: the "" prefix is the one chaquopy-libwebp
++                    # installs (libwebp.so, not liblibwebp.so), so the loop
++                    # settles on it and breaks.
++                    if True or all(
+                         _find_library_file(self, prefix + library)
+                         for library in ("webp", "webpmux", "webpdemux")
+                     ):

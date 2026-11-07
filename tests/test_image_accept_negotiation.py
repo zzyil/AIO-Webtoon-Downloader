@@ -16,7 +16,7 @@ on Accept, which is the single behavior under test.
 
 Cross-file: sites/_image_io.py:IMAGE_ACCEPT is the constant; the senders are
 aio-dl.py:_try_download_url, sites/base.py (_fast_dl_build_headers,
-_fetch_probe_item_bytes_ex, _probe_cover_image) and
+_fetch_probe_item_bytes_ex) and
 sites/mangadex.py:_fetch_image_blob. Grep IMAGE_ACCEPT.
 """
 
@@ -186,11 +186,12 @@ def test_dl_image_does_not_mutate_session_accept(server):
     assert IMAGE_ACCEPT_HEADERS == {"Accept": IMAGE_ACCEPT}  # shared dict intact
 
 
-def test_probe_and_cover_fetchers_send_image_accept(server):
-    """The search-quality probe and the cover fallback fetch images too. Left
-    on the document Accept they would score a negotiating site 0.0 on every
-    page and rate it unusable for a purely request-side reason."""
-    from sites.base import BaseSiteHandler, SearchHit
+def test_probe_page_fetcher_sends_image_accept(server):
+    """The search's matched-page probe fetches images too (match_fetch_window
+    -> _fetch_probe_item_bytes_ex). Left on the document Accept it would fail
+    every page of a negotiating site and rate it unreachable for a purely
+    request-side reason."""
+    from sites.base import BaseSiteHandler
 
     base_url, _ = server
     session = requests.Session()
@@ -200,9 +201,3 @@ def test_probe_and_cover_fetchers_send_image_accept(server):
     data, timed_out = handler._fetch_probe_item_bytes_ex(f"{base_url}/p.jpg", session)
     assert not timed_out
     assert data is not None and data[:2] == b"\xff\xd8", "probe got the wrapper page"
-
-    hit = SearchHit(
-        site="t", title="t", url=f"{base_url}/s", cover=f"{base_url}/cover.jpg"
-    )
-    cover = handler._probe_cover_image(hit, session, None)
-    assert cover is not None and cover[:2] == b"\xff\xd8", "cover got the wrapper page"

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Dark counterpart of values/themes.xml. See that file for why the split. -->
+<resources>
+    <style name="Theme.Aio" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/aio_window_background</item>
+    </style>
+</resources>

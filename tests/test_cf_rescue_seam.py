@@ -542,52 +542,16 @@ def test_mangathemesia_search_uses_the_guarded_fetch_like_everything_else(
 #
 # These replace two tests that asserted an OMISSION — "search() does not call
 # the guarded helper" — which is a fact about one method, not the guarantee
-# anyone cared about. They passed while the probe path (fetch_comic_context /
-# get_chapters / get_chapter_images, grep sites/base.py:_probe_chapter_aggregate)
-# reached an interactive solve from inside a background search.
+# anyone cared about. They passed while the search's image-quality probe
+# (fetch_comic_context / get_chapters / get_chapter_images, then from the old
+# base-class probe, now sites/match_session.py) reached an interactive solve
+# from inside a background search. The match-session case is pinned below
+# (grep match_session in this file).
 #
 # Every test here drives the REAL rescue_cf_html/get_cf_session and asserts on
 # the backend's own solve_challenge call log, because that is the exact moment a
 # window opens on desktop or a ChallengeActivity starts on a phone.
 # --------------------------------------------------------------------------
-
-
-def test_the_probe_path_never_opens_a_browser(android, monkeypatch):
-    """THE regression test for the hole. Differential on purpose: the negative
-    half alone would also pass if the probe never reached a fetch at all, so the
-    positive half pins that this exact call DOES reach the solver when allowed."""
-    from sites.base import SearchHit
-
-    # Isolate the browser tier: impit would rescue first and the solver would
-    # never be consulted either way, which would make both halves vacuous.
-    monkeypatch.setattr(crawlee_utils, "IMPIT_AVAILABLE", False)
-    handler = _mt()
-    hit = SearchHit(
-        title="Frieren", url="https://example.org/manga/frieren", site="mangathemesia"
-    )
-
-    def _probe():
-        return handler._probe_chapter_aggregate(
-            hit,
-            FakeScraper(),
-            RecordingMakeRequest(FakeResponse(403, CHALLENGE_HTML)),
-            fetch_memo=None,
-        )
-
-    # Default context = a background search. No window, no Activity, no wait.
-    _probe()
-    assert android.solved == [], (
-        "the image-quality probe reached an interactive CF solve; a cross-site "
-        "search would open a browser for a series nobody picked"
-    )
-
-    # Same call, foreground download. Now it is allowed to interrupt.
-    # Solved against the site's BASE url, not the page url: rescue_cf_html
-    # passes base_url through to get_cf_session, whose cookie cache is
-    # per-DOMAIN — one solve clears the whole host.
-    with crawlee_utils.interactive_solving(True):
-        _probe()
-    assert android.solved == ["https://example.org"]
 
 
 def test_permission_defaults_to_denied():
@@ -627,18 +591,49 @@ def test_a_fresh_thread_does_not_inherit_permission():
     assert seen == [False]
 
 
-def test_the_orchestrator_sets_the_permission_inside_the_worker():
-    """Structural: _probe_one must enter the scope in its own body. Wrapping the
-    thread start instead would be a no-op per the test above, and the failure
-    would be invisible — the probe would simply solve challenges again."""
-    import inspect
-    from sites import search_orchestrator
+def test_the_search_probe_forbids_interactive_solves_inside_its_workers():
+    """The search's matched-page probe (sites/match_session.py) must enter the
+    scope inside each worker task: a caller that allowed interactive solving
+    (a --multi-source download probes from inside an opted-in main()) must not
+    leak that permission into the probe, and a worker thread starts with an
+    empty context, so wrapping the thread start would be a no-op. Covers the
+    page fetches too: match_fetch_window runs them on its own small pool."""
+    from types import SimpleNamespace
+    from sites import match_session
+    from sites.base import BaseSiteHandler
 
-    src = inspect.getsource(search_orchestrator)
-    assert "def _probe_one(src: SourceEntry) -> None:" in src
-    body = src.split("def _probe_one(src: SourceEntry) -> None:", 1)[1]
-    head = body.split("def _probe_one_guarded", 1)[0]
-    assert "interactive_solving(False)" in head
+    seen = []
+    page_seen = []
+
+    class Probe(BaseSiteHandler):
+        name = "probe"
+
+        def fetch_comic_context(self, url, scraper, make_request):
+            seen.append(crawlee_utils.interactive_solve_allowed())
+            return {}
+
+        def get_chapters(self, context, scraper, language, make_request):
+            seen.append(crawlee_utils.interactive_solve_allowed())
+            return [{"chap": "1", "url": "u1"}]
+
+        def get_chapter_images(self, chapter, scraper, make_request):
+            seen.append(crawlee_utils.interactive_solve_allowed())
+            return [f"p{i}" for i in range(5)]
+
+        def _fetch_probe_item_bytes_ex(self, item, scraper):
+            page_seen.append(crawlee_utils.interactive_solve_allowed())
+            return None, False
+
+    entry = SimpleNamespace(site="probe", url="https://probe/s")
+    sess = match_session.MatchSession(
+        [(0, 1, [(entry, None, Probe(), False)])],
+        get_scraper=lambda e, h: None, make_request=None, deadline_s=10,
+    )
+    with crawlee_utils.interactive_solving(True):
+        sess.run()
+        assert crawlee_utils.interactive_solve_allowed() is True
+    assert seen and not any(seen)
+    assert len(page_seen) >= 5 and not any(page_seen)
 
 
 def test_impit_tier_is_never_gated(monkeypatch):

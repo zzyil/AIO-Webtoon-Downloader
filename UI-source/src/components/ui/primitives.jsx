@@ -174,26 +174,51 @@ export const Select = forwardRef(({ className, children, ...props }, ref) => {
 Select.displayName = "Select";
 
 // ── Checkbox ──
-export function Checkbox({ checked, onCheckedChange, disabled, id, className }) {
+// `checked` is true, false or "mixed" (a group with some rows ticked); clicking
+// a mixed box ticks it. Three visual states for Device Sync's selection lists
+// (approved design spec §7, sync-temp/design/approved/spec.md):
+//   pending — a change sent to main and not yet answered (55% opacity, still
+//             clickable: the next click batches behind it);
+//   locked  — muted and inert, e.g. every row while a sync job writes the target;
+//   danger  — a destructive tick (removals, losses), filled red.
+export function Checkbox({ checked, onCheckedChange, disabled, id, className, pending, locked, danger, title, "aria-label": ariaLabel }) {
+  const mixed = checked === "mixed";
+  const on = checked === true;
   return (
     <button
       type="button"
       id={id}
       role="checkbox"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onCheckedChange?.(!checked)}
+      aria-checked={mixed ? "mixed" : !!on}
+      aria-busy={pending || undefined}
+      aria-label={ariaLabel}
+      title={title}
+      disabled={disabled || locked}
+      onClick={() => onCheckedChange?.(mixed ? true : !on)}
       className={cn(
         "peer h-4 w-4 shrink-0 rounded border border-primary shadow-sm",
         "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-        "disabled:cursor-not-allowed disabled:opacity-50",
-        "flex items-center justify-center",
-        checked ? "bg-primary text-primary-foreground" : "bg-background",
+        "flex items-center justify-center transition-opacity",
+        locked
+          ? "cursor-not-allowed border-muted-foreground/50 bg-muted text-primary-foreground"
+          : "disabled:cursor-not-allowed disabled:opacity-50",
+        on || mixed
+          ? locked
+            ? "bg-muted-foreground/50"
+            : danger
+              ? "bg-destructive border-destructive text-destructive-foreground"
+              : "bg-primary text-primary-foreground"
+          : locked
+            ? ""
+            : danger
+              ? "bg-background border-destructive"
+              : "bg-background",
+        pending && "opacity-[.55]",
         className
       )}
     >
-      {checked && (
-        <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+      {on && (
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
           <path
             d="M1.5 5.5L3.5 7.5L8.5 2.5"
             stroke="currentColor"
@@ -203,7 +228,55 @@ export function Checkbox({ checked, onCheckedChange, disabled, id, className }) 
           />
         </svg>
       )}
+      {mixed && (
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+          <path d="M2 5h6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      )}
     </button>
+  );
+}
+
+// ── Segmented control (one of a few short choices) ──
+// options: [{value, label, title?, disabled?}]. A radiogroup of buttons; the
+// chosen one fills primary. Used by Device Sync for Removals, kind, error
+// budget, size warning (spec §7). size "sm" = 28px (the mockup), "xs" = 24px.
+export function SegmentedControl({ options, value, onChange, disabled, size = "sm", className, "aria-label": ariaLabel }) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel}
+      className={cn(
+        "inline-flex rounded-md overflow-hidden shadow-[inset_0_0_0_1px_hsl(var(--input))]",
+        disabled && "opacity-50",
+        className
+      )}
+    >
+      {options.map((o, i) => {
+        const on = o.value === value;
+        return (
+          <button
+            key={String(o.value)}
+            type="button"
+            role="radio"
+            aria-checked={on}
+            title={o.title}
+            disabled={disabled || o.disabled}
+            onClick={() => !on && onChange?.(o.value)}
+            className={cn(
+              "inline-flex items-center px-2.5 text-xs tabular-nums whitespace-nowrap transition-colors",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+              "disabled:cursor-not-allowed",
+              size === "xs" ? "h-6" : "h-7",
+              i > 0 && "border-l border-input",
+              on ? "bg-primary text-primary-foreground" : "hover:bg-accent"
+            )}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -220,19 +293,33 @@ export function Card({ className, children, ...props }) {
 }
 
 // ── Badge (small label) ──
-export function Badge({ className, variant = "default", children }) {
+// success / warning / destructive are the original literal-colour variants;
+// existing surfaces keep them. The token-* variants are theme tokens (approved
+// Device Sync design spec §2): warning and info text use the darker
+// .text-warn-fg / .text-info-fg utilities (globals.css) because the raw tokens
+// are too light for text on white. New surfaces use token-*. Sync UI never
+// uses orange: orange is the Library "N new" badge.
+export function Badge({ className, variant = "default", children, title }) {
   const variants = {
     default: "bg-primary/10 text-primary border-primary/20",
     secondary: "bg-secondary text-secondary-foreground border-secondary",
     success: "bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20",
     warning: "bg-yellow-500/10 text-yellow-600 dark:text-yellow-400 border-yellow-500/20",
     destructive: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20",
+    "token-success": "bg-success/10 text-success border-success/25",
+    "token-warning": "bg-warning/[.12] text-warn-fg border-warning/30",
+    "token-destructive": "bg-destructive/10 text-destructive border-destructive/25",
+    "token-info": "bg-info/10 text-info-fg border-info/25",
+    "token-muted": "bg-secondary text-secondary-foreground border-secondary",
   };
+  const token = variant.startsWith("token-");
 
   return (
     <span
+      title={title}
       className={cn(
-        "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium",
+        "inline-flex items-center rounded-full border font-medium whitespace-nowrap",
+        token ? "gap-1 px-2 py-px text-[11px] leading-4 [&_svg]:w-[11px] [&_svg]:h-[11px]" : "px-2.5 py-0.5 text-xs",
         variants[variant],
         className
       )}

@@ -13,6 +13,7 @@ import {
   ExternalLink,
   Globe,
   Bell,
+  Check,
   Loader2,
   AlertCircle,
   Link,
@@ -24,14 +25,23 @@ import {
   Filter,
   FilterX,
   Sparkles,
+  AlertTriangle,
+  Merge,
 } from "lucide-react";
 import { cn, chaptersToRangeString, getInitials, naturalCompare } from "@/lib/utils";
-import { buildLibraryDownloadArgs } from "@/lib/downloadArgs";
+import { libraryRecipe } from "@/lib/queueRecipe";
+import { KOMIKKU_VOLUMES_MESSAGE } from "@/lib/downloadArgs";
+import { useSiteCapabilities, volumesSupportedForSite } from "@/lib/siteCapabilities";
 import UpdatesCenter from "./UpdatesCenter";
+import ChapterChips, { ChapterChipsLegend, selectedChapters } from "./ChapterChips";
 import LibraryFilterPanel, {
   FACET_GROUPS,
   FACET_GROUP_BY_KEY,
 } from "./LibraryFilterPanel";
+// Device Sync's Library surfaces (UI pass U4, design D9). Only drawn while
+// sync is on: App passes syncLibrary = null otherwise.
+import { SyncChip, SyncLine } from "./sync/LibrarySync";
+import { seriesSyncChip, seriesSyncLines } from "./sync/libraryView";
 
 // NOTE on the funnel glyph: this repo pins lucide-react 0.263.1, where the
 // funnel icon is still named `Filter` (upstream renamed it to `Funnel` much
@@ -348,7 +358,47 @@ function PdfCover({ entry }) {
 // ============================================================
 // MANGA CARD (grid item)
 // ============================================================
-function MangaCard({ entry, newCount, onClick }) {
+// ── Duplicate warning badge (grid card overlay) ──
+// One series, two folders. A site RENAMING a series used to fork a second
+// folder and split its chapters, which made the update check under-report on
+// both halves. aio-dl.py's allocator no longer forks, so this badge exists for
+// the forks already on disk — and for the weaker "same AniList id from a
+// different source" case, which is a hint the user resolves by hand.
+//
+// Sits bottom-left: top-left is the status badge, top-right the "N new" badge.
+// stopPropagation because the card itself opens the detail view and this must
+// open the merge dialog instead.
+// Cross-file: electron/library.js:findDuplicateSeries populates entry.duplicate.
+function DuplicateBadge({ duplicate, onClick }) {
+  const exact = duplicate.reason === "same-series";
+  const peerNames = duplicate.peers.map((p) => p.title).join(", ");
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      title={
+        exact
+          ? `Split across ${duplicate.peers.length + 1} folders (also: ${peerNames}). Click to merge.`
+          : `Possibly the same series as ${peerNames}. Click to review.`
+      }
+      className={cn(
+        "absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded px-1.5 py-0.5",
+        "text-[9px] font-bold shadow-sm backdrop-blur-sm transition-colors",
+        exact
+          ? "bg-amber-500/90 text-white hover:bg-amber-500"
+          : "bg-amber-500/60 text-white hover:bg-amber-500/80"
+      )}
+    >
+      <AlertTriangle className="w-2.5 h-2.5" />
+      {exact ? "split" : "dupe?"}
+    </button>
+  );
+}
+
+function MangaCard({ entry, newCount, onClick, onShowDuplicate, syncChip }) {
   const formats = getEntryFormats(entry);
   const status = entry.seriesMeta?.status;
 
@@ -382,6 +432,18 @@ function MangaCard({ entry, newCount, onClick }) {
             {newCount} new
           </span>
         )}
+
+        {/* Duplicate-folder warning (bottom-left) */}
+        {entry.duplicate && onShowDuplicate && (
+          <DuplicateBadge
+            duplicate={entry.duplicate}
+            onClick={() => onShowDuplicate(entry)}
+          />
+        )}
+
+        {/* Device Sync (bottom-right): chapters not yet on a target, or a
+            check when in sync everywhere it is (sync/libraryView.js). */}
+        <SyncChip chip={syncChip} />
       </div>
 
       {/* Info area */}
@@ -408,6 +470,13 @@ function MangaCard({ entry, newCount, onClick }) {
               <span>{entry.chapterCount} ch</span>
             </>
           )}
+          {/* Native volumes (electron/library.js volumeCount). */}
+          {entry.volumeCount > 0 && (
+            <>
+              <span>&middot;</span>
+              <span>{entry.volumeCount} vol</span>
+            </>
+          )}
         </div>
       </div>
     </button>
@@ -415,22 +484,530 @@ function MangaCard({ entry, newCount, onClick }) {
 }
 
 // ============================================================
+// MERGE DUPLICATE FOLDERS DIALOG
+//
+// Two-step by contract, and the two steps are the whole safety model: opening
+// the dialog asks main for a DRY RUN and renders exactly what it reports, and
+// only the second click carries it out. Nothing here decides anything —
+// electron/series-merge.js owns every rule (containment, identity, never
+// overwriting, whether the husk can be removed) and this renders its answer.
+//
+// Chapters that collide are the number the user should actually read: a
+// collision means the target ALREADY has that chapter, so the source's copy
+// stays where it is. For a genuine rename fork that count is 0. For two
+// different providers of one series it is usually most of the series, which is
+// exactly the signal that merging them would only duplicate content.
+//
+// Cross-file: electron/library.js:findDuplicateSeries flags the entries,
+// preload.js:mergeSeriesFolders is the bridge.
+// ============================================================
+function MergeDuplicatesDialog({ entry, onClose, onMerged }) {
+  // [self, ...peers] with a chapter count each. Sorted richest-first so the
+  // preselected target is the folder holding the bulk of the series — the same
+  // rule main.js and aio-dl.py apply, but here it is only a DEFAULT the user
+  // can override, not an authority.
+  const members = useMemo(() => {
+    const self = {
+      folderPath: entry.folderPath,
+      title: entry.title,
+      site: entry.seriesMeta?.site || null,
+      chapters:
+        (entry.seriesMeta?.chapters_downloaded || []).length || entry.chapterCount || 0,
+    };
+    const peers = (entry.duplicate?.peers || []).map((p) => ({
+      folderPath: p.folderPath,
+      title: p.title,
+      site: p.site,
+      chapters: p.chapterCount || 0,
+    }));
+    return [self, ...peers].sort((a, b) => b.chapters - a.chapters);
+  }, [entry]);
+
+  const [target, setTarget] = useState(members[0]?.folderPath || "");
+  const [plan, setPlan] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(null);
+
+  const sources = members.map((m) => m.folderPath).filter((p) => p !== target);
+  const exact = entry.duplicate?.reason === "same-series";
+
+  // Re-plan whenever the chosen target changes — the plan is entirely a
+  // function of which folder survives.
+  useEffect(() => {
+    let cancelled = false;
+    if (!target || sources.length === 0) return undefined;
+    setPlan(null);
+    setError(null);
+    (async () => {
+      try {
+        const res = await window.electronAPI.mergeSeriesFolders({
+          targetFolder: target,
+          sourceFolders: sources,
+          dryRun: true,
+        });
+        if (cancelled) return;
+        if (res?.ok) setPlan(res);
+        else setError(res?.error || "unknown_error");
+      } catch (err) {
+        if (!cancelled) setError(err?.message || String(err));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // sources is derived from target; depending on its identity would re-run
+    // this effect on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target]);
+
+  const handleMerge = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await window.electronAPI.mergeSeriesFolders({
+        targetFolder: target,
+        sourceFolders: sources,
+        dryRun: false,
+      });
+      if (res?.ok) {
+        setDone(res);
+        onMerged?.();
+      } else {
+        setError(res?.error || "unknown_error");
+      }
+    } catch (err) {
+      setError(err?.message || String(err));
+    }
+    setBusy(false);
+  };
+
+  const totals = plan
+    ? plan.plans.reduce(
+        (acc, p) => ({
+          moves: acc.moves + p.moves.length,
+          collisions: acc.collisions + p.collisions.length,
+          leftovers: acc.leftovers + p.leftovers.length,
+          removable: acc.removable + (p.willRemoveSource ? 1 : 0),
+        }),
+        { moves: 0, collisions: 0, leftovers: 0, removable: 0 }
+      )
+    : null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg max-h-[85vh] overflow-y-auto rounded-lg border border-border bg-card shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-2 border-b border-border/60 px-4 py-3">
+          <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+          <h2 className="text-sm font-semibold flex-1">
+            {exact ? "This series is split across folders" : "Possible duplicate series"}
+          </h2>
+          <Button variant="ghost" size="sm" onClick={onClose} className="h-7 w-7 p-0">
+            <X className="w-3.5 h-3.5" />
+          </Button>
+        </div>
+
+        <div className="px-4 py-3 space-y-4">
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            {exact ? (
+              <>
+                These folders hold the <strong>same series from the same source</strong>
+                {" "}— the site renamed it, so a second folder was created. Merging moves
+                the chapters into one folder and deletes the empty one.
+              </>
+            ) : (
+              <>
+                These folders come from <strong>different sources</strong> but matched the
+                same AniList entry. They may or may not be the same series, and the two
+                sources number chapters independently — check the collision count below
+                before merging.
+              </>
+            )}
+          </p>
+
+          {/* Target picker */}
+          <div className="space-y-1.5">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Keep everything in
+            </p>
+            {members.map((m) => (
+              <label
+                key={m.folderPath}
+                className={cn(
+                  "flex items-center gap-2.5 rounded border px-2.5 py-2 cursor-pointer transition-colors",
+                  m.folderPath === target
+                    ? "border-primary/50 bg-primary/5"
+                    : "border-border/50 hover:bg-muted/30"
+                )}
+              >
+                <input
+                  type="radio"
+                  name="merge-target"
+                  className="accent-primary"
+                  checked={m.folderPath === target}
+                  onChange={() => setTarget(m.folderPath)}
+                  disabled={busy || !!done}
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-xs font-medium truncate" title={m.title}>
+                    {m.title}
+                  </span>
+                  <span className="block text-[10px] text-muted-foreground tabular-nums">
+                    {m.chapters} chapter{m.chapters === 1 ? "" : "s"}
+                    {m.site ? ` · ${m.site}` : ""}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+
+          {/* Plan / result */}
+          {done ? (
+            <div className="rounded border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs">
+              <p className="font-medium text-emerald-500">Merged.</p>
+              <p className="mt-1 text-muted-foreground">
+                {done.moved.length} file{done.moved.length === 1 ? "" : "s"} moved ·{" "}
+                {done.chaptersBefore} → {done.chaptersAfter} chapters
+                {done.removed.length > 0
+                  ? ` · ${done.removed.length} empty folder removed`
+                  : ""}
+                {done.kept.length > 0
+                  ? ` · ${done.kept.length} folder kept (still holds files)`
+                  : ""}
+              </p>
+            </div>
+          ) : error ? (
+            <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs">
+              <p className="font-medium text-destructive">{mergeErrorText(error)}</p>
+            </div>
+          ) : !plan ? (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              Working out what would move…
+            </div>
+          ) : (
+            <div className="space-y-2 rounded border border-border/60 bg-muted/20 px-3 py-2.5 text-xs">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Chapters after merge</span>
+                <span className="tabular-nums font-medium">
+                  {plan.chaptersBefore} → {plan.chaptersAfter}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Files moved</span>
+                <span className="tabular-nums font-medium">{totals.moves}</span>
+              </div>
+              {totals.collisions > 0 && (
+                <div className="flex justify-between">
+                  <span className="text-amber-500">
+                    Already in the target — left where they are
+                  </span>
+                  <span className="tabular-nums font-medium text-amber-500">
+                    {totals.collisions}
+                  </span>
+                </div>
+              )}
+              {totals.leftovers > 0 && (
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Unrecognized files — untouched</span>
+                  <span className="tabular-nums font-medium">{totals.leftovers}</span>
+                </div>
+              )}
+              <div className="flex justify-between border-t border-border/50 pt-2">
+                <span className="text-muted-foreground">Emptied folders removed</span>
+                <span className="tabular-nums font-medium">
+                  {totals.removable} of {plan.plans.length}
+                </span>
+              </div>
+              {totals.collisions > 0 && totals.moves === 0 && (
+                <p className="pt-1 leading-relaxed text-amber-500">
+                  Every chapter here is already in the target, so merging would move
+                  nothing. These are probably two copies of the same run — delete the one
+                  you don&apos;t want instead.
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-border/60 px-4 py-3">
+          <Button variant="ghost" size="sm" onClick={onClose}>
+            {done ? "Close" : "Cancel"}
+          </Button>
+          {!done && (
+            <Button
+              size="sm"
+              onClick={handleMerge}
+              disabled={busy || !plan || sources.length === 0}
+            >
+              {busy ? (
+                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+              ) : (
+                <Merge className="w-3.5 h-3.5 mr-1.5" />
+              )}
+              {busy ? "Merging…" : "Merge folders"}
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Refusal codes from electron/series-merge.js turned into something a person
+// can act on. Anything unrecognized falls through as-is rather than being
+// swallowed — an unexplained failure is worse than a raw code.
+function mergeErrorText(code) {
+  switch (code) {
+    case "download_running":
+      return "A download is running for this series. Wait for it to finish, then try again.";
+    case "identity_mismatch":
+      return "These folders don't provably hold the same series, so nothing was merged.";
+    case "outside_library":
+      return "One of these folders isn't inside your library folder.";
+    case "missing_folder":
+      return "One of these folders no longer exists — refresh the library.";
+    case "unreadable_source":
+      return "A folder couldn't be read. Check it isn't open in another program.";
+    default:
+      return `Merge failed: ${code}`;
+  }
+}
+
+// ============================================================
 // UPDATE CHECKER SECTION (inside detail view)
 // ============================================================
-function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
+
+// The VOLUME half of a series' update check (MangaFire native volumes). Shown
+// when the check result carries volumes: the series tracks them, or the user
+// pressed "Get volumes" (`browse`). Own tick state, own cross-outs
+// (onSetChaptersIgnored(..., "volume") → volumes.ignored), own download
+// button (libraryRecipe kind "volume"). While Komikku is on the download is
+// refused, because the engine would turn the volume run into chapters
+// (lib/downloadArgs.js KOMIKKU_VOLUMES_MESSAGE).
+//
+// browse: every listed volume starts UNTICKED, because a series that never had
+// volumes reports all of them as missing (117 for One Piece) and an all-ticked
+// default would queue the whole run with one click. Browse also offers NO
+// cross-outs: writing volumes.ignored creates the volume block, and a block
+// alone makes the series track volumes, so every later check would list the
+// whole run as new. Cross-outs appear once a volume download made it tracked.
+function VolumeUpdateBlock({
+  entry, meta, result, browse, komikku, onStartDownload, onSwitchTab,
+  onSetChaptersIgnored, onResultChange, onError,
+}) {
+  const newVolumes = result?.newVolumes || [];
+  const ignoredVolumes = result?.ignoredVolumes || [];
+  const [deselected, setDeselected] = useState(() => new Set(browse ? newVolumes : []));
+  const [busy, setBusy] = useState(false);
+  const selected = selectedChapters(newVolumes, deselected);
+
+  const toggle = (v) =>
+    setDeselected((prev) => {
+      const next = new Set(prev);
+      if (next.has(v)) next.delete(v);
+      else next.add(v);
+      return next;
+    });
+
+  const setIgnored = async (vols, ignored) => {
+    setBusy(true);
+    try {
+      const res = await onSetChaptersIgnored?.(entry.folderPath, vols, ignored, "volume");
+      if (res && res.ok === false) {
+        onError(res.error || "Could not save the change");
+        return;
+      }
+      const moved = new Set(vols);
+      const byNumber = (a, b) => parseFloat(a) - parseFloat(b);
+      onResultChange((prev) => {
+        if (!prev) return prev;
+        const wasNew = prev.newVolumes || [];
+        const wasIgnored = prev.ignoredVolumes || [];
+        return {
+          ...prev,
+          newVolumes: ignored
+            ? wasNew.filter((c) => !moved.has(c))
+            : [...wasNew, ...wasIgnored.filter((c) => moved.has(c))].sort(byNumber),
+          ignoredVolumes: ignored
+            ? [...wasIgnored, ...wasNew.filter((c) => moved.has(c))].sort(byNumber)
+            : wasIgnored.filter((c) => !moved.has(c)),
+        };
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const download = () => {
+    if (!selected.length || !meta?.url || komikku) return;
+    const keep = new Set(selected);
+    const excluding = [...newVolumes.filter((c) => !keep.has(c)), ...ignoredVolumes];
+    const rangeStr = chaptersToRangeString(selected, { excluding });
+    onStartDownload(meta.url, {
+      recipe: libraryRecipe(meta, rangeStr, entry.folderPath, "volume"),
+    });
+    onSwitchTab("queue");
+  };
+
+  if (result?.volumesError) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-destructive">
+        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+        <span>Volumes: {result.volumesError}</span>
+      </div>
+    );
+  }
+
+  if (newVolumes.length === 0) {
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center gap-2 text-xs text-emerald-400">
+          <span>&#10003;</span>
+          <span>
+            {result?.volumesTotal
+              ? `Volumes up to date (${result.volumesTotal} on site, ${result.volumesDownloaded ?? 0} on device)`
+              : "This series has no volumes on the site in this language"}
+          </span>
+        </div>
+        {ignoredVolumes.length > 0 && (
+          <div className="rounded-md border border-border/50 bg-muted/10 p-3 space-y-2">
+            <p className="text-[10px] leading-snug text-muted-foreground">
+              <span className="text-foreground/80">
+                {ignoredVolumes.length} volume{ignoredVolumes.length === 1 ? "" : "s"} crossed out
+              </span>{" "}
+              — saved to this series. Restore to make {ignoredVolumes.length === 1 ? "it" : "them"} downloadable again.
+            </p>
+            <ChapterChips
+              chapters={[]}
+              ignored={ignoredVolumes}
+              deselected={deselected}
+              onToggle={toggle}
+              onSetIgnored={setIgnored}
+              busy={busy}
+              noun="volume"
+            />
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-md border border-sky-500/30 bg-sky-500/10 p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-semibold text-sky-400">
+          {browse
+            ? `${newVolumes.length} volume${newVolumes.length !== 1 ? "s" : ""} on the site`
+            : `${newVolumes.length} new volume${newVolumes.length !== 1 ? "s" : ""} available`}
+        </span>
+        <span className="text-[10px] text-muted-foreground">
+          {result.volumesDownloaded ?? 0} / {result.volumesTotal ?? 0} volumes
+        </span>
+      </div>
+      <ChapterChipsLegend
+        noun="volume"
+        crossOut={!browse}
+        actions={
+          newVolumes.length > 1 && (
+            <span className="flex items-center gap-1.5 shrink-0">
+              <button type="button" onClick={() => setDeselected(new Set())}
+                className="hover:text-foreground transition-colors"
+                title="Include every volume in this download">all</button>
+              <span className="text-muted-foreground/40">|</span>
+              <button type="button" onClick={() => setDeselected(new Set(newVolumes))}
+                className="hover:text-foreground transition-colors"
+                title="Skip every volume in this download (nothing is crossed out)">none</button>
+            </span>
+          )
+        }
+      />
+      <ChapterChips
+        chapters={newVolumes}
+        ignored={ignoredVolumes}
+        deselected={deselected}
+        onToggle={toggle}
+        onSetIgnored={browse ? undefined : setIgnored}
+        busy={busy}
+        noun="volume"
+      />
+      {komikku && (
+        <p className="text-[10px] text-yellow-500 dark:text-yellow-400 leading-snug">
+          {KOMIKKU_VOLUMES_MESSAGE} Turn it off in Settings → Output to download volumes.
+        </p>
+      )}
+      <Button
+        size="sm"
+        onClick={download}
+        disabled={selected.length === 0 || komikku}
+        className="text-xs gap-1.5 w-full"
+      >
+        <Download className="w-3 h-3" />
+        {selected.length === 0
+          ? "Tick volumes to download"
+          : selected.length === newVolumes.length
+          ? `Download ${browse ? "All" : "Missing"} Volumes`
+          : `Download ${selected.length} Selected Volume${selected.length === 1 ? "" : "s"}`}
+      </Button>
+    </div>
+  );
+}
+
+// `onSetChaptersIgnored` is useUpdateCheck's setRowIgnored, threaded down from
+// the tab. Going through the hook rather than calling the IPC directly is what
+// keeps the Updates Center panel and the library entry in step when a chapter
+// is crossed out from here instead of from there.
+function UpdateSection({ entry, onStartDownload, onSwitchTab, settings, onSetChaptersIgnored }) {
   const meta = entry.seriesMeta;
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [manualUrl, setManualUrl] = useState("");
   const [saving, setSaving] = useState(false);
+  // Unticked chapters — this-download-only, exactly as in the panel. Held as
+  // deselections so chapters a later check adds arrive ticked.
+  const [deselected, setDeselected] = useState(() => new Set());
+  const [ignoreBusy, setIgnoreBusy] = useState(false);
+  // "Get volumes" was used for this result: the series doesn't track volumes
+  // yet, so the volume list is a browse, not a diff (VolumeUpdateBlock).
+  const [volumeBrowse, setVolumeBrowse] = useState(false);
+  // Bumped on every check so VolumeUpdateBlock remounts and re-seeds its ticks.
+  const [checkSeq, setCheckSeq] = useState(0);
+  const sites = useSiteCapabilities();
+  const komikku = settings?.defaults?.komikku === true;
+  const seriesTracksVolumes = (entry.trackedKinds || []).includes("volume");
+  const canGetVolumes =
+    !seriesTracksVolumes && volumesSupportedForSite(meta?.site, sites);
+  // A volume-only series has no chapter half to show (its result's
+  // trackedKinds omits "chapter"); results from before kinds existed do.
+  const showChapters = !result?.trackedKinds || result.trackedKinds.includes("chapter");
+  const showVolumes = !!result && (
+    (result.trackedKinds || []).includes("volume") || "newVolumes" in result || !!result.volumesError
+  );
 
-  const handleCheck = async () => {
+  const newChapters = result?.newChapters || [];
+  const ignoredChapters = result?.ignoredChapters || [];
+  const selected = selectedChapters(newChapters, deselected);
+
+  // opts.includeVolumes: the "Get volumes" button (list volumes for a series
+  // that doesn't track them yet; main.js _checkSeriesUpdates).
+  const handleCheck = async (opts = {}) => {
     setChecking(true);
     setError(null);
     setResult(null);
+    setVolumeBrowse(!!opts.includeVolumes);
+    setCheckSeq((n) => n + 1);
+    // A fresh check re-offers everything; carrying ticks across it would mean
+    // silently dropping chapters the user unticked before a different result.
+    setDeselected(new Set());
     try {
-      const res = await window.electronAPI.checkForUpdates(entry.folderPath);
+      const res = await window.electronAPI.checkForUpdates(entry.folderPath, opts);
       if (res.error) {
         setError(res.message || res.error);
       } else {
@@ -442,25 +1019,71 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
     setChecking(false);
   };
 
+  const toggleChapter = (chapter) => {
+    setDeselected((prev) => {
+      const next = new Set(prev);
+      if (next.has(chapter)) next.delete(chapter);
+      else next.add(chapter);
+      return next;
+    });
+  };
+
+  // Cross out / restore. Persists through the hook (which writes
+  // .aio_series.json and updates the panel row), then moves the chapters in
+  // this section's own `result` — that copy came from a one-shot IPC and has
+  // nothing else to refresh it.
+  const handleSetIgnored = async (chapters, ignored) => {
+    setIgnoreBusy(true);
+    try {
+      const res = await onSetChaptersIgnored?.(entry.folderPath, chapters, ignored);
+      if (res && res.ok === false) {
+        setError(res.error || "Could not save the change");
+        return;
+      }
+      const moved = new Set(chapters);
+      const byNumber = (a, b) => parseFloat(a) - parseFloat(b);
+      setResult((prev) => {
+        if (!prev) return prev;
+        const wasNew = prev.newChapters || [];
+        const wasIgnored = prev.ignoredChapters || [];
+        return {
+          ...prev,
+          newChapters: ignored
+            ? wasNew.filter((c) => !moved.has(c))
+            : [...wasNew, ...wasIgnored.filter((c) => moved.has(c))].sort(byNumber),
+          ignoredChapters: ignored
+            ? [...wasIgnored, ...wasNew.filter((c) => moved.has(c))].sort(byNumber)
+            : wasIgnored.filter((c) => !moved.has(c)),
+        };
+      });
+      if (ignored) {
+        setDeselected((prev) => {
+          const next = new Set(prev);
+          for (const c of chapters) next.delete(c);
+          return next;
+        });
+      }
+    } finally {
+      setIgnoreBusy(false);
+    }
+  };
+
   const handleDownloadNew = () => {
-    if (!result?.newChapters?.length || !meta?.url) return;
-    const rangeStr = chaptersToRangeString(result.newChapters);
+    if (!selected.length || !meta?.url) return;
+    // Unticked + crossed-out chapters must not be swept up by a range that
+    // spans them — see the excluding note on chaptersToRangeString.
+    const keep = new Set(selected);
+    const excluding = [...newChapters.filter((c) => !keep.has(c)), ...ignoredChapters];
+    const rangeStr = chaptersToRangeString(selected, { excluding });
 
-    // Start with the user's saved default settings from the Settings tab,
-    // then override format/language/site from the series metadata and set
-    // the chapter range to only the missing ones. Shared with the Updates
-    // Center per-row queue via buildLibraryDownloadArgs (@/lib/downloadArgs),
-    // which forces lazy multi-source for both update-check download paths
-    // (this is a "check for updates" flow — a 1-2 chapter delta shouldn't pay
-    // the eager cross-site discovery). See that builder's header note.
-    const args = buildLibraryDownloadArgs(
-      meta,
-      settings?.defaults,
-      rangeStr,
-      settings?.verboseAlways,
-    );
-
-    onStartDownload(meta.url, args);
+    // Queue a "library" recipe: when the download STARTS, the saved Settings
+    // defaults are applied, format/language/site come from the series
+    // metadata, and the chapter range is only the missing ones. Shared with
+    // the Updates Center per-row queue (buildDownloadArgsForRow). The builder
+    // (lib/downloadArgs.js:buildLibraryDownloadArgs) forces lazy multi-source
+    // for both update-check paths: a 1-2 chapter delta shouldn't pay the eager
+    // cross-site discovery. See that builder's header note.
+    onStartDownload(meta.url, { recipe: libraryRecipe(meta, rangeStr, entry.folderPath) });
     onSwitchTab("queue");
   };
 
@@ -530,19 +1153,41 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
               <span>{meta.chapters_downloaded.length} ch downloaded</span>
             </>
           )}
+          {entry.volumeCount > 0 && (
+            <>
+              <span>&middot;</span>
+              <span>{entry.volumeCount} vol downloaded</span>
+            </>
+          )}
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleCheck}
-          disabled={checking}
-          className="text-xs gap-1.5 shrink-0"
-        >
-          {checking
-            ? <Loader2 className="w-3 h-3 animate-spin" />
-            : <RefreshCw className="w-3 h-3" />}
-          {checking ? "Checking…" : "Check for Updates"}
-        </Button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {/* MangaFire series that has only chapters so far: list its volumes. */}
+          {canGetVolumes && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleCheck({ includeVolumes: true })}
+              disabled={checking}
+              className="text-xs gap-1.5"
+              title="List this series' volumes on the site and pick some to download"
+            >
+              <BookOpen className="w-3 h-3" />
+              Get volumes
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => handleCheck()}
+            disabled={checking}
+            className="text-xs gap-1.5"
+          >
+            {checking
+              ? <Loader2 className="w-3 h-3 animate-spin" />
+              : <RefreshCw className="w-3 h-3" />}
+            {checking ? "Checking…" : "Check for Updates"}
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -552,27 +1197,85 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
         </div>
       )}
 
-      {result && (
+      {result && showVolumes && (
+        <VolumeUpdateBlock
+          key={checkSeq}
+          entry={entry}
+          meta={meta}
+          result={result}
+          browse={volumeBrowse}
+          komikku={komikku}
+          onStartDownload={onStartDownload}
+          onSwitchTab={onSwitchTab}
+          onSetChaptersIgnored={onSetChaptersIgnored}
+          onResultChange={setResult}
+          onError={setError}
+        />
+      )}
+
+      {result && showChapters && (
         <div className="space-y-2">
-          {result.newChapters.length > 0 ? (
+          {newChapters.length > 0 ? (
             <div className="rounded-md border border-orange-500/30 bg-orange-500/10 p-3 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-semibold text-orange-400">
-                  {result.newChapters.length}
+                  {newChapters.length}
                   {result.checkMode === "files"
-                    ? ` chapter${result.newChapters.length !== 1 ? "s" : ""} missing from device`
-                    : ` new chapter${result.newChapters.length !== 1 ? "s" : ""} available`}
+                    ? ` chapter${newChapters.length !== 1 ? "s" : ""} missing from device`
+                    : ` new chapter${newChapters.length !== 1 ? "s" : ""} available`}
                 </span>
                 <span className="text-[10px] text-muted-foreground">
                   {result.downloaded} / {result.total} total
                 </span>
               </div>
-              <p className="text-[10px] text-muted-foreground">
-                Chapters: {chaptersToRangeString(result.newChapters)}
-              </p>
-              <Button size="sm" onClick={handleDownloadNew} className="text-xs gap-1.5 w-full">
+              {/* The plain "Chapters: 51-53" line became these chips: same
+                  information, plus the two per-chapter gestures. Crossed-out
+                  chapters are interleaved in numeric order by ChapterChips, and
+                  the wording is shared with the Updates Center panel so the two
+                  surfaces can't explain the same buttons differently. */}
+              <ChapterChipsLegend
+                actions={
+                  newChapters.length > 1 && (
+                    <span className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setDeselected(new Set())}
+                        className="hover:text-foreground transition-colors"
+                        title="Include every chapter in this download"
+                      >
+                        all
+                      </button>
+                      <span className="text-muted-foreground/40">|</span>
+                      <button
+                        type="button"
+                        onClick={() => setDeselected(new Set(newChapters))}
+                        className="hover:text-foreground transition-colors"
+                        title="Skip every chapter in this download (nothing is crossed out)"
+                      >
+                        none
+                      </button>
+                    </span>
+                  )
+                }
+              />
+              <ChapterChips
+                chapters={newChapters}
+                ignored={ignoredChapters}
+                deselected={deselected}
+                onToggle={toggleChapter}
+                onSetIgnored={handleSetIgnored}
+                busy={ignoreBusy}
+              />
+              <Button
+                size="sm"
+                onClick={handleDownloadNew}
+                disabled={selected.length === 0}
+                className="text-xs gap-1.5 w-full"
+              >
                 <Download className="w-3 h-3" />
-                Download Missing Chapters
+                {selected.length === newChapters.length
+                  ? "Download Missing Chapters"
+                  : `Download ${selected.length} Selected Chapter${selected.length === 1 ? "" : "s"}`}
               </Button>
               {/* Mode indicator */}
               <p className="text-[9px] text-muted-foreground/60 text-right">
@@ -580,14 +1283,44 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
               </p>
             </div>
           ) : (
-            <div className="flex items-center gap-2 text-xs text-emerald-400">
-              <span>&#10003;</span>
-              <span>
-                Up to date ({result.total} on site, {result.downloaded} on device)
-              </span>
-              <span className="text-[9px] text-muted-foreground/60 ml-auto">
-                via {result.checkMode === "files" ? "file scan" : "history"}
-              </span>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 text-xs text-emerald-400">
+                <span>&#10003;</span>
+                <span>
+                  Up to date ({result.total} on site, {result.downloaded} on device)
+                </span>
+                <span className="text-[9px] text-muted-foreground/60 ml-auto">
+                  via {result.checkMode === "files" ? "file scan" : "history"}
+                </span>
+              </div>
+              {/* A series can read up to date purely because every missing
+                  chapter is crossed out. Showing them here is the only way
+                  back — without it the cross-out would be one-way. */}
+              {ignoredChapters.length > 0 && (
+                <div className="rounded-md border border-border/50 bg-muted/10 p-3 space-y-2">
+                  {/* No legend here: with nothing left to tick, the tick half
+                      would describe a control that isn't on screen. This says
+                      the part that matters instead — the cross-out is SAVED, so
+                      it is why the series reads up to date. */}
+                  <p className="text-[10px] leading-snug text-muted-foreground">
+                    <span className="text-foreground/80">
+                      {ignoredChapters.length} chapter{ignoredChapters.length === 1 ? "" : "s"}{" "}
+                      crossed out
+                    </span>{" "}
+                    — saved to this series, so every check leaves{" "}
+                    {ignoredChapters.length === 1 ? "it" : "them"} out. Restore to make{" "}
+                    {ignoredChapters.length === 1 ? "it" : "them"} downloadable again.
+                  </p>
+                  <ChapterChips
+                    chapters={[]}
+                    ignored={ignoredChapters}
+                    deselected={deselected}
+                    onToggle={toggleChapter}
+                    onSetIgnored={handleSetIgnored}
+                    busy={ignoreBusy}
+                  />
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -726,6 +1459,13 @@ function DetailView({
   // (groupKey, facetKey) → add that value to the grid's facet filter and
   // navigate back. Supplied by LibraryTab; grep addFacet.
   onFilterByFacet,
+  // Pass-through for UpdateSection's per-chapter cross-out (useUpdateCheck's
+  // setRowIgnored). Routed through the hook so a cross-out made here also
+  // lands on the Updates Center row and the library entry.
+  onSetChaptersIgnored,
+  // Device Sync (U4): this series' libraryStatus rows + the configured
+  // targets, or null while sync is off; onOpenInSync(folderPath).
+  syncLibrary, onOpenInSync,
 }) {
   const [deleting, setDeleting] = useState(false);
   // Two-step delete confirmation (avoids window.confirm which breaks
@@ -796,8 +1536,9 @@ function DetailView({
       <div className="flex-1 overflow-y-auto px-5 py-4">
         <div className="flex gap-5">
           {/* Cover */}
-          <div className="w-44 shrink-0 aspect-[3/4] rounded-lg overflow-hidden border border-border/50 bg-muted/30">
+          <div className="w-44 shrink-0 aspect-[3/4] rounded-lg overflow-hidden border border-border/50 bg-muted/30 relative">
             <PdfCover entry={entry} />
+            {syncLibrary && <SyncChip chip={seriesSyncChip(syncLibrary.bySeries[entry.folderPath], syncLibrary.targets)} />}
           </div>
 
           {/* Info */}
@@ -846,8 +1587,19 @@ function DetailView({
               {meta?.chapters_downloaded?.length > 0 && (
                 <div>{meta.chapters_downloaded.length} chapters</div>
               )}
+              {entry.volumeCount > 0 && (
+                <div>{entry.volumeCount} volume{entry.volumeCount === 1 ? "" : "s"}</div>
+              )}
               {entry.lastModified && <div>Modified {formatDate(entry.lastModified)}</div>}
             </div>
+
+            {/* Device Sync facts for this series (design D9), with Open in Sync. */}
+            {syncLibrary && (
+              <SyncLine
+                lines={seriesSyncLines(syncLibrary.bySeries[entry.folderPath], syncLibrary.targets)}
+                onOpen={onOpenInSync ? () => onOpenInSync(entry.folderPath) : undefined}
+              />
+            )}
 
             {/* Format badges */}
             <div className="flex gap-1.5">
@@ -928,6 +1680,7 @@ function DetailView({
             onStartDownload={onStartDownload}
             onSwitchTab={onSwitchTab}
             settings={settings}
+            onSetChaptersIgnored={onSetChaptersIgnored}
           />
         </div>
 
@@ -1045,20 +1798,24 @@ export default function LibraryTab({
   onStartDownload, onSwitchTab, settings, onSaveSettings,
   // Lifted state from useDownloader. libraryEntries is null until first
   // load completes (so we know whether to trigger an initial fetch on
-  // mount). loadLibrary forces a fresh scan; setLibraryEntries is exposed
-  // so handleCheckAll can splice updatedMeta back into the entries list
-  // without round-tripping through the IPC scan again.
-  libraryEntries, libraryLoading, loadLibrary, setLibraryEntries,
+  // mount); loadLibrary forces a fresh scan. There is deliberately no
+  // setLibraryEntries here any more — the one writer was the update-sweep's
+  // updatedMeta splice, which moved into hooks/useUpdateCheck.js along with
+  // the rest of the scan.
+  libraryEntries, libraryLoading, loadLibrary,
+  // The "Check All" sweep, owned by useDownloader (hooks/useUpdateCheck.js)
+  // because the sweep runs in the main process and outlives this component —
+  // App.jsx unmounts the whole tab on every switch. Everything scan-shaped
+  // that used to be useState in here now arrives through this prop; the only
+  // scan state LibraryTab still owns is whether the panel is open.
+  updateCheck,
+  // Device Sync (UI pass U4): {bySeries, targets} from useDeviceSync's
+  // libraryStatus + config, or null while sync is off (no chip, no line).
+  // onOpenInSync(folderPath) is App's deep link into the Sync tab.
+  syncLibrary = null, onOpenInSync,
 }) {
   const entries = libraryEntries || [];
   const loading = libraryLoading || libraryEntries === null;
-  // setEntries shim so the existing handleCheckAll / detail-edit code reads
-  // naturally without diverging from the upstream pattern. Calling
-  // setLibraryEntries with a non-null value is safe — null is reserved
-  // exclusively for the "not yet loaded" sentinel that loadLibrary clears
-  // by setting an array (even an empty one).
-  const setEntries = setLibraryEntries;
-
   const [searchQuery, setSearchQuery] = useState("");
   // Lazy-init from persisted settings.libraryOpts.sortBy. Falls back to "title"
   // for first run / older settings dicts. Sync below via useEffect when the
@@ -1156,37 +1913,33 @@ export default function LibraryTab({
   const closeFilterPanel = useCallback(() => setFilterPanelOpen(false), []);
 
   const [selectedEntry, setSelectedEntry] = useState(null);
+  // The entry whose duplicate badge was clicked, or null. Holds the ENTRY (not
+  // just the paths) because the dialog reads its peers, titles and chapter
+  // counts straight off entry.duplicate — see electron/library.js's
+  // findDuplicateSeries for what that carries.
+  const [duplicateEntry, setDuplicateEntry] = useState(null);
 
-  // New chapter counts per series (folderPath → count).
-  // Populated by "Check All" or individual checks. Drives the orange "+N
-  // new" badge on each MangaCard, so dismissing a card must mutate this so
-  // the badge clears.
-  const [newChapterCounts, setNewChapterCounts] = useState({});
+  // ── Updates Center state (read-only here) ──
+  // seriesStates is Map<folderPath, row>; row shape is documented on
+  // electron/preload.js:onUpdateCheckProgress and built in electron/main.js.
+  // newChapterCounts (folderPath → count) drives the orange "+N new" badge
+  // on each MangaCard.
+  const {
+    rows: seriesStates,
+    scanState,          // "idle" | "running" | "done"
+    scanStats,          // { completed, total, durationMs, aborted }
+    newChapterCounts,
+    foundCount: updatesFoundCount,
+    start: startUpdateCheck,
+    cancel: cancelUpdateCheck,
+    resolveRows: resolveUpdateRows,
+    setRowIgnored,
+  } = updateCheck;
 
-  // ── Updates Center state ──
-  // `seriesStates` is the live Map<folderPath, SeriesState> the panel
-  // renders. SeriesState shape:
-  //   {
-  //     folderPath, title, cover, site,
-  //     state: "queued" | "running" | "found" | "uptodate" | "error",
-  //     newChapters?: string[],   // when state === "found"
-  //     total?: number,           // total chapters on site (uptodate/found)
-  //     error?: string,           // shorthand sentinel (uptodate/error)
-  //     errorMessage?: string,    // full message
-  //     enqueuedAt: number,       // monotonic for stable section sort
-  //   }
-  // We keep it as a useRef + a forced bump counter so frequent IPC events
-  // don't re-mount the panel — the actual Map identity churn is throttled.
-  // Frequent re-renders during 30-series scans got janky when state was a
-  // plain object; the Map+bump pattern keeps each update O(1) without
-  // copying the whole structure.
-  const seriesStatesRef = useRef(new Map());
-  const [seriesStateVersion, setSeriesStateVersion] = useState(0);
-  const bumpStates = useCallback(() => setSeriesStateVersion((v) => v + 1), []);
-
-  // Scan-level state for the panel header / progress bar.
-  const [scanState, setScanState] = useState("idle"); // "idle" | "running" | "done"
-  const [scanStats, setScanStats] = useState({ completed: 0, total: 0, durationMs: 0 });
+  // The panel's open/closed flag is the one piece of scan-adjacent state that
+  // is genuinely per-mount: the panel is a full-screen overlay whose backdrop
+  // swallows the click that would switch tabs, so it can never be open across
+  // a switch anyway.
   const [updatesPanelOpen, setUpdatesPanelOpen] = useState(false);
 
   // ── Load library on first mount only ──
@@ -1200,164 +1953,30 @@ export default function LibraryTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Listen for check-all-updates progress (richer event shape) ──
-  // Events come tagged by `kind`. The Map mutation is in-place (we read the
-  // ref, mutate it, then bump a version counter) so React re-renders the
-  // panel without copying every entry on every event — critical when 30+
-  // series each emit 3 events (queued, running, completed) in <60s.
-  useEffect(() => {
-    if (!window.electronAPI?.onUpdateCheckProgress) return;
-    const unsub = window.electronAPI.onUpdateCheckProgress((event) => {
-      const map = seriesStatesRef.current;
-      switch (event.kind) {
-        case "queued": {
-          // Existing entry might be a previous scan's result — overwrite.
-          map.set(event.folderPath, {
-            folderPath: event.folderPath,
-            title: event.title,
-            cover: event.cover,
-            site: event.site,
-            state: "queued",
-            enqueuedAt: Date.now(),
-          });
-          setScanState("running");
-          setScanStats({ completed: 0, total: event.total, durationMs: 0 });
-          bumpStates();
-          break;
-        }
-        case "running": {
-          const prev = map.get(event.folderPath) || {
-            folderPath: event.folderPath,
-            title: event.title,
-            enqueuedAt: Date.now(),
-          };
-          map.set(event.folderPath, {
-            ...prev,
-            state: "running",
-            site: event.site || prev.site,
-          });
-          setScanStats((s) => ({ ...s, completed: event.completed, total: event.total }));
-          bumpStates();
-          break;
-        }
-        case "completed": {
-          const prev = map.get(event.folderPath) || {};
-          const r = event.result || {};
-          let state;
-          let extra = {};
-          if (r.error === "aborted") {
-            state = "error";
-            extra = { error: "aborted", errorMessage: "cancelled" };
-          } else if (r.error) {
-            state = "error";
-            extra = { error: r.error, errorMessage: r.message || r.error };
-          } else if (r.newChapters && r.newChapters.length > 0) {
-            state = "found";
-            extra = { newChapters: r.newChapters, total: r.total };
-          } else {
-            state = "uptodate";
-            extra = { total: r.total };
-          }
-          map.set(event.folderPath, {
-            ...prev,
-            folderPath: event.folderPath,
-            title: event.title || prev.title,
-            cover: r.cover || prev.cover,
-            site: r.site || prev.site,
-            state,
-            ...extra,
-          });
-          setScanStats((s) => ({ ...s, completed: event.completed, total: event.total }));
+  // ── Updates Center entry points ──
+  // The progress subscription used to live here, which is precisely why the
+  // sweep looked like it died on a tab switch — this component unmounts and
+  // took the listener (and every row it had collected) with it. It lives in
+  // hooks/useUpdateCheck.js now; the three callbacks below are all that is
+  // left, and they only decide WHEN a scan is allowed to start.
+  const handleOpenPanel = useCallback(() => setUpdatesPanelOpen(true), []);
 
-          // Mirror "found" rows into newChapterCounts so the grid badges
-          // light up live as the scan progresses (matches the legacy
-          // behavior where the badge only appeared post-scan).
-          if (state === "found") {
-            setNewChapterCounts((prev) => ({
-              ...prev,
-              [event.folderPath]: r.newChapters.length,
-            }));
-          }
-
-          // Splice fresh metadata (status / authors / cover / genres) back
-          // into the entries list so the grid card + detail view reflect
-          // the live data without a manual Refresh. Same merge semantics
-          // as the legacy handler — only overwrite fields the live check
-          // populated, never drop chapters_downloaded etc.
-          if (r.updatedMeta) {
-            setEntries((entries) =>
-              entries.map((e) => {
-                if (e.folderPath !== event.folderPath) return e;
-                const merged = { ...e.seriesMeta };
-                for (const [k, v] of Object.entries(r.updatedMeta)) {
-                  if (v !== undefined && v !== null) merged[k] = v;
-                }
-                return { ...e, seriesMeta: merged };
-              })
-            );
-          }
-          bumpStates();
-          break;
-        }
-        case "done": {
-          setScanState("done");
-          setScanStats({
-            completed: event.completed,
-            total: event.total,
-            durationMs: event.durationMs,
-          });
-          bumpStates();
-          break;
-        }
-        default:
-          // Unknown event shape (e.g. an old main.js firing the legacy
-          // { current, total, title } payload). Ignore silently — when
-          // both ends are upgraded this branch is never reached.
-          break;
-      }
-    });
-    return unsub;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ── Trigger a fresh scan ──
-  // Opens the panel (if closed), clears any previous scan results, and
-  // calls the IPC. The Promise return value is intentionally ignored — the
-  // event stream is the source of truth for the UI; the Promise just tells
-  // us when the sweep is fully drained (sectioned dispatch already handled
-  // by the "done" event).
-  const handleCheckAll = useCallback(async () => {
-    if (!window.electronAPI?.checkAllUpdates) return;
-    // Wipe last scan's bookkeeping so the panel reflects only this run.
-    seriesStatesRef.current = new Map();
-    bumpStates();
-    setScanState("running");
-    setScanStats({ completed: 0, total: 0, durationMs: 0 });
+  // Starts a sweep only when there is nothing to show yet — see the toolbar
+  // button's comment for the full state table. A no-op against a live sweep
+  // (the hook and main both refuse), so a stray click can't restart a scan
+  // that is 20 series deep.
+  const handleCheckAll = useCallback(() => {
     setUpdatesPanelOpen(true);
-    try {
-      await window.electronAPI.checkAllUpdates();
-    } catch (err) {
-      console.error("Check all updates failed:", err);
-      setScanState("done");
-    }
-  }, [bumpStates]);
+    startUpdateCheck();
+  }, [startUpdateCheck]);
 
-  // ── Open the panel without rescanning ──
-  // Used by the toolbar button when a previous scan's results are still
-  // in memory — clicking shouldn't blow them away just to re-open the view.
-  const handleOpenPanel = useCallback(() => {
+  // The explicit "I want fresh results" gesture (panel header). The ONLY
+  // caller that passes force, i.e. the only one that may preempt a running
+  // sweep.
+  const handleRescan = useCallback(() => {
     setUpdatesPanelOpen(true);
-  }, []);
-
-  // ── Cancel an in-flight scan ──
-  const handleCancelScan = useCallback(async () => {
-    if (!window.electronAPI?.cancelCheckAllUpdates) return;
-    try {
-      await window.electronAPI.cancelCheckAllUpdates();
-    } catch (err) {
-      console.error("Cancel check-all failed:", err);
-    }
-  }, []);
+    startUpdateCheck({ force: true });
+  }, [startUpdateCheck]);
 
   // ── Per-row queue (called from the panel) ──
   // Builds the same download args as DetailView's "Download Missing
@@ -1370,103 +1989,108 @@ export default function LibraryTab({
   // actual download. The builder sets multiSourceLazy:true (overriding a
   // global lazy opt-out); downloader.js emits --multi-source-lazy whenever
   // multiSource is on and multiSourceLazy !== false. See the builder header.
-  const buildDownloadArgsForRow = useCallback((row, entry) => {
+  // `chapters` is the subset the panel says to queue — the user's ticked
+  // chapters, never simply row.newChapters. Everything the row offered that is
+  // NOT in it (unticked chapters, plus the crossed-out ones main split off into
+  // ignoredChapters) is handed to chaptersToRangeString as `excluding`, and
+  // that is load-bearing rather than cosmetic: aio-dl.py reads "10-11" as a
+  // closed interval, so without it a range spanning an excluded 10.5 would
+  // download the very chapter the user just crossed out. See the excluding
+  // note on chaptersToRangeString.
+  // An array passed for `chapters` is AUTHORITATIVE, empty included — falling
+  // back to row.newChapters when it happens to be empty would turn "queue
+  // nothing" into "queue everything", which is the worst possible reading of a
+  // user who just unticked the lot. Callers guard against empty before getting
+  // here; omitting the argument entirely still means "the whole row".
+  //
+  // kind "volume": the same, over the row's newVolumes / ignoredVolumes, and a
+  // volume recipe (the series' volume format/language; lib/queueRecipe.js).
+  const buildDownloadArgsForRow = useCallback((row, entry, chapters, kind = "chapter") => {
     const meta = entry?.seriesMeta || {};
-    const rangeStr = chaptersToRangeString(row.newChapters);
-    // Shared with the detail-view "Download Missing Chapters" path via
-    // buildLibraryDownloadArgs (@/lib/downloadArgs) — identical args now
-    // that both paths force lazy multi-source (no per-path options).
-    const args = buildLibraryDownloadArgs(
+    const isVolume = kind === "volume";
+    const offered = (isVolume ? row.newVolumes : row.newChapters) || [];
+    const crossed = (isVolume ? row.ignoredVolumes : row.ignoredChapters) || [];
+    const wanted = Array.isArray(chapters) ? chapters : offered;
+    const keep = new Set(wanted);
+    const excluding = [
+      ...offered.filter((c) => !keep.has(c)),
+      ...crossed,
+    ];
+    const rangeStr = chaptersToRangeString(wanted, { excluding });
+    // Same "library" recipe as the detail-view "Download Missing Chapters"
+    // path; its args are built when the download starts, from the Settings
+    // saved then (lib/queueRecipe.js).
+    const recipe = libraryRecipe(
       meta,
-      settings?.defaults,
       rangeStr,
-      settings?.verboseAlways,
+      // The row's folder, which for a FORKED series is the member holding the
+      // bulk of it (main.js picks it; grep seriesIdentityKey). Passing it as
+      // --series-dir is what stops the delta landing in the husk instead.
+      row.folderPath || entry?.folderPath,
+      kind,
     );
-    return { url: meta.url, args };
-  }, [settings]);
+    return { url: meta.url, args: { recipe } };
+  }, []);
 
-  const handleQueueRow = useCallback((row) => {
+  // Volume downloads are refused under Komikku (lib/downloadArgs.js
+  // KOMIKKU_VOLUMES_MESSAGE); the panel shows why and never hands volumes
+  // over then, and this guards the same rule for the queue paths below.
+  const komikkuOn = settings?.defaults?.komikku === true;
+
+  // `volumes` (optional): the row's ticked VOLUMES, queued as a separate
+  // volume download after the chapter one. A row can carry both kinds.
+  const handleQueueRow = useCallback((row, chapters, volumes) => {
     const entry = entries.find((e) => e.folderPath === row.folderPath);
     if (!entry?.seriesMeta?.url) return;
-    const { url, args } = buildDownloadArgsForRow(row, entry);
-    onStartDownload(url, args);
-    // Clear the badge for the queued row — the user committed; if a new
-    // scan finds more later, the count will repopulate.
-    setNewChapterCounts((prev) => {
-      const next = { ...prev };
-      delete next[row.folderPath];
-      return next;
-    });
-    // Also strip the row from seriesStates so the "Updates Found" section
-    // shrinks. Keep an "uptodate" placeholder so the user sees feedback
-    // that the row was actioned (rather than vanishing without a trace).
-    const map = seriesStatesRef.current;
-    const existing = map.get(row.folderPath);
-    if (existing) {
-      map.set(row.folderPath, {
-        ...existing,
-        state: "uptodate",
-        newChapters: undefined,
-      });
-      bumpStates();
-    }
-  }, [entries, buildDownloadArgsForRow, onStartDownload, bumpStates]);
-
-  const handleQueueAll = useCallback(() => {
-    const map = seriesStatesRef.current;
-    const founds = [];
-    for (const row of map.values()) {
-      if (row.state === "found") founds.push(row);
-    }
-    for (const row of founds) {
-      const entry = entries.find((e) => e.folderPath === row.folderPath);
-      if (!entry?.seriesMeta?.url) continue;
-      const { url, args } = buildDownloadArgsForRow(row, entry);
+    const wanted = Array.isArray(chapters) ? chapters : row.newChapters || [];
+    const wantedVolumes = komikkuOn || !Array.isArray(volumes) ? [] : volumes;
+    if (wanted.length === 0 && wantedVolumes.length === 0) return;
+    if (wanted.length > 0) {
+      const { url, args } = buildDownloadArgsForRow(row, entry, wanted);
       onStartDownload(url, args);
     }
-    // Bulk-clear all queued badges + downgrade rows to up-to-date.
-    setNewChapterCounts((prev) => {
-      const next = { ...prev };
-      for (const r of founds) delete next[r.folderPath];
-      return next;
-    });
-    for (const r of founds) {
-      const existing = map.get(r.folderPath);
-      if (existing) {
-        map.set(r.folderPath, {
-          ...existing,
-          state: "uptodate",
-          newChapters: undefined,
-        });
+    if (wantedVolumes.length > 0) {
+      const { url, args } = buildDownloadArgsForRow(row, entry, wantedVolumes, "volume");
+      onStartDownload(url, args);
+    }
+    // The user committed, so drop the badge and downgrade the row to
+    // "uptodate" — it stays visible in the panel as feedback rather than
+    // vanishing. If a later scan finds more, the count repopulates.
+    resolveUpdateRows([row.folderPath]);
+  }, [entries, buildDownloadArgsForRow, onStartDownload, resolveUpdateRows, komikkuOn]);
+
+  // `plan` is [{ row, chapters, volumes? }] built by the panel, which owns the ticks —
+  // this no longer re-derives the found set from seriesStates, because that
+  // would silently queue every new chapter of a row the user had partly
+  // unticked.
+  const handleQueueAll = useCallback((plan) => {
+    const volsOf = (item) => (komikkuOn ? [] : item.volumes || []);
+    const items = (Array.isArray(plan) ? plan : []).filter(
+      (item) => item?.row && ((item.chapters?.length || 0) + volsOf(item).length) > 0
+    );
+    for (const item of items) {
+      const { row, chapters } = item;
+      const entry = entries.find((e) => e.folderPath === row.folderPath);
+      if (!entry?.seriesMeta?.url) continue;
+      if (chapters?.length > 0) {
+        const { url, args } = buildDownloadArgsForRow(row, entry, chapters);
+        onStartDownload(url, args);
+      }
+      if (volsOf(item).length > 0) {
+        const { url, args } = buildDownloadArgsForRow(row, entry, volsOf(item), "volume");
+        onStartDownload(url, args);
       }
     }
-    bumpStates();
+    // Bulk-clear all queued badges + downgrade rows to up-to-date.
+    resolveUpdateRows(items.map(({ row }) => row.folderPath));
     onSwitchTab("queue");
     setUpdatesPanelOpen(false);
-  }, [entries, buildDownloadArgsForRow, onStartDownload, onSwitchTab, bumpStates]);
+  }, [entries, buildDownloadArgsForRow, onStartDownload, onSwitchTab, resolveUpdateRows, komikkuOn]);
 
   // Clear badges for the given folderPaths without queueing anything.
   // Used by the "Dismiss" buttons (per-row + bulk). The row itself stays in
   // the panel as "uptodate" so the user can see the dismiss took effect.
-  const handleDismiss = useCallback((folderPaths) => {
-    setNewChapterCounts((prev) => {
-      const next = { ...prev };
-      for (const p of folderPaths) delete next[p];
-      return next;
-    });
-    const map = seriesStatesRef.current;
-    for (const p of folderPaths) {
-      const existing = map.get(p);
-      if (existing) {
-        map.set(p, {
-          ...existing,
-          state: "uptodate",
-          newChapters: undefined,
-        });
-      }
-    }
-    bumpStates();
-  }, [bumpStates]);
+  const handleDismiss = resolveUpdateRows;
 
   const handleRefresh = useCallback(() => {
     setSelectedEntry(null);
@@ -1641,40 +2265,44 @@ export default function LibraryTab({
   // series count too because aggregators (notably mangafire) lie about
   // status. If the user has opted out via Settings, restore the legacy
   // ongoing-only filter.
+  //
+  // Counted per SERIES, not per folder: main.js runs one check per identity
+  // group, so a library holding a forked series (two folders, one series;
+  // grep seriesIdentityKey) would otherwise advertise a bigger number than the
+  // sweep ever reports back. seriesKey rides on the entry from
+  // electron/library.js's scanLibrary; folderPath is the fallback for a folder
+  // with no identity, which is exactly how main.js buckets those too.
   const includeCompletedInCheck = settings?.checkAllIncludeCompleted !== false;
-  const ongoingCount = entries.filter((e) => {
-    if (!e.seriesMeta?.url) return false;
-    if (includeCompletedInCheck) return true;
-    const s = e.seriesMeta.status;
-    return !s || s === "Ongoing" || s === "Releasing";
-  }).length;
-
-  // Total updates found in the current/last scan. Drives the badge on the
-  // toolbar button so users see at a glance how many actionable updates
-  // are waiting in the panel.
-  // The dep on seriesStateVersion forces this to recompute when the Map
-  // mutates (the Ref's reference identity never changes).
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const updatesFoundCount = useMemo(() => {
-    let n = 0;
-    for (const r of seriesStatesRef.current.values()) {
-      if (r.state === "found") n += 1;
+  const ongoingCount = useMemo(() => {
+    const keys = new Set();
+    for (const e of entries) {
+      if (!e.seriesMeta?.url) continue;
+      if (!includeCompletedInCheck) {
+        const s = e.seriesMeta.status;
+        if (!(!s || s === "Ongoing" || s === "Releasing")) continue;
+      }
+      keys.add(e.seriesKey || e.folderPath);
     }
-    return n;
-  }, [seriesStateVersion]);
+    return keys.size;
+  }, [entries, includeCompletedInCheck]);
 
-  // Shallow-cloned copy of the series-state Map. The ref's Map identity
-  // never changes (we mutate in place to avoid copy cost on every IPC
-  // event), but the UpdatesCenter panel's useMemo over seriesStates needs
-  // a fresh identity to recompute its grouping. Cloning once per version
-  // bump here gives the panel a stable "input changed" signal at the
-  // expense of one O(N) Map iteration per LibraryTab render — trivial
-  // for N ≤ a few hundred.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const seriesStatesSnapshot = useMemo(
-    () => new Map(seriesStatesRef.current),
-    [seriesStateVersion]
-  );
+  // ── Toolbar button mode ──
+  //   "scanning" — a sweep is live. It runs in the MAIN process, so this
+  //                mode is reached on a remount too: leaving the Library tab
+  //                never stopped the scan, it only used to hide it.
+  //   "results"  — a finished sweep worth reopening (including a clean one:
+  //                "everything was up to date" is a result).
+  //   "fresh"    — nothing to show; the click starts the first scan.
+  // Cancelled-with-nothing-found falls back to "fresh" because there is no
+  // result to preserve — anything else would make the user open the panel
+  // just to reach Rescan. Every other post-scan click OPENS rather than
+  // re-scans; Rescan inside the panel is the one way to spend the work again.
+  const updatesButtonMode =
+    scanState === "running"
+      ? "scanning"
+      : scanState === "done" && (updatesFoundCount > 0 || !scanStats.aborted)
+      ? "results"
+      : "fresh";
 
   // ── Detail view ──
   if (selectedEntry) {
@@ -1691,6 +2319,9 @@ export default function LibraryTab({
           addFacet(groupKey, valueKey);
           setSelectedEntry(null);
         }}
+        onSetChaptersIgnored={setRowIgnored}
+        syncLibrary={syncLibrary}
+        onOpenInSync={onOpenInSync}
       />
     );
   }
@@ -1777,58 +2408,56 @@ export default function LibraryTab({
           )}
         </div>
 
-        {/* Updates Center button.
-            Three label states:
-              - Scanning N/M  (during a sweep)
-              - Updates ●N    (after a sweep with N found, distinct accent)
-              - Check All     (fresh / no results to show)
-            Click behavior:
-              - While scanning: opens the panel (visible progress)
-              - After a sweep with results: opens the panel WITHOUT
-                re-scanning (the user just wants to see what's there)
-              - Otherwise: triggers a new scan AND opens the panel
-            Cross-file: UpdatesCenter.jsx is the rendered panel; its scan
-            state is owned here in LibraryTab. */}
+        {/* Updates Center button — see updatesButtonMode above for the
+            state table. Four labels:
+              - Scanning N/M  (sweep live, here or started in a hidden tab)
+              - Updates ●N    (finished with N found, orange accent)
+              - Up to date    (finished clean)
+              - Check All     (nothing to show — the only mode that scans)
+            Only "fresh" starts a sweep. That used to be the ONLY behavior
+            available after a tab switch, because the tab remounted with an
+            empty scanState while the sweep was still running — clicking then
+            aborted the live sweep and restarted it from zero.
+            Cross-file: UpdatesCenter.jsx is the panel; hooks/useUpdateCheck.js
+            owns the state; electron/main.js owns the sweep. */}
         {ongoingCount > 0 && (
           <Button
             variant="outline"
             size="sm"
-            onClick={() => {
-              if (scanState === "running") {
-                handleOpenPanel();
-              } else if (scanState === "done" && updatesFoundCount > 0) {
-                handleOpenPanel();
-              } else {
-                handleCheckAll();
-              }
-            }}
+            onClick={updatesButtonMode === "fresh" ? handleCheckAll : handleOpenPanel}
             disabled={loading}
             className={cn(
               "gap-1.5 text-xs relative",
-              scanState === "done" && updatesFoundCount > 0 && [
+              updatesButtonMode === "results" && updatesFoundCount > 0 && [
                 "border-orange-500/50 text-orange-300",
                 "hover:bg-orange-500/10 hover:text-orange-200 hover:border-orange-500/60",
               ]
             )}
             title={
-              scanState === "running"
-                ? `Scanning ${scanStats.completed} of ${scanStats.total}…`
+              updatesButtonMode === "scanning"
+                ? `Scanning ${scanStats.completed} of ${scanStats.total}… (runs in the background — click to watch)`
+                : updatesButtonMode === "fresh"
+                ? `Check ${ongoingCount} ongoing series for new chapters`
                 : updatesFoundCount > 0
                 ? `${updatesFoundCount} series have new chapters — click to view`
-                : `Check ${ongoingCount} ongoing series for new chapters`
+                : "Last check found nothing new — click to view, then Rescan for a fresh check"
             }
           >
-            {scanState === "running" ? (
+            {updatesButtonMode === "scanning" ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : updatesButtonMode === "results" && updatesFoundCount === 0 ? (
+              <Check className="w-3.5 h-3.5" />
             ) : (
               <Bell className="w-3.5 h-3.5" />
             )}
-            {scanState === "running"
+            {updatesButtonMode === "scanning"
               ? `Scanning ${scanStats.completed}/${scanStats.total}`
-              : scanState === "done" && updatesFoundCount > 0
+              : updatesButtonMode === "fresh"
+              ? "Check All"
+              : updatesFoundCount > 0
               ? `Updates ${updatesFoundCount}`
-              : "Check All"}
-            {scanState === "done" && updatesFoundCount > 0 && (
+              : "Up to date"}
+            {updatesButtonMode === "results" && updatesFoundCount > 0 && (
               <span
                 aria-hidden
                 className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-orange-400 shadow-[0_0_6px_rgba(249,115,22,0.8)]"
@@ -1934,6 +2563,8 @@ export default function LibraryTab({
                 entry={entry}
                 newCount={newChapterCounts[entry.folderPath] || 0}
                 onClick={() => setSelectedEntry(entry)}
+                onShowDuplicate={setDuplicateEntry}
+                syncChip={syncLibrary ? seriesSyncChip(syncLibrary.bySeries[entry.folderPath], syncLibrary.targets) : null}
               />
             ))}
 
@@ -1957,16 +2588,30 @@ export default function LibraryTab({
       <UpdatesCenter
         open={updatesPanelOpen}
         onClose={() => setUpdatesPanelOpen(false)}
-        seriesStates={seriesStatesSnapshot}
+        seriesStates={seriesStates}
         scanState={scanState}
         scanStats={scanStats}
-        onRescan={handleCheckAll}
-        onCancel={handleCancelScan}
+        onRescan={handleRescan}
+        onCancel={cancelUpdateCheck}
         onQueueRow={handleQueueRow}
         onQueueAll={handleQueueAll}
         onDismiss={handleDismiss}
+        onSetChaptersIgnored={setRowIgnored}
         hasCheckableSeries={ongoingCount > 0}
+        komikku={komikkuOn}
       />
+
+      {/* ── Merge duplicate folders ──
+          Opened from a card's amber badge. Rescans on success because a merge
+          moves files between folders and removes one — every entry the grid
+          holds for this series is stale afterwards. */}
+      {duplicateEntry && (
+        <MergeDuplicatesDialog
+          entry={duplicateEntry}
+          onClose={() => setDuplicateEntry(null)}
+          onMerged={loadLibrary}
+        />
+      )}
     </div>
   );
 }

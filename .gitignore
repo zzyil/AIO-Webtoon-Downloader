@@ -92,3 +92,9 @@ test_downloads.py
 # Local compression test corpus (raw + modernized page samples for codec
 # benchmarking). Copyrighted manga pages + series-named files — never track.
 /_testpages/
+
+# Device-sync cloud handoff folder (plans, CompareManga.zip, library snapshot,
+# session digests). Tracked ONLY on wip/device-sync-handoff, which never goes
+# upstream; ignored everywhere else. A branch that carries it must run
+# `git rm -r --cached sync-temp` before it ships.
+/sync-temp/

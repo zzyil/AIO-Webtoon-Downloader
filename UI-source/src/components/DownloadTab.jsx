@@ -4,12 +4,30 @@
 // The main form for starting new downloads. Every CLI argument
 // from aio-dl.py has a corresponding UI control.
 //
+// FORM STATE IS SPARSE EDITS (lib/downloadForm.js header has the model). The
+// tab keeps only the fields the user changed; what it shows is
+// {...formDefaults(settings), ...edits}, so unedited fields always show the
+// current Settings value. Start queues a "newTab" recipe carrying those edits
+// (lib/queueRecipe.js), and the args are built when the download STARTS:
+// a waiting New-tab item keeps exactly the fields the user changed here and
+// follows Settings for the rest. The draft App.jsx holds across tab switches
+// is the same edits object (plus the URL text).
+//
+// CHAPTERS | VOLUMES. A single URL on a site with native volumes (MangaFire;
+// lib/siteCapabilities.js) shows a switch under the URL box. Volume mode is
+// job data (downloadForm.js DEFAULT_FORM.downloadVolumes), is greyed out while
+// Komikku is on (Python turns volumes off under --komikku), and disables the
+// chapter-only controls the engine would override anyway (grep "[Volumes]
+// Forcing" in aio-dl.py): keep/skip chapter files, multi-source, splitting,
+// scanlation groups. The format choice is shared with chapters (user decision
+// 2026-11-06).
+//
 // SCROLL FIX: The form area uses flex-1 + overflow-y-auto so
 // it scrolls when content is taller than the window. The Start
 // button stays pinned at the bottom with flex-shrink-0.
 // ============================================================
 
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
 import {
   Button, Input, Textarea, Label, Switch, Slider, Select,
   Checkbox, SectionHeader, Collapsible, Badge,
@@ -17,114 +35,13 @@ import {
 import { Download, Lock, Sparkles, MonitorPlay, LogIn } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
-
-// ── DEFAULT VALUES ──
-// Match aio-dl.py's defaults so you can start a basic download
-// without changing anything.
-//
-// NOTE on quality=100 vs aio-dl.py's argparse default of 85:
-// Phase G4 in aio-dl.py (~line 4272) reads `_user_set_quality` from sys.argv;
-// any explicit --quality < 100 disables the CBZ byte-preserving fast-path.
-// The UI always emits --quality from form state (line 111), so a default
-// of 85 would force every CBZ download into the slow decode/re-encode path.
-// Keep this at 100 unless you also revisit Phase G4. Direct CLI users still
-// get aio-dl.py's argparse default of 85 — the divergence is intentional.
-const DEFAULT_FORM = {
-  urls: "",
-  format: "pdf",
-  epubLayout: "vertical",
-  quality: 100,
-  scaling: 100,
-  width: "",
-  aspectRatio: "",
-  chapters: "all",
-  language: "en",
-  noPartials: false,
-  keepChapters: false,
-  noFinalFile: false,
-  keepImages: false,
-  noProcessing: false,
-  noCleanup: false,
-  splitMode: "none",
-  splitValue: "",
-  group: "",
-  excludeGroup: "",
-  // "avoid" mirrors aio-dl.py's --mtl default: machine-translated versions
-  // rank below every human one but are still used when they're the only
-  // version of a chapter.
-  mtl: "avoid",
-  mixByUpvote: false,
-  cookies: "",
-  jobs: 1,
-  imageWorkers: 3,
-  httpTimeout: 30,
-  httpMaxRetries: 6,
-  httpBackoffBase: 1.0,
-  httpBackoffCap: 45,
-  netMinGap: 0.25,
-  missedRetries: 2,
-  noRetryMissedChapters: false,
-  // Multi-source fallback (also exposed in Search tab; applies here for
-  // direct-URL downloads). When enabled, aio-dl.py pre-fetches chapter
-  // lists from cross-site alternatives so per-chapter download failures
-  // can fall over to another source instead of aborting. Quality floor
-  // gates which alternatives qualify (mirror of --multi-source-quality-min).
-  multiSource: false,
-  multiSourceQualityMin: 0.65,
-  // Lazy-discovery modifier (--multi-source-lazy, 2026-07-02): defer the
-  // cross-site discovery until a chapter fails. Opt-out nested in the
-  // multi-source opt-in — the multiSource switch below force-resets it to
-  // true on enable, and consumers treat absent as on (`!== false`) so
-  // settings dicts saved before the field existed stay lazy. handleStart
-  // forwards only an explicit false; downloader.js's chokepoint emits the
-  // flag whenever multiSource is on and this isn't false.
-  multiSourceLazy: true,
-  // CBZ byte-preservation (Phase F, 2026-05-07). True = use original wire
-  // bytes when --format cbz with --scaling 100 and no --width/--quality
-  // override. False emits --no-cbz-preserve-originals and forces the
-  // legacy decode/recombine/re-encode path. Settings tab provides the
-  // global default; per-job overrides aren't surfaced in this form
-  // (the setting is essentially "trust the bytes" yes/no, not per-job).
-  cbzPreserveOriginals: true,
-  // LINE Webtoon WebP recompression (Phase 1, 2026-05-11). Re-encodes
-  // each downloaded page from PNG/JPEG to lossy WebP at the chosen quality
-  // before packaging. Only fires on webtoons.com (Python checks
-  // handler.name === "linewebtoon"); silently no-ops elsewhere, so this is
-  // safe to leave on as a global default for users whose library is mostly
-  // webtoons. Target: ~45GB Eleceed library → ~5GB at q85. Same useEffect
-  // at line ~110 spreads settings.defaults onto the form, so the Settings
-  // tab counterparts pre-populate these on a fresh New tab open.
-  webtoonRecompress: false,
-  webtoonRecompressQuality: 85,
-  webtoonRecompressMethod: 4,
-  // Content-aware JXL/AVIF transcode (--modernize, CBZ-only). Master toggle +
-  // knobs; settings.defaults spreads these onto the form via formDefaults()
-  // (line ~123). handleStart emits them when modernizeAllowed; downloader.js
-  // :buildCliArgs maps modernize* → --modernize* and strips the family if the
-  // CBZ fast-path is disabled. aio-dl.py: grep '--modernize compatibility checks'.
-  modernize: false,
-  // Fully-reversible archival preset — resolved at downloader.js:buildCliArgs
-  // into the forced PAIR --modernize-format jxl + --modernize-distance 0
-  // (auto + distance 0 is NOT reversible: color pages would still take the
-  // always-lossy AVIF branch). No per-job UI here; hydrates from
-  // settings.defaults like the other modernize knobs (SettingsTab owns the
-  // toggle).
-  modernizeReversible: false,
-  modernizeFormat: "auto",
-  modernizeQuality: 90,
-  modernizeDistance: 1.0,
-  modernizeMinSaving: 0.92,
-  // CPU<->size encoder knobs (no pixel change). INVERSE axes: higher JXL effort
-  // = slower/smaller; higher AVIF speed = faster/larger. Defaults = sweet spot.
-  modernizeEffort: 7,           // JXL effort 1-9 → --modernize-effort
-  modernizeAvifSpeed: 6,        // AVIF speed 0-10 → --modernize-avif-speed
-  // Komikku-compatible per-chapter CBZ output (2026-05-12, Komikku LocalSource format).
-  // When on, Python force-coerces format=cbz / keep-chapters / no-final-file,
-  // writes per-chapter ComicInfo.xml inside each CBZ, plus cover.jpg +
-  // details.json at the series-folder root. settings.defaults.komikku
-  // propagates here via the useEffect at line ~120-124 below.
-  komikku: false,
-};
+import {
+  formDefaults,
+  applyEdits,
+  recompressAllowed as isRecompressAllowed,
+} from "@/lib/downloadForm";
+import { useSiteCapabilities, volumesSupportedForUrl } from "@/lib/siteCapabilities";
+import ItemKindSwitch from "./ItemKindSwitch";
 
 const FORMATS = [
   { value: "pdf", label: "PDF", desc: "Tablet reading" },
@@ -342,10 +259,6 @@ function ComixBrowserCallout({ active, onEnable, onLogin }) {
   );
 }
 
-function formDefaults(settings) {
-  return { ...DEFAULT_FORM, ...(settings?.defaults || {}) };
-}
-
 export default function DownloadTab({
   onStartDownload,
   settings,
@@ -353,170 +266,67 @@ export default function DownloadTab({
   onDraftChange,
   onDraftConsumed,
 }) {
-  const [form, setFormState] = useState(() => ({
-    ...formDefaults(settings),
-    ...(draft || {}),
-  }));
+  // Only the fields the user changed (see the file header). Seeded from App's
+  // draft so a tab switch keeps unsent work.
+  const [edits, setEdits] = useState(() => ({ ...(draft || {}) }));
+  const baseline = formDefaults(settings);
+  const form = { ...baseline, ...edits };
 
-  // Apply saved defaults from Settings tab when they load. If the user has an
-  // unsent draft, keep that draft on top so tab switches don't wipe their work.
-  useEffect(() => {
-    setFormState({
-      ...formDefaults(settings),
-      ...(draft || {}),
-    });
-  }, [settings?.defaults, draft]);
-
-  const updateForm = (updater) => {
-    setFormState((prev) => {
-      const next = typeof updater === "function" ? updater(prev) : updater;
+  // Write fields. A value equal to the current default drops the edit, so the
+  // field follows later Settings changes again. Side-effect writes (None →
+  // keep images, etc.) go through the same rule: they're visible on screen.
+  const update = (patch) => {
+    setEdits((prev) => {
+      const next = applyEdits(prev, patch, baseline);
       onDraftChange?.(next);
       return next;
     });
   };
 
   // Helper to update one form field
-  const set = (key, value) => updateForm((prev) => ({ ...prev, [key]: value }));
+  const set = (key, value) => update({ [key]: value });
 
   // UIR-3: clamp numeric inputs whose raw Number() read is forwarded straight
   // to the CLI (Network Tuning). Empty/NaN (e.g. the user cleared the field)
-  // falls back to the field's DEFAULT_FORM value instead of emitting 0/null;
+  // falls back to the field's current default instead of emitting 0/null;
   // `min` enforces a sane floor so e.g. --http-timeout can't go to 0.
   const setNum = (key, raw, min) => {
     const n = Number(raw);
-    const value = raw === "" || Number.isNaN(n) ? DEFAULT_FORM[key] : Math.max(min, n);
-    updateForm((prev) => ({ ...prev, [key]: value }));
+    const value = raw === "" || Number.isNaN(n) ? baseline[key] : Math.max(min, n);
+    update({ [key]: value });
   };
 
-  // --webtoon-recompress needs an archive to write the converted pages into,
-  // so aio-dl.py rejects it for --format pdf/none (hard error at startup,
-  // see the --webtoon-recompress validation block ~aio-dl.py:6028). --komikku
-  // coerces format→cbz BEFORE that check (~aio-dl.py:5999), so recompress
-  // stays valid when Komikku is on regardless of the selected format button.
-  // Drives the toggle's disabled state + the handleStart emit guard below.
-  const recompressAllowed =
-    form.komikku || form.format === "cbz" || form.format === "epub";
+  // Format gates for the recompress / modernize toggles. DERIVED from the
+  // format, never written into the form — see lib/downloadForm.js.
+  const recompressAllowed = isRecompressAllowed(form);
 
-  // --modernize is CBZ-only (stricter than webtoon's cbz/epub): its .jxl/.avif
-  // pages only survive the CBZ byte-passthrough fast-path. komikku coerces
-  // format→cbz so it qualifies. Gates the handleStart emit below so a stale
-  // saved default can't push --modernize onto a pdf/none/epub job.
-  const modernizeAllowed =
-    form.komikku || form.format === "cbz";
+  // Volume mode is offered for exactly one URL on a site with native volumes.
+  // `volumeMode` is what the job will actually do; a leftover downloadVolumes
+  // edit from an earlier URL is ignored (and stripped at Start) once the URL
+  // no longer qualifies.
+  const sites = useSiteCapabilities();
+  const urlList = form.urls.split("\n").map((u) => u.trim()).filter(Boolean);
+  const volumesOffered = urlList.length === 1 && volumesSupportedForUrl(urlList[0], sites);
+  const volumeMode = volumesOffered && !!form.downloadVolumes && !form.komikku;
 
-  // Build CLI args from form state and trigger download
+  // Queue a "newTab" recipe: the args are built when the download starts
+  // (lib/queueRecipe.js), from these edits over the settings at that moment.
   const handleStart = () => {
     const urls = form.urls.split("\n").map((u) => u.trim()).filter(Boolean);
     if (urls.length === 0) return;
 
-    const args = {
-      format: form.format,
-      quality: form.quality,
-      language: form.language,
-      verbose: settings?.verboseAlways !== false,
-    };
+    // The URL text is the job, not a setting. downloadVolumes rides only when
+    // the switch is actually in effect (see volumeMode).
+    const { urls: _urls, downloadVolumes: _dv, ...formEdits } = edits;
+    if (volumeMode) formEdits.downloadVolumes = true;
+    const recipe = { kind: "newTab", input: { formEdits, urlCount: urls.length } };
 
-    // Only include changed-from-default values
-    if (form.scaling !== 100) args.scaling = form.scaling;
-    if (form.format === "epub") args.epubLayout = form.epubLayout;
-    if (form.width) args.width = parseInt(form.width, 10);
-    if (form.aspectRatio) args.aspectRatio = form.aspectRatio;
-    if (form.chapters !== "all") args.chapters = form.chapters;
-    if (form.noPartials) args.noPartials = true;
-    if (form.keepChapters) args.keepChapters = true;
-    if (form.noFinalFile) args.noFinalFile = true;
-    if (form.keepImages) args.keepImages = true;
-    if (form.noProcessing) args.noProcessing = true;
-    if (form.noCleanup) args.noCleanup = true;
-    if (form.noRetryMissedChapters) args.noRetryMissedChapters = true;
-    if (form.missedRetries !== 2) args.missedRetries = form.missedRetries;
-    if (form.multiSource) {
-      args.multiSource = true;
-      // Only emit --multi-source-quality-min when it differs from the CLI
-      // default (0.65). Keeps the spawn args cleaner.
-      if (form.multiSourceQualityMin !== 0.65) {
-        args.multiSourceQualityMin = form.multiSourceQualityMin;
-      }
-      // Lazy discovery is absent-means-on: downloader.js's chokepoint emits
-      // --multi-source-lazy whenever multiSource is on UNLESS the key is an
-      // explicit false, so only the opt-out needs forwarding.
-      if (form.multiSourceLazy === false) {
-        args.multiSourceLazy = false;
-      }
-    }
-    // Phase F (2026-05-07): forward the CBZ byte-preservation toggle. Only
-    // emit when the user has it OFF — buildCliArgs's negative-form handler
-    // turns this into --no-cbz-preserve-originals. Default (true) is the
-    // implicit Python-side default, so omitting from args keeps spawn lines
-    // clean.
-    if (form.cbzPreserveOriginals === false) {
-      args.cbzPreserveOriginals = false;
-    }
-    // Webtoon WebP recompression (Phase 1, 2026-05-11). Emit the master
-    // toggle so downloader.js's boolMap picks it up; pass quality/method
-    // through too so buildCliArgs can decide whether to forward them
-    // (it only does when the master toggle is on AND the value differs
-    // from the Python-side default, to keep the spawn line clean).
-    // Guard on recompressAllowed so an incompatible combo (pdf/none without
-    // komikku) never reaches the CLI even if form.webtoonRecompress is stale-
-    // true from a saved default — aio-dl.py would hard-error on it otherwise.
-    if (form.webtoonRecompress && recompressAllowed) {
-      args.webtoonRecompress = true;
-      args.webtoonRecompressQuality = form.webtoonRecompressQuality;
-      args.webtoonRecompressMethod = form.webtoonRecompressMethod;
-    }
-    // Komikku output (2026-05-12, Komikku LocalSource format). One boolean — Python
-    // does all the coercion. downloader.js boolMap emits --komikku when
-    // this is true.
-    if (form.komikku) {
-      args.komikku = true;
-    }
-    // Content-aware JXL/AVIF transcode (--modernize, CBZ-only). Emit the master
-    // toggle + valued knobs; downloader.js:buildCliArgs maps them and strips the
-    // whole family if the effective args can't ride the CBZ fast-path (quality
-    // 100 / scaling 100 / preserve-on / no-processing-off / no width-aspect
-    // override), so we don't re-check those here. modernizeAllowed gates on
-    // format like webtoon so a stale saved default never reaches a pdf/none/epub job.
-    if (form.modernize && modernizeAllowed) {
-      args.modernize = true;
-      args.modernizeReversible = form.modernizeReversible === true;
-      args.modernizeFormat = form.modernizeFormat;
-      args.modernizeDistance = form.modernizeDistance;
-      args.modernizeQuality = form.modernizeQuality;
-      args.modernizeMinSaving = form.modernizeMinSaving;
-      args.modernizeEffort = form.modernizeEffort;
-      args.modernizeAvifSpeed = form.modernizeAvifSpeed;
-    }
-    if (form.splitMode === "size" && form.splitValue) args.split = form.splitValue;
-    if (form.splitMode === "chapters" && form.splitValue) args.split = `${form.splitValue}ch`;
-    if (form.group.trim()) args.group = form.group.trim();
-    if (form.excludeGroup.trim()) args.excludeGroup = form.excludeGroup.trim();
-    if (form.mtl && form.mtl !== "avoid") args.mtl = form.mtl;
-    if (form.mixByUpvote) args.mixByUpvote = true;
-    if (form.cookies.trim()) args.cookies = form.cookies.trim();
-    if (form.jobs > 1) args.jobs = form.jobs;
-    if (form.imageWorkers !== 3) args.imageWorkers = form.imageWorkers;
-    if (form.httpTimeout !== 30) args.httpTimeout = form.httpTimeout;
-    if (form.httpMaxRetries !== 6) args.httpMaxRetries = form.httpMaxRetries;
-    if (form.httpBackoffBase !== 1.0) args.httpBackoffBase = form.httpBackoffBase;
-    if (form.httpBackoffCap !== 45) args.httpBackoffCap = form.httpBackoffCap;
-    if (form.netMinGap !== 0.25) args.netMinGap = form.netMinGap;
-
-    // ── Multi-URL handling ──
-    // Single URL: start one download, no --jobs needed
-    // Multiple URLs: pass them all to one aio-dl.py process with --jobs N
-    //   The Python script handles parallelism natively (spawns workers, retries, etc.)
-    if (urls.length === 1) {
-      onStartDownload(urls[0], args);
-    } else {
-      // Automatically set --jobs to the number of URLs
-      // (user can still override via the Parallel Workers section)
-      args.jobs = form.jobs > 1 ? form.jobs : urls.length;
-      onStartDownload(urls, args);
-    }
+    // Single URL: one download. Multiple URLs: one aio-dl.py process with
+    // --jobs N (the builder sets it); Python handles the parallelism.
+    onStartDownload(urls.length === 1 ? urls[0] : urls, { recipe });
 
     onDraftConsumed?.();
-    setFormState((prev) => ({ ...prev, urls: "" }));
+    setEdits({});
   };
 
   return (
@@ -554,11 +364,7 @@ export default function DownloadTab({
               onEnable={() =>
                 // Mirror the Multi-source switch: enabling force-resets the
                 // nested lazy toggle ON (opt-out inside the opt-in).
-                updateForm((prev) => ({
-                  ...prev,
-                  multiSource: true,
-                  multiSourceLazy: true,
-                }))
+                update({ multiSource: true, multiSourceLazy: true })
               }
             />
           )}
@@ -568,15 +374,34 @@ export default function DownloadTab({
           {hasComixUrl(form.urls) && (
             <ComixBrowserCallout
               active={form.multiSource}
-              onEnable={() =>
-                updateForm((prev) => ({
-                  ...prev,
-                  multiSource: true,
-                  multiSourceLazy: true,
-                }))
-              }
+              onEnable={() => update({ multiSource: true, multiSourceLazy: true })}
               onLogin={() => window.electronAPI?.comixLogin?.()}
             />
+          )}
+          {volumesOffered && (
+            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 animate-slide-up">
+              <ItemKindSwitch
+                volumes={volumeMode}
+                disabled={!!form.komikku}
+                onChange={(v) => set("downloadVolumes", v)}
+              />
+              <p className="text-[10px] leading-snug text-muted-foreground flex-1 min-w-[12rem]">
+                {form.komikku ? (
+                  <span className="text-yellow-500 dark:text-yellow-400">
+                    Volumes are unavailable with Komikku output, which is per chapter.
+                    Turn Komikku off to download volumes.
+                  </span>
+                ) : volumeMode ? (
+                  <>
+                    One file per volume (<span className="font-mono">Title Vol.01</span>) in
+                    the series folder, next to any chapters. Chapter-only options
+                    below are off.
+                  </>
+                ) : (
+                  <>This site also offers whole volumes.</>
+                )}
+              </p>
+            </div>
           )}
         </div>
 
@@ -591,29 +416,20 @@ export default function DownloadTab({
                 // aio-dl.py treats --format none as "skip the final book
                 // build" and produces nothing unless --keep-images or
                 // --keep-chapters is also set. Auto-enable keepImages here
-                // so the label is truthful out of the box. update form in one
-                // pass so the next render sees both fields consistent
-                // (avoids a brief frame where format=none but keepImages
-                // is still false, which would flash the warning below).
-                updateForm((prev) => ({
-                  ...prev,
+                // so the label is truthful out of the box. One update so the
+                // next render sees both fields consistent (avoids a frame
+                // where format=none but keepImages is still false, which would
+                // flash the warning below).
+                //
+                // Recompress and modernize are NOT cleared here any more: an
+                // incompatible format gates them off where they're read
+                // (recompressAllowed / modernizeAllowed in lib/downloadForm.js).
+                // Writing false would pin "off" as an edit, so going PDF→CBZ
+                // would lose the Settings value.
+                update({
                   format: f.value,
                   ...(f.value === "none" ? { keepImages: true } : {}),
-                  // Picking PDF or None makes --webtoon-recompress invalid
-                  // (no archive to write the converted pages into), so auto-
-                  // clear it — the user can't launch the rejected combo. Skip
-                  // when Komikku is on: it coerces format→cbz, keeping
-                  // recompress valid (mirror of recompressAllowed).
-                  ...((f.value === "pdf" || f.value === "none") && !prev.komikku
-                    ? { webtoonRecompress: false }
-                    : {}),
-                  // --modernize is CBZ-only (stricter than webtoon): clear it
-                  // whenever the picked format isn't cbz and komikku isn't
-                  // coercing to cbz, so an incompatible combo can't be launched.
-                  ...(f.value !== "cbz" && !prev.komikku
-                    ? { modernize: false }
-                    : {}),
-                }));
+                });
               }}
               className={cn(
                 "flex flex-col items-center gap-1 rounded-lg border p-3 transition-all text-sm",
@@ -643,8 +459,8 @@ export default function DownloadTab({
         )}
 
         {/* Komikku-mode per-job toggle (2026-05-12, Komikku LocalSource format).
-            Pre-filled from settings.defaults.komikku via the useEffect at
-            line ~120-124 (which spreads settings.defaults into the form).
+            Shows settings.defaults.komikku until the user flips it here
+            (formDefaults in lib/downloadForm.js).
             Python-side --komikku auto-coerces format=cbz / keep-chapters /
             no-final-file, so the format buttons above are effectively
             ignored when this is on — that's intentional, and the helper
@@ -735,11 +551,12 @@ export default function DownloadTab({
           </div>
         </div>
 
-        {/* Chapters */}
-        <SectionHeader>Chapters</SectionHeader>
+        {/* Chapters (volume numbers in volume mode: --chapters selects
+            volumes then, grep "--chapters" help in aio-dl.py) */}
+        <SectionHeader>{volumeMode ? "Volumes" : "Chapters"}</SectionHeader>
         <div className="grid grid-cols-2 gap-x-6 gap-y-3">
           <div>
-            <Label htmlFor="chapters" className="text-xs">Chapter Range</Label>
+            <Label htmlFor="chapters" className="text-xs">{volumeMode ? "Volume Range" : "Chapter Range"}</Label>
             <Input
               id="chapters"
               value={form.chapters}
@@ -747,7 +564,7 @@ export default function DownloadTab({
               onFocus={(e) => {
                 if (e.target.value === "all") e.target.select();
               }}
-              placeholder="all, or 1-50, 75, 80-100"
+              placeholder={volumeMode ? "all, or 1-5, 8" : "all, or 1-50, 75, 80-100"}
               className="mt-1"
             />
           </div>
@@ -760,16 +577,21 @@ export default function DownloadTab({
             </Select>
           </div>
         </div>
-        <div className="flex items-center gap-2 pt-2">
-          <Checkbox id="noPartials" checked={form.noPartials} onCheckedChange={(v) => set("noPartials", v)} />
-          <Label htmlFor="noPartials" className="text-xs cursor-pointer">Skip partial chapters (1.5, 60.1, etc.)</Label>
-        </div>
+        {!volumeMode && (
+          <div className="flex items-center gap-2 pt-2">
+            <Checkbox id="noPartials" checked={form.noPartials} onCheckedChange={(v) => set("noPartials", v)} />
+            <Label htmlFor="noPartials" className="text-xs cursor-pointer">Skip partial chapters (1.5, 60.1, etc.)</Label>
+          </div>
+        )}
 
         {/* Output Options */}
         <SectionHeader>Output Options</SectionHeader>
         <div className="space-y-2">
+          {/* Volume runs always write one file per volume and never a combined
+              file; the engine forces both, so the controls are frozen. */}
+          <fieldset disabled={volumeMode} className={cn("space-y-2", volumeMode && "opacity-40")}>
           <div className="flex items-center gap-2">
-            <Checkbox id="keepChapters" checked={form.keepChapters} onCheckedChange={(v) => { set("keepChapters", v); if (!v) set("noFinalFile", false); }} />
+            <Checkbox id="keepChapters" checked={form.keepChapters} onCheckedChange={(v) => update({ keepChapters: v, ...(!v ? { noFinalFile: false } : {}) })} />
             <Label htmlFor="keepChapters" className="text-xs cursor-pointer">Keep individual chapter files</Label>
           </div>
           <div className="flex items-center gap-2">
@@ -778,6 +600,7 @@ export default function DownloadTab({
               Skip combined final file (chapters only)
             </Label>
           </div>
+          </fieldset>
           <div className="flex items-center gap-2">
             <Checkbox id="keepImages" checked={form.keepImages} onCheckedChange={(v) => set("keepImages", v)} />
             <Label htmlFor="keepImages" className="text-xs cursor-pointer">Keep original unprocessed images</Label>
@@ -882,7 +705,9 @@ export default function DownloadTab({
             poisons. The same toggle is exposed in the Search tab; this
             duplicate lives here for direct-URL pastes that bypass Search. */}
         <SectionHeader>Multi-source fallback</SectionHeader>
-        <div className="space-y-3">
+        {/* Other sites list chapters, not this site's volume scans: nothing to
+            fall back to in volume mode (item_kinds.py VOLUMES.multi_source). */}
+        <fieldset disabled={volumeMode} className={cn("space-y-3", volumeMode && "opacity-40")}>
           <div className="flex items-start gap-3">
             <Switch
               id="multiSource"
@@ -890,13 +715,9 @@ export default function DownloadTab({
               onCheckedChange={(v) =>
                 // Enabling multi-source force-resets the nested lazy toggle
                 // to ON (opt-out inside the opt-in), mirroring the Settings
-                // master switch. One updateForm pass so both fields land in
-                // the same render.
-                updateForm((prev) => ({
-                  ...prev,
-                  multiSource: v,
-                  ...(v ? { multiSourceLazy: true } : {}),
-                }))
+                // master switch. One update so both fields land in the same
+                // render.
+                update({ multiSource: v, ...(v ? { multiSourceLazy: true } : {}) })
               }
               className="mt-0.5"
             />
@@ -956,12 +777,14 @@ export default function DownloadTab({
               </div>
             </div>
           )}
-        </div>
+        </fieldset>
 
         {/* Splitting */}
         <SectionHeader>Splitting</SectionHeader>
-        <div className="flex items-center gap-3">
-          <Select value={form.splitMode} onChange={(e) => { set("splitMode", e.target.value); set("splitValue", ""); }} className="w-40">
+        {/* --split is an error with --download-volumes (each volume is
+            already its own file). */}
+        <fieldset disabled={volumeMode} className={cn("flex items-center gap-3", volumeMode && "opacity-40")}>
+          <Select value={form.splitMode} onChange={(e) => update({ splitMode: e.target.value, splitValue: "" })} className="w-40">
             <option value="none">No splitting</option>
             <option value="size">By file size</option>
             <option value="chapters">By chapter count</option>
@@ -974,13 +797,15 @@ export default function DownloadTab({
               className="w-32 animate-slide-in"
             />
           )}
-        </div>
+        </fieldset>
 
         {/* Advanced */}
         <SectionHeader>Advanced</SectionHeader>
         <div className="space-y-2">
           <Collapsible title="Scanlation Groups">
-            <div className="space-y-3">
+            {/* A volume is the site's own scan; the engine clears group,
+                exclude-group and the MTL policy in volume mode. */}
+            <fieldset disabled={volumeMode} className={cn("space-y-3", volumeMode && "opacity-40")}>
               <div className="space-y-1.5">
                 <Label htmlFor="group" className="text-xs">Preferred groups (comma-separated, priority order)</Label>
                 <Input id="group" value={form.group} onChange={(e) => set("group", e.target.value)} placeholder='e.g. "Official, GroupA"' />
@@ -1014,7 +839,7 @@ export default function DownloadTab({
                   costs you a chapter; "Exclude" leaves gaps where only MTL exists.
                 </p>
               </div>
-            </div>
+            </fieldset>
           </Collapsible>
 
           <Collapsible title="Network Tuning">

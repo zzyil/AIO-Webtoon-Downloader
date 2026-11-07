@@ -592,10 +592,11 @@ def sync_cf_cookies(scraper, url: str) -> None:
 # NOT inherit the spawning thread's context — it starts empty and reads the
 # DEFAULT. So the permission cannot be granted around a pool submission and
 # expected to reach the workers, and (the direction that matters here) a worker
-# can never accidentally inherit a download's permission. The orchestrator still
-# sets False explicitly at its probe entry point (search_orchestrator.py:
-# _probe_one) because that body ALSO runs on the main thread in some paths, e.g.
-# a --multi-source download that probes inside an already-opted-in main().
+# can never accidentally inherit a download's permission. The search probe still
+# sets False explicitly in its worker (match_session.py, grep
+# interactive_solving) so the guarantee does not rest on how its threads are
+# started, e.g. a --multi-source download that probes inside an
+# already-opted-in main().
 _INTERACTIVE_SOLVE: "ContextVar[bool]" = _ContextVar(
     "aio_cf_interactive_solve", default=False
 )

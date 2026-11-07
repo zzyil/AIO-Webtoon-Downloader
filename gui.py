@@ -32,6 +32,7 @@ from library_state import (
     build_update_chapters_arg,
     list_saved_books,
     scan_library,
+    volume_update_argv,
 )
 from metadata_dialog import MetadataEditorDialog
 
@@ -118,7 +119,11 @@ class AIODownloaderGUI:
         self.library_detail = StringVar(value="Select a series to inspect its saved settings.")
 
         self.save_params = BooleanVar(value=bool(self.prefs.get("save_params", True)))
-        self.download_volumes = BooleanVar(value=bool(self.prefs.get("download_volumes", False)))
+        # Job data, never a pref: volumes only exist on some sites (MangaFire),
+        # so a remembered True would make every later download fail with
+        # "Volumes unavailable". Older prefs files may still carry the key;
+        # it is ignored and no longer written (_save_current_prefs).
+        self.download_volumes = BooleanVar(value=False)
         self.keep_chapters = BooleanVar(value=self.prefs.get("keep_chapters", True))
         self.keep_images = BooleanVar(value=self.prefs.get("keep_images", False))
         self.mix_by_upvote = BooleanVar(value=self.prefs.get("mix_by_upvote", False))
@@ -968,8 +973,8 @@ class AIODownloaderGUI:
             "no_cleanup": self.no_cleanup.get(),
             "verbose": self.verbose.get(),
             "debug_mode": self.debug_mode.get(),
-            "download_volumes": self.download_volumes.get(),
         })
+        self.prefs.pop("download_volumes", None)
         save_prefs(self.prefs)
 
     # ── Command construction ─────────────────────────────────
@@ -1361,11 +1366,21 @@ class AIODownloaderGUI:
         group_text = ", ".join(groups) if groups else "none"
         url_text = entry.get("url") or "(no saved URL)"
         latest = entry.get("latest_chapter") or "-"
-        detail = (
-            f"URL: {url_text} | format: {params.get('format', '?')} | latest saved chapter: {latest} "
-            f"| next update starts at: {entry.get('next_update', 'all')} | groups: {group_text}"
-        )
-        self.library_detail.set(detail)
+        kinds = entry.get("tracked_kinds") or ["chapter"]
+        parts = [f"URL: {url_text}"]
+        if "chapter" in kinds:
+            parts.append(
+                f"format: {params.get('format', '?')} | latest saved chapter: {latest} "
+                f"| next update starts at: {entry.get('next_update', 'all')} | groups: {group_text}"
+            )
+        # Volumes are a separate namespace (library_state.scan_library); a
+        # volume-only series would otherwise read "next update starts at: all".
+        if "volume" in kinds:
+            parts.append(
+                f"volumes: {entry.get('volumes', 0)} ({entry.get('volume_format') or 'cbz'}) "
+                f"| next volume update starts at: {entry.get('next_volume_update', 'all')}"
+            )
+        self.library_detail.set(" | ".join(parts))
 
     def _load_selected_into_form(self):
         selected = self.lib_tree.selection()
@@ -1440,6 +1455,13 @@ class AIODownloaderGUI:
                     "chapter_numbers": entry.get("chapter_numbers", set()),
                     "next_update": entry.get("next_update", "all"),
                     "latest_chapter": entry.get("latest_chapter", ""),
+                    # Per-kind update (library_state.scan_library): which kinds
+                    # this series tracks, and the volume half's own settings.
+                    "tracked_kinds": entry.get("tracked_kinds") or ["chapter"],
+                    "next_volume_update": entry.get("next_volume_update", "all"),
+                    "volume_format": entry.get("volume_format"),
+                    "volume_language": entry.get("volume_language"),
+                    "language": entry.get("language", "en"),
                 }
             )
         return results
@@ -1494,12 +1516,34 @@ class AIODownloaderGUI:
             return
         self._save_current_prefs()
         self._clear_output()
+        # One command per item kind the series tracks, chapters first (same plan
+        # as aio-dl.py _build_update_children). A volume-only series gets no
+        # chapter command: it would download every chapter of the series.
         cmds = []
+        skipped = []
         for s in series_list:
             title = s["params"].get("title", os.path.basename(s["folder"]))
-            start_ch = s.get("next_update", "all")
-            label = f"Updating: {title} (from {start_ch})"
-            cmds.append((label, self._build_update_cmd(s)))
+            kinds = s.get("tracked_kinds") or ["chapter"]
+            if "chapter" in kinds:
+                start_ch = s.get("next_update", "all")
+                label = f"Updating: {title} (from {start_ch})"
+                cmds.append((label, self._build_update_cmd(s)))
+            if "volume" in kinds:
+                vol_argv = volume_update_argv(s, self.output_dir.get())
+                if vol_argv is None:
+                    skipped.append(title)
+                else:
+                    start_vol = s.get("next_volume_update", "all")
+                    label = f"Updating volumes: {title} (from {start_vol})"
+                    cmds.append((label, [sys.executable, "-u", str(AIO_DL), s["params"]["url"], *vol_argv]))
+        if skipped:
+            messagebox.showinfo(
+                "Volumes Skipped",
+                "Volume updates are skipped for series saved in Komikku mode "
+                "(Komikku output is per chapter):\n" + "\n".join(skipped),
+            )
+        if not cmds:
+            return
         self._set_running(True)
         self.stop_flag.clear()
         self.sequence_cancelled = False

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .base import BaseSiteHandler
 from .atsumaru import AtsumaruSiteHandler
@@ -274,9 +274,41 @@ def iter_search_capable_handlers() -> Iterable[BaseSiteHandler]:
             yield handler
 
 
+def handler_capabilities() -> List[Dict[str, Any]]:
+    """What each registered handler can do, for UIs that adapt to the site.
+
+    One row per handler: name, display_name, domains, and these capability
+    flags:
+      search:  overrides BaseSiteHandler.search
+      volumes: overrides get_volumes (native volume releases; see
+               BaseSiteHandler.supports_volumes)
+    Every flag is DERIVED from the code by an override check, never declared,
+    so a UI can't offer something a handler doesn't implement.
+
+    Readers: aio-dl.py --site-capabilities (the Electron app caches it per
+    session; grep site-capabilities in UI-source/electron/main.js) and
+    api.py /api/handlers.
+    """
+    rows: List[Dict[str, Any]] = []
+    base_search = BaseSiteHandler.search
+    for handler in _REGISTERED_HANDLERS:
+        cls = type(handler)
+        rows.append(
+            {
+                "name": getattr(handler, "name", None),
+                "display_name": getattr(handler, "display_name", None),
+                "domains": list(getattr(handler, "domains", ()) or ()),
+                "search": cls.search is not base_search,
+                "volumes": cls.supports_volumes(),
+            }
+        )
+    return rows
+
+
 __all__ = [
     "get_handler_by_name",
     "get_handler_for_url",
+    "handler_capabilities",
     "iter_search_capable_handlers",
     "BaseSiteHandler",
 ]

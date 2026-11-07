@@ -11,7 +11,7 @@
 // (or any other format) when resuming without re-downloading.
 //
 // Props (from useDownloader):
-//   resumable: [{ hid, tmpDir, params, cachedChapters, url, title }]
+//   resumable: [{ hid, tmpDir, kind, params, cachedChapters, url, title }]
 //   onResume:  ({ url, tmpDir, format, epubLayout }) => void
 //   onDelete:  (tmpDir) => void
 //   onRefresh: () => void
@@ -34,7 +34,9 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
   const [expanded, setExpanded] = useState(false);
   // Per-item URL input (for items missing a URL)
   const [urlInputs, setUrlInputs] = useState({});
-  // Per-item format override: { [hid]: "epub" }
+  // Per-item state below is keyed by tmpDir, not hid: one series can have a
+  // chapter run (tmp_<hid>) and a volume run (tmpvol_<hid>) resumable at once.
+  // Per-item format override: { [tmpDir]: "epub" }
   // If not set, uses the original format from params
   const [formatOverrides, setFormatOverrides] = useState({});
   // Per-item EPUB layout (only relevant when format is epub)
@@ -65,17 +67,17 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
   //      tool wrote params with the field.
   //   4. "pdf" — last-resort safety net.
   const getFormat = (item) =>
-    formatOverrides[item.hid] || item.format || item.params?.format || "pdf";
+    formatOverrides[item.tmpDir] || item.format || item.params?.format || "pdf";
 
   const getEpubLayout = (item) =>
-    epubLayouts[item.hid] || "vertical";
+    epubLayouts[item.tmpDir] || "vertical";
 
   const handleResume = (item) => {
-    const url = item.params?.url || item.url || urlInputs[item.hid];
+    const url = item.params?.url || item.url || urlInputs[item.tmpDir];
 
     if (!url) {
       // Show the URL input field for this item
-      setUrlInputs((prev) => ({ ...prev, [item.hid]: "" }));
+      setUrlInputs((prev) => ({ ...prev, [item.tmpDir]: "" }));
       return;
     }
 
@@ -95,22 +97,22 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
     // Clean up state for this item
     setUrlInputs((prev) => {
       const next = { ...prev };
-      delete next[item.hid];
+      delete next[item.tmpDir];
       return next;
     });
   };
 
   const handleDelete = (item) => {
-    if (confirmDeleteHid === item.hid) {
+    if (confirmDeleteHid === item.tmpDir) {
       // Second click — actually delete
       setConfirmDeleteHid(null);
       onDelete(item.tmpDir);
     } else {
       // First click — show confirmation state
-      setConfirmDeleteHid(item.hid);
+      setConfirmDeleteHid(item.tmpDir);
       // Auto-cancel after 3 seconds if user doesn't confirm
       setTimeout(() => {
-        setConfirmDeleteHid((prev) => (prev === item.hid ? null : prev));
+        setConfirmDeleteHid((prev) => (prev === item.tmpDir ? null : prev));
       }, 3000);
     }
   };
@@ -187,7 +189,7 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
             const originalFormat = item.format || item.params?.format || "pdf";
             const isFormatChanged = currentFormat !== originalFormat;
             const hasUrl = !!(item.params?.url || item.url);
-            const showUrlInput = urlInputs.hasOwnProperty(item.hid);
+            const showUrlInput = urlInputs.hasOwnProperty(item.tmpDir);
 
             // Build info tags
             const tags = [];
@@ -198,7 +200,7 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
 
             return (
               <div
-                key={item.hid}
+                key={item.tmpDir}
                 className="flex items-start gap-3 p-3 rounded-md bg-background border"
               >
                 {/* Info column */}
@@ -206,11 +208,11 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
                   {/* Title + cached chapters */}
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-sm font-medium truncate">
-                      {item.params?.title || item.title || `tmp_${item.hid}`}
+                      {item.params?.title || item.title || item.folderName}
                     </span>
                     {item.cachedChapters > 0 && (
                       <Badge variant="default" className="text-[10px]">
-                        {item.cachedChapters} ch cached
+                        {item.cachedChapters} {item.kind === "volume" ? "vol" : "ch"} cached
                       </Badge>
                     )}
                   </div>
@@ -223,7 +225,7 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
                       onChange={(e) =>
                         setFormatOverrides((prev) => ({
                           ...prev,
-                          [item.hid]: e.target.value,
+                          [item.tmpDir]: e.target.value,
                         }))
                       }
                       className={cn(
@@ -251,7 +253,7 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
                             onClick={() =>
                               setEpubLayouts((prev) => ({
                                 ...prev,
-                                [item.hid]: layout,
+                                [item.tmpDir]: layout,
                               }))
                             }
                             className={cn(
@@ -287,9 +289,9 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
                     <div className="mt-2 flex gap-2 animate-slide-up">
                       <input
                         type="text"
-                        value={urlInputs[item.hid] || ""}
+                        value={urlInputs[item.tmpDir] || ""}
                         onChange={(e) =>
-                          setUrlInputs((prev) => ({ ...prev, [item.hid]: e.target.value }))
+                          setUrlInputs((prev) => ({ ...prev, [item.tmpDir]: e.target.value }))
                         }
                         placeholder="Paste the manga URL to resume…"
                         className={cn(
@@ -299,11 +301,11 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
                         )}
                         autoFocus
                         onKeyDown={(e) => {
-                          if (e.key === "Enter" && urlInputs[item.hid]) handleResume(item);
+                          if (e.key === "Enter" && urlInputs[item.tmpDir]) handleResume(item);
                           if (e.key === "Escape") {
                             setUrlInputs((prev) => {
                               const next = { ...prev };
-                              delete next[item.hid];
+                              delete next[item.tmpDir];
                               return next;
                             });
                           }
@@ -312,7 +314,7 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
                       <Button
                         size="sm"
                         className="h-7 text-xs"
-                        disabled={!urlInputs[item.hid]}
+                        disabled={!urlInputs[item.tmpDir]}
                         onClick={() => handleResume(item)}
                       >
                         Go
@@ -346,14 +348,14 @@ export default function ResumeBar({ resumable, onResume, onDelete, onRefresh }) 
                     onBlur={() => setConfirmDeleteHid(null)}
                     className={cn(
                       "h-7 text-xs",
-                      confirmDeleteHid === item.hid
+                      confirmDeleteHid === item.tmpDir
                         ? "text-destructive bg-destructive/10 hover:bg-destructive/20 hover:text-destructive"
                         : "text-destructive hover:text-destructive"
                     )}
                     title="Delete temp folder"
                   >
                     <Trash2 className="w-3 h-3" />
-                    {confirmDeleteHid === item.hid && (
+                    {confirmDeleteHid === item.tmpDir && (
                       <span className="ml-1">Sure?</span>
                     )}
                   </Button>

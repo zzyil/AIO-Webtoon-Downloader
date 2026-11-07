@@ -239,6 +239,84 @@ def test_undownloadable_still_wins_when_it_is_the_only_version(handler):
     assert handler.select_best_chapter_version(versions, [], False)["id"] == "external"
 
 
+# MangaDex publisher link-outs (plan sync-temp/plans/mangadex-link-outs.md):
+# `_locked` placeholders with `_locked_kind="external"`, pages 0 or 1.
+
+def _link_out(chap="1", group="Manga UP!", **extra):
+    return _v(
+        chap=chap,
+        groups=[GroupInfo(name=group, is_official=True)],
+        _locked=True, _locked_kind="external", _pages=1, **extra,
+    )
+
+
+def test_readable_fan_version_beats_a_one_page_link_out(handler):
+    """A 1-page link-out card used to win: official ranks above pages, and the
+    placeholder page tier stays inert while the median (6.5) is below 8."""
+    versions = [_link_out(id="card"), _v(groups=["Fan Scans"], _pages=12, id="fan")]
+    winner = handler.select_best_chapter_version(versions, [], False)
+    assert winner["id"] == "fan"
+
+
+def test_placeholder_only_number_keeps_its_placeholder(handler):
+    """The downloader still needs the number to fill it from another site."""
+    winner = handler.select_best_chapter_version([_link_out(id="card")], [], False)
+    assert winner["id"] == "card"
+
+
+def test_group_naming_the_publisher_falls_back_to_readable(handler):
+    """User decision 5: a link-out is not a match for `--group <publisher>`,
+    so the normal group fallback (on by default) takes the readable version."""
+    versions = [_link_out(id="card"), _v(groups=["Fan Scans"], id="fan")]
+    winner = handler.select_best_chapter_version(versions, ["Manga UP!"], False)
+    assert winner["id"] == "fan"
+    assert winner["_group_selection"]["kind"] == "fallback_missing_group"
+    # --no-group-fallback: nothing readable from that group, so skip.
+    assert handler.select_best_chapter_version(
+        versions, ["Manga UP!"], False, allow_group_fallback=False
+    ) is None
+
+
+def test_group_naming_the_publisher_still_gets_a_placeholder_only_number(handler):
+    winner = handler.select_best_chapter_version([_link_out(id="card")], ["Manga UP!"], False)
+    assert winner["id"] == "card"
+    assert winner["_group_selection"]["kind"] == "preferred_priority"
+
+
+def test_mtl_exclude_hands_an_mtl_only_number_to_its_placeholder(handler):
+    """An MTL-only readable set beside a link-out returns the link-out under
+    --mtl exclude, so another site can fill the number (user decision
+    2026-10-17); without a placeholder the number is still skipped."""
+    policy = GroupSelectionPolicy(mtl="exclude")
+    versions = [_link_out(id="card"), _v(groups=["MTL Sans"], id="mtl")]
+    winner = handler.select_best_chapter_version(
+        versions, [], False, selection_policy=policy
+    )
+    assert winner["id"] == "card"
+    assert winner["_group_selection"]["excluded_mtl"] == 1
+    assert handler.select_best_chapter_version(
+        [_v(groups=["MTL Sans"], id="mtl")], [], False, selection_policy=policy
+    ) is None
+
+
+def test_census_ignores_placeholders(handler):
+    """A publisher whose rows are all link-outs supplies nothing, and
+    link-out-only numbers don't count toward the total."""
+    by_num = {
+        "1": [_link_out(chap="1"), _v(chap="1", groups=["Fan"])],
+        "2": [_link_out(chap="2")],
+        "3": [_v(chap="3", groups=["Fan"])],
+    }
+    census, total = build_group_census(handler, by_num)
+    assert census == {"fan": 2}
+    assert total == 2
+
+
+def test_tapas_locked_placeholder_is_also_set_aside(handler):
+    versions = [_v(groups=["Tapas"], _locked=True, id="locked"), _v(groups=["Alt"], id="alt")]
+    assert handler.select_best_chapter_version(versions, [], False)["id"] == "alt"
+
+
 def test_official_beats_fan_when_both_are_downloadable(handler):
     versions = [
         _v(groups=["Fan Scans"], id="fan"),

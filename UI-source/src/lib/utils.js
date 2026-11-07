@@ -64,6 +64,25 @@ export function formatEta(ms) {
   return m ? `${h}h ${m}m` : `${h}h`;
 }
 
+// Decimal bytes for Device Sync's sizes and capacity ("6.8 GB", "412 MB",
+// "57 GB"): one decimal below 10 GB, none above, as in the approved mockup
+// (sync-temp/design/approved, fmtBytes). Decimal because the capacity gauge
+// sits beside the tablet's own storage screen, which Android shows in
+// decimal units. LibraryTab's local formatSize is binary and left alone, so
+// the same folder can read slightly differently on the two tabs.
+// Returns "" for null / non-finite so callers can conditional-render; a
+// negative value (an "after sync" that doesn't fit) keeps its sign.
+export function formatBytes(b) {
+  if (b == null || !Number.isFinite(b)) return "";
+  const sign = b < 0 ? "−" : "";
+  const n = Math.abs(b);
+  if (n >= 1e12) return `${sign}${(n / 1e12).toFixed(n >= 10e12 ? 0 : 1)} TB`;
+  if (n >= 1e9) return `${sign}${(n / 1e9).toFixed(n >= 10e9 ? 0 : 1)} GB`;
+  if (n >= 1e6) return `${sign}${Math.round(n / 1e6)} MB`;
+  if (n >= 1e3) return `${sign}${Math.round(n / 1e3)} KB`;
+  return `${sign}${Math.round(n)} B`;
+}
+
 // Collapse a list of chapter numbers into a compact human range string:
 // ["51","52","53","55","60"] → "51-53, 55, 60". Consecutive runs (gap ≤ 1.001,
 // so decimals like 60.1 join their neighbor) collapse to "start-end"; isolated
@@ -73,13 +92,32 @@ export function formatEta(ms) {
 // UpdatesCenter.jsx (both rendered "new chapters" ranges). Grep
 // chaptersToRangeString. Input may be strings or numbers — mapped through
 // Number() before sorting.
-export function chaptersToRangeString(chapters) {
+//
+// `opts.excluding` is a list of chapter numbers that MUST NOT fall inside any
+// emitted range, and it exists because this string is not only a label — the
+// update-check download paths feed it to `--chapters`, where aio-dl.py's
+// is_chapter_wanted treats "10-11" as the closed interval and would happily
+// download a 10.5 that is not in `chapters` at all. That is exactly what a
+// user who crossed out 10.5 (or unticked it) asked us not to do. So a run is
+// extended only when nothing excluded sits strictly between the two ends;
+// otherwise the range is cut and a new one started.
+//
+// With no exclusions the output is byte-identical to before — every caller
+// that just renders a label is unaffected. Note this only fixes over-selection
+// the caller KNOWS about: a range can still span an already-downloaded chapter
+// the caller never passed either list, which is long-standing behavior (that
+// chapter simply gets re-downloaded) and deliberately left alone here.
+export function chaptersToRangeString(chapters, opts = {}) {
   if (!chapters || chapters.length === 0) return "";
   const nums = chapters.map(Number).sort((a, b) => a - b);
+  const excluded = (opts.excluding || []).map(Number).filter((n) => !Number.isNaN(n));
+  // Strict inequalities: an excluded value equal to either end would mean the
+  // two lists overlap, and then the caller's own intent is what should win.
+  const blocked = (lo, hi) => excluded.some((x) => x > lo && x < hi);
   const ranges = [];
   let start = nums[0], end = nums[0];
   for (let i = 1; i < nums.length; i++) {
-    if (nums[i] - end <= 1.001) {
+    if (nums[i] - end <= 1.001 && !blocked(end, nums[i])) {
       end = nums[i];
     } else {
       ranges.push(start === end ? String(start) : `${start}-${end}`);

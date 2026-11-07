@@ -10,8 +10,9 @@
 //   - chapter coverage map (multi-source only)
 //
 // Result cards push downloads into the existing queue via the
-// onStartDownload callback — same path the New tab uses, so the
-// Queue tab handles them transparently.
+// onStartDownload callback as a "search" queue recipe
+// (lib/queueRecipe.js), so a waiting item picks up Settings saved
+// before it starts. The Queue tab handles them like any other item.
 // ============================================================
 
 import React, { useState, useMemo, useEffect, useRef } from "react";
@@ -32,11 +33,17 @@ import {
   Gauge,
   AlertTriangle,
   ArrowRight,
+  Info,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
+import { searchDialogInitial } from "@/lib/downloadArgs";
+import { applyEdits } from "@/lib/downloadForm";
+import { useSiteCapabilities, volumesSupportedForUrl } from "@/lib/siteCapabilities";
+import ItemKindSwitch from "./ItemKindSwitch";
 import SearchSourceCard from "./SearchSourceCard";
 import SearchChapterMap from "./SearchChapterMap";
+import FindBanner from "./sync/FindBanner";
 
 // Detect HTTP/S URLs in the search query — when matched, we cross-reference
 // against the resumable list (tmp_* folders) so the user can pick up a
@@ -67,7 +74,7 @@ function normalizeUrl(u) {
 // settings.collapseSplits in 2026-05-08 because the same toggle now affects
 // download behavior, not just search-display diagnostics. SearchTab's inline
 // toggle below reads/writes settings.collapseSplits directly via
-// onSaveSettings, and useDownloader.runSearch injects it into opts before IPC.
+// onSaveSettings, and useSearch's runSearch injects it into opts before IPC.
 const DEFAULT_OPTS = {
   searchLanguage: "en",
   seededOnly: true,         // user-facing default ON: faster, cleaner results
@@ -76,14 +83,6 @@ const DEFAULT_OPTS = {
   searchTimeout: 20,
   searchMinMatch: 0.55,
   searchParallelism: 6,
-  // ML image-quality rating (CLIP-IQA + NIQE + paired DISTS). Default OFF
-  // because torch's Windows import path hits platform.machine() which Python
-  // 3.13 routes through WMI — that can hang indefinitely on degraded hosts,
-  // bricking --search for the whole session. See search_orchestrator.py's
-  // _ML_RATING_ENABLED docstring for the full rationale. The toggle wires
-  // through to electron/searcher.js (opts.enableMlRating → --enable-ml-rating)
-  // and aio_search_cli sets the orchestrator gate before search_all runs.
-  enableMlRating: false,
 };
 
 const DOWNLOAD_FORMATS = [
@@ -163,8 +162,16 @@ export default function SearchTab({
   onResumeDownload,
   searchSiteHealth = {},
   onManageSources,
+  // Device Sync single find (UI pass U4-6): App's request {token, query,
+  // folder, targetName, searched, error} or null. The tab runs the search
+  // itself (with its own options) once per token, then reports it with
+  // onFindSearched(token) so a remount doesn't search again; the banner's
+  // ✕ calls onDismissFind. App links any download started meanwhile.
+  findFor = null,
+  onFindSearched,
+  onDismissFind,
 }) {
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(() => (findFor ? findFor.query : ""));
   const [downloadDialog, setDownloadDialog] = useState(null);
   // Session-only "don't recommend these again" set for the SlowSitesCallout.
   // Persists nothing — a chronically-bad site re-surfaces next session, which
@@ -237,6 +244,32 @@ export default function SearchTab({
   const isRunning = searchState?.status === "running";
   const hasResults = searchState?.status === "done" && searchState.results;
 
+  // Single find: prefill once per request, and run the find's own search
+  // once nothing else is running. A search already running is left to
+  // finish (it may be the user's), and the request stays un-searched until
+  // its own search starts: App links a download to the device folder only
+  // after that (review R13), so results of the OTHER search can't be linked.
+  // Two refs on purpose: `prefilled` fires as soon as the request arrives,
+  // `ranFor` only when its search starts (possibly a later run, after the
+  // running search ends). `ranFor` is what stops React StrictMode's second
+  // effect run, whose closure still sees the request un-searched, from
+  // starting the same search twice.
+  const findToken = findFor && !findFor.searched ? findFor.token : null;
+  const prefilled = useRef(null);
+  const ranFor = useRef(null);
+  useEffect(() => {
+    if (findToken == null) return;
+    if (prefilled.current !== findToken) {
+      prefilled.current = findToken;
+      setQuery(findFor.query);
+    }
+    if (isRunning || ranFor.current === findToken) return;
+    ranFor.current = findToken;
+    runSearch(findFor.query, opts);
+    onFindSearched?.(findToken);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findToken, isRunning]);
+
   // Auto-focus on mount so users can type immediately when they switch tabs.
   useEffect(() => {
     inputRef.current?.focus();
@@ -274,17 +307,20 @@ export default function SearchTab({
 
   const closeDownloadDialog = () => setDownloadDialog(null);
 
-  const confirmSearchDownload = (overrides) => {
+  // Queues a "search" recipe (lib/queueRecipe.js): the result's own args plus
+  // the dialog's edits. The args are built when the download starts, by
+  // lib/downloadArgs.js:confirmSearchArgs over the settings at that moment.
+  const confirmSearchDownload = (dialogEdits) => {
     if (!downloadDialog) return;
-    const finalArgs = {
-      ...(downloadDialog.args || {}),
-      ...overrides,
+    const recipe = {
+      kind: "search",
+      input: {
+        searchArgs: downloadDialog.args || {},
+        dialogEdits: dialogEdits || {},
+        extraArgs: {},
+      },
     };
-    if (!finalArgs.multiSource) {
-      delete finalArgs.prefetchedAlts;
-      delete finalArgs.multiSourcePrefetched;
-    }
-    onStartDownload?.(downloadDialog.url, finalArgs);
+    onStartDownload?.(downloadDialog.url, { recipe });
     setDownloadDialog(null);
   };
 
@@ -362,7 +398,7 @@ export default function SearchTab({
   // Add the chosen sites to the durable disabled list, then re-run the SAME
   // search — now faster, since the fan-out skips them. The merged list is
   // passed explicitly in opts (not just saved) so the re-search doesn't race
-  // the async settings write (see useDownloader.runSearch's disabledSites note).
+  // the async settings write (see hooks/useSearch.js runSearch's disabledSites note).
   const handleDisableAndReSearch = (siteNames) => {
     if (!siteNames?.length) return;
     const cur = Array.isArray(settings?.disabledSites) ? settings.disabledSites : [];
@@ -386,10 +422,14 @@ export default function SearchTab({
     <div className="flex flex-col h-full">
       {/* Scrollable content area */}
       <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
+        <FindBanner findFor={findFor} onDismiss={onDismissFind} />
         {/* ── Search bar ── */}
         <form onSubmit={handleSubmit}>
           <Label htmlFor="search-query" className="text-sm font-semibold">
-            Find a manga across {opts.seededOnly ? "30" : "280+"} sites
+            {/* Hand-kept: the curated count = keys of sites/quality_seed.json that
+                are also registered handlers (a listed key with no handler isn't
+                searched, so it doesn't count). Update when that file changes. */}
+            Find a manga across {opts.seededOnly ? "29" : "280+"} sites
           </Label>
           <p className="text-xs text-muted-foreground mt-0.5 mb-2">
             Cross-site search ranks results by title match, measured chapter
@@ -548,9 +588,9 @@ export default function SearchTab({
 
           {/* Collapse split chapters — global setting (settings.collapseSplits),
               moved out of opts in 2026-05-08 because it now affects download
-              behavior too. SettingsTab → "Default Chapter Behavior" mirrors
-              this same toggle; the global state stays in sync regardless of
-              which surface the user changes it from. Always visible (not
+              behavior too. Settings → Search mirrors this same toggle
+              (SettingsTab renderSearch); the global state stays in sync
+              regardless of which surface the user changes it from. Always visible (not
               gated on multi-source) since downloads are affected too.
               2026-05-27: flipped to OPT-IN — checked = strictly true.
               `=== true` (not `!== false`) so undefined/null defaults to OFF;
@@ -596,8 +636,10 @@ export default function SearchTab({
                 disabled={isRunning}
               />
               <p className="text-[10px] text-muted-foreground mt-1">
-                Sources below this seed/measured quality won't be used as fallbacks.
-                Default 0.65 keeps unknown-language Madara extras out.
+                Applies to unmeasured sources (their seed rating): below it they
+                won't be used as fallbacks. Measured sources that served pages
+                qualify at any rating. Default 0.65 keeps unknown-language Madara
+                extras out.
               </p>
             </div>
           )}
@@ -667,27 +709,6 @@ export default function SearchTab({
                 onChange={(e) => set("searchParallelism", parseInt(e.target.value, 10) || 6)}
                 disabled={isRunning}
                 className="w-20 h-8 text-xs"
-              />
-            </div>
-            {/* ML image-quality rating — opt-in. Forwards to --enable-ml-rating
-                via electron/searcher.js (opts.enableMlRating). Off by default;
-                see DEFAULT_OPTS above for the WMI-hang rationale. */}
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <Label htmlFor="opt-ml-rating" className="text-xs font-medium">
-                  ML image rating
-                </Label>
-                <p className="text-[10px] text-muted-foreground">
-                  Torch-backed CLIP-IQA + NIQE + DISTS for sharper ranking
-                  on borderline matches. Adds ~5 s startup and ~150 MB of
-                  model weights on first use. Default off.
-                </p>
-              </div>
-              <Switch
-                id="opt-ml-rating"
-                checked={opts.enableMlRating}
-                onCheckedChange={(v) => set("enableMlRating", v)}
-                disabled={isRunning}
               />
             </div>
           </div>
@@ -779,6 +800,9 @@ export default function SearchTab({
           />
         )}
 
+        {/* ── Sites skipped because of THIS machine, not the site ── */}
+        {hasResults && <BusySitesNotice health={searchState.results.site_health} />}
+
         {/* ── Results ── */}
         {hasResults && (
           <SearchResults
@@ -797,6 +821,31 @@ export default function SearchTab({
           onConfirm={confirmSearchDownload}
         />
       )}
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────
+// BUSY-SITES NOTICE
+//
+// One info line naming the sites this search skipped because another AIO
+// process had their browser (site_health entries with status "busy" — today
+// only mangafire; grep SiteBusyError in sites/base.py). Deliberately NOT part of
+// SlowSitesCallout: busy is our contention, not the site's health, so it gets no
+// strike, no checkbox and no "disable" offer (useDownloader.js skips it in the
+// strike fold). Renders nothing when no site was busy.
+// ────────────────────────────────────────────────────────────
+function BusySitesNotice({ health }) {
+  const busy = (Array.isArray(health) ? health : []).filter((h) => h?.status === "busy");
+  if (busy.length === 0) return null;
+  const names = busy.map((h) => h.display_name || h.site).join(", ");
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-info/25 bg-info/10 px-3 py-2 text-xs text-info-fg animate-slide-up">
+      <Info className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+      <span>
+        Skipped {names}: its browser was in use by another download or update check. Search
+        again once that finishes to include it.
+      </span>
     </div>
   );
 }
@@ -968,24 +1017,32 @@ function SlowSitesCallout({ sites, eligibleCount, onDisable, onDismiss, onManage
   );
 }
 
+// "Download settings" before a search result is queued. Same sparse-edits
+// model as the New tab (lib/downloadForm.js header): the dialog keeps only the
+// fields the user changed, shows them over searchDialogInitial(settings), and
+// hands back just those edits. The queued "search" recipe pins exactly those
+// and follows Settings for every other field until the download starts
+// (lib/queueRecipe.js). A Settings save while the dialog is open updates the
+// unedited fields and leaves the edited ones alone.
+//
+// CHAPTERS | VOLUMES. When the clicked source's URL is on a site with native
+// volumes (MangaFire; lib/siteCapabilities.js), the range field's label
+// becomes an ItemKindSwitch (placement chosen by the user 2026-11-06: on the
+// field it relabels). Only the clicked source counts, never another source of
+// the same result. Volume mode greys out what aio-dl.py forces or ignores for
+// volumes (grep "[Volumes] Forcing"): Group, Multi-source, and Keep chapters /
+// No final file (shown ticked, since every volume is its own file).
+// lib/downloadArgs.js searchDialogArgs turns it into the args.
 function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) {
-  const initial = useMemo(() => ({
-    format: settings?.defaults?.format || "pdf",
-    epubLayout: settings?.defaults?.epubLayout || "vertical",
-    chapters: "all",
-    group: settings?.defaults?.group || "",
-    language: settings?.defaults?.language || settings?.searchOpts?.searchLanguage || "en",
-    quality: settings?.defaults?.quality ?? 100,
-    keepChapters: !!settings?.defaults?.keepChapters,
-    keepImages: !!settings?.defaults?.keepImages,
-    noFinalFile: !!settings?.defaults?.noFinalFile,
-    multiSource: !!pending?.args?.multiSource,
-  }), [pending?.args?.multiSource, settings?.defaults, settings?.searchOpts?.searchLanguage]);
-  const [form, setForm] = useState(initial);
+  const initial = searchDialogInitial(settings, pending?.args?.multiSource);
+  const [edits, setEdits] = useState({});
+  const form = { ...initial, ...edits };
 
-  useEffect(() => {
-    setForm(initial);
-  }, [initial]);
+  // `volumeMode` is what the job will do: Komikku on means chapters, whatever
+  // the switch says (same rule as DownloadTab.jsx volumeMode).
+  const sites = useSiteCapabilities();
+  const volumesOffered = volumesSupportedForUrl(pending?.url, sites);
+  const volumeMode = volumesOffered && !!form.downloadVolumes && !form.komikku;
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -995,32 +1052,29 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
+  // A value equal to what the dialog shows unedited drops the edit (it then
+  // follows Settings again); the side-effect writes go through the same rule.
   const set = (key, value) => {
-    setForm((prev) => ({
-      ...prev,
-      [key]: value,
-      ...(key === "format" && value === "none" ? { keepImages: true } : {}),
-      ...(key === "keepChapters" && !value ? { noFinalFile: false } : {}),
-    }));
+    setEdits((prev) =>
+      applyEdits(
+        prev,
+        {
+          [key]: value,
+          ...(key === "format" && value === "none" ? { keepImages: true } : {}),
+          ...(key === "keepChapters" && !value ? { noFinalFile: false } : {}),
+        },
+        initial
+      )
+    );
   };
 
+  // Hands back the EDITS only; confirmSearchDownload wraps them in a recipe.
+  // downloadVolumes rides only when volume mode is actually in effect, so a
+  // switch left on Volumes before Komikku was turned on queues chapters.
   const submit = (event) => {
     event?.preventDefault();
-    const chapters = (form.chapters || "").trim();
-    const group = (form.group || "").trim();
-    const args = {
-      format: form.format,
-      quality: form.quality,
-      language: form.language,
-      keepChapters: form.keepChapters,
-      keepImages: form.keepImages,
-      noFinalFile: form.noFinalFile,
-      multiSource: form.multiSource,
-    };
-    if (form.format === "epub") args.epubLayout = form.epubLayout;
-    if (chapters && chapters.toLowerCase() !== "all") args.chapters = chapters;
-    if (group) args.group = group;
-    onConfirm?.(args);
+    const { downloadVolumes: _dv, ...rest } = edits;
+    onConfirm?.(volumeMode ? { ...rest, downloadVolumes: true } : rest);
   };
 
   const title =
@@ -1030,12 +1084,16 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
     "Search result";
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm px-4">
+    // Sized off the viewport rather than a fixed max-w-lg so it grows with the
+    // window: width tracks 60vw between 32rem and 64rem, height caps at 90vh
+    // with only the body scrolling (header/footer stay put). The field grid
+    // below goes 2→4 columns at lg so the extra width is used, not padded.
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm p-4">
       <form
         onSubmit={submit}
-        className="w-full max-w-lg rounded-lg border bg-card shadow-xl animate-slide-up"
+        className="flex w-full max-w-[clamp(32rem,60vw,64rem)] max-h-[90vh] flex-col rounded-lg border bg-card shadow-xl animate-slide-up"
       >
-        <div className="flex items-center justify-between gap-3 border-b px-4 py-3">
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b px-4 py-3">
           <div className="flex items-center gap-2 min-w-0">
             <SlidersHorizontal className="w-4 h-4 text-primary shrink-0" />
             <div className="min-w-0">
@@ -1057,7 +1115,7 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
           </Button>
         </div>
 
-        <div className="max-h-[70vh] overflow-y-auto px-4 py-3 space-y-4">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 space-y-4">
           <div>
             <Label className="text-xs">Format</Label>
             <div className="grid grid-cols-4 gap-2 mt-1">
@@ -1076,6 +1134,46 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
                   {format.label}
                 </button>
               ))}
+            </div>
+
+            {/* Same per-job Komikku toggle as DownloadTab.jsx (grep
+                "Komikku-compatible output"); defaults to settings.defaults.komikku
+                via searchDialogInitial. --komikku forces CBZ on the Python side,
+                so the format buttons above are ignored while it's on. */}
+            <div
+              className={cn(
+                "flex items-center justify-between gap-3 mt-2 rounded-md border p-3 transition-colors",
+                form.komikku ? "border-primary/50 bg-primary/5" : "border-border bg-background"
+              )}
+            >
+              <div className="flex-1">
+                <Label htmlFor="search-komikku" className="text-xs cursor-pointer">
+                  Komikku-compatible output
+                </Label>
+                <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug">
+                  {form.komikku ? (
+                    <>
+                      Overrides format → <span className="font-mono">CBZ</span>. Writes
+                      per-chapter CBZs with their own{" "}
+                      <span className="font-mono">ComicInfo.xml</span>, plus{" "}
+                      <span className="font-mono">cover.jpg</span> +{" "}
+                      <span className="font-mono">details.json</span> at the
+                      series-folder root.
+                    </>
+                  ) : (
+                    <>
+                      Enable for Mihon/Tachiyomi/Komikku readers. Each chapter
+                      becomes its own CBZ with per-chapter metadata, plus
+                      series-level cover.jpg + details.json. Forces format=CBZ.
+                    </>
+                  )}
+                </p>
+              </div>
+              <Switch
+                id="search-komikku"
+                checked={!!form.komikku}
+                onCheckedChange={(value) => set("komikku", value)}
+              />
             </div>
           </div>
 
@@ -1102,19 +1200,29 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
             </div>
           )}
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div>
-              <Label htmlFor="search-download-chapters" className="text-xs">
-                Chapters
-              </Label>
+              {volumesOffered ? (
+                <ItemKindSwitch
+                  compact
+                  volumes={volumeMode}
+                  disabled={!!form.komikku}
+                  onChange={(v) => set("downloadVolumes", v)}
+                />
+              ) : (
+                <Label htmlFor="search-download-chapters" className="text-xs">
+                  Chapters
+                </Label>
+              )}
               <Input
                 id="search-download-chapters"
+                aria-label={volumeMode ? "Volume range" : "Chapter range"}
                 value={form.chapters}
                 onChange={(e) => set("chapters", e.target.value)}
                 onFocus={(e) => {
                   if (e.target.value === "all") e.target.select();
                 }}
-                placeholder="all, 1-20, 44"
+                placeholder={volumeMode ? "all, 1-5, 8" : "all, 1-20, 44"}
                 className="mt-1 h-8 text-xs font-mono"
               />
             </div>
@@ -1135,10 +1243,7 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
                 ))}
               </Select>
             </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
+            <div className={cn(volumeMode && "opacity-40")}>
               <Label htmlFor="search-download-group" className="text-xs">
                 Group
               </Label>
@@ -1147,6 +1252,7 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
                 value={form.group}
                 onChange={(e) => set("group", e.target.value)}
                 placeholder="optional"
+                disabled={volumeMode}
                 className="mt-1 h-8 text-xs"
               />
             </div>
@@ -1169,12 +1275,13 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div className="flex items-center gap-2">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className={cn("flex items-center gap-2", volumeMode && "opacity-40")}>
               <Checkbox
                 id="search-keep-chapters"
-                checked={form.keepChapters}
+                checked={volumeMode || form.keepChapters}
                 onCheckedChange={(value) => set("keepChapters", value)}
+                disabled={volumeMode}
               />
               <Label htmlFor="search-keep-chapters" className="text-xs cursor-pointer">
                 Keep chapters
@@ -1190,25 +1297,26 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
                 Keep images
               </Label>
             </div>
-            <div className="flex items-center gap-2">
+            <div className={cn("flex items-center gap-2", volumeMode && "opacity-40")}>
               <Checkbox
                 id="search-no-final-file"
-                checked={form.noFinalFile}
+                checked={volumeMode || form.noFinalFile}
                 onCheckedChange={(value) => set("noFinalFile", value)}
-                disabled={!form.keepChapters}
+                disabled={volumeMode || !form.keepChapters}
               />
               <Label
                 htmlFor="search-no-final-file"
-                className={cn("text-xs cursor-pointer", !form.keepChapters && "opacity-40")}
+                className={cn("text-xs cursor-pointer", !volumeMode && !form.keepChapters && "opacity-40")}
               >
                 No final file
               </Label>
             </div>
-            <div className="flex items-center gap-2">
+            <div className={cn("flex items-center gap-2", volumeMode && "opacity-40")}>
               <Switch
                 id="search-multi-source-download"
-                checked={form.multiSource}
+                checked={!volumeMode && form.multiSource}
                 onCheckedChange={(value) => set("multiSource", value)}
+                disabled={volumeMode}
               />
               <Label
                 htmlFor="search-multi-source-download"
@@ -1218,9 +1326,26 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
               </Label>
             </div>
           </div>
+
+          {volumesOffered && (form.komikku || volumeMode) && (
+            <p className="text-[11px] leading-snug text-muted-foreground animate-slide-up">
+              {form.komikku ? (
+                <span className="text-yellow-500 dark:text-yellow-400">
+                  Volumes are unavailable with Komikku output, which is per chapter.
+                  Turn Komikku off to download volumes.
+                </span>
+              ) : (
+                <>
+                  One file per volume (<span className="font-mono">Title Vol.01</span>) in
+                  the series folder, next to any chapters. Group and multi-source
+                  don't apply to volumes.
+                </>
+              )}
+            </p>
+          )}
         </div>
 
-        <div className="flex items-center justify-end gap-2 border-t px-4 py-3">
+        <div className="flex shrink-0 items-center justify-end gap-2 border-t px-4 py-3">
           <Button type="button" variant="outline" size="sm" onClick={onClose}>
             Cancel
           </Button>

@@ -237,9 +237,10 @@ class DynastySiteHandler(BaseSiteHandler):
     # /search?q=<query>&classes[]=... path works. Search results live in
     # `<dd>` blocks, each containing `<a class="name" href="/<dir>/<slug>">Title</a>`
     # where <dir> ∈ {series, anthologies, doujins, issues}. There are no
-    # cover thumbnails in the search HTML — the chapter-probe path fetches
+    # cover thumbnails in the search HTML — fetch_comic_context reads
     # /<dir>/<slug>.json which has the cover, so cover=None here is fine
-    # (the _probe_chapter_aggregate chapter path doesn't need hit.cover).
+    # (the search quality probe compares chapter pages and never reads
+    # hit.cover).
     _SEARCH_HREF_RE = re.compile(r"^/(series|anthologies|doujins|issues)/[^/?#]+/?$")
 
     def search(

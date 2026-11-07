@@ -1,0 +1,27 @@
+{
+  "__aioSyncFixture": "devices.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": {
+    "ok": true,
+    "devices": [
+      {
+        "serial": "R5CW71ABCDE",
+        "state": "device",
+        "stateKind": "device",
+        "model": "SM_X710",
+        "product": "gts9wifi",
+        "transportId": 1,
+        "targetable": true
+      },
+      {
+        "serial": "RZ8N40XYZ12",
+        "state": "unauthorized",
+        "stateKind": "unauthorized",
+        "model": null,
+        "product": null,
+        "transportId": 2,
+        "targetable": true
+      }
+    ]
+  }
+}

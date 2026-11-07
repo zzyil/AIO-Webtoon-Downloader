@@ -34,8 +34,8 @@ What reads from it:
     aio-dl.py:dl_image handles the actual download with the session-level
     Referer (set in configure_session).
   - sites/search_orchestrator.py — picks up search() override via
-    iter_search_capable_handlers and runs the 5-page chapter-quality probe
-    (default _probe_chapter_aggregate is sufficient — pure HTTP).
+    iter_search_capable_handlers; the matched-page quality probe
+    (sites/match_session.py) uses the default match_fetch_window — pure HTTP.
 
 Cross-file coupling worth flagging:
   - chapter dicts emit `is_official: True` + `publisher: "LINE Webtoon"`
@@ -165,8 +165,8 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
     method so downstream parsers (selectors, folder-naming) see canonical
     desktop URLs.
 
-    EXPENSIVE_PROBE stays False (default) — pure-HTTP, the 5-page aggregate
-    probe runs at full sample count.
+    EXPENSIVE_PROBE stays False (default) — pure HTTP, so its search probe is
+    not slow by design.
     """
 
     name = "linewebtoon"
@@ -177,8 +177,8 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
     # SeriesCandidate. Without this, aggregators that upscale our PNGs
     # to higher-res JPEG were winning the image-quality probe despite
     # being generation-loss copies. See BaseSiteHandler.OFFICIAL_PUBLISHER
-    # for the full rationale and search_orchestrator.py:_cmp for the
-    # consuming sort.
+    # for the full rationale and search_orchestrator.py:source_rank_key for
+    # the consuming sort.
     OFFICIAL_PUBLISHER = True
 
     # Opt into the curl_cffi fast image-download path (HTTP/2 multiplex over
@@ -1129,8 +1129,8 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
         # this signal a 20-episode Canvas "One Piece" stays clustered with
         # MangaDex's 1100-chapter One Piece purely on title-normalize, and
         # the per-hit is_official=False alone doesn't sink it below all
-        # the real sources — _cmp would still let it stay where its
-        # title_match places it. Probing the API costs ~1.6s per hit so we
+        # the real sources — source_rank_key would still let it stay where
+        # its title_match places it. Probing the API costs ~1.6s per hit so we
         # parallelize + cap the total budget. See _populate_chapter_counts
         # docstring for the bandwidth/timeout tradeoff.
         if hits:

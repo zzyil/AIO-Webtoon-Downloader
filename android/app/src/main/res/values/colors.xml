@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  KEEP IN SYNC with LightTokens.background in ui/theme/Color.kt (`0 0% 98%`).
+  This is the pre-composition window background; a mismatch shows up as a flash
+  of the wrong shade on every cold start.
+-->
+<resources>
+    <color name="aio_window_background">#FAFAFA</color>
+</resources>

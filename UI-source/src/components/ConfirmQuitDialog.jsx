@@ -4,8 +4,14 @@
 // Renders ONLY while the main process has a window close pending. main.js's
 // mainWindow "close" listener preventDefaults whenever a download is actually
 // RUNNING and pushes "confirm-quit" with { running: [{downloadId, title, url,
-// startedAt}] }; this component is the answer surface and replies with exactly
-// one of confirmQuit / cancelQuit (preload.js).
+// startedAt}], sync }; this component is the answer surface and replies with
+// exactly one of confirmQuit / cancelQuit (preload.js).
+//
+// `sync` is Device Sync's running job, or null: main asks only while an
+// apply, prune or rename runs (sync/contract.js QUIT_ASK_PHASES), and the
+// payload is sync/service.js quitInfo() → {target, phase, unit, done, total}
+// (unit "files" for an apply, "folders" for a prune or rename). The dialog
+// can open for a sync job alone, with no download running.
 //
 // A React dialog rather than dialog.showMessageBox on purpose: a native modal
 // breaks Electron's renderer focus/input handling, which is why every
@@ -25,11 +31,20 @@
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/primitives";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { AlertTriangle, FolderSync, Loader2 } from "lucide-react";
 
 // Cap the visible list so a "start alongside" spree can't push the buttons off
 // screen; the remainder collapses into a "+N more" line.
 const MAX_LISTED = 5;
+
+const SYNC_VERB = { apply: "Copying to", prune: "Removing folders on", rename: "Renaming a folder on" };
+
+// "Copying to Galaxy Tab S9: 120 of 340 files". Counts are left off until the
+// job knows its total (a job that has only just started reports 0 of 0).
+function syncLine(s) {
+  const head = `${SYNC_VERB[s.phase] || "Syncing"} ${s.target || "a sync target"}`;
+  return s.total > 0 ? `${head}: ${s.done} of ${s.total} ${s.unit || "files"}` : head;
+}
 
 export default function ConfirmQuitDialog() {
   // null = no close pending (the overwhelmingly common state, and the one
@@ -41,7 +56,10 @@ export default function ConfirmQuitDialog() {
     const api = typeof window !== "undefined" && window.electronAPI;
     if (!api || typeof api.onConfirmQuit !== "function") return;
     return api.onConfirmQuit((data) => {
-      setPending({ running: Array.isArray(data?.running) ? data.running : [] });
+      setPending({
+        running: Array.isArray(data?.running) ? data.running : [],
+        sync: data && data.sync && typeof data.sync === "object" ? data.sync : null,
+      });
     });
   }, []);
 
@@ -73,7 +91,7 @@ export default function ConfirmQuitDialog() {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [pending, cancel]);
 
-  // Land the focus ring on "Keep downloading", not on the destructive button.
+  // Land the focus ring on the keep button, not on the destructive one.
   useEffect(() => {
     if (pending) keepRef.current?.focus();
   }, [pending]);
@@ -81,8 +99,27 @@ export default function ConfirmQuitDialog() {
   if (!pending) return null;
 
   const running = pending.running;
+  const sync = pending.sync;
   const n = running.length;
   const plural = n !== 1;
+  // Main also asks when a sync job is running but quitInfo() failed (sync is
+  // null); with no download either, there is nothing to list, so the title
+  // still has to say something true.
+  const syncOnly = n === 0;
+  const title = syncOnly
+    ? "Device Sync is still running"
+    : sync
+      ? plural
+        ? `${n} downloads and a sync are still running`
+        : "A download and a sync are still running"
+      : plural
+        ? `${n} downloads are still running`
+        : "A download is still running";
+  const sub = syncOnly
+    ? "Closing now stops it partway."
+    : sync
+      ? "Closing now stops them partway."
+      : `Closing now stops ${plural ? "them" : "it"} mid-chapter.`;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm px-4">
@@ -98,16 +135,20 @@ export default function ConfirmQuitDialog() {
           </span>
           <div className="min-w-0">
             <div id="confirm-quit-title" className="text-sm font-semibold">
-              {plural ? `${n} downloads are still running` : "A download is still running"}
+              {title}
             </div>
-            <div className="text-[11px] text-muted-foreground mt-0.5">
-              Closing now stops {plural ? "them" : "it"} mid-chapter.
-            </div>
+            <div className="text-[11px] text-muted-foreground mt-0.5">{sub}</div>
           </div>
         </div>
 
         <div className="px-4 py-3 space-y-3">
           <ul className="space-y-1">
+            {sync && (
+              <li className="flex items-center gap-2 rounded-md border border-border/60 bg-secondary/40 px-2.5 py-1.5 animate-slide-up">
+                <FolderSync className="w-3 h-3 text-primary shrink-0" />
+                <span className="text-xs truncate">{syncLine(sync)}</span>
+              </li>
+            )}
             {running.slice(0, MAX_LISTED).map((r, i) => (
               <li
                 key={r.downloadId || i}
@@ -130,13 +171,25 @@ export default function ConfirmQuitDialog() {
           {/* The point of this dialog is that quitting is CHEAP, not scary —
               say what actually survives so the choice is informed rather than
               a speed bump. */}
-          <p className="text-[11px] text-muted-foreground leading-relaxed">
-            Chapters that already finished are kept:{" "}
-            {plural ? "each run reappears" : "the run reappears"} in the{" "}
-            <span className="font-medium text-foreground">Resume</span> bar next
-            launch and picks up where it stopped. Anything still queued is
-            restored automatically.
-          </p>
+          {n > 0 && (
+            <p className="text-[11px] text-muted-foreground leading-relaxed">
+              Chapters that already finished are kept:{" "}
+              {plural ? "each run reappears" : "the run reappears"} in the{" "}
+              <span className="font-medium text-foreground">Resume</span> bar next
+              launch and picks up where it stopped. Anything still queued is
+              restored automatically.
+            </p>
+          )}
+          {/* True of every phase: the executor records each file's intent
+              before it acts and finishes or reverts a half-done step on the
+              next sync (sync/executor.js header, INTENT). */}
+          {(sync || syncOnly) && (
+            <p className="text-[11px] text-muted-foreground leading-relaxed">
+              {sync && sync.phase !== "apply"
+                ? "The next sync finishes or undoes the step it stopped in."
+                : "Files already copied stay on the target, and the next sync copies the rest."}
+            </p>
+          )}
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t px-4 py-3">
@@ -144,7 +197,7 @@ export default function ConfirmQuitDialog() {
             Quit anyway
           </Button>
           <Button ref={keepRef} size="sm" autoFocus onClick={cancel}>
-            Keep downloading
+            {syncOnly ? "Keep syncing" : "Keep downloading"}
           </Button>
         </div>
       </div>

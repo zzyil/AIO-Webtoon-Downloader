@@ -1,0 +1,1081 @@
+{
+  "__aioSyncFixture": "prompts.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": {
+    "ready": {
+      "pending": {
+        "kind": "prompt",
+        "action": "pending",
+        "prompts": [],
+        "pending": [
+          {
+            "promptId": "p1-1793121401075",
+            "connKey": "folder:ta8ad856cac",
+            "serial": null,
+            "targetIds": [
+              "ta8ad856cac"
+            ],
+            "since": 1793121401075
+          }
+        ]
+      },
+      "show": {
+        "kind": "prompt",
+        "action": "show",
+        "prompt": {
+          "promptId": "p1-1793121401075",
+          "connKey": "folder:ta8ad856cac",
+          "serial": null,
+          "targetIds": [
+            "ta8ad856cac"
+          ],
+          "card": {
+            "serial": null,
+            "targets": [
+              {
+                "targetId": "ta8ad856cac",
+                "targetName": "Galaxy Tab",
+                "firstSync": true,
+                "series": 3,
+                "files": 13,
+                "bytes": 39037,
+                "deletions": 0,
+                "replaces": 0,
+                "renames": 0,
+                "losses": 0,
+                "verifyFolders": 0,
+                "verifyBytes": 0,
+                "removedOnDevice": [],
+                "nothingToDo": false,
+                "gen": 1
+              }
+            ],
+            "attention": [],
+            "empty": false
+          },
+          "createdAt": 1793121401117
+        },
+        "prompts": [
+          {
+            "promptId": "p1-1793121401075",
+            "connKey": "folder:ta8ad856cac",
+            "serial": null,
+            "targetIds": [
+              "ta8ad856cac"
+            ],
+            "card": {
+              "serial": null,
+              "targets": [
+                {
+                  "targetId": "ta8ad856cac",
+                  "targetName": "Galaxy Tab",
+                  "firstSync": true,
+                  "series": 3,
+                  "files": 13,
+                  "bytes": 39037,
+                  "deletions": 0,
+                  "replaces": 0,
+                  "renames": 0,
+                  "losses": 0,
+                  "verifyFolders": 0,
+                  "verifyBytes": 0,
+                  "removedOnDevice": [],
+                  "nothingToDo": false,
+                  "gen": 1
+                }
+              ],
+              "attention": [],
+              "empty": false
+            },
+            "createdAt": 1793121401117
+          }
+        ],
+        "pending": []
+      },
+      "state": {
+        "ok": true,
+        "enabled": true,
+        "settings": {
+          "syncEnabled": true,
+          "syncPromptOnConnect": true,
+          "syncDeletePolicy": "guarded",
+          "syncHashMode": "cached",
+          "syncErrorBudget": 3,
+          "syncSizeWarnPct": 30,
+          "syncChapterPatterns": "",
+          "syncDiagnosticLog": true,
+          "chapterPatternErrors": []
+        },
+        "specs": {
+          "syncEnabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "syncPromptOnConnect": {
+            "type": "boolean",
+            "default": true
+          },
+          "syncDeletePolicy": {
+            "type": "enum",
+            "default": "guarded",
+            "presets": [
+              "guarded",
+              "add-only",
+              "auto-replace"
+            ]
+          },
+          "syncHashMode": {
+            "type": "enum",
+            "default": "cached",
+            "presets": [
+              "cached",
+              "rehash"
+            ]
+          },
+          "syncErrorBudget": {
+            "type": "enum",
+            "default": 3,
+            "presets": [
+              1,
+              3,
+              5,
+              10
+            ]
+          },
+          "syncSizeWarnPct": {
+            "type": "enum",
+            "default": 30,
+            "presets": [
+              0,
+              15,
+              30,
+              50
+            ]
+          },
+          "syncChapterPatterns": {
+            "type": "patterns",
+            "default": ""
+          },
+          "syncDiagnosticLog": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "config": {
+          "version": 1,
+          "adbPath": null,
+          "targets": [
+            {
+              "id": "ta8ad856cac",
+              "deletePolicy": "guarded",
+              "excludes": [],
+              "aliases": [],
+              "ignoredSuggestions": [],
+              "acknowledged": [],
+              "name": "Galaxy Tab",
+              "kind": "folder",
+              "root": "D:\\Sync-fixture\\Tablet3\\Komikku",
+              "profile": "komikku"
+            }
+          ]
+        },
+        "adb": {
+          "binary": null,
+          "serverVersion": null,
+          "error": null,
+          "candidates": null,
+          "tracking": "stopped",
+          "trackingError": null,
+          "at": null
+        },
+        "devices": [],
+        "folderPresence": {
+          "ta8ad856cac": true
+        },
+        "job": {
+          "job": {
+            "runId": 1,
+            "phase": "plan",
+            "targetId": "ta8ad856cac",
+            "serial": null,
+            "auto": true,
+            "state": "done",
+            "startedAt": 1793121401075,
+            "finishedAt": 1793121401117,
+            "progress": {
+              "bytesDone": 39037,
+              "bytesTotal": 39037,
+              "filesDone": 13,
+              "filesTotal": 13,
+              "current": null,
+              "preflight": {
+                "kind": "folder",
+                "caps": {
+                  "sha256sum": true,
+                  "local": true
+                },
+                "canonicalRoot": "D:\\Sync-fixture\\Tablet3\\Komikku",
+                "caseInsensitive": true,
+                "caseMeasured": false,
+                "canHash": true,
+                "mayNeedMode": false,
+                "refusal": null
+              },
+              "step": "planning",
+              "at": 1793121401110
+            },
+            "status": "completed",
+            "summary": {
+              "plan": {
+                "targetId": "ta8ad856cac",
+                "asOf": 1793121401110,
+                "firstSync": true,
+                "totals": {
+                  "push": {
+                    "count": 13,
+                    "bytes": 39037
+                  },
+                  "update": {
+                    "count": 0,
+                    "bytes": 0
+                  },
+                  "replace": {
+                    "count": 0,
+                    "bytes": 0
+                  },
+                  "rename": {
+                    "count": 0,
+                    "bytes": 0
+                  },
+                  "delete": {
+                    "count": 0,
+                    "bytes": 0
+                  },
+                  "series": 3,
+                  "files": 13,
+                  "bytes": 39037
+                },
+                "losses": 0,
+                "massDelete": {
+                  "required": false,
+                  "count": 0,
+                  "deletes": 0,
+                  "overwrites": 0,
+                  "swaps": 0,
+                  "series": 0
+                },
+                "massRepush": {
+                  "required": false,
+                  "count": 0
+                },
+                "needsVerify": 0,
+                "settleAt": null,
+                "series": [
+                  {
+                    "seriesKey": "pc:Eleceed",
+                    "title": "Eleceed",
+                    "folder": "Eleceed",
+                    "deviceFolder": "Eleceed",
+                    "state": "new",
+                    "heldReason": null,
+                    "removing": false,
+                    "counts": {
+                      "inSync": 0,
+                      "kept": 0,
+                      "settling": 0,
+                      "unhashed": 0,
+                      "unmanaged": 0,
+                      "push": 6,
+                      "update": 0,
+                      "replace": 0,
+                      "rename": 0,
+                      "delete": 0,
+                      "bytes": 18021,
+                      "loss": 0,
+                      "offered": 6,
+                      "preselected": 6
+                    },
+                    "tags": [],
+                    "anomalies": 1,
+                    "attention": [
+                      "anomaly"
+                    ],
+                    "suggestions": 0,
+                    "hasLoss": false,
+                    "rebind": null,
+                    "strip": [
+                      {
+                        "state": "push",
+                        "count": 6,
+                        "from": "1",
+                        "to": "6"
+                      }
+                    ]
+                  },
+                  {
+                    "seriesKey": "pc:Frieren",
+                    "title": "Frieren",
+                    "folder": "Frieren",
+                    "deviceFolder": "Frieren",
+                    "state": "new",
+                    "heldReason": null,
+                    "removing": false,
+                    "counts": {
+                      "inSync": 0,
+                      "kept": 0,
+                      "settling": 0,
+                      "unhashed": 0,
+                      "unmanaged": 0,
+                      "push": 4,
+                      "update": 0,
+                      "replace": 0,
+                      "rename": 0,
+                      "delete": 0,
+                      "bytes": 12010,
+                      "loss": 0,
+                      "offered": 4,
+                      "preselected": 4
+                    },
+                    "tags": [],
+                    "anomalies": 1,
+                    "attention": [
+                      "anomaly"
+                    ],
+                    "suggestions": 0,
+                    "hasLoss": false,
+                    "rebind": null,
+                    "strip": [
+                      {
+                        "state": "push",
+                        "count": 4,
+                        "from": "1",
+                        "to": "4"
+                      }
+                    ]
+                  },
+                  {
+                    "seriesKey": "pc:Kagurabachi",
+                    "title": "Kagurabachi",
+                    "folder": "Kagurabachi",
+                    "deviceFolder": "Kagurabachi",
+                    "state": "new",
+                    "heldReason": null,
+                    "removing": false,
+                    "counts": {
+                      "inSync": 0,
+                      "kept": 0,
+                      "settling": 0,
+                      "unhashed": 0,
+                      "unmanaged": 0,
+                      "push": 3,
+                      "update": 0,
+                      "replace": 0,
+                      "rename": 0,
+                      "delete": 0,
+                      "bytes": 9006,
+                      "loss": 0,
+                      "offered": 3,
+                      "preselected": 3
+                    },
+                    "tags": [],
+                    "anomalies": 1,
+                    "attention": [
+                      "anomaly"
+                    ],
+                    "suggestions": 0,
+                    "hasLoss": false,
+                    "rebind": null,
+                    "strip": [
+                      {
+                        "state": "push",
+                        "count": 3,
+                        "from": "1",
+                        "to": "3"
+                      }
+                    ]
+                  }
+                ],
+                "deviceOnly": [],
+                "anomalies": 3,
+                "suggestions": 0,
+                "suggestionList": [],
+                "gen": 1,
+                "warnings": [],
+                "capacity": {
+                  "free": 95618981888,
+                  "total": 1999343972352,
+                  "needed": 39037,
+                  "lowest": 95618942851,
+                  "reserve": 1073741824,
+                  "freeable": 0,
+                  "after": 95618942851,
+                  "shortBy": 0,
+                  "shortAt": null,
+                  "fits": true,
+                  "asOf": 1793121401081
+                },
+                "policy": {
+                  "deletePolicy": "guarded",
+                  "hashMode": "cached",
+                  "verifyMode": null
+                }
+              }
+            }
+          },
+          "queue": []
+        },
+        "plans": {
+          "ta8ad856cac": {
+            "summary": {
+              "targetId": "ta8ad856cac",
+              "asOf": 1793121401110,
+              "firstSync": true,
+              "totals": {
+                "push": {
+                  "count": 13,
+                  "bytes": 39037
+                },
+                "update": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "replace": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "rename": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "delete": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "series": 3,
+                "files": 13,
+                "bytes": 39037
+              },
+              "losses": 0,
+              "massDelete": {
+                "required": false,
+                "count": 0,
+                "deletes": 0,
+                "overwrites": 0,
+                "swaps": 0,
+                "series": 0
+              },
+              "massRepush": {
+                "required": false,
+                "count": 0
+              },
+              "needsVerify": 0,
+              "settleAt": null,
+              "series": [
+                {
+                  "seriesKey": "pc:Eleceed",
+                  "title": "Eleceed",
+                  "folder": "Eleceed",
+                  "deviceFolder": "Eleceed",
+                  "state": "new",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 0,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 6,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 18021,
+                    "loss": 0,
+                    "offered": 6,
+                    "preselected": 6
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly"
+                  ],
+                  "suggestions": 0,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "push",
+                      "count": 6,
+                      "from": "1",
+                      "to": "6"
+                    }
+                  ]
+                },
+                {
+                  "seriesKey": "pc:Frieren",
+                  "title": "Frieren",
+                  "folder": "Frieren",
+                  "deviceFolder": "Frieren",
+                  "state": "new",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 0,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 4,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 12010,
+                    "loss": 0,
+                    "offered": 4,
+                    "preselected": 4
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly"
+                  ],
+                  "suggestions": 0,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "push",
+                      "count": 4,
+                      "from": "1",
+                      "to": "4"
+                    }
+                  ]
+                },
+                {
+                  "seriesKey": "pc:Kagurabachi",
+                  "title": "Kagurabachi",
+                  "folder": "Kagurabachi",
+                  "deviceFolder": "Kagurabachi",
+                  "state": "new",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 0,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 3,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 9006,
+                    "loss": 0,
+                    "offered": 3,
+                    "preselected": 3
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly"
+                  ],
+                  "suggestions": 0,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "push",
+                      "count": 3,
+                      "from": "1",
+                      "to": "3"
+                    }
+                  ]
+                }
+              ],
+              "deviceOnly": [],
+              "anomalies": 3,
+              "suggestions": 0,
+              "suggestionList": [],
+              "gen": 1,
+              "warnings": [],
+              "capacity": {
+                "free": 95618981888,
+                "total": 1999343972352,
+                "needed": 39037,
+                "lowest": 95618942851,
+                "reserve": 1073741824,
+                "freeable": 0,
+                "after": 95618942851,
+                "shortBy": 0,
+                "shortAt": null,
+                "fits": true,
+                "asOf": 1793121401081
+              },
+              "policy": {
+                "deletePolicy": "guarded",
+                "hashMode": "cached",
+                "verifyMode": null
+              }
+            },
+            "refusal": null,
+            "stale": false,
+            "updating": false,
+            "links": [],
+            "lastRun": null,
+            "gen": 1,
+            "selSeq": null,
+            "lastPlan": {
+              "runId": 1,
+              "status": "completed",
+              "auto": true,
+              "reason": null,
+              "at": 1793121401117
+            }
+          }
+        },
+        "prompt": {
+          "promptId": "p1-1793121401075",
+          "connKey": "folder:ta8ad856cac",
+          "serial": null,
+          "targetIds": [
+            "ta8ad856cac"
+          ],
+          "card": {
+            "serial": null,
+            "targets": [
+              {
+                "targetId": "ta8ad856cac",
+                "targetName": "Galaxy Tab",
+                "firstSync": true,
+                "series": 3,
+                "files": 13,
+                "bytes": 39037,
+                "deletions": 0,
+                "replaces": 0,
+                "renames": 0,
+                "losses": 0,
+                "verifyFolders": 0,
+                "verifyBytes": 0,
+                "removedOnDevice": [],
+                "nothingToDo": false,
+                "gen": 1
+              }
+            ],
+            "attention": [],
+            "empty": false
+          },
+          "createdAt": 1793121401117
+        },
+        "prompts": [
+          {
+            "promptId": "p1-1793121401075",
+            "connKey": "folder:ta8ad856cac",
+            "serial": null,
+            "targetIds": [
+              "ta8ad856cac"
+            ],
+            "card": {
+              "serial": null,
+              "targets": [
+                {
+                  "targetId": "ta8ad856cac",
+                  "targetName": "Galaxy Tab",
+                  "firstSync": true,
+                  "series": 3,
+                  "files": 13,
+                  "bytes": 39037,
+                  "deletions": 0,
+                  "replaces": 0,
+                  "renames": 0,
+                  "losses": 0,
+                  "verifyFolders": 0,
+                  "verifyBytes": 0,
+                  "removedOnDevice": [],
+                  "nothingToDo": false,
+                  "gen": 1
+                }
+              ],
+              "attention": [],
+              "empty": false
+            },
+            "createdAt": 1793121401117
+          }
+        ],
+        "pending": [],
+        "find": null,
+        "prewarm": {
+          "state": "idle",
+          "done": 0,
+          "total": 0,
+          "bytesDone": 0,
+          "bytesTotal": 0,
+          "at": null
+        },
+        "logDir": "D:\\Sync-fixture\\prompt-ud\\sync\\logs"
+      },
+      "job": {
+        "runId": 1,
+        "phase": "plan",
+        "targetId": "ta8ad856cac",
+        "serial": null,
+        "auto": true,
+        "state": "running",
+        "startedAt": 1793121401075,
+        "finishedAt": null,
+        "progress": {
+          "bytesDone": 0,
+          "bytesTotal": 0,
+          "filesDone": 0,
+          "filesTotal": 0,
+          "current": null,
+          "preflight": null
+        },
+        "status": null,
+        "summary": null
+      }
+    },
+    "needsMode": {
+      "show": {
+        "kind": "prompt",
+        "action": "show",
+        "prompt": {
+          "promptId": "p1-1793121401139",
+          "connKey": "R5CW71ABCDE#1",
+          "serial": "R5CW71ABCDE",
+          "targetIds": [
+            "t148dfc3949"
+          ],
+          "card": {
+            "serial": "R5CW71ABCDE",
+            "targets": [],
+            "attention": [
+              {
+                "targetId": "t148dfc3949",
+                "targetName": "Old tablet",
+                "code": "needs-mode",
+                "message": "this device can't hash files: choose how to verify",
+                "cause": null,
+                "folder": null,
+                "firstSync": true,
+                "folders": [
+                  "Eleceed"
+                ],
+                "bytes": 9006
+              }
+            ],
+            "empty": false
+          },
+          "createdAt": 1793121401227
+        },
+        "prompts": [
+          {
+            "promptId": "p1-1793121401139",
+            "connKey": "R5CW71ABCDE#1",
+            "serial": "R5CW71ABCDE",
+            "targetIds": [
+              "t148dfc3949"
+            ],
+            "card": {
+              "serial": "R5CW71ABCDE",
+              "targets": [],
+              "attention": [
+                {
+                  "targetId": "t148dfc3949",
+                  "targetName": "Old tablet",
+                  "code": "needs-mode",
+                  "message": "this device can't hash files: choose how to verify",
+                  "cause": null,
+                  "folder": null,
+                  "firstSync": true,
+                  "folders": [
+                    "Eleceed"
+                  ],
+                  "bytes": 9006
+                }
+              ],
+              "empty": false
+            },
+            "createdAt": 1793121401227
+          }
+        ],
+        "pending": []
+      },
+      "state": {
+        "ok": true,
+        "enabled": true,
+        "settings": {
+          "syncEnabled": true,
+          "syncPromptOnConnect": true,
+          "syncDeletePolicy": "guarded",
+          "syncHashMode": "cached",
+          "syncErrorBudget": 3,
+          "syncSizeWarnPct": 30,
+          "syncChapterPatterns": "",
+          "syncDiagnosticLog": true,
+          "chapterPatternErrors": []
+        },
+        "specs": {
+          "syncEnabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "syncPromptOnConnect": {
+            "type": "boolean",
+            "default": true
+          },
+          "syncDeletePolicy": {
+            "type": "enum",
+            "default": "guarded",
+            "presets": [
+              "guarded",
+              "add-only",
+              "auto-replace"
+            ]
+          },
+          "syncHashMode": {
+            "type": "enum",
+            "default": "cached",
+            "presets": [
+              "cached",
+              "rehash"
+            ]
+          },
+          "syncErrorBudget": {
+            "type": "enum",
+            "default": 3,
+            "presets": [
+              1,
+              3,
+              5,
+              10
+            ]
+          },
+          "syncSizeWarnPct": {
+            "type": "enum",
+            "default": 30,
+            "presets": [
+              0,
+              15,
+              30,
+              50
+            ]
+          },
+          "syncChapterPatterns": {
+            "type": "patterns",
+            "default": ""
+          },
+          "syncDiagnosticLog": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "config": {
+          "version": 1,
+          "adbPath": null,
+          "targets": [
+            {
+              "id": "t148dfc3949",
+              "deletePolicy": "guarded",
+              "excludes": [],
+              "aliases": [],
+              "ignoredSuggestions": [],
+              "acknowledged": [],
+              "name": "Old tablet",
+              "kind": "adb",
+              "serial": "R5CW71ABCDE",
+              "root": "/sdcard/Komikku/local",
+              "profile": "komikku"
+            }
+          ]
+        },
+        "adb": {
+          "binary": null,
+          "serverVersion": null,
+          "error": null,
+          "candidates": null,
+          "tracking": "tracking",
+          "trackingError": null,
+          "at": null
+        },
+        "devices": [
+          {
+            "serial": "R5CW71ABCDE",
+            "state": "device",
+            "stateKind": "device",
+            "model": "SM_T290",
+            "product": "a06xx",
+            "transportId": 1,
+            "targetable": true
+          }
+        ],
+        "folderPresence": {},
+        "job": {
+          "job": {
+            "runId": 1,
+            "phase": "plan",
+            "targetId": "t148dfc3949",
+            "serial": "R5CW71ABCDE",
+            "auto": true,
+            "state": "done",
+            "startedAt": 1793121401139,
+            "finishedAt": 1793121401227,
+            "progress": {
+              "bytesDone": 39037,
+              "bytesTotal": 39037,
+              "filesDone": 13,
+              "filesTotal": 13,
+              "current": null,
+              "preflight": {
+                "kind": "adb",
+                "caps": {
+                  "lsV2": true,
+                  "statV2": true,
+                  "shellV2": true,
+                  "sha256sum": false,
+                  "findPrintf": false,
+                  "statC": false,
+                  "statF": true,
+                  "df": false
+                },
+                "canonicalRoot": "/storage/emulated/0/Komikku/local",
+                "caseInsensitive": false,
+                "caseMeasured": true,
+                "canHash": false,
+                "mayNeedMode": true,
+                "refusal": null
+              },
+              "step": "planning",
+              "at": 1793121401225
+            },
+            "status": "failed",
+            "summary": {
+              "refusal": {
+                "folders": [
+                  "Eleceed"
+                ],
+                "modes": [
+                  "read-back",
+                  "adopt-size"
+                ],
+                "bytes": 9006,
+                "firstSync": true,
+                "ok": false,
+                "code": "needs-mode",
+                "message": "this device can't hash files: choose how to verify",
+                "warnings": []
+              }
+            }
+          },
+          "queue": []
+        },
+        "plans": {
+          "t148dfc3949": {
+            "summary": null,
+            "refusal": {
+              "folders": [
+                "Eleceed"
+              ],
+              "modes": [
+                "read-back",
+                "adopt-size"
+              ],
+              "bytes": 9006,
+              "firstSync": true,
+              "ok": false,
+              "code": "needs-mode",
+              "message": "this device can't hash files: choose how to verify",
+              "warnings": []
+            },
+            "stale": false,
+            "updating": false,
+            "links": [],
+            "lastRun": null,
+            "gen": null,
+            "selSeq": null,
+            "lastPlan": {
+              "runId": 1,
+              "status": "failed",
+              "auto": true,
+              "reason": "needs-mode",
+              "at": 1793121401227
+            }
+          }
+        },
+        "prompt": {
+          "promptId": "p1-1793121401139",
+          "connKey": "R5CW71ABCDE#1",
+          "serial": "R5CW71ABCDE",
+          "targetIds": [
+            "t148dfc3949"
+          ],
+          "card": {
+            "serial": "R5CW71ABCDE",
+            "targets": [],
+            "attention": [
+              {
+                "targetId": "t148dfc3949",
+                "targetName": "Old tablet",
+                "code": "needs-mode",
+                "message": "this device can't hash files: choose how to verify",
+                "cause": null,
+                "folder": null,
+                "firstSync": true,
+                "folders": [
+                  "Eleceed"
+                ],
+                "bytes": 9006
+              }
+            ],
+            "empty": false
+          },
+          "createdAt": 1793121401227
+        },
+        "prompts": [
+          {
+            "promptId": "p1-1793121401139",
+            "connKey": "R5CW71ABCDE#1",
+            "serial": "R5CW71ABCDE",
+            "targetIds": [
+              "t148dfc3949"
+            ],
+            "card": {
+              "serial": "R5CW71ABCDE",
+              "targets": [],
+              "attention": [
+                {
+                  "targetId": "t148dfc3949",
+                  "targetName": "Old tablet",
+                  "code": "needs-mode",
+                  "message": "this device can't hash files: choose how to verify",
+                  "cause": null,
+                  "folder": null,
+                  "firstSync": true,
+                  "folders": [
+                    "Eleceed"
+                  ],
+                  "bytes": 9006
+                }
+              ],
+              "empty": false
+            },
+            "createdAt": 1793121401227
+          }
+        ],
+        "pending": [],
+        "find": null,
+        "prewarm": {
+          "state": "idle",
+          "done": 0,
+          "total": 0,
+          "bytesDone": 0,
+          "bytesTotal": 0,
+          "at": null
+        },
+        "logDir": "D:\\Sync-fixture\\prompt-ud2\\sync\\logs"
+      }
+    }
+  }
+}

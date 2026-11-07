@@ -1,0 +1,15 @@
+# Machine-specific SDK path — regenerate with the command in README.md.
+local.properties
+
+# Build output. Note this also covers app/build/generated/python, the staged
+# copy of the repo's Python sources (see app/build.gradle.kts:stagePythonSources)
+# — that is generated, never edited, and must not be committed.
+.gradle/
+build/
+app/build/
+
+# Android Studio
+*.iml
+.idea/
+captures/
+.cxx/

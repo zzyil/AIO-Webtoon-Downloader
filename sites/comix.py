@@ -43,7 +43,7 @@ except ImportError:
 # All bare print() calls in this module emit to stderr by default. Why: this
 # handler's Patchright bridge logs [!] diagnostic messages when chapter-API
 # capture fails, and when invoked from the orchestrator's search-time probe
-# path (sites/search_orchestrator.py:_probe_one) those lines would land on
+# path (sites/match_session.py, via get_chapter_images) those lines would land on
 # stdout — which carries the JSON --search output for piped consumers. The
 # UI's searcher.js rejects non-JSON stdout with "Search produced non-JSON
 # stdout" so any leak hard-breaks the search results panel. This shim keeps
@@ -58,16 +58,14 @@ def _stderr_print(*args, **kwargs):
 print = _stderr_print  # noqa: A001 — intentional shadow of builtins.print
 
 
-# Probe-time page-capture cap. The image-quality probe
-# (ComixSiteHandler._probe_chapter_aggregate) renders only this many pages of
-# its one sampled chapter (chapter 1) instead of the whole ~70-page chapter,
-# keeping a single browser render at ~8-20s so it fits the orchestrator's 240s
-# probe deadline. The probe scores the LATTER half of these pages (skipping the
-# cover/splash-prone opening) and medians them — the first live run mis-scored
-# the flagship series at 0.1 on a sparse page-3, hence "latter half" + median
-# instead of one early page. The download path (get_chapter_images) passes no
-# cap → all pages.
-_COMIX_PROBE_PAGE_CAP = 8
+# Wall-clock budget for the search-time alt-title lookup (one batched in-page
+# fetch of every typeahead row's title page — see _enrich_hits_with_alt_titles).
+# Sized against a measured ~1.7s for two rows on a warm page; 10s leaves room
+# for a full 6-row dropdown on a cold connection while staying well inside
+# search()'s own 28s budget, since this runs INSIDE the orchestrator's fan-out
+# and every second here delays the whole cross-site search. Overrun aborts
+# in-page and keeps whatever rows already landed.
+_COMIX_ALT_TITLE_BUDGET_S = 10.0
 
 # Cadence of the whole-chapter readiness poll in fetch_chapter_images_via_dom.
 # Matches the 250ms the old per-page loop used; the difference is that ONE
@@ -353,10 +351,13 @@ def _cached_stable_user_agent() -> str:
 def _comix_http_headers() -> Dict[str, str]:
     """One COHERENT modern-Chrome header set for the plain-HTTP session.
 
-    THE PROBLEM THIS SOLVES (measured 2026-08-02). aio-dl builds the scraper as
-    `cloudscraper.create_scraper(browser={"browser":"chrome","platform":
-    "windows"})`, and cloudscraper answers that by picking a RANDOM entry from
-    its bundled profile list — every one of which is 2016-2019:
+    THE PROBLEM THIS SOLVED (measured 2026-08-02). aio-dl built the scraper as
+    `cloudscraper.create_scraper(browser={"browser":"chrome",...})`, and
+    cloudscraper answers that by picking a RANDOM entry from its bundled
+    profile list — every one of which is 2016-2019. (Since 2026-10-31 the
+    shared session pins a modern UA + Accept for every site — grep
+    create_http_session — but this fuller set, client hints included, still
+    layers on top for comix.) Measured samples:
 
         Chrome/56.0.2924.87 ... OPR/43.0.2442.1144 (Edition Yx)   (Win 7, 2017)
         Chrome/55.0.2883.87 UBrowser/7.0.125.1629
@@ -755,13 +756,13 @@ class ComixSiteHandler(BaseSiteHandler):
     # comix is a FULL search + --multi-source + image-quality-probe participant
     # (2026-07-12). The old SKIP_QUALITY_PROBE / SKIP_MULTI_SOURCE opt-outs are
     # gone: keyword search runs through the header-typeahead DOM scrape (see
-    # `search` / `fetch_search_via_dom`), and the image probe is a custom
-    # SINGLE-chapter override (`_probe_chapter_aggregate` below) that renders
-    # just one chapter (chapter 1 by preference) with a capped page count so the
-    # single-threaded browser bridge fits the orchestrator's 240 s probe
-    # deadline. The calibrated 0.74 seed in sites/quality_seed.json is now only
-    # the probe's FALLBACK (when the probe returns None), not the ranking signal.
-    # Both the SKIP_QUALITY_PROBE (search_orchestrator._probe_one loop) and
+    # `search` / `fetch_search_via_dom`). The matched-page probe uses the base
+    # BaseSiteHandler.match_fetch_window, so each window is a full
+    # get_chapter_images browser render (the old single-chapter capped-render
+    # probe override went with the old scorer); the per-source budget
+    # (PROBE_SOURCE_BUDGET_S) caps how many windows it starts. The calibrated 0.74 seed in
+    # sites/quality_seed.json is the rating when the probe measures nothing.
+    # Both the SKIP_QUALITY_PROBE (search_orchestrator._probe_eligible) and
     # SKIP_MULTI_SOURCE (aio_search_cli._filter_and_rank_alt_sources + the
     # prefetched-alts path) getattr hooks still exist as generic opt-outs;
     # comix just no longer sets them.
@@ -773,17 +774,6 @@ class ComixSiteHandler(BaseSiteHandler):
     # full duration in a late wave. Grep SEARCH_COST_HINT in sites/base.py
     # (contract) + search_orchestrator.py (the sort).
     SEARCH_COST_HINT = "slow"
-
-    # The probe override below IGNORES the orchestrator's max_samples clamp
-    # (it hard-caps to ONE chapter regardless), so its result is always this
-    # probe's full form. The orchestrator's clamped-probe cache (2026-07-12)
-    # keys off this flag: comix results are written UNCLAMPED (full 30-day
-    # TTL, servable in both top-candidate and non-top roles) — which is what
-    # retires the old behavior of re-running the 15-70s browser probe on
-    # EVERY search whenever comix wasn't the top candidate. Grep
-    # PROBE_SAMPLES_FIXED in search_orchestrator.py (_desired_max_samples
-    # serve rule + _probe_one write rule).
-    PROBE_SAMPLES_FIXED = True
 
     # Patchright's sync API requires that every call run on the same thread
     # that started the browser, AND that thread must own an asyncio loop.
@@ -1051,6 +1041,23 @@ class ComixSiteHandler(BaseSiteHandler):
         try:
             tag = soup.find("script", id="initial-data")
             raw = (tag.string or tag.get_text()) if tag else None
+        except Exception:
+            return None
+        return self._manga_detail_from_initial_data(raw)
+
+    def _manga_detail_from_initial_data(self, raw: Optional[str]) -> Optional[Dict]:
+        """Walk a raw <script id="initial-data"> JSON string down to the
+        manga-detail dict, or None.
+
+        Split out of _extract_initial_data_manga (2026-08-20) so the search
+        alt-title enrichment can share it. That path receives the blob TEXT
+        from an in-page fetch (ComixSiteHandler.search -> the bridge's
+        fetch_initial_data_blobs) and never builds a soup, but the React-Query
+        key shape it has to walk is identical. Keep this the ONLY place that
+        encodes that shape — duplicating the ["manga","detail"] match in the
+        scrape JS is exactly the drift this split exists to prevent.
+        """
+        try:
             data = json.loads(raw) if raw else None
         except Exception:
             return None
@@ -1695,8 +1702,8 @@ class ComixSiteHandler(BaseSiteHandler):
             url_full = f"https://comix.to/title/{hid}"
             # The typeahead is already relevance-ranked, so position 0 = best.
             # raw_score only orders comix's own hits + seeds the _quality_for
-            # fallback; the real cross-site ranking comes from the image-quality
-            # probe (_probe_chapter_aggregate) + title match.
+            # fallback; the real cross-site ranking comes from the matched-page
+            # image-quality probe (sites/match_session.py) + title match.
             raw_score = max(0.05, 1.0 - (idx / max(1, n)))
             hits.append(
                 SearchHit(
@@ -1711,197 +1718,79 @@ class ComixSiteHandler(BaseSiteHandler):
                     raw_score=raw_score,
                 )
             )
+        self._enrich_hits_with_alt_titles(hits)
         return hits
 
-    # ------------------------------------------------------ image-quality probe
-    # comix competes on MEASURED image quality now (2026-07-12), not just the
-    # static seed. The standard 8-chapter breadth probe
-    # (sites/base.py:_probe_chapter_aggregate) is infeasible here: each
-    # chapter's get_chapter_images renders the WHOLE chapter in the
-    # single-threaded browser bridge, so 8 serialized renders blow the
-    # orchestrator's 240 s probe deadline and fall back to the seed anyway. The
-    # override below probes exactly ONE chapter (chapter 1 by preference — user
-    # directive; see _pick_probe_chapter) with a capped page render
-    # (_COMIX_PROBE_PAGE_CAP), scoring the latter half of those pages (median),
-    # so a single render is ~8-20 s. The seed stays as the fallback when the
-    # probe returns None.
-    def _pick_probe_chapter(
-        self, chapters: List[Dict],
-    ) -> Optional[Tuple[int, Dict]]:
-        """Return (absolute_index, chapter) to probe. Prefers the chapter
-        numbered EXACTLY 1 (user directive 2026-07-12: probe chapter 1, "not 0
-        or 0.5", unless there is no chapter 1). Fallback ladder when there's no
-        ch.1: the lowest WHOLE chapter >= 1 (skips a ch.0 prologue and x.5
-        omake/specials), then the lowest-numbered chapter of any kind, then row
-        0. The absolute index feeds _pick_random_middle_page_index's
-        deterministic page seed. Returns None only on an empty list.
+    def _enrich_hits_with_alt_titles(self, hits: List[SearchHit]) -> None:
+        """Fill alt_titles (and year) on typeahead hits, IN PLACE.
+
+        WHY this is not optional polish: the orchestrator gates every hit on
+        rapidfuzz similarity against ONE query string, and comix lists a great
+        many series under romaji while the query often arrives as the English
+        licensed title. Measured 2026-08-20 — query "The Disastrous Life of
+        Saiki K." vs comix's "Saiki Kusuo no Psi Nan" scores 0.466 against a
+        0.55 floor, so the correct series was dropped while "Disastrous
+        Romance" (0.855) and "The Life of Ichabod" (0.855) were admitted. That
+        series' alt_titles literally begin with the English title, so one
+        lookup turns 0.466 into 1.0. alt_titles ALSO drive the orchestrator's
+        union-find grouping (search_orchestrator.py, grep _union), which is
+        what merges comix into the same candidate as the other sites' hit
+        rather than emitting a lookalike second candidate.
+
+        Best-effort by construction: any failure leaves alt_titles == [], i.e.
+        exactly the previous behavior. Never raises — see search() for why a
+        raise here would blocklist comix.to for an hour.
         """
-        if not chapters:
-            return None
-        numbered: List[Tuple[float, int, Dict]] = []
-        for idx, ch in enumerate(chapters):
-            try:
-                num = float(ch.get("chap"))
-            except (TypeError, ValueError):
-                continue
-            numbered.append((num, idx, ch))
-        # Exact chapter 1 — the preferred sample.
-        for num, idx, ch in numbered:
-            if num == 1.0:
-                return idx, ch
-        # No ch.1 → lowest whole-numbered chapter >= 1 (dodges ch.0 and x.5).
-        whole_ge1 = [t for t in numbered if t[0] >= 1.0 and t[0] == int(t[0])]
-        if whole_ge1:
-            _num, idx, ch = min(whole_ge1, key=lambda t: t[0])
-            return idx, ch
-        # Any numeric chapter, lowest number (e.g. a ch.0-only oneshot).
-        if numbered:
-            _num, idx, ch = min(numbered, key=lambda t: t[0])
-            return idx, ch
-        # No numeric chapters at all — probe the first row as a last resort.
-        return 0, chapters[0]
-
-    def _probe_chapter_aggregate(
-        self, hit: SearchHit, scraper, make_request,
-        max_samples: Optional[int] = None,
-        fetch_memo=None,
-    ) -> Optional[tuple]:
-        """comix override: probe a SINGLE chapter (chapter 1 by preference),
-        rendering only the first _COMIX_PROBE_PAGE_CAP pages and scoring the
-        LATTER half of them (median), so the browser cost (~8-20 s) fits the
-        orchestrator's 240 s probe deadline. See the section comment above for
-        why the base 8-chapter breadth probe is infeasible, and the page-sample
-        block below for why the latter-half median (not a single page) — the
-        first live run mis-scored the flagship series at 0.1 on a sparse opening
-        page. ``max_samples`` is IGNORED — this hard-caps to one chapter
-        regardless of the orchestrator's rank-based clamp (which assumes cheap
-        HTTP handlers). Returns (score, metadata) or None (→ orchestrator falls
-        to cover probe → seed, the fallback). Race-free: no shared instance
-        state.
-
-        Cross-file: scoring via search_orchestrator._score_image_blob; page
-        bytes come from the _fetch_probe_item_bytes override below (reads
-        image_cache, which the render just populated). Chapter-1 selection is
-        in _pick_probe_chapter.
-        """
-        from .search_orchestrator import _score_image_blob
-
-        if not hit or not hit.url:
-            return None
-        # Context + FULL chapter-list scrape — comix lists newest-first, so
-        # chapter 1 is the OLDEST entry and only found by paginating the whole
-        # list. ~5-50 s for normal series; a pathological 1000+ chapter series
-        # may approach the probe deadline and degrade to seed (accepted — rare,
-        # and the seed is a calibrated prior). Routed through the per-run
-        # FetchMemo when provided (sites/fetch_memo.py, 2026-07-12): T3 and the
-        # winner chapter fetch then reuse THIS scrape instead of re-paying the
-        # browser cost — for comix that reuse is worth 5-50s per later phase.
+        if not hits:
+            return
+        by_hid: Dict[str, List[SearchHit]] = {}
+        for h in hits:
+            # Same hid rule as fetch_comic_context: last path segment, then the
+            # part before the first '-'. search() builds slug-less /title/{hid}
+            # URLs today, but this keeps the helper correct for any /title/ URL
+            # rather than silently keying on "{hid}-{slug}".
+            slug_part = (h.url or "").rstrip("/").rsplit("/", 1)[-1]
+            hid = slug_part.split("-")[0] if slug_part else ""
+            if hid:
+                by_hid.setdefault(hid, []).append(h)
+        if not by_hid:
+            return
         try:
-            if fetch_memo is not None:
-                chapters = fetch_memo.get_chapters(
-                    self, hit.url, "en", scraper, make_request,
-                )
-            else:
-                context = self.fetch_comic_context(hit.url, scraper, make_request)
-                if context is None:
-                    return None
-                chapters = self.get_chapters(context, scraper, "en", make_request)
-        except Exception:
-            return None
-        if not chapters:
-            return None
-        pick = self._pick_probe_chapter(chapters)
-        if pick is None:
-            return None
-        abs_idx, chapter = pick
-        chap_url = chapter.get("url")
-        if not chap_url:
-            return None
-        # Capped render: only the first _COMIX_PROBE_PAGE_CAP pages, not the
-        # whole ~70-page chapter. Straight to the bridge (not
-        # get_chapter_images) so (a) the cap is honored, (b) the handler's memo
-        # cache isn't populated with a truncated (capped) page list a later real
-        # download would wrongly serve, and (c) — since the strict
-        # IncompleteChapterError raise lives in get_chapter_images — a capped
-        # render can never be mistaken for a short chapter. A probe wants
-        # representative pages, not every page.
-        try:
-            capture = _COMIX_BROWSER_BRIDGE.fetch_chapter_images_via_dom(
-                chap_url,
-                time_budget_s=60.0,
-                max_capture_pages=_COMIX_PROBE_PAGE_CAP,
+            blobs = _COMIX_BROWSER_BRIDGE.fetch_initial_data_blobs(
+                list(by_hid.keys()), time_budget_s=_COMIX_ALT_TITLE_BUDGET_S,
             )
         except Exception:
-            return None
-        image_items = list(capture.urls or [])
-        if not image_items:
-            return None
-        # Score the LATTER half of the captured pages, not a single page. Two
-        # reasons, both from the first live run (main Frieren scored 0.1):
-        # (1) the opening pages of chapter 1 (cover / title splash / sparse
-        # cold-open) are the LEAST representative, and capping capture to the
-        # first N pages meant the base middle-of-N picker landed on an early
-        # page (page 3, a 0.03-bpp near-blank) rather than the middle of the
-        # real chapter — sampling the latter half of the captured window skips
-        # that opening. (2) Median across several pages is robust to a single
-        # atypical page; the base probe gets that robustness from 8-chapter
-        # breadth, which we deliberately don't have here, so we recover it
-        # within the one chapter. Deterministic (index range from the page
-        # count) → a re-probe on cache miss samples the same pages.
-        n_pages = len(image_items)
-        if n_pages <= 2:
-            sample_idxs = list(range(n_pages))
-        else:
-            sample_idxs = list(range(n_pages // 2, n_pages))[:5]
-        scores: List[float] = []
-        metas: List[Dict] = []
-        for si in sample_idxs:
-            blob = self._fetch_probe_item_bytes(image_items[si], scraper)
-            if not blob:
+            return
+        if not blobs:
+            return
+        enriched = 0
+        for hid, raw in blobs.items():
+            detail = self._manga_detail_from_initial_data(raw)
+            if not detail:
                 continue
-            scored = _score_image_blob(blob)
-            if scored is None:
-                continue
-            scores.append(scored[0])
-            metas.append(scored[1])
-        if not scores:
-            return None
-        import statistics
-        agg_score = statistics.median(scores)
-        # Representative metadata = the sample nearest the median score.
-        order = sorted(range(len(scores)), key=lambda i: scores[i])
-        meta = dict(metas[order[len(order) // 2]])
-        meta["samples_attempted"] = len(sample_idxs)
-        meta["samples_succeeded"] = len(scores)
-        meta["probe_mode"] = "comix_first_chapter"
-        meta["chapter_indices_sampled"] = [abs_idx]
-        return agg_score, meta
-
-    def _fetch_probe_item_bytes(self, item, scraper) -> Optional[bytes]:
-        """comix override: serve probe bytes from image_cache first.
-
-        The browser render (fetch_chapter_images_via_dom) already cached each
-        page's bytes — real webp under its CDN URL, or synthetic-key bytes for a
-        legacy tile-scrambled <canvas> page under a `comix-page://…` URL. The
-        base implementation does scraper.get(url), which (a) can't fetch the
-        synthetic scheme → would score that page 0.0, and (b) re-downloads a
-        page the browser already holds. Read the cache first (fair scoring for
-        BOTH page shapes, no second fetch); fall back to the base HTTP path only
-        on a cache miss for a real https URL.
-
-        Cross-file: image_cache populated in _ComixBrowserSession (the
-        page.on("response") listener + the canvas toDataURL path); the same
-        cache aio-dl.py:dl_image reads.
-        """
-        if isinstance(item, str) and item:
-            try:
-                from . import image_cache
-                cached = image_cache.get_cached_image(item)
-            except Exception:
-                cached = None
-            if cached is not None and cached[0]:
-                return cached[0]
-        return super()._fetch_probe_item_bytes(item, scraper)
+            alts = self._normalize_named_list(
+                detail.get("altTitles")
+                or detail.get("alt_titles")
+                or detail.get("alt_names")
+            )
+            year = detail.get("year")
+            for h in by_hid.get(hid, []):
+                # Drop an alt that merely repeats the primary title — it adds a
+                # duplicate union-find key and a wasted rapidfuzz pair.
+                primary = (h.title or "").strip().casefold()
+                h.alt_titles = [
+                    a for a in alts if a.strip().casefold() != primary
+                ]
+                if isinstance(year, int) and year > 0:
+                    h.year = year
+                if h.alt_titles:
+                    enriched += 1
+        if enriched:
+            print(
+                f"[*] Comix search: alt titles for {enriched}/{len(hits)} "
+                f"result(s).",
+                flush=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -3216,6 +3105,106 @@ class _ComixBrowserSession:
             flush=True,
         )
         return rows
+
+    def fetch_initial_data_blobs(
+        self,
+        hids: List[str],
+        time_budget_s: float = 12.0,
+    ) -> Dict[str, str]:
+        """Fetch several title pages IN-PAGE and return {hid: initial-data JSON}.
+
+        Feeds the search alt-title enrichment (ComixSiteHandler.search). The
+        typeahead dropdown carries no alternate titles — verified against the
+        live anchor markup, which holds only thumb / title / type / "Ch.N" /
+        rating — so the only source is each title page's SSR
+        <script id="initial-data"> blob, the same one fetch_comic_context reads.
+
+        WHY a same-origin fetch() rather than plain HTTP or a navigation:
+          - Plain cloudscraper/requests GETs of /title/{hid} are answered with a
+            ~6 KB block page (403, measured 2026-08-20), same barrier that
+            forces every other comix data path through the browser.
+          - page.goto per hid works but costs a full SPA boot each and returns
+            the ~63 KB hydrated document; the fetch returns the ~18 KB raw SSR
+            response, which is all we need, and runs them concurrently. Two
+            title pages: 2.7 s by navigation vs 1.7 s by fetch, and the gap
+            widens with row count.
+        Same idiom as mangafire's fetch_api_json (sites/mangafire.py) — read
+        through the cleared page rather than trying to reproduce its identity.
+
+        Returns only the hids that produced a blob; a 403 (cold profile, WAF
+        not yet cleared) or a page without the script simply drops out, so the
+        caller degrades to no alt titles rather than failing. NEVER raises —
+        search must not poison the orchestrator's ProbeFailureCache. Returns
+        RAW TEXT, deliberately: _manga_detail_from_initial_data owns the
+        React-Query shape, and this method must not learn a second copy of it.
+        """
+        wanted = [h for h in (hids or []) if h]
+        if not wanted:
+            return {}
+        if not self._start():
+            return {}
+        page = self._page
+        if page is None:
+            return {}
+        import time as _time
+
+        deadline = _time.monotonic() + time_budget_s
+        # The page must be ON comix.to for the relative fetch to be same-origin
+        # and carry the clearance cookies. Reuse whatever page the typeahead
+        # left us on when it is already there — search calls this immediately
+        # after fetch_search_via_dom, so the common case is a free check.
+        try:
+            if "comix.to" not in (page.url or ""):
+                page.goto(
+                    "https://comix.to/",
+                    wait_until="domcontentloaded",
+                    timeout=max(1, int((deadline - _time.monotonic()) * 1000)),
+                )
+        except Exception:
+            return {}
+
+        # One evaluate, all rows concurrent. The JS extracts ONLY the script
+        # text — no JSON walking here (see the docstring). Each row is
+        # individually try/caught so one failure can't void the batch.
+        # The budget is enforced INSIDE the page via AbortController rather than
+        # by a Playwright timeout: page.evaluate takes no timeout argument, and
+        # the bridge's outer _comix_call cap would surface a slow batch as a
+        # dead browser instead of "no alt titles this run". Aborting in-page
+        # lets the rows that already landed still be returned.
+        scrape_js = """async ([hids, budgetMs]) => {
+            const out = {};
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), budgetMs);
+            try {
+                await Promise.all(hids.map(async (hid) => {
+                    try {
+                        const r = await fetch('/title/' + hid, {
+                            credentials: 'same-origin', signal: ctrl.signal,
+                        });
+                        if (!r.ok) return;
+                        const txt = await r.text();
+                        const doc = new DOMParser().parseFromString(txt, 'text/html');
+                        const el = doc.querySelector('script#initial-data');
+                        if (el && el.textContent) out[hid] = el.textContent;
+                    } catch (e) { /* this row drops out; batch continues */ }
+                }));
+            } finally { clearTimeout(timer); }
+            return out;
+        }"""
+        budget_ms = max(1, int((deadline - _time.monotonic()) * 1000))
+        try:
+            blobs = page.evaluate(scrape_js, [wanted, budget_ms]) or {}
+        except Exception as e:
+            print(
+                f"[*] Comix search: alt-title lookup skipped "
+                f"({type(e).__name__}: {e}); titles stay as the typeahead gave "
+                f"them.",
+                flush=True,
+            )
+            return {}
+        if not isinstance(blobs, dict):
+            return {}
+        return {str(k): v for k, v in blobs.items() if isinstance(v, str) and v}
 
     def fetch_chapters_via_dom(
         self,
@@ -4836,7 +4825,8 @@ _COMIX_SHUTDOWN_SENTINEL = object()
 # the sum of those plus a small slack so a legitimate slow nav still
 # completes but a stuck one surfaces as TimeoutError rather than
 # deadlocking the caller. Search-phase callers should also have their
-# own outer deadline (PROBE_PHASE_DEADLINE_S in search_orchestrator);
+# own outer deadline (PROBE_PHASE_DEADLINE_S in search_orchestrator, plus
+# BaseSiteHandler.PROBE_SOURCE_BUDGET_S per source);
 # this is the inner guard.
 _COMIX_DEFAULT_TIMEOUT_S = 60.0
 
@@ -5094,6 +5084,25 @@ class _ComixBrowserBridge:
             _timeout_s=time_budget_s + 12.0,
         )
 
+    def fetch_initial_data_blobs(
+        self,
+        hids: List[str],
+        time_budget_s: float = 12.0,
+    ) -> Dict[str, str]:
+        """Bridge facade for the search alt-title lookup.
+
+        Same tight outer-cap reasoning as fetch_search_via_dom: this runs
+        INSIDE the fan-out, so a slow batch delays the whole cross-site search.
+        The load-bearing bound is the in-page AbortController; this is the net.
+        Cross-file: _ComixBrowserSession.fetch_initial_data_blobs.
+        """
+        return _comix_call(
+            "fetch_initial_data_blobs",
+            hids,
+            time_budget_s,
+            _timeout_s=time_budget_s + 12.0,
+        )
+
     def fetch_chapter_images_via_dom(
         self,
         chapter_url: str,
@@ -5116,11 +5125,11 @@ class _ComixBrowserBridge:
         `comix-page://<chap_id>/<NNNN>.webp` keys.
 
         ``max_capture_pages`` (default None = every page, the download path)
-        limits the capture to the FIRST that many pages — the image-quality
-        probe (ComixSiteHandler._probe_chapter_aggregate) passes
-        _COMIX_PROBE_PAGE_CAP so one chapter renders in ~5-15 s instead of
-        minutes. It also shrinks ``expected_pages`` to match, so a deliberately
-        capped probe render is never mistaken for a truncated chapter.
+        limits the capture to the FIRST that many pages, for a caller that
+        needs only a chapter's opening pages (no caller passes it since the old
+        image-quality probe was removed; the match probe renders whole chapters).
+        It also shrinks ``expected_pages`` to match, so a deliberately capped
+        render is never mistaken for a truncated chapter.
 
         Returns ComixChapterCapture. Callers that only want the URLs read
         ``.urls``; ``get_chapter_images`` additionally compares against

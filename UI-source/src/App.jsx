@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { useDownloader } from "@/hooks/useDownloader";
+import { useDeviceSync } from "@/hooks/useDeviceSync";
 import DownloadTab from "@/components/DownloadTab";
 import SearchTab from "@/components/SearchTab";
 import QueueTab from "@/components/QueueTab";
@@ -8,6 +9,14 @@ import SettingsTab from "@/components/SettingsTab";
 import LibraryTab from "@/components/LibraryTab";
 import ResumeBar from "@/components/ResumeBar";
 import ConfirmQuitDialog from "@/components/ConfirmQuitDialog";
+import SyncTab from "@/components/sync/SyncTab";
+import ConnectPrompt, { RailBadge } from "@/components/sync/ConnectPrompt";
+import { railBadge } from "@/components/sync/connectView";
+import { pickTargets } from "@/components/sync/syncView";
+import { librarySeriesKey, openInSyncTarget } from "@/components/sync/libraryView";
+import { findQueueArgs } from "@/components/sync/findView";
+import { useConfigOps } from "@/components/sync/useConfigOps";
+import { configRefusalCopy } from "@/components/sync/copy";
 import appIcon from "../build-resources/icon.png";
 import {
   Download,
@@ -15,6 +24,7 @@ import {
   ListOrdered,
   Terminal,
   Settings,
+  FolderSync,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -22,13 +32,16 @@ import { cn } from "@/lib/utils";
 // Search sits between New and Queue: cross-site discovery feeds the same
 // queue the New tab does, so the visual order matches the user's flow:
 //   Search (find URL) → New (configure if needed) → Queue (running)
-const TABS = [
+// Sync is inserted just above Settings, and only while Device Sync is on
+// (App's `tabs` memo below).
+const BASE_TABS = [
   { id: "new", label: "New", icon: Download },
   { id: "search", label: "Search", icon: Search },
   { id: "queue", label: "Queue", icon: ListOrdered },
   { id: "logs", label: "Logs", icon: Terminal },
   { id: "settings", label: "Settings", icon: Settings },
 ];
+const SYNC_TAB = { id: "sync", label: "Sync", icon: FolderSync };
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("new");
@@ -41,6 +54,96 @@ export default function App() {
 
   // Central hook that manages all download state and Electron IPC
   const dl = useDownloader();
+
+  // Device Sync, mounted once here so its event subscription lives as long as
+  // the window: the Sync tab and Settings → Sync both read this one instance
+  // (hooks/useDeviceSync.js). `sync.enabled` is the service's live state, not
+  // the saved setting, so the tab appears only once the service has started.
+  const sync = useDeviceSync();
+  // The Sync tab's per-visit view (picked target, tile filter, query, sort,
+  // dismissed last-run cards) lives here, not in the tab: App unmounts tabs
+  // on every switch (UI-pass U2-14; components/sync/SyncTab.jsx `view`).
+  // `focus` {seriesKey} is the Library's Open in Sync (U4-5): the tab opens
+  // that series' detail once its plan holds the row, then clears it.
+  const [syncView, setSyncView] = useState({ targetId: null, tile: null, query: "", sort: "copy", dismissed: {}, focus: null });
+  const patchSyncView = React.useCallback((patch) => setSyncView((v) => ({ ...v, ...patch })), []);
+  // The Sync rail badge (UI-pass U3-14, components/sync/connectView.js
+  // railBadge): series count on connected targets + red / pulsing dot.
+  const syncBadge = useMemo(
+    () => (sync.enabled ? railBadge({ targets: (sync.config && sync.config.targets) || [], plans: sync.plans, devices: sync.devices, folderPresence: sync.folderPresence, job: sync.job, dismissed: syncView.dismissed }) : null),
+    [sync.enabled, sync.config, sync.plans, sync.devices, sync.folderPresence, sync.job, syncView.dismissed]
+  );
+  // The target the Sync tab is showing, resolved the way SyncTab resolves it
+  // (pickTargets, else the first): connect cards for it stay hidden while the
+  // tab is open, so they don't cover its dock (U3-13).
+  const syncShownTarget = useMemo(() => {
+    if (activeTab !== "sync" || !sync.enabled) return null;
+    const list = pickTargets((sync.config && sync.config.targets) || [], sync.devices, sync.folderPresence);
+    const picked = list.find((x) => x.target.id === syncView.targetId) || list[0] || null;
+    return picked ? picked.target.id : null;
+  }, [activeTab, sync.enabled, sync.config, sync.devices, sync.folderPresence, syncView.targetId]);
+  const syncTargets = useMemo(() => (sync.config && sync.config.targets) || [], [sync.config]);
+  // The Library's chip + Sync line (U4-3/4): null while sync is off or the
+  // status hasn't loaded (no chips rather than wrong ones).
+  const syncLibrary = useMemo(
+    () => (sync.enabled && sync.libraryStatus ? { bySeries: sync.libraryStatus.bySeries || {}, targets: syncTargets } : null),
+    [sync.enabled, sync.libraryStatus, syncTargets]
+  );
+  const openInSync = React.useCallback(
+    (folderPath) => {
+      const rows = sync.libraryStatus && sync.libraryStatus.bySeries ? sync.libraryStatus.bySeries[folderPath] : null;
+      patchSyncView({ targetId: openInSyncTarget(rows, syncTargets), tile: null, query: "", focus: { seriesKey: librarySeriesKey(folderPath) } });
+      setActiveTab("sync");
+    },
+    [sync.libraryStatus, syncTargets, patchSyncView]
+  );
+
+  // Single find source (U4-6/7): {token, targetId, targetName, folder, query,
+  // searched, error}. Set by the Sync tab's "Find source", searched once by
+  // SearchTab, cleared by the banner's ✕ or once a download is queued.
+  const [findFor, setFindFor] = useState(null);
+  const syncOps = useConfigOps(sync);
+  // A download started from Search while the banner is up: link it to the
+  // folder FIRST (config-op add-alias), then queue; a refused link queues
+  // nothing and says why on the banner. Komikku follows the target (U4-8).
+  // `opts` is SearchTab's { recipe } (a "search" recipe, lib/queueRecipe.js);
+  // the target's komikku flag rides in its extraArgs, which win over the
+  // dialog and the Settings defaults when the download starts.
+  const startFoundDownload = async (f, url, opts) => {
+    const r = await syncOps.run("add-alias", { targetId: f.targetId, alias: { url, deviceFolder: f.folder } });
+    if (!r || r.ok === false) {
+      setFindFor((x) => (x && x.token === f.token ? { ...x, error: configRefusalCopy(r, f.targetName) } : x));
+      return;
+    }
+    const t = syncTargets.find((x) => x.id === f.targetId);
+    const recipe = opts?.recipe;
+    const withTarget = recipe
+      ? {
+          recipe: {
+            ...recipe,
+            input: {
+              ...recipe.input,
+              extraArgs: { ...(recipe.input?.extraArgs || {}), ...findQueueArgs(t) },
+            },
+          },
+        }
+      : opts;
+    dl.queueDownload(url, withTarget);
+    setFindFor((x) => (x && x.token === f.token ? null : x));
+    setActiveTab("queue");
+  };
+
+  const tabs = useMemo(() => {
+    if (!sync.enabled) return BASE_TABS;
+    const at = BASE_TABS.findIndex((t) => t.id === "settings");
+    return [...BASE_TABS.slice(0, at), SYNC_TAB, ...BASE_TABS.slice(at)];
+  }, [sync.enabled]);
+
+  // Turning sync off while its tab is open would leave the view on a tab the
+  // rail no longer shows; land on Settings, where the switch that did it is.
+  useEffect(() => {
+    if (activeTab === "sync" && !sync.enabled) setActiveTab("settings");
+  }, [activeTab, sync.enabled]);
 
   // Apply the system dark/light theme on mount and listen for changes
   useEffect(() => {
@@ -101,7 +204,7 @@ export default function App() {
         </button>
 
         {/* Tab buttons */}
-        {TABS.map((tab) => {
+        {tabs.map((tab) => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.id;
 
@@ -138,6 +241,9 @@ export default function App() {
                 </div>
               )}
 
+              {/* Sync: series count, plus a red (problem) or pulsing (job) dot. */}
+              {tab.id === "sync" && <RailBadge badge={syncBadge} />}
+
               {/* Red dot on logs tab when there's a recent error */}
               {/* UIR-2: skip trailing 'divider' entries (a completion divider is
                   appended after the final error line, which would otherwise
@@ -164,7 +270,7 @@ export default function App() {
           <h1 className="text-sm font-semibold tracking-wide">
             {activeTab === "library"
               ? "Library"
-              : TABS.find((t) => t.id === activeTab)?.label}
+              : tabs.find((t) => t.id === activeTab)?.label}
           </h1>
         </div>
 
@@ -172,16 +278,18 @@ export default function App() {
         <div className="flex-1 min-h-0 overflow-hidden">
           {activeTab === "library" && (
             <LibraryTab
-              onStartDownload={(url, args) =>
-                dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args })
-              }
+              // LibraryTab passes a "library" recipe; Settings are applied
+              // when the download starts (lib/queueRecipe.js).
+              onStartDownload={dl.queueDownload}
               onSwitchTab={setActiveTab}
               settings={dl.settings}
               onSaveSettings={dl.saveSettings}
               libraryEntries={dl.libraryEntries}
               libraryLoading={dl.libraryLoading}
               loadLibrary={dl.loadLibrary}
-              setLibraryEntries={dl.setLibraryEntries}
+              updateCheck={dl.updateCheck}
+              syncLibrary={syncLibrary}
+              onOpenInSync={openInSync}
             />
           )}
           {activeTab === "new" && (
@@ -217,16 +325,22 @@ export default function App() {
                 setSettingsCategory("search");
                 setActiveTab("settings");
               }}
-              onStartDownload={(url, args) => {
-                // Fix A (2026-05-07): merge settings.defaults so search- and
-                // library-driven downloads inherit format / quality / scaling /
-                // image-workers / etc. without going through the New tab. The
-                // caller-passed `args` wins on conflicts (search may set
-                // `multiSource: true` even when defaults.multiSource is false,
-                // because the search itself was multi-source). DownloadTab does
-                // its own merge via form initialization, so it doesn't need
-                // this wrapper. Same fix applied to LibraryTab above.
-                dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args });
+              findFor={findFor}
+              onFindSearched={(token) => setFindFor((x) => (x && x.token === token ? { ...x, searched: true } : x))}
+              onDismissFind={() => setFindFor(null)}
+              onStartDownload={(url, opts) => {
+                // Linked only once the find's own search has started
+                // (SearchTab defers it behind a running search, R13);
+                // before that the results on screen belong to another query.
+                if (findFor && findFor.searched) {
+                  startFoundDownload(findFor, url, opts);
+                  return;
+                }
+                // `opts` is a "search" recipe. settings.defaults go UNDER the
+                // search's own args when the download starts
+                // (lib/queueRecipe.js), so format / quality / image workers /
+                // etc. follow Settings saved while the item waits.
+                dl.queueDownload(url, opts);
                 setActiveTab("queue");
               }}
             />
@@ -250,12 +364,41 @@ export default function App() {
               onSaveSettings={dl.saveSettings}
             />
           )}
+          {activeTab === "sync" && sync.enabled && (
+            <SyncTab
+              sync={sync}
+              view={syncView}
+              onView={patchSyncView}
+              libraryEntries={dl.libraryEntries}
+              loadLibrary={dl.loadLibrary}
+              onOpenSettings={(category) => {
+                setSettingsCategory(category === "general" || category === "search" ? category : "sync");
+                setActiveTab("settings");
+              }}
+              onFindSource={(f) => {
+                setFindFor({ ...f, token: Date.now(), searched: false, error: null });
+                setActiveTab("search");
+              }}
+              // Sync's row args (multi-source, fallback sites, komikku) over
+              // settings.defaults, applied when the download starts
+              // ("defaultsPlus" in lib/queueRecipe.js). Returns the promise:
+              // FindSourcesSheet awaits it.
+              onQueueDownload={(url, args) =>
+                dl.queueDownload(url, { recipe: { kind: "defaultsPlus", input: { jobArgs: args || {} } } })
+              }
+              searchSettings={{ seededOnly: dl.settings?.searchOpts?.seededOnly, collapseSplits: dl.settings?.collapseSplits, multiSource: dl.settings?.searchOpts?.multiSource }}
+            />
+          )}
           {activeTab === "settings" && (
             <SettingsTab
               settings={dl.settings}
               onSave={dl.saveSettings}
               searchSiteHealth={dl.searchSiteHealth}
               initialCategory={settingsCategory}
+              sync={sync}
+              libraryEntries={dl.libraryEntries}
+              libraryLoading={dl.libraryLoading}
+              loadLibrary={dl.loadLibrary}
             />
           )}
         </div>
@@ -280,6 +423,20 @@ export default function App() {
           "confirm-quit" push, renders null the rest of the time). Sits outside
           the tab-content area so it overlays whatever tab is open. */}
       <ConfirmQuitDialog />
+
+      {/* Device Sync connect cards (UI-pass U3): bottom-right over any tab,
+          non-blocking. Review lands on the Sync tab's series list for that
+          target (U3-2). */}
+      {sync.enabled && (
+        <ConnectPrompt
+          sync={sync}
+          hiddenTargetId={syncShownTarget}
+          onReview={(targetId) => {
+            if (targetId) patchSyncView({ targetId, tile: null });
+            setActiveTab("sync");
+          }}
+        />
+      )}
     </div>
   );
 }

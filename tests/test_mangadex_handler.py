@@ -314,3 +314,185 @@ def test_extension_from_filename_recognizes_png_jpg_webp():
     assert handler._extension_from_filename("noext") == ".jpg"
     # Trailing dot → fallback
     assert handler._extension_from_filename("trailing.") == ".jpg"
+
+
+# --- Publisher link-outs (plan sync-temp/plans/mangadex-link-outs.md, L1) ---
+# MangaDex lists licensed chapters that live on the publisher's site as rows
+# with `externalUrl` and pages 0 or 1 (the 1 page is an "EXTERNAL CHAPTER"
+# card). get_chapters must keep them as `_locked` placeholders, and
+# get_chapter_images must refuse them before any request.
+
+from sites.base import IncompleteChapterError, SiteComicContext  # noqa: E402
+
+
+def _chapter_row(cid, chap, *, pages, external=None, unavailable=False):
+    attrs = {
+        "chapter": chap,
+        "title": None,
+        "translatedLanguage": "en",
+        "publishAt": "2024-01-01T00:00:00+00:00",
+        "pages": pages,
+        "externalUrl": external,
+    }
+    if unavailable:
+        attrs["isUnavailable"] = True
+    return {"id": cid, "attributes": attrs, "relationships": []}
+
+
+def _list_chapters(rows):
+    handler = MangaDexSiteHandler()
+    ctx = SiteComicContext(comic={"_manga_id": "m1"}, title="T", identifier="m1")
+    resp = MagicMock()
+    resp.json.return_value = {"data": rows, "total": len(rows)}
+    make_request = MagicMock(return_value=resp)
+    return handler.get_chapters(ctx, MagicMock(), "en", make_request)
+
+
+def test_link_out_rows_become_external_placeholders(capsys):
+    rows = [
+        _chapter_row("hosted", "1", pages=20),
+        _chapter_row("ext0", "2", pages=0, external="https://mangaplus.shueisha.co.jp/viewer/1"),
+        _chapter_row("ext1", "2.1", pages=1, external="https://www.global.manga-up.com/x"),
+        _chapter_row("extreal", "3", pages=136, external="https://www.bilibilicomics.com/x"),
+        _chapter_row("extnone", "4", pages=None, external="https://viz.com/x"),
+        _chapter_row("gone", "5", pages=10, unavailable=True),
+    ]
+    by_id = {c["hid"]: c for c in _list_chapters(rows)}
+
+    assert "gone" not in by_id  # isUnavailable rows stay dropped
+    assert not by_id["hosted"].get("_locked")
+    assert not by_id["extreal"].get("_locked")  # real pages: a normal chapter
+    for cid, host in (
+        ("ext0", "mangaplus.shueisha.co.jp"),
+        ("ext1", "global.manga-up.com"),
+        ("extnone", "viz.com"),
+    ):
+        row = by_id[cid]
+        assert row["_locked"] is True
+        assert row["_locked_kind"] == "external"
+        assert row["_external_host"] == host
+        assert row["_external_url"]
+    err = capsys.readouterr().err
+    assert "3 of 5 chapter rows are publisher links" in err
+
+
+def test_no_link_outs_prints_nothing(capsys):
+    _list_chapters([_chapter_row("a", "1", pages=12)])
+    assert "publisher links" not in capsys.readouterr().err
+
+
+def test_get_chapter_images_refuses_link_out_before_any_request():
+    handler = MangaDexSiteHandler()
+    scraper = MagicMock()
+    scraper.get.side_effect = AssertionError("no request for a link-out")
+    make_request = MagicMock(side_effect=AssertionError("no request for a link-out"))
+    chapter = {
+        "hid": "ext1", "url": "ext1", "chap": "2.1",
+        "_locked": True, "_locked_kind": "external",
+        "_external_host": "global.manga-up.com",
+    }
+    with pytest.raises(IncompleteChapterError) as exc:
+        handler.get_chapter_images(chapter, scraper, make_request)
+    assert exc.value.reason == "external_link"
+    assert exc.value.host == "global.manga-up.com"
+    assert scraper.get.call_count == 0 and make_request.call_count == 0
+
+
+def test_search_count_excludes_external_rows():
+    """The per-hit count request carries includeExternalUrl=0, and a zero
+    verified count lands on the hit (the orchestrator sinks it)."""
+    handler = MangaDexSiteHandler()
+    calls = []
+
+    def make_request(url, scraper):
+        calls.append(url)
+        resp = MagicMock()
+        if "/manga?" in url:
+            resp.json.return_value = {"data": [{
+                "id": "gs",
+                "attributes": {"title": {"en": "Goblin Slayer"}, "lastChapter": None},
+                "relationships": [],
+            }]}
+        else:
+            resp.json.return_value = {"total": 0, "data": []}
+        return resp
+
+    hits = handler.search("Goblin Slayer", MagicMock(), make_request)
+    count_urls = [u for u in calls if "/chapter?" in u]
+    assert count_urls and all("includeExternalUrl=0" in u for u in count_urls)
+    assert hits[0].actual_chapter_count == 0
+
+
+# --- match_fetch_window (search ranking; contract in sites/base.py) ---------
+
+def _window_handler(monkeypatch, n_pages=20, statuses=None, swap_names=None):
+    """A handler whose /at-home/server and MD@H fetches are stubbed.
+    statuses: page index -> list of per-attempt statuses (None = the fetch
+    raised, int = HTTP status; 200 serves bytes). Unlisted pages serve."""
+    h = MangaDexSiteHandler()
+    calls = {"assign": 0, "urls": []}
+    names = [f"{i + 1}-h{i}.png" for i in range(n_pages)]
+
+    def assign(scraper, cid):
+        calls["assign"] += 1
+        lst = swap_names if (swap_names is not None and calls["assign"] > 1) else names
+        return {"base_url": f"https://node{calls['assign']}.mangadex.network", "file_hash": "fh",
+                "data_filenames": list(lst), "saver_filenames": [f"s{i}.jpg" for i in range(n_pages)]}
+
+    tries = {}
+
+    def fetch(scraper, url):
+        calls["urls"].append(url)
+        idx = names.index(url.rsplit("/", 1)[1])
+        k = tries[idx] = tries.get(idx, -1) + 1
+        seq = (statuses or {}).get(idx, [200])
+        st = seq[min(k, len(seq) - 1)]
+        if st == 200:
+            return True, b"img%d" % idx, 4, 1, False, 200
+        return False, None, 0, 1, False, st
+
+    monkeypatch.setattr(h, "_fetch_at_home_assignment", assign)
+    monkeypatch.setattr(h, "_fetch_image_blob", fetch)
+    monkeypatch.setattr(h, "_report_to_mdah", lambda *a, **k: None)
+    return h, calls
+
+
+def test_match_window_fetches_only_the_window_pages_in_data_mode(monkeypatch):
+    """The window, not the chapter: get_chapter_images downloads every page,
+    which held the search probe to its deadline. Full-quality `data` files
+    only - a data-saver page would rate MangaDex below a download."""
+    h, calls = _window_handler(monkeypatch)
+    res = h.match_fetch_window({"url": "cid"}, None, None)
+    want = MangaDexSiteHandler.match_window_order(20, 5)
+    assert sorted(i for i, _ in res["pages"]) == sorted(want)
+    assert len(calls["urls"]) == 5 and calls["assign"] == 1
+    assert all("/data/fh/" in u for u in calls["urls"])
+    assert res == {**res, "n_total": 20, "attempted": 5, "failed": 0, "timed_out": 0}
+
+
+def test_match_window_swaps_once_and_splits_timeouts_from_failures(monkeypatch):
+    want = MangaDexSiteHandler.match_window_order(20, 5)
+    a, b, c = want[0], want[1], want[2]
+    # a: fails then serves on the swapped node; b: raises twice (timeout);
+    # c: 404 twice (a failure)
+    h, calls = _window_handler(monkeypatch, statuses={a: [500, 200], b: [None], c: [404]})
+    res = h.match_fetch_window({"url": "cid"}, None, None)
+    got = {i for i, _ in res["pages"]}
+    assert a in got and b not in got and c not in got
+    assert calls["assign"] == 2
+    assert (res["attempted"], res["failed"], res["timed_out"]) == (5, 1, 1)
+
+
+def test_match_window_does_not_swap_onto_a_different_page_list(monkeypatch):
+    want = MangaDexSiteHandler.match_window_order(20, 5)
+    h, calls = _window_handler(monkeypatch, statuses={want[0]: [500]},
+                               swap_names=[f"x{i}.png" for i in range(18)])
+    res = h.match_fetch_window({"url": "cid"}, None, None)
+    assert len(calls["urls"]) == 5          # no second-round fetches
+    assert res["failed"] == 1 and len(res["pages"]) == 4
+
+
+def test_match_window_link_out_makes_no_request(monkeypatch):
+    h, calls = _window_handler(monkeypatch)
+    res = h.match_fetch_window({"url": "cid", "_locked": True}, None, None)
+    assert calls["assign"] == 0 and res["failed"] == 1 and res["pages"] == []

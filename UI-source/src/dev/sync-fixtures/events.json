@@ -1,0 +1,402 @@
+{
+  "__aioSyncFixture": "events.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": [
+    {
+      "kind": "config",
+      "config": {
+        "version": 0,
+        "adbPath": null,
+        "targets": []
+      }
+    },
+    {
+      "kind": "adb",
+      "adb": {
+        "binary": "C:\\platform-tools\\adb.exe",
+        "serverVersion": null,
+        "error": null,
+        "candidates": [
+          {
+            "path": "C:\\platform-tools\\adb.exe",
+            "source": "configured",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "35.0.2-12147458"
+          },
+          {
+            "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+            "source": "LOCALAPPDATA",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "34.0.5-10900879"
+          }
+        ],
+        "tracking": "stopped",
+        "trackingError": null,
+        "at": 1793121385232
+      }
+    },
+    {
+      "kind": "adb",
+      "adb": {
+        "binary": "C:\\platform-tools\\adb.exe",
+        "serverVersion": 41,
+        "error": null,
+        "candidates": [
+          {
+            "path": "C:\\platform-tools\\adb.exe",
+            "source": "configured",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "35.0.2-12147458"
+          },
+          {
+            "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+            "source": "LOCALAPPDATA",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "34.0.5-10900879"
+          }
+        ],
+        "tracking": "stopped",
+        "trackingError": null,
+        "at": 1793121385232
+      }
+    },
+    {
+      "kind": "adb",
+      "adb": {
+        "binary": "C:\\platform-tools\\adb.exe",
+        "serverVersion": 41,
+        "error": null,
+        "candidates": [
+          {
+            "path": "C:\\platform-tools\\adb.exe",
+            "source": "configured",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "35.0.2-12147458"
+          },
+          {
+            "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+            "source": "LOCALAPPDATA",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "34.0.5-10900879"
+          }
+        ],
+        "tracking": "connecting",
+        "trackingError": null,
+        "at": 1793121385232
+      }
+    },
+    {
+      "kind": "config",
+      "config": {
+        "version": 1,
+        "adbPath": null,
+        "targets": [
+          {
+            "id": "tf50fe92999",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Galaxy Tab S9",
+            "kind": "adb",
+            "serial": "R5CW71ABCDE",
+            "root": "/sdcard/Komikku/local",
+            "profile": "komikku"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "adb",
+      "adb": {
+        "binary": "C:\\platform-tools\\adb.exe",
+        "serverVersion": 41,
+        "error": null,
+        "candidates": [
+          {
+            "path": "C:\\platform-tools\\adb.exe",
+            "source": "configured",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "35.0.2-12147458"
+          },
+          {
+            "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+            "source": "LOCALAPPDATA",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "34.0.5-10900879"
+          }
+        ],
+        "tracking": "tracking",
+        "trackingError": null,
+        "at": 1793121385232
+      }
+    },
+    {
+      "kind": "config",
+      "config": {
+        "version": 2,
+        "adbPath": null,
+        "targets": [
+          {
+            "id": "tf50fe92999",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Galaxy Tab S9",
+            "kind": "adb",
+            "serial": "R5CW71ABCDE",
+            "root": "/sdcard/Komikku/local",
+            "profile": "komikku"
+          },
+          {
+            "id": "t8e8c81b2a2",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Komikku folder",
+            "kind": "folder",
+            "root": "D:\\Sync-fixture\\Komikku\\local",
+            "profile": "everything"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "config",
+      "config": {
+        "version": 3,
+        "adbPath": null,
+        "targets": [
+          {
+            "id": "tf50fe92999",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Galaxy Tab S9",
+            "kind": "adb",
+            "serial": "R5CW71ABCDE",
+            "root": "/sdcard/Komikku/local",
+            "profile": "komikku"
+          },
+          {
+            "id": "t8e8c81b2a2",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Komikku folder",
+            "kind": "folder",
+            "root": "D:\\Sync-fixture\\Komikku\\local",
+            "profile": "everything"
+          },
+          {
+            "id": "t5e03b218ae",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Pixel 7",
+            "kind": "adb",
+            "serial": "2A161FDH200ABC",
+            "root": "/storage/emulated/0/Mihon/local",
+            "profile": "custom",
+            "formats": [
+              "cbz",
+              "pdf"
+            ],
+            "sidecars": [
+              "cover.jpg"
+            ],
+            "nomedia": false,
+            "namingPolicy": "title"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "config",
+      "config": {
+        "version": 4,
+        "adbPath": null,
+        "targets": [
+          {
+            "id": "tf50fe92999",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [
+              {
+                "pcFolder": "Tonikaku Kawaii",
+                "deviceFolder": "Fly Me to the Moon"
+              }
+            ],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Galaxy Tab S9",
+            "kind": "adb",
+            "serial": "R5CW71ABCDE",
+            "root": "/sdcard/Komikku/local",
+            "profile": "komikku"
+          },
+          {
+            "id": "t8e8c81b2a2",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Komikku folder",
+            "kind": "folder",
+            "root": "D:\\Sync-fixture\\Komikku\\local",
+            "profile": "everything"
+          },
+          {
+            "id": "t5e03b218ae",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Pixel 7",
+            "kind": "adb",
+            "serial": "2A161FDH200ABC",
+            "root": "/storage/emulated/0/Mihon/local",
+            "profile": "custom",
+            "formats": [
+              "cbz",
+              "pdf"
+            ],
+            "sidecars": [
+              "cover.jpg"
+            ],
+            "nomedia": false,
+            "namingPolicy": "title"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "config",
+      "config": {
+        "version": 5,
+        "adbPath": null,
+        "targets": [
+          {
+            "id": "tf50fe92999",
+            "deletePolicy": "guarded",
+            "excludes": [
+              {
+                "pcFolder": "Blue Lock"
+              }
+            ],
+            "aliases": [
+              {
+                "pcFolder": "Tonikaku Kawaii",
+                "deviceFolder": "Fly Me to the Moon"
+              }
+            ],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Galaxy Tab S9",
+            "kind": "adb",
+            "serial": "R5CW71ABCDE",
+            "root": "/sdcard/Komikku/local",
+            "profile": "komikku"
+          },
+          {
+            "id": "t8e8c81b2a2",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Komikku folder",
+            "kind": "folder",
+            "root": "D:\\Sync-fixture\\Komikku\\local",
+            "profile": "everything"
+          },
+          {
+            "id": "t5e03b218ae",
+            "deletePolicy": "guarded",
+            "excludes": [],
+            "aliases": [],
+            "ignoredSuggestions": [],
+            "acknowledged": [],
+            "name": "Pixel 7",
+            "kind": "adb",
+            "serial": "2A161FDH200ABC",
+            "root": "/storage/emulated/0/Mihon/local",
+            "profile": "custom",
+            "formats": [
+              "cbz",
+              "pdf"
+            ],
+            "sidecars": [
+              "cover.jpg"
+            ],
+            "nomedia": false,
+            "namingPolicy": "title"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "settings",
+      "enabled": false,
+      "settings": {
+        "syncEnabled": false,
+        "syncPromptOnConnect": true,
+        "syncDeletePolicy": "guarded",
+        "syncHashMode": "cached",
+        "syncErrorBudget": 3,
+        "syncSizeWarnPct": 30,
+        "syncChapterPatterns": "Episode\\s*(?<ch>\\d+(?:\\.\\d+)?)",
+        "syncDiagnosticLog": true,
+        "chapterPatternErrors": []
+      }
+    },
+    {
+      "kind": "adb",
+      "adb": {
+        "binary": "C:\\platform-tools\\adb.exe",
+        "serverVersion": 41,
+        "error": null,
+        "candidates": [
+          {
+            "path": "C:\\platform-tools\\adb.exe",
+            "source": "configured",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "35.0.2-12147458"
+          },
+          {
+            "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+            "source": "LOCALAPPDATA",
+            "ok": true,
+            "version": "1.0.41",
+            "build": "34.0.5-10900879"
+          }
+        ],
+        "tracking": "stopped",
+        "trackingError": null,
+        "at": 1793121385232
+      }
+    }
+  ]
+}

@@ -1,0 +1,282 @@
+{
+  "__aioSyncFixture": "state-on.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": {
+    "ok": true,
+    "enabled": true,
+    "settings": {
+      "syncEnabled": true,
+      "syncPromptOnConnect": true,
+      "syncDeletePolicy": "guarded",
+      "syncHashMode": "cached",
+      "syncErrorBudget": 3,
+      "syncSizeWarnPct": 30,
+      "syncChapterPatterns": "Episode\\s*(?<ch>\\d+(?:\\.\\d+)?)",
+      "syncDiagnosticLog": true,
+      "chapterPatternErrors": []
+    },
+    "specs": {
+      "syncEnabled": {
+        "type": "boolean",
+        "default": false
+      },
+      "syncPromptOnConnect": {
+        "type": "boolean",
+        "default": true
+      },
+      "syncDeletePolicy": {
+        "type": "enum",
+        "default": "guarded",
+        "presets": [
+          "guarded",
+          "add-only",
+          "auto-replace"
+        ]
+      },
+      "syncHashMode": {
+        "type": "enum",
+        "default": "cached",
+        "presets": [
+          "cached",
+          "rehash"
+        ]
+      },
+      "syncErrorBudget": {
+        "type": "enum",
+        "default": 3,
+        "presets": [
+          1,
+          3,
+          5,
+          10
+        ]
+      },
+      "syncSizeWarnPct": {
+        "type": "enum",
+        "default": 30,
+        "presets": [
+          0,
+          15,
+          30,
+          50
+        ]
+      },
+      "syncChapterPatterns": {
+        "type": "patterns",
+        "default": ""
+      },
+      "syncDiagnosticLog": {
+        "type": "boolean",
+        "default": true
+      }
+    },
+    "config": {
+      "version": 5,
+      "adbPath": null,
+      "targets": [
+        {
+          "id": "tf50fe92999",
+          "deletePolicy": "guarded",
+          "excludes": [
+            {
+              "pcFolder": "Blue Lock"
+            }
+          ],
+          "aliases": [
+            {
+              "pcFolder": "Tonikaku Kawaii",
+              "deviceFolder": "Fly Me to the Moon"
+            }
+          ],
+          "ignoredSuggestions": [],
+          "acknowledged": [],
+          "name": "Galaxy Tab S9",
+          "kind": "adb",
+          "serial": "R5CW71ABCDE",
+          "root": "/sdcard/Komikku/local",
+          "profile": "komikku"
+        },
+        {
+          "id": "t8e8c81b2a2",
+          "deletePolicy": "guarded",
+          "excludes": [],
+          "aliases": [],
+          "ignoredSuggestions": [],
+          "acknowledged": [],
+          "name": "Komikku folder",
+          "kind": "folder",
+          "root": "D:\\Sync-fixture\\Komikku\\local",
+          "profile": "everything"
+        },
+        {
+          "id": "t5e03b218ae",
+          "deletePolicy": "guarded",
+          "excludes": [],
+          "aliases": [],
+          "ignoredSuggestions": [],
+          "acknowledged": [],
+          "name": "Pixel 7",
+          "kind": "adb",
+          "serial": "2A161FDH200ABC",
+          "root": "/storage/emulated/0/Mihon/local",
+          "profile": "custom",
+          "formats": [
+            "cbz",
+            "pdf"
+          ],
+          "sidecars": [
+            "cover.jpg"
+          ],
+          "nomedia": false,
+          "namingPolicy": "title"
+        }
+      ]
+    },
+    "adb": {
+      "binary": "C:\\platform-tools\\adb.exe",
+      "serverVersion": 41,
+      "error": null,
+      "candidates": [
+        {
+          "path": "C:\\platform-tools\\adb.exe",
+          "source": "configured",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "35.0.2-12147458"
+        },
+        {
+          "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+          "source": "LOCALAPPDATA",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "34.0.5-10900879"
+        }
+      ],
+      "tracking": "tracking",
+      "trackingError": null,
+      "at": 1793121385232
+    },
+    "devices": [
+      {
+        "serial": "R5CW71ABCDE",
+        "state": "device",
+        "stateKind": "device",
+        "model": "SM_X710",
+        "product": "gts9wifi",
+        "transportId": 1,
+        "targetable": true
+      },
+      {
+        "serial": "RZ8N40XYZ12",
+        "state": "unauthorized",
+        "stateKind": "unauthorized",
+        "model": null,
+        "product": null,
+        "transportId": 2,
+        "targetable": true
+      }
+    ],
+    "folderPresence": {
+      "t8e8c81b2a2": true
+    },
+    "job": {
+      "job": {
+        "runId": 1,
+        "phase": "plan",
+        "targetId": "tf50fe92999",
+        "serial": "R5CW71ABCDE",
+        "auto": true,
+        "state": "running",
+        "startedAt": 1793121385248,
+        "finishedAt": null,
+        "progress": {
+          "bytesDone": 0,
+          "bytesTotal": 0,
+          "filesDone": 0,
+          "filesTotal": 0,
+          "current": null,
+          "preflight": null,
+          "step": "probe",
+          "at": 1793121385250
+        },
+        "status": null,
+        "summary": null
+      },
+      "queue": [
+        {
+          "targetId": "t8e8c81b2a2",
+          "serial": null,
+          "queuedAt": 1793121385260,
+          "kind": "plan"
+        }
+      ]
+    },
+    "plans": {
+      "tf50fe92999": {
+        "summary": null,
+        "refusal": null,
+        "stale": true,
+        "updating": true,
+        "links": [],
+        "lastRun": null,
+        "gen": null,
+        "selSeq": null,
+        "lastPlan": null
+      },
+      "t8e8c81b2a2": {
+        "summary": null,
+        "refusal": null,
+        "stale": false,
+        "updating": false,
+        "links": [],
+        "lastRun": null,
+        "gen": null,
+        "selSeq": null,
+        "lastPlan": null
+      },
+      "t5e03b218ae": {
+        "summary": null,
+        "refusal": null,
+        "stale": false,
+        "updating": false,
+        "links": [],
+        "lastRun": null,
+        "gen": null,
+        "selSeq": null,
+        "lastPlan": null
+      }
+    },
+    "prompt": null,
+    "prompts": [],
+    "pending": [
+      {
+        "promptId": "p1-1793121385248",
+        "connKey": "R5CW71ABCDE#1",
+        "serial": "R5CW71ABCDE",
+        "targetIds": [
+          "tf50fe92999"
+        ],
+        "since": 1793121385248
+      },
+      {
+        "promptId": "p2-1793121385260",
+        "connKey": "folder:t8e8c81b2a2",
+        "serial": null,
+        "targetIds": [
+          "t8e8c81b2a2"
+        ],
+        "since": 1793121385260
+      }
+    ],
+    "find": null,
+    "prewarm": {
+      "state": "idle",
+      "done": 0,
+      "total": 0,
+      "bytesDone": 0,
+      "bytesTotal": 0,
+      "at": null
+    },
+    "logDir": "D:\\Sync-fixture\\ud\\sync\\logs"
+  }
+}

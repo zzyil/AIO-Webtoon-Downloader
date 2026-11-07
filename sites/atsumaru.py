@@ -1,9 +1,71 @@
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus, urljoin, urlparse
 
 from .base import BaseSiteHandler, GroupInfo, SearchHit, SiteComicContext
+
+
+# Anything that is neither a word character nor whitespace, plus "_" (which \w
+# admits). Replaced by a SPACE, so "Level-Up" splits into two words the way
+# atsu.moe's own variant generator splits it. Combining marks (Thai vowel signs)
+# are not \w either, which matches the generator dropping them.
+_NAME_PUNCT_RE = re.compile(r"[^\w\s]|_")
+
+
+def _name_words(name: str) -> List[str]:
+    return _NAME_PUNCT_RE.sub(" ", name.lower()).split()
+
+
+def _drop_generated_name_variants(names: List[str]) -> List[str]:
+    """Remove the search-index variants atsu.moe mixes into `otherNames`.
+
+    WHY: the site's search document carries, beside the real alternate titles,
+    machine-made spellings for its own typo tolerance — every name with its
+    spaces removed ('acertainscientificrailgun') and every name with ONE pair of
+    adjacent words fused ('a certainscientific railgun'), the latter often cut
+    off after the first few words. Two different series that open with the same
+    words therefore share identical junk: the main "A Certain Scientific
+    Railgun" and its spin-off "...Railgun: Astral Buddy" both carry
+    'acertain scientific railgun'. The cross-site merge in
+    sites/search_orchestrator.py (grep `_union(`) joins any two hits sharing a
+    title key, so that junk welded the spin-off into the main series' candidate
+    and mangahub's spin-off entry was offered as the main series.
+
+    RULE: a name is generated junk when it is entirely lowercase AND its words,
+    run together, equal a run of CONSECUTIVE words from another name that has
+    MORE words. The generator only ever removes spaces, so a variant always has
+    fewer words than its source; requiring strictly more words is also what
+    stops two spellings eliminating each other.
+
+    Kept on purpose: anything with a capital letter (every real Latin-script
+    name atsu.moe lists is capitalised), and the lowercase copy of the title
+    that the site puts first (same word count as its source, so not junk). The
+    accepted loss is a REAL alternate title that is all-lowercase and is also a
+    respacing of a longer name — for matching it is the same string as the name
+    it was derived from, which stays.
+    """
+    if not names:
+        return names
+    longest_run: Dict[str, int] = {}
+    for name in names:
+        words = _name_words(name)
+        for i in range(len(words)):
+            joined = ""
+            for j in range(i, len(words)):
+                joined += words[j]
+                n = j - i + 1
+                if n > longest_run.get(joined, 0):
+                    longest_run[joined] = n
+    kept: List[str] = []
+    for name in names:
+        if name == name.lower():
+            words = _name_words(name)
+            if words and longest_run.get("".join(words), 0) > len(words):
+                continue
+        kept.append(name)
+    return kept
 
 
 class AtsumaruSiteHandler(BaseSiteHandler):
@@ -11,20 +73,25 @@ class AtsumaruSiteHandler(BaseSiteHandler):
     domains = ("atsu.moe", "www.atsu.moe")
 
     _BASE_URL = "https://atsu.moe"
+    # Every `/static/...` asset (chapter pages, posters) is served from this
+    # host, NOT _BASE_URL. Since 2026-10 atsu.moe itself answers `410 Gone` for
+    # /static/pages/*, for old and new chapters alike. The API still returns
+    # host-less `/static/...` paths, and the site's own client hardcodes this
+    # host (the `staticImages-<hash>.js` chunk), so a constant here mirrors the
+    # site exactly. If pages start failing again, open a chapter in a browser and
+    # compare `document.images[*].src` with this value.
+    _STATIC_URL = "https://cdn.atsu.moe"
     _SEARCH_URL = "/collections/manga/documents/search"
 
-    # Probe atsumaru's 8 breadth-sample chapters in ONE wave, not 2. Each sample
-    # is a full-res color WebP CDN download (atsu.moe is WebP-native), so at the
-    # base width of 4 the 8-chapter image-quality probe needs 2 waves and
-    # routinely blew PROBE_SOURCE_BUDGET_S, timing out half the samples and
-    # (pre-v5.2) scoring them 0.0 → a ~0.8 source read as ~0.10. atsu.moe is a
-    # plain JSON API + CDN and real downloads already run ~8-wide image workers,
-    # so 8 concurrent probe fetches is within its normal load. Combined with the
-    # v5.2 timeout-exclusion in base._probe_chapter_aggregate this keeps the
-    # probe measuring real quality; it does NOT (and is not meant to) drop the
-    # probe under the 30s slow_probe threshold — atsumaru stays honestly flagged
-    # "slow" in the search-health system (user decision). Grep
-    # PROBE_BREADTH_CONCURRENCY.
+    # Fetch a match window's pages 8 at a time, not the base 4. Each page is a
+    # full-res color WebP CDN download (atsu.moe is WebP-native) and slow per
+    # request; at width 4 the old 8-chapter probe needed 2 waves and routinely
+    # blew PROBE_SOURCE_BUDGET_S. atsu.moe is a plain JSON API + CDN and real
+    # downloads already run ~8-wide image workers, so 8 concurrent probe
+    # fetches is within its normal load. It does NOT (and is not meant to) drop
+    # the probe under the 30s slow_probe threshold — atsumaru stays honestly
+    # flagged "slow" in the search-health system (user decision). Grep
+    # PROBE_BREADTH_CONCURRENCY (read by BaseSiteHandler.match_fetch_window).
     PROBE_BREADTH_CONCURRENCY = 8
 
     def __init__(self) -> None:
@@ -59,7 +126,7 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             poster = poster.lstrip("/")
             if poster.startswith("static/"):
                 poster = poster[len("static/") :]
-            return f"{self._BASE_URL}/static/{poster}"
+            return f"{self._STATIC_URL}/static/{poster}"
         return None
 
     def _parse_people(self, entries: Optional[List[Dict]]) -> List[str]:
@@ -376,7 +443,9 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             image = page.get("image")
             if not image:
                 continue
-            images.append(urljoin(self._BASE_URL, image))
+            # urljoin keeps an absolute URL as-is, so a future API that returns
+            # full CDN URLs still works.
+            images.append(urljoin(self._STATIC_URL, image))
         if not images:
             raise RuntimeError("No images returned for Atsumaru chapter.")
         return images
@@ -420,6 +489,12 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             for value in (doc.get("title"), *(doc.get("otherNames") or [])):
                 if isinstance(value, str) and value.strip() and value.strip() != title:
                     alt_titles.append(value.strip())
+            # The title joins the witness set (it is where most variants come
+            # from) but is never itself a removal candidate.
+            alt_titles = [
+                n for n in _drop_generated_name_variants([title, *alt_titles])
+                if n != title
+            ]
             cover = self._parse_cover(doc)
             chapter_count = doc.get("chaptersCount") or doc.get("chapterCount")
             if not isinstance(chapter_count, int):

@@ -636,20 +636,25 @@ def test_decode_drop_withholds_the_chapter_instead_of_shipping_it_short():
 def test_decode_drop_reaches_alt_sources_but_not_the_inline_retry():
     """Placement in the strict wrapper's ladder IS the fix.
 
-    _PERMANENT_SKIP_REASONS is checked AFTER the alt-source loop and BEFORE the
-    inline retry, which is exactly right here: an alternate source serving a
-    format this build can read is the only real rescue, while re-downloading the
-    same bytes cannot make a codec appear (two long waits of pure cost), and the
-    failure is environmental so it must not abort the run.
+    _PERMANENT_SKIP_REASONS bars the inline retries (re-downloading the same
+    bytes cannot make a codec appear: two long waits of pure cost), yet the
+    chapter still reaches the alt-source rescue (an alternate source serving a
+    format this build can read is the only real rescue), and only after that
+    does it skip — the failure is environmental, so it must not abort the run.
+    Since 2026-10-27 the primary's retries run FIRST (plan
+    sync-temp/plans/multisource-offset.md D1), so the bar sits in the retry
+    loop's guard (`_no_retry`) rather than in front of a retry block.
     """
     assert "decode_dropped_pages" in aio._PERMANENT_SKIP_REASONS
 
     strict = inspect.getsource(aio.main)
-    i_alt = strict.index("# Phase 4b: try alternative sources before the inline-retry sleep.")
-    i_perm = strict.index("if primary_err.reason in _PERMANENT_SKIP_REASONS:")
-    i_inline = strict.index("for retry_attempt in range(max_retries):")
-    assert i_alt < i_perm < i_inline, (
-        "permanent-skip must sit between the alt loop and the inline retry"
+    i_bar = strict.index("or err.reason in _PERMANENT_SKIP_REASONS)")
+    i_retry = strict.index("while not _no_retry(last_err)")
+    # The alternatives step is the content-proven rescue search (grep _rescue_search).
+    i_alt = strict.index("rescued, rescue_notes = _rescue_search(")
+    i_perm = strict.index("if last_err.reason in _PERMANENT_SKIP_REASONS:")
+    assert i_bar < i_retry < i_alt < i_perm, (
+        "a permanent reason must skip the retries, reach the alt rescue, then skip"
     )
 
 

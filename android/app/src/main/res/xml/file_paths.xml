@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The roots the FileProvider (declared in AndroidManifest.xml, authority
+  `${applicationId}.files`) may mint content:// URIs inside. Its only consumers
+  are the "open with" handoffs on the series detail screen — grep `openBook` in
+  ui/screens/SeriesDetailScreen.kt.
+
+  DECLARATION ORDER IS NOT PRECEDENCE. FileProvider keeps its roots in a
+  HashMap and picks the LONGEST matching prefix
+  (SimplePathStrategy.getUriForFile), so the app-scoped entry always wins for a
+  file under it even though the volumes entry below also contains it. The order
+  here is for a reader, not for the resolver.
+
+  1. external-files-path `manga/` — Context.getExternalFilesDir(null)/manga,
+     which is Aio.defaultLibraryDir (grep `defaultLibraryDir` in core/Aio.kt).
+     The no-permission default, and still the tightest declaration.
+
+  2. root-path `/storage/` — every mounted volume: primary shared storage
+     (/storage/emulated/0/…) and removable ones (/storage/XXXX-XXXX/…).
+     M7 made the library root USER-CHOSEN (AppSettings.libraryPath, resolved by
+     Aio.resolveLibraryDir), and a library moved to shared storage — the whole
+     point of the MANAGE_EXTERNAL_STORAGE opt-in, since Komikku and Mihon
+     cannot see inside an app-scoped directory — sits outside every scoped
+     `*-path` element. Without this entry getUriForFile throws
+     IllegalArgumentException and EVERY "open with" fails, for exactly the
+     audience that storage flow courts.
+
+     `/storage/` rather than <external-path> (which is only
+     Environment.getExternalStorageDirectory(), i.e. the primary volume)
+     because the Settings path field is free text and the writability verdict
+     comes from aio_android.probe_library_root actually writing a file — so an
+     SD-card root is reachable and would otherwise reproduce the same bug.
+     It is NOT path="/": /data, /system and the app's own internal filesDir
+     stay unnameable.
+
+  WHAT THIS WIDENS, STATED HONESTLY. The previous scoping argument was that
+  everything else under getExternalFilesDir is ours alone — the browser
+  profiles holding a solved Cloudflare clearance, the vrf token cache,
+  run_params.json — and that a provider path is a standing capability rather
+  than a per-file one. Root 2 contains those too (they live under
+  /storage/emulated/0/Android/data/<pkg>/files/…), and FileProvider has no
+  exclusion mechanism, so ANY declaration broad enough to reach a user-chosen
+  library root reaches them as well. That is acceptable because the capability
+  is not reachable from outside the app: the provider is exported="false" with
+  grantUriPermissions="true", so a URI exists only once OUR code mints one, for
+  a path the library scan produced, handed out with a one-shot
+  FLAG_GRANT_READ_URI_PERMISSION on a single Intent. This widens what we CAN
+  name; it does not widen what anyone else can ask for.
+-->
+<paths>
+    <external-files-path name="library" path="manga/" />
+    <root-path name="volumes" path="/storage/" />
+</paths>

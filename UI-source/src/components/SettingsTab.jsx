@@ -6,7 +6,7 @@ import {
   Save, RotateCcw, FolderOpen, FileText, Package, Terminal, RefreshCw,
   Check, AlertTriangle, Gauge, Cpu, Network, Lock, X,
   // Category-nav icons (2026-07-05 two-pane redesign) — one per CATEGORIES group.
-  Settings, Image as ImageIcon, Tags, Search, Library,
+  Settings, Image as ImageIcon, Tags, Search, Library, FolderSync,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
@@ -17,6 +17,12 @@ import {
   NETWORK_LEVELS, CPU_LEVELS, isNetworkManaged, networkEffective,
   networkPreviewText, cpuPreviewText, levelLabel,
 } from "@/lib/resourceLimits";
+// Device Sync's eight global keys (owner: electron/sync/sync-settings.js;
+// drift guard: tools/_test_device_sync_settings_twin.js).
+import { SYNC_DEFAULTS } from "@/lib/syncSettings";
+// Settings → Sync's sections (draft keys + immediate config-op sections).
+import { syncSettingsSections, useConfigOps } from "@/components/sync/SyncSettings";
+import { Dialog } from "@/components/ui/overlay";
 
 // Default values for settings.searchOpts. Mirrors DEFAULT_OPTS in
 // SearchTab.jsx. Both surfaces (Settings + Search) read/write this
@@ -34,11 +40,6 @@ const DEFAULT_SEARCH_OPTS = {
   searchTimeout: 20,
   searchMinMatch: 0.55,
   searchParallelism: 6,
-  // Mirror of SearchTab.jsx DEFAULT_OPTS.enableMlRating. The UI control is
-  // in SearchTab's "Advanced search options" Collapsible (not surfaced here)
-  // so the shared settings.searchOpts namespace stays schema-aligned across
-  // both surfaces. See SearchTab.jsx for the WMI-hang rationale.
-  enableMlRating: false,
 };
 
 // ── IntInput ──
@@ -163,7 +164,9 @@ const DEV_DEFAULTS = {
 // The comments below are the field-level rationale that used to live inline in
 // the useState initializer — preserved because they're load-bearing for the
 // next reader (quality=100 fast-path, collapseSplits opt-in, etc.).
-const DEFAULT_SETTINGS = {
+// Exported only for the DEV gallery (src/dev/SyncGallery.jsx), which seeds
+// its frames' saved settings with it so the Save button reads "0 changed".
+export const DEFAULT_SETTINGS = {
   pythonCmd: DEV_DEFAULTS.pythonCmd,
   scriptPath: DEV_DEFAULTS.scriptPath,
   workingDir: DEV_DEFAULTS.workingDir,
@@ -190,14 +193,18 @@ const DEFAULT_SETTINGS = {
   // Clamped [0, 60] in electron/updater.js (_clampDelayDays — keep the
   // IntInput bounds below in sync with MAX_DELAY_DAYS there).
   appUpdateDelayDays: 5,
+  // Device Sync (syncEnabled, syncDeletePolicy, …). Top-level like
+  // appAutoUpdate; main.js get-settings resolves the saved values the same
+  // way (syncSettingsForRenderer), so a first launch shows no phantom changes.
+  ...SYNC_DEFAULTS,
   // Global chapter-collapse toggle. Affects:
   //   - Search-display "X main / Y entries" diagnostic counts.
   //   - Actual download behavior — split clusters (e.g. 1.1/1.2/1.3/1.4)
   //     merge into one combined chapter file; redundant duplicate uploads
   //     of the same chapter are pruned. See sites/chapter_merger.py
   //     :group_chapters_for_download for the full 6-rule cluster table.
-  // Persisted as settings.collapseSplits; useDownloader.queueDownload and
-  // .runSearch inject this into args/opts before IPC.
+  // Persisted as settings.collapseSplits; lib/queueRecipe.js globalArgs and
+  // hooks/useSearch.js runSearch inject this into args/opts before IPC.
   // Default OFF (opt-in, documented 2026-05-27) to MATCH the spawn sites,
   // which all read `settings.collapseSplits === true` (absent → OFF): with a
   // `true` default here the toggle showed ON while downloads ran OFF until the
@@ -271,7 +278,7 @@ const DEFAULT_SETTINGS = {
   // electronAPI.startDownload, so it's a true app-wide preference rather
   // than a per-download form value. Defaults match the Python argparse
   // defaults so a Save with the section untouched is a no-op for the
-  // spawn line. Python side: aio-dl.py near --enable-ml-rating (flag
+  // spawn line. Python side: aio-dl.py's "--metadata-source" (flag
   // registration) + sites/external_metadata.py (the AniList GraphQL
   // client). Grep cross-file: metadataSource, metadata-source.
   metadataSource: "none",
@@ -281,8 +288,8 @@ const DEFAULT_SETTINGS = {
   // Handler names the user opted out of (Settings → Search → "Search Sources"
   // or the SearchTab slow-sites callout). Excluded from the search fan-out/probe
   // AND multi-source download alternatives. Persisted top-level (mirrors
-  // collapseSplits). useDownloader injects it into runSearch (→ --disable-sites)
-  // and queueDownload (→ --disable-sites). IMMEDIATE-PERSIST from the Settings
+  // collapseSplits). hooks/useSearch.js runSearch and lib/queueRecipe.js
+  // globalArgs inject it (→ --disable-sites). IMMEDIATE-PERSIST from the Settings
   // section (writes via onSave, not the Save button) — so it's in SKIP_TOP of
   // countDirtySettings (never a dirty-badge count) and the hydration effect is
   // diff-aware so an immediate write can't clobber unsaved draft edits.
@@ -355,16 +362,16 @@ const DEFAULT_SETTINGS = {
     // --no-final-file and writes per-chapter ComicInfo.xml + cover.jpg
     // + details.json at <out>/manga/<Series>/. The format selector
     // above is effectively ignored when this is on (Python prints a
-    // [Komikku] coercion notice in the log). DownloadTab's DEFAULT_FORM
-    // spread picks this up via the useEffect at line ~120-124; App.jsx's
-    // search/library wrappers spread it into queueDownload args.
+    // [Komikku] coercion notice in the log). The New tab shows it via
+    // lib/downloadForm.js:formDefaults; search/library/Sync downloads get
+    // it when they start (lib/queueRecipe.js spreads settings.defaults).
     komikku: false,
     // LINE Webtoon WebP recompression defaults (Phase 1, 2026-05-11).
     // When enabled here, BOTH the New tab AND search/library-initiated
-    // downloads inherit these knobs: the New tab's DEFAULT_FORM spread
-    // (DownloadTab.jsx:~110) and App.jsx's settings.defaults spread for
-    // the search/library onStartDownload wrappers (App.jsx:~155 and
-    // :~192) both pick this up. Master toggle is off by default so
+    // downloads inherit these knobs: the New tab via
+    // lib/downloadForm.js:formDefaults, and every queued download when it
+    // STARTS via lib/queueRecipe.js (so a save reaches waiting items too).
+    // Master toggle is off by default so
     // existing user flows are unchanged; toggling on in Settings makes
     // every new webtoons.com download recompress without per-job UI.
     // Silently no-ops for non-webtoons.com handlers (Python checks
@@ -434,7 +441,21 @@ const CATEGORIES = [
     desc: "Defaults for cross-site title search." },
   { id: "library", label: "Library", icon: Library,
     desc: "Update checks and how the library is scanned." },
+  // Last in the nav (approved Device Sync design, spec §4). Its sections
+  // come from components/sync/SyncSettings.jsx (grep syncSettingsSections).
+  { id: "sync", label: "Sync", icon: FolderSync,
+    desc: "Mirror your library to a tablet or a folder." },
 ];
+
+// Stand-in for the Device Sync hook when SettingsTab renders without one
+// (nothing mounts it that way today; keeps the Sync category inert rather
+// than crashing). Shape = useDeviceSync's INITIAL plus actions.
+const NO_SYNC = Object.freeze({
+  loaded: false, enabled: false, config: null, devices: [], folderPresence: {}, adb: null, job: null,
+  actions: new Proxy({}, { get: () => () => Promise.resolve({ ok: false, code: "disabled", message: "Device Sync isn't available" }) }),
+});
+// Sync job phases that write to a target (contract.js QUIT_ASK_PHASES).
+const SYNC_WRITING_PHASES = new Set(["apply", "prune", "rename"]);
 
 // ── Dirty diff for the Save Settings button ──
 // Compares the local in-memory settings draft against the most recently
@@ -656,7 +677,10 @@ function SaveSettingsButton({ dirty, onSave }) {
   );
 }
 
-export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, initialCategory }) {
+export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, initialCategory, sync: syncProp, libraryEntries, libraryLoading, loadLibrary }) {
+  // Device Sync (App.jsx mounts useDeviceSync once and passes it down).
+  const sync = syncProp || NO_SYNC;
+  const syncOps = useConfigOps(sync);
   // Local copy of settings so changes don't apply until you click Save
   // Local copy of settings so changes don't apply until you click Save.
   // Sourced from the module-level DEFAULT_SETTINGS (single source of truth,
@@ -910,8 +934,22 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
   // full, EACCES, etc.). Pre-change behavior dropped the promise; the
   // failure was an unhandled rejection. `await onSave(saveable)`
   // preserves the rejection so the button's try/catch sees it.
+  // Turning Device Sync off while a job writes to a target stops that job;
+  // ask first (plan decision 6). The dialog resolves the pending save:
+  // "Keep syncing" saves everything else with sync still on.
+  const [syncOffAsk, setSyncOffAsk] = useState(null); // {job, targetName, resolve}
   const handleSave = async () => {
     const { isPackaged, ...saveable } = local;
+    const job = sync.job;
+    if (settings?.syncEnabled && !local.syncEnabled && job && job.state === "running" && SYNC_WRITING_PHASES.has(job.phase)) {
+      const t = (sync.config?.targets || []).find((x) => x.id === job.targetId);
+      const stop = await new Promise((resolve) => setSyncOffAsk({ job, targetName: t ? t.name : "the target", resolve }));
+      setSyncOffAsk(null);
+      if (!stop) {
+        saveable.syncEnabled = true;
+        set("syncEnabled", true);
+      }
+    }
     await onSave(saveable);
   };
 
@@ -1481,7 +1519,15 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
           <span className="font-mono">details.json</span> (status, genres,
           authors). Forces format=CBZ, keep-chapters, no-final-file.
           Output stays at <span className="font-mono">manga/&lt;Series&gt;/</span>;
-          sync that into Komikku's storage root yourself.
+          copy that into Komikku's storage folder yourself, or turn on{" "}
+          <button
+            type="button"
+            onClick={() => setActiveCategory("sync")}
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            Settings → Sync
+          </button>
+          .
         </p>
       </div>
       <Switch
@@ -2446,7 +2492,11 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
 
   // ── Search › Search Options ──
   // Same settings.searchOpts namespace SearchTab reads/writes; the two surfaces
-  // stay in sync on every change.
+  // stay in sync on every change. "Collapse split chapters" is the top-level
+  // settings.collapseSplits (it shapes downloads too, so it isn't in
+  // searchOpts); SearchTab's inline toggle writes the same key. Device Sync's
+  // find-sources searches with exactly these saved values (electron/sync/
+  // find-sources.js _searchOptions) and links here instead of overriding them.
   const renderSearch = () => (
     <div className="grid grid-cols-2 gap-x-6 gap-y-3">
       <div>
@@ -2483,6 +2533,20 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
         <Switch
           checked={!!local.searchOpts?.multiSource}
           onCheckedChange={(v) => setSearchOpt("multiSource", v)}
+        />
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex-1">
+          <Label className="text-xs cursor-pointer">Collapse split chapters</Label>
+          <p className="text-[10px] text-muted-foreground mt-0.5">
+            Merge X.1/X.2/X.3 splits and drop fragment uploads, in search
+            counts and downloads
+          </p>
+        </div>
+        <Switch
+          // `=== true`: absent means off, like every spawn site reads it.
+          checked={local.collapseSplits === true}
+          onCheckedChange={(v) => set("collapseSplits", v)}
         />
       </div>
       {local.searchOpts?.multiSource && (
@@ -2785,6 +2849,10 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
     { group: "search",      title: "Search Options",                render: renderSearch },
     { group: "search",      title: "Search Sources",                render: renderSearchSources },
     { group: "library",     title: "Library & Update Checks",       render: renderLibrary },
+    ...syncSettingsSections({
+      local, set, settings, sync, ops: syncOps,
+      library: { entries: libraryEntries || [], loading: !!libraryLoading, load: loadLibrary },
+    }),
   ];
 
   const activeCat = CATEGORIES.find((c) => c.id === activeCategory) || CATEGORIES[0];
@@ -2885,6 +2953,29 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
           <RotateCcw className="w-4 h-4" />
         </Button>
       </div>
+
+      <Dialog
+        open={!!syncOffAsk}
+        onClose={() => syncOffAsk?.resolve(false)}
+        title="Turn off Device Sync?"
+        width={420}
+        footer={
+          <>
+            <Button variant="ghost" size="sm" onClick={() => syncOffAsk?.resolve(false)}>
+              Keep syncing
+            </Button>
+            <Button variant="destructive" size="sm" onClick={() => syncOffAsk?.resolve(true)}>
+              Stop and turn off
+            </Button>
+          </>
+        }
+      >
+        <p className="text-[13px]">
+          {syncOffAsk?.job?.phase === "apply" ? "Copying" : syncOffAsk?.job?.phase === "prune" ? "Removing folders" : "Renaming a folder"} on{" "}
+          <b className="font-semibold">{syncOffAsk?.targetName}</b> is still running. Turning sync off stops it; files already copied stay and count as synced.
+        </p>
+        <p className="mt-2 text-xs text-muted-foreground">Keep syncing saves your other changes and leaves Device Sync on.</p>
+      </Dialog>
     </div>
   );
 }

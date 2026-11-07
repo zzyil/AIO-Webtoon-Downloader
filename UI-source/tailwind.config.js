@@ -4,8 +4,12 @@ export default {
   // The Electron main process will add/remove this class based on Windows theme
   darkMode: "class",
 
-  // Tell Tailwind which files contain class names to scan
-  content: ["./index.html", "./src/**/*.{js,jsx,ts,tsx}"],
+  // Tell Tailwind which files contain class names to scan. relative: the
+  // globs resolve against THIS file's folder, not the process cwd. Without it
+  // a Vite started from another folder (tools/_e2e_launch.js's dev server
+  // runs in the harness process, cwd = repo root) matched nothing and served
+  // CSS with no utilities at all: an unstyled UI with 0x0 checkboxes.
+  content: { relative: true, files: ["./index.html", "./src/**/*.{js,jsx,ts,tsx}"] },
 
   theme: {
     extend: {
@@ -75,11 +79,17 @@ export default {
           "0%, 100%": { opacity: "1" },
           "50%": { opacity: "0.7" },
         },
+        // Dialogs and popovers appear without movement (Device Sync spec §6).
+        "fade-in": {
+          from: { opacity: "0" },
+          to: { opacity: "1" },
+        },
       },
       animation: {
         "slide-in": "slide-in-right 0.2s ease-out",
         "slide-up": "slide-up 0.15s ease-out",
         "pulse-subtle": "pulse-subtle 2s ease-in-out infinite",
+        "in-fade": "fade-in 120ms ease-out",
       },
     },
   },

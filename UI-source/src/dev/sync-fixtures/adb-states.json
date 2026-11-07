@@ -1,0 +1,135 @@
+{
+  "__aioSyncFixture": "adb-states.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": {
+    "tracking": {
+      "binary": "C:\\platform-tools\\adb.exe",
+      "serverVersion": 41,
+      "error": null,
+      "candidates": [
+        {
+          "path": "C:\\platform-tools\\adb.exe",
+          "source": "configured",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "35.0.2-12147458"
+        },
+        {
+          "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+          "source": "LOCALAPPDATA",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "34.0.5-10900879"
+        }
+      ],
+      "tracking": "tracking",
+      "trackingError": null,
+      "at": 1793121385232
+    },
+    "connecting": {
+      "binary": "C:\\platform-tools\\adb.exe",
+      "serverVersion": null,
+      "error": null,
+      "candidates": [
+        {
+          "path": "C:\\platform-tools\\adb.exe",
+          "source": "configured",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "35.0.2-12147458"
+        },
+        {
+          "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+          "source": "LOCALAPPDATA",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "34.0.5-10900879"
+        }
+      ],
+      "tracking": "connecting",
+      "trackingError": null,
+      "at": 1793121385232
+    },
+    "polling": {
+      "binary": "C:\\platform-tools\\adb.exe",
+      "serverVersion": 41,
+      "error": null,
+      "candidates": [
+        {
+          "path": "C:\\platform-tools\\adb.exe",
+          "source": "configured",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "35.0.2-12147458"
+        },
+        {
+          "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+          "source": "LOCALAPPDATA",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "34.0.5-10900879"
+        }
+      ],
+      "tracking": "polling",
+      "trackingError": null,
+      "at": 1793121385232
+    },
+    "stopped": {
+      "binary": "C:\\platform-tools\\adb.exe",
+      "serverVersion": 41,
+      "error": null,
+      "candidates": [
+        {
+          "path": "C:\\platform-tools\\adb.exe",
+          "source": "configured",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "35.0.2-12147458"
+        },
+        {
+          "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+          "source": "LOCALAPPDATA",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "34.0.5-10900879"
+        }
+      ],
+      "tracking": "stopped",
+      "trackingError": null,
+      "at": 1793121385232
+    },
+    "error": {
+      "binary": "C:\\platform-tools\\adb.exe",
+      "serverVersion": null,
+      "error": "C:\\platform-tools\\adb.exe exited with code 1",
+      "candidates": [
+        {
+          "path": "C:\\platform-tools\\adb.exe",
+          "source": "configured",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "35.0.2-12147458"
+        },
+        {
+          "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+          "source": "LOCALAPPDATA",
+          "ok": true,
+          "version": "1.0.41",
+          "build": "34.0.5-10900879"
+        }
+      ],
+      "tracking": "stopped",
+      "trackingError": "connect ECONNREFUSED 127.0.0.1:5037",
+      "at": 1793121385232
+    },
+    "missing": {
+      "binary": null,
+      "serverVersion": null,
+      "error": "no adb binary to start the server with",
+      "candidates": [],
+      "tracking": "stopped",
+      "trackingError": null,
+      "at": 1793121385232
+    }
+  }
+}

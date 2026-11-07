@@ -1,0 +1,26 @@
+{
+  "__aioSyncFixture": "locate-adb.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": {
+    "ok": true,
+    "candidates": [
+      {
+        "path": "C:\\platform-tools\\adb.exe",
+        "source": "configured",
+        "ok": true,
+        "version": "1.0.41",
+        "build": "35.0.2-12147458"
+      },
+      {
+        "path": "C:\\Users\\Reader\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+        "source": "LOCALAPPDATA",
+        "ok": true,
+        "version": "1.0.41",
+        "build": "34.0.5-10900879"
+      }
+    ],
+    "resolved": "C:\\platform-tools\\adb.exe",
+    "serverVersion": 41,
+    "error": null
+  }
+}

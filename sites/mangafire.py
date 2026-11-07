@@ -10,7 +10,7 @@ import time
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from .base import BaseSiteHandler, SearchHit, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteBusyError, SiteComicContext
 # _CURL_CFFI_AVAILABLE gates SUPPORTS_FAST_DOWNLOAD (curl_cffi async image path
 # lives on BaseSiteHandler.fast_download_images). Re-exported for back-compat
 # with anything that grepped this symbol on mangafire.py historically.
@@ -57,6 +57,15 @@ from . import mangafire_vrf
 #                     &page=N&limit=100                       -> {items[], meta{}}
 #                 (limit caps at 100 server-side; paginate on meta.hasNext)
 #   chapter pages /api/chapters/{chapterId}                  -> {data:{pages:[{url,…}]}}
+#   volume list   /api/titles/{hid}/volumes                  -> {items:[{id,number,name,language,chapterCount}]}
+#                 (unpaginated, and returns EVERY language whatever `language`
+#                 says, so get_volumes filters client-side; checked 2026-11-06)
+#   volume pages  /api/volumes/{volumeId}                    -> {data:{pages:[{url,…}]}}
+#                 (volume ids and chapter ids are separate id spaces:
+#                 /api/chapters/{volumeId} 404s or names another item)
+#   detail.hasVolumes says whether a title has any volume releases at all.
+#   Volume reader URLs are /title/{hid}-{slug}/volume/{volumeId}; _extract_hid
+#   already reads the hid from them (it stops at the first '-').
 #
 # ID model: the URL-facing id is the short base-36 `hid` (e.g. "dkw", "0w5k").
 # The API only accepts hid (numeric `id` 404s). Old library URLs of the form
@@ -73,7 +82,7 @@ from . import mangafire_vrf
 
 # All bare print() calls in this module emit to stderr by default. Why: this
 # handler logs progress/diagnostics via plain print(); when called from the
-# orchestrator's search-time probe (sites/search_orchestrator.py:_probe_one),
+# orchestrator's search-time probe (sites/match_session.py),
 # that chatter would otherwise land in stdout — which carries the JSON --search
 # output for piped consumers. Explicit file=sys.stdout still opts out.
 def _stderr_print(*args, **kwargs):
@@ -244,6 +253,21 @@ class MangaFireSiteHandler(BaseSiteHandler):
         if "." in path:
             return path.split(".")[-1].split("/")[0]
         return ""
+
+    @staticmethod
+    def _busy(exc: Optional[Exception]) -> SiteBusyError:
+        """search()'s contention outcome. Raised rather than returned as [] so
+        the orchestrator can tell "another AIO process had the browser" from "no
+        matches" and from "site down" — the first must neither strike the site
+        nor count toward recommending it be disabled (see SiteBusyError).
+        Raising does not reach the ProbeFailureCache: _run_one catches this type
+        before its generic failure branch."""
+        detail = f": {exc}" if exc else ""
+        return SiteBusyError(
+            "MangaFire skipped — another AIO process was using its browser and "
+            f"the temporary-profile fallback did not get through{detail}",
+            reason="profile_busy",
+        )
 
     def _warn_signing_unavailable_once(self, exc: Exception) -> None:
         """One warning per process. Search fan-out probes several candidates and
@@ -466,6 +490,11 @@ class MangaFireSiteHandler(BaseSiteHandler):
             "url": canonical_url,
             # Stashed for get_chapters + any downstream language selection.
             "_languages": languages,
+            # Read by has_volumes / get_volumes so a title without volumes
+            # costs no volume request. None when the detail omits the field.
+            "_has_volumes": (
+                bool(payload["hasVolumes"]) if "hasVolumes" in payload else None
+            ),
         }
         if year is not None:
             comic["year"] = year
@@ -559,6 +588,64 @@ class MangaFireSiteHandler(BaseSiteHandler):
             if isinstance(p, dict) and isinstance(p.get("url"), str) and p.get("url")
         ]
 
+    # ----------------------------- volumes -----------------------------
+    # Native volume releases. Callers go through BaseSiteHandler.list_volumes /
+    # get_item_images, never these two directly (see the contract in
+    # sites/base.py, grep _ITEM_KIND_VOLUME).
+
+    def has_volumes(self, context: SiteComicContext) -> Optional[bool]:
+        return (context.comic or {}).get("_has_volumes")
+
+    def get_volumes(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
+        hid = context.identifier
+        if not hid or self.has_volumes(context) is False:
+            return []
+        slug = (context.comic or {}).get("slug") or ""
+        lang = (language or "en").strip().lower() or "en"
+        data = self._api_get(
+            f"/titles/{hid}/volumes", [], scraper, make_request, label="volumes"
+        )
+        items = data.get("items") if isinstance(data, dict) else None
+        volumes: List[Dict] = []
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict) or it.get("id") is None or it.get("number") is None:
+                continue
+            # The endpoint ignores `language`, so filter here. An item with no
+            # language field is kept: dropping it would hide a real release.
+            item_lang = str(it.get("language") or "").strip().lower()
+            if item_lang and item_lang != lang:
+                continue
+            vid = it.get("id")
+            num = self._fmt_num(it.get("number"))
+            volumes.append(
+                {
+                    "hid": str(vid),  # volume id → get_volume_images
+                    "chap": num,
+                    "title": (it.get("name") or "").strip() or f"Volume {num}",
+                    "url": f"{self._BASE_URL}/title/{hid}-{slug}/volume/{vid}",
+                    "chapter_count": it.get("chapterCount"),
+                }
+            )
+        volumes.sort(key=lambda v: self._num_sort_key(v["chap"]))
+        return volumes
+
+    def get_volume_images(self, volume: Dict, scraper, make_request) -> List[str]:
+        vid = volume.get("hid")
+        if not vid:
+            print("[!] Volume missing id; cannot fetch images.")
+            return []
+        data = self._api_get(
+            f"/volumes/{vid}", [], scraper, make_request, label=f"volume pages {vid}"
+        )
+        payload = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            return []
+        return [
+            p["url"]
+            for p in payload.get("pages") or []
+            if isinstance(p, dict) and isinstance(p.get("url"), str) and p.get("url")
+        ]
+
     # ----------------------------- search -----------------------------
 
     def search(
@@ -586,6 +673,11 @@ class MangaFireSiteHandler(BaseSiteHandler):
         # deliberate override of base.py:search's "let errors propagate" rule
         # that sites/comix.py:search makes, for the same reason. Genuine HTTP
         # errors from make_request still propagate.
+        #
+        # The one exception raised ON PURPOSE is SiteBusyError, when another AIO
+        # process held the browser profile (mangafire_vrf.profile_contended):
+        # the orchestrator catches that type before its ProbeFailureCache
+        # branch, so it costs no blocklist strike.
         try:
             data = self._api_get(
                 "/titles",
@@ -595,8 +687,15 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 label="search",
             )
         except mangafire_vrf.MangaFireSigningError as e:
+            if mangafire_vrf.profile_contended():
+                raise self._busy(e) from e
             self._warn_signing_unavailable_once(e)
             return []
+        if data is None and mangafire_vrf.profile_contended():
+            # Signed fine, but the read failed — on a temporary profile that is
+            # typically a Cloudflare check only the shared profile's saved
+            # session passes. Still contention, not the site.
+            raise self._busy(None)
         items = data.get("items") if isinstance(data, dict) else None
         if not isinstance(items, list) or not items:
             return []

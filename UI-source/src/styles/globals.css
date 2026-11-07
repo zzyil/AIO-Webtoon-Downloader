@@ -44,6 +44,11 @@
     --success: 142 60% 40%;
     --warning: 38 92% 50%;
     --info: 200 80% 50%;
+
+    /* Device Sync (approved design spec §2, sync-temp/design/approved/spec.md):
+       the 1px inset edge on `warn` chapter-strip segments only. Light
+       --warning on white is 2.14:1; with the edge the segment reaches 4.51:1. */
+    --warn-edge: 32 95% 36%;
   }
 
   /* ── Dark mode ── */
@@ -73,6 +78,8 @@
     --success: 142 55% 48%;
     --warning: 38 92% 55%;
     --info: 200 75% 55%;
+
+    --warn-edge: 38 92% 55%; /* = --warning: dark already has the contrast */
   }
 
   /* ── Base element styles ── */
@@ -148,6 +155,70 @@
     background: hsl(var(--card) / 0.8);
     backdrop-filter: blur(12px);
     border: 1px solid hsl(var(--border) / 0.5);
+  }
+
+  /* Warning / info as TEXT. The raw --warning / --info tokens are too light
+     for text on white (spec §2), so light theme darkens them; dark theme
+     uses the tokens as-is. Used by Badge token-warning / token-info and by
+     Device Sync's callouts. Not new colour tokens: shades of the existing ones. */
+  .text-warn-fg { color: hsl(32 90% 34%); }
+  .dark .text-warn-fg { color: hsl(var(--warning)); }
+  .text-info-fg { color: hsl(200 85% 34%); }
+  .dark .text-info-fg { color: hsl(var(--info)); }
+
+  /* ── Device Sync: Chapter Strip segments and the capacity gauge ──
+     Colours and contrast are spec §2 (sync-temp/design/approved/spec.md);
+     consumers: components/sync/ChapterStrip.jsx, CapacityGauge.jsx. Plain
+     CSS rather than Tailwind arbitrary values because the hatches are
+     repeating gradients. `--fill` on a push segment is the transfer lane
+     (spec §6): the part already copied this run, drawn as synced. */
+  /* No height here: strip segments fill the strip by flex stretch, and a
+     height in this (utilities) layer out-ranked the h-* on legend / group
+     swatches that reuse .sync-seg, collapsing them to nothing. */
+  .sync-seg { min-width: 1px; }
+  .sync-seg-synced { background: hsl(var(--success)); }
+  .sync-seg-push {
+    background: linear-gradient(90deg, hsl(var(--success)) 0 var(--fill, 0%), hsl(var(--primary)) var(--fill, 0%));
+  }
+  .sync-seg-warn { background: hsl(var(--warning)); box-shadow: inset 0 0 0 1px hsl(var(--warn-edge)); }
+  .sync-seg-delete { background: hsl(var(--destructive)); min-width: 3px; }
+  .sync-seg-absent { background: transparent; box-shadow: inset 0 0 0 1px hsl(var(--muted-foreground) / 0.85); }
+  .sync-seg-other {
+    background: repeating-linear-gradient(135deg, hsl(var(--muted-foreground) / 0.45) 0 2px, transparent 2px 4px);
+    box-shadow: inset 0 0 0 1px hsl(var(--muted-foreground) / 0.3);
+  }
+  .sync-gauge-ghost {
+    background: repeating-linear-gradient(135deg, hsl(var(--primary) / 0.85) 0 3px, hsl(var(--primary) / 0.45) 3px 6px);
+  }
+  /* Space the run holds only mid-run (CapacityGauge: lowest below after). */
+  .sync-gauge-dip {
+    background: repeating-linear-gradient(135deg, hsl(var(--primary) / 0.35) 0 3px, transparent 3px 6px);
+  }
+  .sync-gauge-reserve {
+    background: repeating-linear-gradient(135deg, hsl(var(--destructive) / 0.35) 0 2px, transparent 2px 4px);
+  }
+  /* The one orchestrated motion (spec §6): when a NEW plan lands, rows rise
+     and strips sweep in, staggered by --d. SyncTab sets an `animating` flag
+     for ANIM_MS when the plan gen changes while it is mounted (grep ANIM_MS);
+     rows are keyed by seriesKey, so a filter or selection change outside
+     that window never replays it. */
+  .sync-row-in { animation: sync-row-in 320ms ease-out both; animation-delay: var(--d, 0ms); }
+  .sync-strip-in { animation: sync-strip-in 600ms cubic-bezier(0.2, 0.7, 0.2, 1) both; animation-delay: var(--d, 0ms); }
+  @keyframes sync-row-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes sync-strip-in {
+    from { clip-path: inset(0 100% 0 0); }
+    to { clip-path: inset(0); }
+  }
+  .sync-pulse { animation: sync-pulse 1.6s ease-out infinite; }
+  @keyframes sync-pulse {
+    0% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0.55); }
+    100% { box-shadow: 0 0 0 6px hsl(var(--primary) / 0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sync-row-in, .sync-strip-in, .sync-pulse { animation: none; }
   }
 
   /* The log panel monospace text style */

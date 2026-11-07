@@ -106,8 +106,8 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         mechanism was not. "Don't interrupt a human" is a property of the CALL
         CONTEXT, and encoding it as "one method doesn't call this helper" left
         the other ~6 doors open — the image-quality probe calls
-        fetch_comic_context / get_chapters / get_chapter_images (grep
-        sites/base.py:_probe_chapter_aggregate), so a search reached an
+        fetch_comic_context / get_chapters / get_chapter_images (then from
+        sites/base.py, now sites/match_session.py), so a search reached an
         interactive solve anyway, a few seconds later than it would have.
 
         That concern now lives where it belongs: crawlee_utils' opt-in

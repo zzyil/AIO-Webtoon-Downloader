@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  No `package` attribute — AGP 8 takes it from `namespace` in build.gradle.kts.
+
+  Still no launcher icon of our own (the platform default stands in). Everything
+  else the UI needs now lives here: a DayNight window theme so a cold start does
+  not flash the wrong shade, and the foreground-service plumbing a multi-minute
+  download requires.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- A download blocks for minutes and has to survive the screen locking. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- API 34+ requires the per-type permission alongside the generic one. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- API 33+ runtime permission. Without it the service still runs, it just
+         shows no notification — which also means no Cancel button. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- The opt-in self-updater hands a downloaded APK to the system installer.
+         DECLARING it here is a build-time fact; GRANTING it is a separate trip
+         to system settings. core/AppUpdater.kt reports those two failures
+         differently on purpose - an UNDECLARED permission cannot be granted at
+         all, so telling the user to visit Settings would be a lie. Without this
+         line the updater correctly reports itself unsupported and downloads
+         nothing. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- OPT-IN, and unused unless the user picks a shared library folder in
+         Settings. The default library lives in app-scoped external storage,
+         which needs no permission at all.
+
+         Why this and not SAF: SAF hands back content:// URIs, and Python
+         cannot open() one — adopting it would mean rewriting every file path
+         in a 40k-line codebase. The whole point of a shared folder is that
+         Komikku/Mihon can READ the library, which they cannot do inside this
+         app's own directory.
+
+         Declared here, granted from system settings (there is no runtime
+         prompt for it), and revocable at any time — Aio.resolveLibraryDir
+         falls back to the app's own folder when it goes away. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="AIO Downloader"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Aio">
+
+        <!-- singleTop so a second `am start` is DELIVERED to the running
+             instance via onNewIntent instead of stacking another copy. The
+             cancel test depends on that delivery being deterministic.
+
+             configChanges keeps the Activity alive across rotation and dark-mode
+             flips. Compose re-reads both from the composition, so recreating for
+             them buys nothing and costs a full teardown mid-download. -->
+        <activity
+            android:name=".MainActivity"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|uiMode|keyboardHidden"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- The interactive bot-check window. singleTop for the same reason
+             MainActivity is: the solve is reached BOTH by a direct start and by
+             tapping a notification, and stacking two copies would leave one of
+             them waiting on a request the other already settled.
+
+             excludeFromRecents because it is a modal errand, not a destination —
+             leaving a stale verification card in Recents invites the user to
+             reopen it long after the download it belonged to finished.
+
+             Not exported: nothing outside the app has any business opening it. -->
+        <activity
+            android:name=".browser.ChallengeActivity"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|uiMode|keyboardHidden"
+            android:label="Site verification"
+            android:exported="false" />
+
+        <!-- Lets the library hand a downloaded CBZ/EPUB/PDF (or the first page
+             of a raw Chapter_N/ folder) to an external reader. A content:// URI
+             plus a one-shot read grant is the only route that works for both
+             library roots: the app-scoped default is unreadable by other apps,
+             and a shared-storage root is reachable but still needs a URI a
+             chooser can carry. res/xml/file_paths.xml declares the two roots
+             and argues the scoping — read it before widening anything. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- dataSync, not a more specific type: this is bulk network transfer
+             plus local file writing. Note Android 15 caps dataSync services at
+             ~6h/day, which is far beyond any single download. Same process as
+             the UI on purpose — see DownloadService's class doc. -->
+        <service
+            android:name=".DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>

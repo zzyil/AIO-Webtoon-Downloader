@@ -4,8 +4,8 @@ Owns: FetchMemo — a thread-safe, in-process cache of (site, url) → scraper /
 comic context / chapter list, shared across the up-to-four phases of one
 search or multi-source operation that all need the SAME data:
 
-    probe (search_orchestrator._probe_one → handler._probe_chapter_aggregate)
-      → T3 pairwise (search_orchestrator._run_pairwise_ranking)
+    matched-page probe (sites/match_session.py: chapter lists, scrapers via
+      search_orchestrator._run_match_phase)
         → winner chapter fetch (aio_search_cli._fetch_chapters_for_winner)
 
 Before 2026-07-12 each phase re-fetched fetch_comic_context + get_chapters
@@ -24,7 +24,7 @@ Deliberate non-goals (user decisions, 2026-07-12):
     bounded-retry shim) gets a genuine fresh attempt instead of a poisoned
     blank. Empty chapter lists likewise aren't stored.
 
-Concurrency model: phases are sequential (probe joins before T3, T3 before
+Concurrency model: phases are sequential (the probe phase ends before the
 winner fetch) and the probe phase dedupes (site, url) pairs across workers,
 so same-key racing is rare; when it happens both threads fetch and
 setdefault keeps the first result — a harmless duplicate fetch, never a
@@ -39,18 +39,16 @@ or between sources. Contexts are returned by reference — they're treated as
 read-mostly by every consumer and sharing them (same object the probe used)
 is exactly the reuse we want.
 
-Separate module (not in search_orchestrator) because base.py's probe needs
-it too and base ↔ search_orchestrator already dance around a circular
-import; a leaf module keeps the dependency graph acyclic and the class
-unit-testable without dragging in the orchestrator.
+Separate module (not in search_orchestrator) because match_session needs it
+too and the orchestrator imports match_session; a leaf module keeps the
+dependency graph acyclic and the class unit-testable without dragging in the
+orchestrator.
 
 Cross-file (grep fetch_memo):
-  - sites/base.py:_probe_chapter_aggregate — probe-side population.
-  - sites/comix.py:_probe_chapter_aggregate — same, saves the 5-50s browser
-    chapter scrape on reuse.
-  - sites/rizzcomic.py — passthrough wrapper.
+  - sites/match_session.py — MatchSession(fetch_memo=) reads chapter lists
+    through it (saves comix's 5-50s browser chapter scrape on reuse).
   - sites/search_orchestrator.py — search_all(fetch_memo=) threads it into
-    _probe_one (scrapers) and _run_pairwise_ranking (chapter lists).
+    _run_match_phase (scrapers + the session).
   - aio_search_cli.py — builds one per operation, passes it to search_all +
     _fetch_chapters_for_winner; _try_extract_seed_hit pre-populates it via
     put_context/put_chapters (the URL-seed path already paid for that data).
@@ -102,8 +100,8 @@ class FetchMemo:
     # ------------------------------------------------------------ scrapers
     def get_scraper(self, site: str, url: str, builder: Callable[[], Any]) -> Any:
         """Return the scraper registered for (site, url), building one via
-        ``builder()`` on first use. Reusing the probe phase's scraper in T3
-        and the winner fetch keeps CF clearances / cookies warm. The builder
+        ``builder()`` on first use. Reusing the probe phase's scraper in the
+        winner fetch keeps CF clearances / cookies warm. The builder
         runs OUTSIDE the lock; a same-key race wastes one build and keeps
         the first registered instance."""
         key = (site, url)
@@ -152,7 +150,7 @@ class FetchMemo:
         """Return a DEEP COPY of the memoized chapter list for
         (handler.name, url, language), fetching context + chapters on a
         miss. Language is part of the key because get_chapters filters by
-        it (probe/T3 hardcode "en"; the winner fetch passes the run's
+        it (the probe hardcodes "en"; the winner fetch passes the run's
         language — a non-en run correctly misses the "en" entries and
         fetches its own). Non-empty results only are stored (no negative
         caching); exceptions propagate."""

@@ -1,0 +1,133 @@
+{
+  "__aioSyncFixture": "browse-remote.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": {
+    "/sdcard": {
+      "ok": true,
+      "path": "/storage/emulated/0",
+      "parent": "/storage/emulated",
+      "entries": [
+        {
+          "name": "Download",
+          "isDir": true
+        },
+        {
+          "name": "Komikku",
+          "isDir": true
+        },
+        {
+          "name": "Mihon",
+          "isDir": true
+        }
+      ],
+      "presets": [
+        {
+          "label": "Komikku local source",
+          "path": "/sdcard/Komikku/local",
+          "exists": true
+        },
+        {
+          "label": "Mihon local source",
+          "path": "/sdcard/Mihon/local",
+          "exists": true
+        },
+        {
+          "label": "Downloads",
+          "path": "/sdcard/Download",
+          "exists": true
+        },
+        {
+          "label": "Internal storage",
+          "path": "/sdcard",
+          "exists": true
+        }
+      ]
+    },
+    "/sdcard/Komikku/local": {
+      "ok": true,
+      "path": "/storage/emulated/0/Komikku/local",
+      "parent": "/storage/emulated/0/Komikku",
+      "entries": [
+        {
+          "name": "Berserk",
+          "isDir": true
+        },
+        {
+          "name": "Chainsaw Man",
+          "isDir": true
+        },
+        {
+          "name": "Dungeon Meshi",
+          "isDir": true
+        },
+        {
+          "name": "Eleceed",
+          "isDir": true
+        }
+      ],
+      "presets": [
+        {
+          "label": "Komikku local source",
+          "path": "/sdcard/Komikku/local",
+          "exists": true
+        },
+        {
+          "label": "Mihon local source",
+          "path": "/sdcard/Mihon/local",
+          "exists": true
+        },
+        {
+          "label": "Downloads",
+          "path": "/sdcard/Download",
+          "exists": true
+        },
+        {
+          "label": "Internal storage",
+          "path": "/sdcard",
+          "exists": true
+        }
+      ]
+    },
+    "/storage/emulated/0": {
+      "ok": true,
+      "path": "/storage/emulated/0",
+      "parent": "/storage/emulated",
+      "entries": [
+        {
+          "name": "Download",
+          "isDir": true
+        },
+        {
+          "name": "Komikku",
+          "isDir": true
+        },
+        {
+          "name": "Mihon",
+          "isDir": true
+        }
+      ],
+      "presets": [
+        {
+          "label": "Komikku local source",
+          "path": "/sdcard/Komikku/local",
+          "exists": true
+        },
+        {
+          "label": "Mihon local source",
+          "path": "/sdcard/Mihon/local",
+          "exists": true
+        },
+        {
+          "label": "Downloads",
+          "path": "/sdcard/Download",
+          "exists": true
+        },
+        {
+          "label": "Internal storage",
+          "path": "/sdcard",
+          "exists": true
+        }
+      ]
+    }
+  }
+}

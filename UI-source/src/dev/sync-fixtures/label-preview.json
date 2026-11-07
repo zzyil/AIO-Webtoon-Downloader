@@ -1,0 +1,78 @@
+{
+  "__aioSyncFixture": "label-preview.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": {
+    "byName": {
+      "Episode 42 - Eleceed.cbz": {
+        "custom": {
+          "ok": true,
+          "unit": "chapter",
+          "label": "42"
+        },
+        "builtin": {
+          "ok": true,
+          "unit": "unknown",
+          "label": null
+        }
+      },
+      "Ch.118.5 Extra.cbz": {
+        "custom": {
+          "ok": true,
+          "unit": "chapter",
+          "label": "118.5"
+        },
+        "builtin": {
+          "ok": true,
+          "unit": "chapter",
+          "label": "118.5"
+        }
+      },
+      "Vol.03 Ch.021.cbz": {
+        "custom": {
+          "ok": true,
+          "unit": "chapter",
+          "label": "21"
+        },
+        "builtin": {
+          "ok": true,
+          "unit": "chapter",
+          "label": "21"
+        }
+      },
+      "Omake (bonus).cbz": {
+        "custom": {
+          "ok": true,
+          "unit": "unknown",
+          "label": null
+        },
+        "builtin": {
+          "ok": true,
+          "unit": "unknown",
+          "label": null
+        }
+      },
+      "Eleceed Ch 12~5.cbz": {
+        "custom": {
+          "ok": true,
+          "unit": "chapter",
+          "label": "12.5"
+        },
+        "builtin": {
+          "ok": true,
+          "unit": "chapter",
+          "label": "12.5"
+        }
+      }
+    },
+    "badPattern": {
+      "ok": true,
+      "error": [
+        {
+          "line": 1,
+          "text": "Episode (\\d+",
+          "message": "Invalid regular expression: /Episode (\\d+/i: Unterminated group"
+        }
+      ]
+    }
+  }
+}

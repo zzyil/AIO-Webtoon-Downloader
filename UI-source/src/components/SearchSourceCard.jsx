@@ -3,8 +3,11 @@
 //
 // Single source within a candidate (one row in the JSON's
 // candidates[i].sources[]). Renders cover, site label, quality
-// bar, badges (DMCA / official-publisher / chapter-count), and
-// a Download button that pushes to the existing queue.
+// bar, badges (DMCA / official-publisher / other edition / chapter
+// count), the "same file / same scan as …" note, and a Download
+// button that pushes to the existing queue. What the rating shows
+// (number vs reason label) is lib/qualityDisplay.js's rule, shared
+// with Device Sync.
 //
 // Compact card sized for a horizontal scroll-snap row of 4-8
 // sources per candidate. ~160px wide.
@@ -14,6 +17,8 @@ import React, { useEffect, useState } from "react";
 import { Button, Badge } from "@/components/ui/primitives";
 import { Download, Image as ImageIcon, AlertTriangle, Clock } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { buildPrefetchedAlts } from "@/lib/prefetchedAlts";
+import { editionNote, measuredRating, measuredTitle, qualityStatus, sameNote } from "@/lib/qualityDisplay";
 
 // Map a 0..1 quality score to one of 4 visual tiers. Returns Tailwind
 // classes that match the existing primitives' destructive/warning/
@@ -46,31 +51,6 @@ function qualityTier(score) {
 // for the next handler that breaks.
 const BROKEN_HANDLERS = {};
 
-// Where this source's displayed rating came from. The orchestrator emits
-// `quality_basis` per source (search_orchestrator.py:_quality_basis —
-// "chapter_probe" | "cover" | "seed"); anything that ISN'T a real
-// chapter-page measurement gets a red AlertTriangle next to the site name
-// (user request 2026-07-12, same affordance BROKEN_HANDLERS uses). That
-// covers: seed-prior-only ratings (unprobed candidates under the top-2
-// probe scope, late-merged fan-out stragglers, cache misses) and
-// cover-image fallbacks / all-samples-failed probes. The fallback inference
-// below handles JSON from an older spawn that predates the field: null
-// score means the UI is showing seed_quality; metadata without a successful
-// sample means cover/failed-probe.
-function qualityBasis(source) {
-  if (source.quality_basis) return source.quality_basis;
-  if (source.img_quality_score == null) return "seed";
-  const m = source.img_quality_metadata;
-  if (m && (m.samples_succeeded ?? 0) > 0) return "chapter_probe";
-  return "cover";
-}
-
-const QUALITY_BASIS_WARNINGS = {
-  seed: "Rating is the per-site prior — no chapter pages were measured for this source in this search.",
-  cover:
-    "Rating was not measured from chapter pages — it comes from the cover image only, or every sampled page failed to fetch.",
-};
-
 export default function SearchSourceCard({
   source,           // SourceEntry from JSON (site, url, cover, scores, etc.)
   officialPublisher, // string | null — non-null if any chapter via this site is is_official=true
@@ -92,17 +72,40 @@ export default function SearchSourceCard({
     setFallbackImgErr(false);
   }, [source.cover, fallbackCover]);
 
-  const final = source.img_quality_score != null ? source.img_quality_score : source.seed_quality;
-  const tier = qualityTier(final);
-  // Red-triangle warning when the displayed rating isn't grounded in real
-  // chapter pages. null for "chapter_probe" (no icon).
-  const basisWarning = QUALITY_BASIS_WARNINGS[qualityBasis(source)] || null;
-  // Phase H aggregate metadata from sites/base.py:_probe_chapter_aggregate.
-  // null when un-measured (cache miss + probe failed). Drives the format chip
-  // beside the site name, the bpp/B&W/outlier breakdown in the quality-bar
-  // tooltip, and the ⚠ icon next to the score when an outlier flag is set.
+  // quality_basis: search_orchestrator._quality_basis (match_session.rate_sources
+  // decides it; "seed" = not probed). img_quality_metadata:
+  // match_session.quality_metadata (reason, samples_*, same_file/same_scan,
+  // colored, …). Only a measured rating is a number; the rest show a reason
+  // label (lib/qualityDisplay.js).
+  const basis = source.quality_basis || "seed";
   const m = source.img_quality_metadata;
-  const formatLabel = m?.format ? m.format.toLowerCase() : null;
+  const final = measuredRating(basis, source.img_quality_score);
+  const tier = qualityTier(final);
+  const status = qualityStatus(basis, m?.reason);
+  const same = sameNote(m);
+  const edition = editionNote(source.edition ?? m?.edition, m?.colored);
+  const fetches =
+    m?.samples_attempted
+      ? ` · ${m.samples_succeeded ?? 0}/${m.samples_attempted} page fetches` +
+        ((m.samples_timed_out ?? 0) > 0 ? ` (${m.samples_timed_out} timed out)` : "")
+      : "";
+  const barTitle =
+    (final != null ? `rating ${final.toFixed(2)} · ${measuredTitle(basis)}` : status?.title ?? "") +
+    fetches +
+    (source.dmca_likely ? " · DMCA / publisher-hosted" : "");
+  // Chapter count: the VERIFIED count when the site measured one, else its
+  // metadata claim. MangaDex's verified count excludes publisher link-outs
+  // (sites/mangadex.py, grep includeExternalUrl), so Goblin Slayer reads 0,
+  // not the 203 rows it lists. Same rule as Device Sync's Find sources
+  // (electron/sync/find-sources.js, grep actual_chapter_count) and Android
+  // (SearchModels.kt chapterCount).
+  const chapterCount = source.actual_chapter_count ?? source.chapter_count_hint ?? null;
+  const chapterCountTitle =
+    source.actual_chapter_count != null &&
+    source.chapter_count_hint != null &&
+    source.actual_chapter_count !== source.chapter_count_hint
+      ? `${source.actual_chapter_count} downloadable · the site's info claims ${source.chapter_count_hint}`
+      : undefined;
   const displayCover = source.cover && !imgErr
     ? source.cover
     : (fallbackCover && !fallbackImgErr ? fallbackCover : null);
@@ -121,31 +124,13 @@ export default function SearchSourceCard({
       multiSource: multiSourceUsed,
     };
 
-    if (candidate?.sources?.length > 1) {
-      // Strip the primary itself; keep everything else as alternatives. The
-      // ordering preserves the search-time quality ranking (candidate.sources
-      // is sorted official-first / DMCA-last / quality-desc by the orchestrator),
-      // which becomes the alignment input order in chapter_merger.
-      const alternatives = candidate.sources
-        .filter((s) => s.url !== source.url)
-        .map((s) => ({
-          site: s.site,
-          url: s.url,
-          title: s.title || undefined,
-          cover: s.cover || undefined,
-        }));
-      if (alternatives.length > 0) {
-        // downloader.js intercepts `prefetchedAlts`, writes it to a JSON file
-        // under ~/.aio-dl/cache/, and replaces it with `multiSourcePrefetched`
-        // (a path) which buildCliArgs's flagMap turns into the CLI arg.
-        args.prefetchedAlts = {
-          primary: { site: source.site, url: source.url },
-          alternatives,
-          title: candidate.canonical_title || "",
-          year: candidate.canonical_year || null,
-        };
-      }
-    }
+    // The candidate's other sites, primary stripped, in the search's rank
+    // order. Shared with Device Sync's Find sources (lib/prefetchedAlts.js).
+    // downloader.js intercepts `prefetchedAlts`, writes it to a JSON file
+    // under ~/.aio-dl/cache/, and replaces it with `multiSourcePrefetched`
+    // (a path) which buildCliArgs's flagMap turns into the CLI arg.
+    const alts = buildPrefetchedAlts(candidate?.sources, source, candidate?.canonical_title, candidate?.canonical_year);
+    if (alts) args.prefetchedAlts = alts;
 
     onQueue?.(source.url, args, { source, candidate });
   };
@@ -183,7 +168,10 @@ export default function SearchSourceCard({
 
         {/* DMCA overlay — top-right corner, tucked over cover */}
         {source.dmca_likely && (
-          <div className="absolute top-1.5 right-1.5">
+          <div
+            className="absolute top-1.5 right-1.5"
+            title="Most chapters this site lists can't be downloaded from it: taken down (DMCA) or hosted by the publisher (a link out, no pages)."
+          >
             <Badge variant="destructive" className="text-[9px] px-1.5 py-0 leading-tight">
               DMCA
             </Badge>
@@ -200,21 +188,32 @@ export default function SearchSourceCard({
             </Badge>
           </div>
         )}
+
+        {/* Other-edition badge — bottom-left. The search's color check
+            (sites/match_session.py _editions) found this site's pages are a
+            different edition from most sites' (e.g. fan-colored). Such a
+            source never becomes another download's fallback
+            (lib/prefetchedAlts.js editionOf); the tooltip says which way it
+            differs. */}
+        {edition && (
+          <div className="absolute bottom-1.5 left-1.5" title={edition.title}>
+            <Badge variant="default" className="text-[9px] px-1.5 py-0 leading-tight bg-background/90">
+              {edition.label}
+            </Badge>
+          </div>
+        )}
       </div>
 
       {/* Body */}
       <div className="px-2.5 py-2 space-y-1.5">
-        {/* Site name + broken-handler warning + format chip + chapter count */}
+        {/* Site name + broken-handler warning + chapter count */}
         <div className="flex items-center gap-1 min-w-0">
           <span className="font-mono text-[11px] font-medium text-foreground truncate">
             {source.site}
           </span>
           {/* Broken-handler danger icon. Sourced from BROKEN_HANDLERS map at
               the top of this file — keyed by source.site, value is the
-              tooltip text. Red AlertTriangle distinguishes "handler is
-              broken" (this) from the yellow outlier-flag AlertTriangle on
-              the score row below (which is "this source's image quality is
-              suspect"). Inline span carries the title because lucide-react's
+              tooltip text. Inline span carries the title because lucide-react's
               SVGs don't surface native tooltips reliably across browsers.
               Cross-file: BROKEN_HANDLERS comment for current entries and
               the why; remove an entry when the handler is fixed. */}
@@ -229,107 +228,56 @@ export default function SearchSourceCard({
               />
             </span>
           )}
-          {/* Quality-basis danger icon (2026-07-12): red AlertTriangle when
-              the displayed rating is seed-prior-only or a cover fallback —
-              i.e. NOT measured from real chapter pages. Same affordance as
-              the BROKEN_HANDLERS icon above (and distinct from the yellow
-              outlier triangle on the score row, which means "measured but
-              suspect"). Data contract + derivation:
-              search_orchestrator.py:_quality_basis; helper qualityBasis at
-              the top of this file handles pre-field JSON. */}
-          {basisWarning && (
+          {chapterCount != null && (
             <span
-              className="shrink-0 inline-flex items-center"
-              title={basisWarning}
+              className="text-[10px] text-muted-foreground tabular-nums shrink-0 ml-auto"
+              title={chapterCountTitle}
             >
-              <AlertTriangle
-                className="w-3 h-3 text-red-500"
-                aria-label={`${source.site} rating basis warning: ${basisWarning}`}
-              />
-            </span>
-          )}
-          {formatLabel && (
-            // Format chip from Phase H metadata. Lowercase font-mono lines up
-            // with the site name visually; muted color keeps it secondary.
-            <span className="font-mono text-[9px] text-muted-foreground/70 uppercase tracking-wide shrink-0">
-              {formatLabel}
-            </span>
-          )}
-          {source.chapter_count_hint != null && (
-            <span className="text-[10px] text-muted-foreground tabular-nums shrink-0 ml-auto">
-              {source.chapter_count_hint}ch
+              {chapterCount}ch
             </span>
           )}
         </div>
 
-        {/* Quality bar — width proportional to final score, color by tier.
-            Tooltip on hover surfaces the seed / measured / final breakdown
-            plus Phase H per-source metadata (format, bpp, content type,
-            outlier flag) so the user can audit why a source ranked where
-            it did without leaving the card. */}
-        <div
-          className="h-1 rounded-full bg-muted overflow-hidden"
-          title={
-            `seed=${(source.seed_quality ?? 0).toFixed(2)}` +
-            (source.img_quality_score != null
-              ? ` · measured=${source.img_quality_score.toFixed(2)}`
-              : " · unmeasured") +
-            ` · final=${(final ?? 0).toFixed(2)}` +
-            (m?.format ? ` · ${m.format}` : "") +
-            (m?.bpp != null ? ` · ${m.bpp.toFixed(3)} bpp` : "") +
-            (m?.is_grayscale != null ? (m.is_grayscale ? " · B&W" : " · color") : "") +
-            (m?.decode_quality != null ? ` · decode=${m.decode_quality.toFixed(2)}` : "") +
-            (m?.outlier ? ` · outlier=${m.outlier}` : "") +
-            (m?.samples_attempted != null
-              ? ` · ${m.samples_succeeded ?? 0}/${m.samples_attempted} samples` +
-                ((m?.samples_timed_out ?? 0) > 0 ? ` (${m.samples_timed_out} timed out)` : "")
-              : "") +
-            (source.dmca_likely ? " · DMCA-flagged" : "")
-          }
-        >
+        {/* Quality bar — width = the measured rating, color by tier; empty
+            when there is no measured rating. Tooltip: what the rating means
+            for this basis (or why there is none), plus page-fetch counts. */}
+        <div className="h-1 rounded-full bg-muted overflow-hidden" title={barTitle}>
           <div
             className={cn("h-full transition-all duration-300", tier.color)}
             style={{ width: `${Math.max(0, Math.min(1, final || 0)) * 100}%` }}
           />
         </div>
 
-        {/* Outlier ⚠ + final score number — right-aligned. The icon flags a
-            broken-encoding source (currently only "webp_below_floor") so the
-            user can spot a degenerate score at a glance without hovering for
-            the tooltip. yellow-500 is the existing warning palette. */}
-        <div className="flex items-center justify-end gap-1">
-          {/* Partial-probe hint (2026-07-14): some breadth-sample chapters timed
-              out, so the score was measured on fewer chapters than usual. Muted
-              Clock — distinct from the red basis triangle (rating not from
-              chapter pages) and the yellow outlier triangle (measured-but-
-              suspect); the score itself is FAIR, this just flags it's partial.
-              Keyed on samples_timed_out (covers budget-miss AND per-fetch
-              timeout); older JSON lacks the field → ?? 0 → no icon. Wrapped in a
-              title span because lucide SVGs don't surface native tooltips
-              reliably (see the site-name icons above). Data:
-              sites/base.py:_probe_chapter_aggregate metadata
-              samples_timed_out / samples_measured. */}
+        {/* Rating number, or the reason label when there is none (user
+            decision 2026-10-21: measured ratings are the only numbers). The
+            Clock flags page fetches that timed out: the rating is FAIR but
+            rests on fewer pages; older JSON lacks the field → no icon. Title
+            on a span because lucide SVGs don't surface native tooltips
+            reliably (see the site-name icons above). */}
+        <div className="flex items-center justify-end gap-1" title={barTitle}>
           {(m?.samples_timed_out ?? 0) > 0 && (
             <span
               className="shrink-0 inline-flex items-center"
-              title={`Partial probe — ${m.samples_succeeded ?? 0}/${m.samples_attempted} sample chapters measured; ${m.samples_timed_out} timed out (site is slow to probe). Score reflects the chapters we could fetch.`}
+              title={`${m.samples_timed_out} of ${m.samples_attempted} page fetches timed out (the site is slow).`}
             >
               <Clock
                 className="w-3 h-3 text-muted-foreground"
-                aria-label={`partial probe: ${m.samples_timed_out} of ${m.samples_attempted} sample chapters timed out`}
+                aria-label={`${m.samples_timed_out} of ${m.samples_attempted} page fetches timed out`}
               />
             </span>
           )}
-          {m?.outlier && (
-            <AlertTriangle
-              className="w-3 h-3 text-yellow-500 shrink-0"
-              aria-label={`outlier flag: ${m.outlier}`}
-            />
-          )}
           <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
-            {final != null ? final.toFixed(2) : "—"}
+            {final != null ? final.toFixed(2) : status?.label ?? "—"}
           </span>
         </div>
+
+        {/* Same file / same scan note (match_session rate_sources
+            same_file / same_scan): which other sites serve this copy. */}
+        {same && (
+          <div className="text-[10px] leading-tight text-muted-foreground truncate" title={same.title}>
+            {same.label}
+          </div>
+        )}
 
         {/* Download button */}
         <Button

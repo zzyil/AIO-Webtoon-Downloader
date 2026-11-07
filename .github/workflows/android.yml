@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Android workflow — build the Chaquopy port and run its JVM unit tests on every
+# push and PR. The Android sibling of test.yml, and it exists for the same
+# reason: until it did, everything under android/ was dark code that only got
+# compiled when someone happened to build it locally, on the one machine with a
+# JDK in range.
+#
+# THIS DOES NOT PRODUCE A RELEASE. The signed release APK, the android-latest.json
+# update feed and the attach-to-draft step all live in the `android` job of
+# release.yml. Splitting them keeps this job free of secrets, so it runs on
+# pull requests from forks like every other pre-merge check.
+#
+# Linux-only, for exactly test.yml's reason: nothing here is platform-specific.
+# Gradle, the Android SDK and Chaquopy's wheel index behave identically on all
+# three runner OSes, and android/gradlew is committed with its exec bit set
+# (`git ls-tree` reports mode 100755), so `./gradlew` runs unmodified on Linux.
+# A matrix would triple CI minutes for no signal.
+#
+# WHAT IT DOES NOT DO, and why:
+#   - No `assembleRelease`. It would double the Chaquopy pip work (each variant
+#     gets its own pip pass) for a variant whose only difference this job could
+#     observe is minification, which is off. Release assembly is exercised on
+#     every release run instead. `printVersion` below is the cheap smoke test
+#     that the date-version derivation still resolves.
+#   - No instrumentation tests. There is no emulator here, and the things that
+#     would actually need one — the Chaquopy bridges — are precisely what a
+#     headless runner cannot exercise.
+#
+# TOOLCHAIN NOTES (the two things that break this job):
+#   - JDK must be 17-21. AGP 8.13 rejects anything newer; android/README.md
+#     documents the same trap for local builds.
+#   - Chaquopy's buildPython must be the interpreter matching `version = "3.13"`
+#     in app/build.gradle.kts. The runner's bare `python3` is the distro's, so
+#     the setup-python step's own `python-path` output is handed over through
+#     AIO_BUILD_PYTHON — grep that name in android/app/build.gradle.kts.
+#
+# Cross-file: android/gradle/libs.versions.toml pins AGP/Kotlin/Chaquopy;
+# android/README.md "Why these versions" argues each pin.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Chaquopy downloads and unpacks a CPython runtime plus four native wheels
+    # per ABI on a cold cache; the default 360m is far too generous and a hung
+    # download should fail fast rather than hold a runner for six hours.
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      # Action runtimes pinned to majors that ship with Node 24, same as
+      # test.yml and release.yml — see test.yml's header for the deprecation
+      # context. setup-java v5 and setup-python v6 are those majors.
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          # 21 is the top of AGP 8.13's supported range and matches the JDK
+          # android/README.md tells local builders to use (Android Studio's
+          # bundled jbr is a 21). Do not "modernize" this to 25.
+          java-version: "21"
+          # Caches ~/.gradle/caches + wrapper, keyed on the gradle files. Worth
+          # far more here than on the Node jobs: it also carries Chaquopy's
+          # downloaded target wheels.
+          cache: gradle
+
+      - uses: actions/setup-python@v6
+        id: buildpython
+        with:
+          # MUST match `chaquopy { defaultConfig { version } }`.
+          python-version: "3.13"
+
+      # Belt and braces. AGP auto-downloads a missing platform when the licenses
+      # are accepted (they are, on the hosted image), but doing it explicitly
+      # turns "compileSdk 36 is not installed" into a clear failure here rather
+      # than a Gradle stack trace 20 minutes into the build.
+      - name: Ensure the compileSdk platform is installed
+        run: |
+          set -eu
+          SDKMANAGER="$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1 || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "No sdkmanager on this image; relying on AGP's own SDK download."
+            exit 0
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-36" || \
+            echo "::warning::sdkmanager could not install platforms;android-36 — AGP will try."
+
+      - name: Unit tests and debug APK
+        env:
+          AIO_BUILD_PYTHON: ${{ steps.buildpython.outputs.python-path }}
+        run: |
+          ./gradlew --console=plain --no-daemon \
+            :app:printVersion \
+            :app:testDebugUnitTest \
+            :app:assembleDebug
+
+      # The HTML report is the only readable form of a Kotlin test failure; the
+      # console prints "there were failing tests" and a file path that does not
+      # exist on the runner once the job ends.
+      - name: Upload test report on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-test-report
+          path: android/app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: ignore
+          retention-days: 7
