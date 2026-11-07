@@ -480,3 +480,133 @@ def test_a_source_that_served_nothing_does_not_set_the_title_band():
     dead.basis = "unreachable"
     live = _make_source("live", title_match=0.85)
     assert abs(best_title_of([dead, live]) - 0.85) < 1e-9
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Other-name queries (2026-11-08): in a URL-seeded search (or with
+# title_variants), a site whose search for the seed title found no exact match
+# is searched again under the seed's ASCII alt names. Live case: MangaFire's
+# "Monster Tale" is Bakemonogatari, which mangahub/mangapill/weebcentral list
+# only under that name. See _search_other_names in search_all.
+# ────────────────────────────────────────────────────────────────────────
+
+def _hit(site, title, url, alts=()):
+    from sites.base import SearchHit
+    return SearchHit(site=site, title=title, url=url, cover=None,
+                     alt_titles=list(alts), year=None, language=None,
+                     chapter_count_hint=5, raw_score=1.0)
+
+
+def _indexed_site(name, index):
+    """Fake handler whose search returns index[query] (else []) and records
+    every query it was sent on .queries."""
+    from sites.base import BaseSiteHandler
+
+    class _H(BaseSiteHandler):
+        def search(self, query, *a, **kw):
+            self.queries.append(query)
+            rows = index.get(query, [])
+            if isinstance(rows, Exception):
+                raise rows
+            return [_hit(name, t, f"https://{name}.example/{t.replace(' ', '-')}")
+                    for t in rows]
+
+    _H.name = name
+    _H.domains = (f"{name}.example",)
+    h = _H()
+    h.queries = []
+    return h
+
+
+_MONSTER_SEED_ALTS = ["Bakemonogatari", "Истории монстров",
+                      "Những Câu Chuyện Huyền Bí", "Monogatari Series", "Bake"]
+
+
+def _monster_seed():
+    return _hit("seedsite", "Monster Tale", "https://seed.example/monster-tale",
+                alts=_MONSTER_SEED_ALTS)
+
+
+def _search(handlers, query="Monster Tale", **kw):
+    with patch("sites.iter_search_capable_handlers", lambda: iter(handlers)):
+        with patch("sites.get_handler_by_name", lambda _: None):
+            return search_all(query, MagicMock(return_value=MagicMock()),
+                              MagicMock(), **kw)
+
+
+def test_site_indexing_only_the_other_name_joins_the_seeded_candidate():
+    site = _indexed_site("romajisite", {
+        "Monster Tale": ["The Bride of a Monster"],
+        "Bakemonogatari": ["Bakemonogatari"],
+    })
+    cands = _search([site], seed_hits=[_monster_seed()])
+    where = _where(cands, "romajisite")
+    seed_at = _where(cands, "seedsite")
+    assert where is not None and seed_at is not None
+    assert where[0] == seed_at[0], "recovered entry landed in another candidate"
+    assert where[1].title == "Bakemonogatari"
+    # Stops at the first name that yields an exact match.
+    assert site.queries == ["Monster Tale", "Bakemonogatari"]
+
+
+def test_exact_primary_match_is_not_searched_again():
+    site = _indexed_site("englishsite", {"Monster Tale": ["Monster Tale"]})
+    _search([site], seed_hits=[_monster_seed()])
+    assert site.queries == ["Monster Tale"]
+
+
+def test_only_ascii_names_are_sent_and_at_most_two():
+    site = _indexed_site("emptysite", {})
+    _search([site], seed_hits=[_monster_seed()])
+    # Cyrillic and Vietnamese skipped; "Bake" is long enough to be a variant
+    # but the cap of 2 stops before it.
+    assert site.queries == ["Monster Tale", "Bakemonogatari", "Monogatari Series"]
+
+
+def test_keyword_search_sends_only_the_query():
+    site = _indexed_site("plainsite", {})
+    _search([site], query="Bakemonogatari")
+    assert site.queries == ["Bakemonogatari"]
+
+
+def test_timing_out_primary_skips_the_other_names():
+    site = _indexed_site("deadsite", {})
+    # per_site_timeout_s=0: every primary counts as having hit the timeout.
+    _search([site], seed_hits=[_monster_seed()], per_site_timeout_s=0.0)
+    assert site.queries == ["Monster Tale"]
+
+
+def test_failing_other_name_query_does_not_strike_the_host(tmp_path):
+    site = _indexed_site("flakysite", {
+        "Bakemonogatari": RuntimeError("search endpoint 500"),
+        "Monogatari Series": ["Bakemonogatari"],
+    })
+    cache = _isolated_probe_cache(tmp_path, threshold=1, ttl_s=3600)
+    diagnostics = {}
+    cands = _search([site], seed_hits=[_monster_seed()],
+                    probe_failure_cache=cache, diagnostics=diagnostics)
+    assert site.queries == ["Monster Tale", "Bakemonogatari", "Monogatari Series"]
+    assert _where(cands, "flakysite") is not None, "next name not tried"
+    assert cache.is_blocked("flakysite.example") is False
+    assert not [h for h in diagnostics["site_health"] if h["site"] == "flakysite"]
+
+
+def test_title_variants_alone_drive_queries_and_scoring():
+    """The direct-URL --multi-source path has no seed hit, only the primary
+    page's alt_names (aio_search_cli passes them as title_variants)."""
+    site = _indexed_site("romajisite", {"Bakemonogatari": ["Bakemonogatari"]})
+    cands = _search([site], title_variants=["Bakemonogatari"])
+    assert site.queries == ["Monster Tale", "Bakemonogatari"]
+    where = _where(cands, "romajisite")
+    assert where is not None and where[1].title_match >= 1.0
+
+
+def test_primary_alt_names_reads_the_handler_context():
+    from types import SimpleNamespace
+    from aio_search_cli import _primary_alt_names
+
+    assert _primary_alt_names(SimpleNamespace(comic={"alt_names": ["A b", " ", 3]})) == ["A b"]
+    assert _primary_alt_names(SimpleNamespace(comic={"alt_names": "Solo"})) == ["Solo"]
+    assert _primary_alt_names(SimpleNamespace(comic={})) == []
+    assert _primary_alt_names(SimpleNamespace(comic=None)) == []
+    assert _primary_alt_names(object()) == []

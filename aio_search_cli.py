@@ -49,7 +49,7 @@ except Exception:
     pass
 
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 import requests
 
@@ -230,6 +230,24 @@ def _try_extract_seed_hit(query: str, fetch_memo=None) -> Optional[SearchHit]:
         raw_score=1.0,
         is_official=is_official,
     )
+
+
+def _primary_alt_names(context: Any) -> List[str]:
+    """The handler-scraped alt_names of a download's primary series, as strings.
+
+    Handlers store them on ``context.comic["alt_names"]`` (grep
+    `comic["alt_names"]` under sites/) — usually a list, occasionally a single
+    string. Anything else, or a context with no comic dict, gives [].
+    """
+    comic = getattr(context, "comic", None)
+    if not isinstance(comic, dict):
+        return []
+    raw = comic.get("alt_names")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(a) for a in raw if isinstance(a, str) and a.strip()]
 
 
 def _search_make_request_factory(timeout: float, attempts: int = 2):
@@ -1116,6 +1134,14 @@ def find_alternatives_for_direct_url(
         # alternatives; aio-dl.py also guard-filters the assembled dict to catch
         # prefetched/cached alts that predate the disable.
         exclude_sites=parse_disable_sites(args),
+        # The primary page's own other names (the handler's alt_names, read off
+        # the series page this download already fetched — never AniList
+        # synonyms, which aren't written back into ctx.comic). Same role as a
+        # URL seed's alt_titles in run_search_mode: sites that list the series
+        # only under another name get searched AND scored by it. Without this,
+        # a MangaFire "Monster Tale" download found no alternative on the
+        # sites that list it as "Bakemonogatari". See search_all title_variants.
+        title_variants=_primary_alt_names(primary_context),
     )
     if not candidates:
         if on_status:

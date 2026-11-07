@@ -60,6 +60,21 @@ DEFAULT_MIN_MATCH = 0.55
 _SEED_VARIANT_MIN_LEN = 4
 _SEED_VARIANT_MAX = 12
 
+# Seed alt-title QUERIES (2026-11-08). Scoring against the alt names (above)
+# only helps when a site's search RETURNED the series; a site whose index only
+# knows the other name never does. Measured on the MangaFire "Monster Tale"
+# URL (= Bakemonogatari): searched as "Monster Tale", mangahub and mangapill
+# returned 20 unrelated hits each and weebcentral none, while all three list
+# the series as "Bakemonogatari". So in _run_one a site whose primary search
+# found no exact match is searched again under up to _SEED_QUERY_MAX of those
+# names. ASCII-only (see _fanout_query_variants): Cyrillic/Arabic/Hangul
+# aliases cost a request per site on sites that index English/romaji and
+# return nothing. _SEED_QUERY_SATISFIED is "exact title" — WRatio returns 100
+# only for identical strings, and a spin-off that merely contains the title
+# ("X - Side Story") scores below it, so it doesn't suppress the re-query.
+_SEED_QUERY_MAX = 2
+_SEED_QUERY_SATISFIED = 1.0
+
 # Tiebreaker window: when two sources for the same candidate score within
 # this much on title-match, the quality_seed prior breaks the tie. Above this
 # delta, title-match is fully decisive. See plan section "G. --search wired
@@ -877,6 +892,62 @@ def _best_title_match(
     return best
 
 
+def _collect_title_variants(
+    query: str,
+    seed_hits: Optional[Sequence[SearchHit]],
+    title_variants: Optional[Sequence[str]],
+) -> List[str]:
+    """Distinct other spellings of the series being searched, in trust order.
+
+    Seed hits first (their own title, then alt_titles — the URL the user
+    pasted), then the caller's ``title_variants``. Deduped by
+    _normalize_title against the query and each other, fragments shorter
+    than _SEED_VARIANT_MIN_LEN dropped, capped at _SEED_VARIANT_MAX. The
+    query itself is never in the result. Empty when neither source gives
+    anything, which keeps keyword searches byte-identical to before.
+    """
+    raw: List[str] = []
+    for sh in seed_hits or ():
+        raw.append(sh.title)
+        raw.extend(sh.alt_titles or [])
+    raw.extend(title_variants or ())
+
+    out: List[str] = []
+    seen = {_normalize_title(query)}
+    for alt in raw:
+        if len(out) >= _SEED_VARIANT_MAX:
+            break
+        a = (alt or "").strip()
+        if len(a) < _SEED_VARIANT_MIN_LEN:
+            continue
+        k = _normalize_title(a)
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(a)
+    return out
+
+
+def _fanout_query_variants(variants: Sequence[str]) -> List[str]:
+    """The subset of ``variants`` worth sending to other sites as a search query.
+
+    Pure-ASCII names with at least one letter, in the given order, at most
+    _SEED_QUERY_MAX. ASCII rather than "Latin script" on purpose: Vietnamese
+    and other diacritic-heavy localizations are translations no English-indexed
+    site lists, while the names that DO recover a series (romaji, the other
+    English title) are plain ASCII in practice. Order is trust order from
+    _collect_title_variants, so a site's first alt name — usually the main
+    other title — goes first.
+    """
+    out: List[str] = []
+    for v in variants:
+        if len(out) >= _SEED_QUERY_MAX:
+            break
+        if v.isascii() and any(c.isalpha() for c in v):
+            out.append(v)
+    return out
+
+
 def _src_key(src: "SourceEntry") -> str:
     """ImageQualityCache / match_session key of a source."""
     return f"{src.site}:{src.url}"
@@ -1364,6 +1435,7 @@ def search_all(
     fetch_memo=None,
     exclude_sites: Optional[Set[str]] = None,
     diagnostics: Optional[dict] = None,
+    title_variants: Optional[Sequence[str]] = None,
 ) -> List[SeriesCandidate]:
     """Fan out search across all search-capable handlers, dedupe, rank.
 
@@ -1422,6 +1494,17 @@ def search_all(
         ["eligible_count"], ["tested_sites"] and ["phase_times"].
         Assembled at return under the fan-out/probe locks (stragglers may still
         be mutating the timing containers). See _classify_site_health.
+      title_variants: other names of the SAME series that the caller already
+        trusts, beyond what seed_hits carry — the direct-URL --multi-source
+        path passes the primary page's alt_names (it has no seed hit). Merged
+        with the seed hits' title + alt_titles into one variant list that is
+        (a) scored against every hit (_best_title_match extra_queries) and
+        (b) sent as extra search queries to sites whose primary search found
+        no exact match (_fanout_query_variants, _run_one). Never pass
+        user-unverified names here (e.g. AniList synonyms off a library entry
+        — see external_metadata's poisoned-synonym note): they widen
+        admission. None/empty with no seed_hits = keyword search, scored and
+        queried exactly as before.
 
     Returns:
       List of SeriesCandidate, ranked best-first.
@@ -1574,6 +1657,81 @@ def search_all(
         if seed_hits:
             on_status(f"[*] Including {len(seed_hits)} seeded source(s) from URL")
 
+    # Other known names of the series (seed page's title + alt_names, then the
+    # caller's title_variants). URL-seed mode searches every other site with
+    # the seed site's title (aio_search_cli: `query = seed.title`), so without
+    # these a site listing the series under another name (a) scores against a
+    # title it was never going to match, and (b) is never even ASKED for that
+    # name. They feed both: _best_title_match extra_queries for (a),
+    # seed_query_variants in _run_one for (b). Computed BEFORE the fan-out
+    # because (b) runs inside it. Keyword searches leave both empty.
+    seed_title_variants: List[str] = _collect_title_variants(
+        query, seed_hits, title_variants,
+    )
+    seed_query_variants: List[str] = _fanout_query_variants(seed_title_variants)
+    # Sites whose extra-name search ran / added a hit — status line only.
+    variant_queried: Set[str] = set()
+    variant_recovered: Set[str] = set()
+    if seed_query_variants and eligible and on_status:
+        on_status(
+            "[*] Sites without an exact match are also searched as: "
+            + ", ".join(repr(v) for v in seed_query_variants)
+        )
+
+    def _search_other_names(
+        handler: BaseSiteHandler, scraper: Any, hits: List[SearchHit],
+        primary_s: float,
+    ) -> List[SearchHit]:
+        """Re-search ``handler`` under seed_query_variants when its primary
+        search found no exact match; returns ``hits`` plus any new ones.
+
+        Skipped when the primary already holds an exact title (the series is
+        found; another query only adds noise) or when the primary took at least
+        per_site_timeout_s — at that point the host is timing out, and a second
+        query would wait the same timeout again and push the site past the
+        fan-out barrier. A variant query that raises is dropped WITHOUT a
+        ProbeFailureCache strike or errored_names entry: the primary already
+        proved the host reachable, so the failure is about the query string.
+        Stops at the first variant that yields an exact match. New hits dedupe
+        by URL against what the site already returned.
+        """
+        if not seed_query_variants or primary_s >= per_site_timeout_s:
+            return hits
+
+        def _has_exact(hs: List[SearchHit]) -> bool:
+            return any(
+                _best_title_match(query, h, seed_title_variants)
+                >= _SEED_QUERY_SATISFIED
+                for h in hs
+            )
+
+        if _has_exact(hits):
+            return hits
+        merged = list(hits)
+        seen_urls = {h.url for h in merged}
+        with fanout_lock:
+            variant_queried.add(handler.name)
+        for variant in seed_query_variants:
+            try:
+                extra = handler.search(
+                    variant, scraper, make_request,
+                    language=language, limit=top_per_site,
+                )
+            except Exception:
+                # SiteBusyError included: our own contention, and the primary
+                # already answered — nothing to record. Try the next name.
+                continue
+            if not isinstance(extra, list):
+                continue
+            new = [h for h in extra if h.url not in seen_urls]
+            seen_urls.update(h.url for h in new)
+            merged.extend(new)
+            if _has_exact(new):
+                with fanout_lock:
+                    variant_recovered.add(handler.name)
+                break
+        return merged
+
     def _run_one(handler: BaseSiteHandler) -> List[SearchHit]:
         host = (handler.domains[0] if getattr(handler, "domains", None) else "") or ""
         try:
@@ -1588,11 +1746,15 @@ def search_all(
                 cache.record_failure(host)
             return []
         try:
+            _primary_t0 = time.monotonic()
             hits = handler.search(
                 query, scraper, make_request, language=language, limit=top_per_site
             )
             if not isinstance(hits, list):
                 hits = []
+            hits = _search_other_names(
+                handler, scraper, hits, time.monotonic() - _primary_t0,
+            )
             if cache and host and hits:
                 # Record success ONLY on a NON-EMPTY result — that's the sole
                 # proof we actually reached AND parsed the site. An empty list
@@ -1693,6 +1855,13 @@ def search_all(
             on_status(
                 "[*] fan-out slowest: "
                 + " · ".join(f"{n} {t:.1f}s" for n, t in fanout_slowest)
+            )
+        if variant_queried and on_status:
+            with fanout_lock:
+                _vq, _vr = len(variant_queried), sorted(variant_recovered)
+            on_status(
+                f"[*] other-name search: {_vq} site(s) re-searched, exact match "
+                f"found on {len(_vr)}" + (f" ({', '.join(_vr)})" if _vr else "")
             )
         if late_pending and on_status:
             on_status(
@@ -1882,28 +2051,6 @@ def search_all(
         _emit_site_health()
         return []
 
-    # Alternate spellings of the seeded series, harvested from the seed's own
-    # alt_names. URL-seed mode searches every other site with the seed site's
-    # title (aio_search_cli: `query = seed.title`), so without this a site that
-    # lists the series under a different romanization scores against a title it
-    # was never going to match. Only URL-seed searches populate seed_hits, so
-    # keyword searches keep their exact previous scores. Grep _SEED_VARIANT_MAX
-    # for the bounds and _best_title_match for how they are consumed.
-    seed_title_variants: List[str] = []
-    if seed_hits:
-        _seen_variants = {_normalize_title(query)}
-        for _sh in seed_hits:
-            for _alt in [_sh.title] + list(_sh.alt_titles or []):
-                if len(seed_title_variants) >= _SEED_VARIANT_MAX:
-                    break
-                _a = (_alt or "").strip()
-                if len(_a) < _SEED_VARIANT_MIN_LEN:
-                    continue
-                _k = _normalize_title(_a)
-                if not _k or _k in _seen_variants:
-                    continue
-                _seen_variants.add(_k)
-                seed_title_variants.append(_a)
     if seed_title_variants and on_status:
         _shown = ", ".join(seed_title_variants[:3])
         _more = f" +{len(seed_title_variants) - 3} more" if len(seed_title_variants) > 3 else ""

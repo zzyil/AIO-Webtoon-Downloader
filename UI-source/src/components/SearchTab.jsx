@@ -426,7 +426,10 @@ export default function SearchTab({
         {/* ── Search bar ── */}
         <form onSubmit={handleSubmit}>
           <Label htmlFor="search-query" className="text-sm font-semibold">
-            Find a manga across {opts.seededOnly ? "30" : "280+"} sites
+            {/* Hand-kept: the curated count = keys of sites/quality_seed.json that
+                are also registered handlers (a listed key with no handler isn't
+                searched, so it doesn't count). Update when that file changes. */}
+            Find a manga across {opts.seededOnly ? "29" : "280+"} sites
           </Label>
           <p className="text-xs text-muted-foreground mt-0.5 mb-2">
             Cross-site search ranks results by title match, measured chapter
